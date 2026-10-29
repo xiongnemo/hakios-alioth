@@ -145,6 +145,19 @@ sleep_ms(uint32_t ms)
 
 #define GPIO_CFG(n)             (gpio_base(n) + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (gpio_base(n) + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
+/*
+ * A pin's interrupt detection (pinctrl-kona.c: intr_cfg +8, intr_status +0xc; enable bit 0, polarity 1,
+ * detection [3:2], raw status 4): with "raw status" on and "enable" off an edge is latched in the status
+ * register and goes nowhere else -- no interrupt controller is involved (Linux keeps it so while an
+ * interrupt is masked, for the same reason: edges are not lost).
+ */
+#define GPIO_INTR_CFG(n)        (gpio_base(n) + 0x1000UL * (n) + 8)
+#define GPIO_INTR_STATUS(n)     (gpio_base(n) + 0x1000UL * (n) + 0xc)
+#define INTR_ENABLE             (1u << 0)
+#define INTR_POLARITY_HIGH      (1u << 1)
+#define INTR_DETECT_MASK        (3u << 2)
+#define INTR_DETECT_FALLING     (2u << 2)       /* (with the polarity bit, as msm_gpio_irq_set_type() does) */
+#define INTR_RAW_STATUS         (1u << 4)
 #define PULL_NONE               0
 #define PULL_UP                 3
 
@@ -164,6 +177,30 @@ static bool
 gpio_get(unsigned pin)
 {
 	return rd(GPIO_IO(pin)) & 1;
+}
+
+/* Falling edges on the pin latched from now on (see GPIO_INTR_CFG); false if the latch does not take. */
+static bool
+gpio_latch_falling(unsigned pin)
+{
+	uint32_t cfg = rd(GPIO_INTR_CFG(pin));
+
+	cfg &= ~(INTR_ENABLE | INTR_DETECT_MASK);
+	wr(GPIO_INTR_CFG(pin), cfg | INTR_RAW_STATUS | INTR_DETECT_FALLING | INTR_POLARITY_HIGH);
+	wr(GPIO_INTR_STATUS(pin), 0);
+	return (rd(GPIO_INTR_CFG(pin)) & (INTR_ENABLE | INTR_RAW_STATUS | INTR_DETECT_MASK)) ==
+	       (INTR_RAW_STATUS | INTR_DETECT_FALLING);
+}
+
+/* Whether a falling edge came since the last look; the latch cleared for the next one. */
+static bool
+gpio_latched(unsigned pin)
+{
+	if (!(rd(GPIO_INTR_STATUS(pin)) & 1)) {
+		return false;
+	}
+	wr(GPIO_INTR_STATUS(pin), 0);
+	return true;
 }
 
 static void
@@ -896,7 +933,17 @@ goodix_command(uint8_t command, uint8_t data)
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
 static struct {
 	uint32_t polls, reports, touches, bad, last_x, last_y;
+	uint32_t latched;       /* reports read for a latched edge alone, the line already high again: missed before */
+	uint32_t ups, late_ups; /* fingers lifted; of them, seen only by a read at the 80 ms look */
 } seen;
+static bool reading_idle;       /* the report being read is the 80 ms look's, with no sign from the chip */
+
+static void
+count_up(void)
+{
+	seen.ups++;
+	seen.late_ups += reading_idle;
+}
 
 /* Which fingers were down in the last report, and where. */
 static struct {
@@ -1346,6 +1393,7 @@ focaltech_contact_update(uint32_t id, uint32_t event, uint32_t x, uint32_t y,
 		focaltech_contact[id].seen = true;
 		if (focaltech_contact[id].down) {
 			focaltech_contact[id].down = false;
+			count_up();
 			hakios_touch_post(HAKIOS_TOUCH_UP, id, focaltech_contact[id].x, focaltech_contact[id].y);
 		}
 		return;
@@ -1406,6 +1454,7 @@ focaltech_report(const uint8_t *report)
 	for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
 		if (!focaltech_contact[i].seen && focaltech_contact[i].down) {
 			focaltech_contact[i].down = false;
+			count_up();
 			hakios_touch_post(HAKIOS_TOUCH_UP, i, focaltech_contact[i].x, focaltech_contact[i].y);
 		}
 	}
@@ -1625,7 +1674,21 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
-	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us\n", chip_name(), poll_us);
+	/*
+	 * The line is not held low until the report is read: a look found it high again with a finger down
+	 * (2026-10-30, tl: c lines), so a report could come and go between two looks -- the last one of a touch,
+	 * the finger's lifting, among them. Then the lift was seen only at the 80 ms look, and a tap that came
+	 * before it, with the same finger number, was taken for the first finger moving: a tap lost. So the
+	 * line's falling edges are latched by the pin controller and a look reads a report for either.
+	 * Boot-arg touch_edge=0: the level only, as before.
+	 */
+	uint32_t edge = 1;
+	bool latching;
+
+	PE_parse_boot_argn("touch_edge", &edge, sizeof(edge));
+	latching = edge != 0 && gpio_latch_falling(PIN_INT);
+	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us%s\n", chip_name(), poll_us,
+	    edge == 0 ? "" : latching ? ", its falling edges latched in between" : "; ITS EDGES CANNOT BE LATCHED (the level only)");
 	{
 		uint32_t rate = 0;
 
@@ -1641,28 +1704,38 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	for (unsigned tick = 1;; tick++) {
 		uint64_t looked = micros_now(), read_at;
 
-		/* the interrupt line is low while a report waits; look anyway every 80 ms in case it is missed */
-		if (!gpio_get(PIN_INT)) {
+		/*
+		 * The interrupt line is low while a report waits, and its falling edge latched (above) if it went up
+		 * again before this look; look anyway every 80 ms in case both are missed.
+		 */
+		bool edge_seen = latching && gpio_latched(PIN_INT), low = !gpio_get(PIN_INT);
+
+		if (low || edge_seen) {
 			idle = 0;
+			seen.latched += !low;
 			chip_poll();
 			read_at = micros_now();
 			reads++;
 			reading += read_at - looked;
 			if (latency) {
-				hakios_tl("tl: c before %llu seen %llu read %llu\n", before, looked, read_at);
+				hakios_tl("tl: c before %llu seen %llu read %llu%s\n", before, looked, read_at, low ? "" : " latched");
 			}
 		} else if (++idle >= idle_looks) {
 			idle = 0;
+			reading_idle = true;
 			chip_poll();
+			reading_idle = false;
 			reads++;
 			reading += micros_now() - looked;
 		}
 		before = looked;
 		if (tick % (stat_seconds * (1000000 / poll_us)) == 0) {
 			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
-			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
+			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second; "
+			    "%u reports for an edge alone; %u lifts, %u of them seen only at the 80 ms look\n",
 			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
-			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
+			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate, seen.latched, seen.ups,
+			    seen.late_ups);
 		}
 		sleep_us(poll_us);
 	}
