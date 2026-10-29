@@ -4159,11 +4159,29 @@ usb_poll_command(void)
 	usb_device_event_data data;
 	char cmd[128];
 
+	static uint64_t rx_since, last_try;
+	uint64_t now = READ_SYSREG(CNTVCT_EL0), freq = READ_SYSREG(CNTFRQ_EL0);
+
 	if (USB == NULL || usb_lent) {
 		return;         /* this run was not started over USB, or the kernel has the controller */
 	}
-	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
-		usb_rx_queued = 1;
+	/*
+	 * A cable pulled and put back while a kernel runs: the controller enumerated again (the host saw the
+	 * device) but the receive queued before was left dead in it, with no state change reported, and every
+	 * write of the host timed out from then on ("AdbWriteEndpointSync failed", 2026-10-30). So an idle
+	 * receive is queued afresh every few seconds, and one is tried even without a "connected" event.
+	 */
+	if (usb_rx_queued && now - rx_since > 5 * freq) {
+		(void)USB->abort_xfer(USB_EP_OUT);
+		usb_rx_queued = 0;
+	}
+	if (!usb_rx_queued && (usb_connected || now - last_try > 2 * freq)) {
+		last_try = now;
+		if (!EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
+			usb_rx_queued = 1;
+			usb_connected = 1;
+			rx_since = now;
+		}
 	}
 	USB->handle_event(&msg, &size, &data);
 	if (msg == UsbDeviceEventDeviceStateChange) {
