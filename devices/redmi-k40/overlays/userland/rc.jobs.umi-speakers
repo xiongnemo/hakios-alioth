@@ -1,0 +1,2 @@
+# UMI stereo identification: top/left, bottom/right, then both.
+/redwood/bin/sound_test route wait 8 level 0.25 tone 1 440 0 wait 1 tone 1 0 660 wait 1 tone 2 440 660

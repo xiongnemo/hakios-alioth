@@ -1,0 +1,142 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,16 @@
+ bsd/dev/hakios.input.c		standard
+ bsd/dev/hakios.virtio_input.c	standard
+ bsd/dev/hakios.goodix.c	standard
++bsd/dev/umi_touch.c		standard
++bsd/dev/umi_keys.c		standard
++bsd/dev/umi_rpmh.c		standard
++bsd/dev/umi_touch_boost.c		standard
++bsd/dev/umi_wifi.c		standard
++bsd/dev/umi_bluetooth.c		standard
++bsd/dev/umi_mhi.c		standard
++bsd/dev/umi_pcie.c		standard
++bsd/dev/umi_camera.c		standard
++bsd/dev/umi_camera_dma.c		standard
+ bsd/dev/hakios.buttons.c	standard
+ bsd/dev/hakios.battery.c	standard
+ bsd/dev/hakios.ufs.c	standard
+@@ -639,3 +649,9 @@
+ bsd/skywalk/packet/pbufpool.c			optional skywalk
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
++
++# Xiaomi Mi 10 device overlay support
++bsd/dev/hakios.board.c standard
++bsd/dev/hakios.thermal.c standard
++bsd/dev/hakios.display.c standard
++bsd/dev/alioth_dsi.c standard
+--- a/bsd/conf/Makefile.arm64
++++ b/bsd/conf/Makefile.arm64
+@@ -1,3 +1,7 @@
++# Camera probe runs on a kernel thread without a userspace SIMD context.
++umi_camera.o_CFLAGS_ADD += -mgeneral-regs-only
++umi_camera_dma.o_CFLAGS_ADD += -mgeneral-regs-only
++
+ ######################################################################
+ #BEGIN  Machine dependent Makefile fragment for arm
+ ######################################################################
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -149,6 +149,7 @@
+ #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
+ #include <sys/hakios.input.h>
+ #include <sys/hakios.audio.h>
++#include <sys/hakios.bluetooth.h>
+ #include <sys/hakios.virtio_blk.h>
+ #include <sys/hakios.sparse.h>
+ #if APFS
+@@ -985,6 +986,7 @@
+ 		devfs_kernel_mount(mounthere);
+ 		hakios_input_init();           /* /dev/hakios-touch */
+ 		hakios_audio_init();           /* /dev/hakios-audio */
++		umi_bluetooth_init();      /* explicit UMI transport diagnostic */
+ 		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
+ 		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
+ #if APFS
+--- a/config/Makefile
++++ b/config/Makefile
+@@ -66,12 +66,15 @@
+ Kasan_EXPORTS := $(SRCROOT)/config/Kasan_enabled.$(KASAN_ARCH_SUFFIX).exports
+ endif
+ 
++# UMI links a device-specific subset of the XNU exports. Emit only symbols present
++# in this kernel so each generated kext symbol set matches the linked image.
+ define symbol_set_template
+ $(1)_EXPORTS := $$(addprefix $$(SOURCE)/,$$(filter $(1)%,$$(EXPORTS_FILES)))
+ $$(TARGET)/$(1).symbolset: MY_EXPORTS_ARGS := $$(foreach file,$$($(1)_EXPORTS),-export $$(file))
+ $$(TARGET)/$(1).symbolset: $$($(1)_EXPORTS) $$(TARGET)/allsymbols $$(KEXT_CREATE_SYMBOL_SET)
+ 	@$$(LOG_SYMBOLSET) "$(1)$$(Color0) ($$(ColorLF)$$(CURRENT_ARCH_CONFIG_LC)$$(Color0))"
+ 	$$(_v)$$(KEXT_CREATE_SYMBOL_SET)			\
++		-sect					\
+ 		$$(ARCH_FLAGS_$$(CURRENT_ARCH_CONFIG))	\
+ 		-import $$(TARGET)/allsymbols		\
+ 		$$(MY_EXPORTS_ARGS)			\
+@@ -119,19 +122,21 @@
+ 
+ check_all_exports: $(TARGET)/allsymbols $(KEXT_CREATE_SYMBOL_SET)
+ 	$(_v)$(KEXT_CREATE_SYMBOL_SET)					\
++		-sect				\
+ 		$(ARCH_FLAGS_$(CURRENT_ARCH_CONFIG))			\
+ 		-import $(TARGET)/allsymbols				\
+ 		$(foreach symbolset,$(filter-out Private,$(SYMBOL_COMPONENT_LIST)),	\
+ 			-export $(SOURCE)/$(symbolset).exports		\
+ 			-export $(SOURCE)/$(symbolset).$(EXPORT_SOURCE_ARCH_CONFIG_LC).exports)	\
+-		-output /dev/null $(_vstdout)
++		-output $(TARGET)/check_all_exports.symbolset $(_vstdout)
+ 	$(_v)$(KEXT_CREATE_SYMBOL_SET)					\
++		-sect				\
+ 		$(ARCH_FLAGS_$(CURRENT_ARCH_CONFIG))			\
+ 		-import $(TARGET)/allsymbols				\
+ 		$(foreach symbolset,$(filter-out Unsupported,$(SYMBOL_COMPONENT_LIST)),	\
+ 			-export $(SOURCE)/$(symbolset).exports		\
+ 			-export $(SOURCE)/$(symbolset).$(EXPORT_SOURCE_ARCH_CONFIG_LC).exports)	\
+-		-output /dev/null $(_vstdout)
++		-output $(TARGET)/check_all_exports.symbolset $(_vstdout)
+ 
+ $(OBJPATH)/$(MD_SUPPORTED_KPI_FILENAME): $(EXPORTS_FILES)
+ 	@$(LOG_SUPPORTED_KPI) "$(CURRENT_ARCH_CONFIG_LC)"
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -87,6 +87,7 @@
+ iokit/Kernel/hakios.battery.cpp			optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
+ iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
++iokit/Kernel/hakios.bluetooth.cpp			optional iokitcpp
+ iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
+ 
+ iokit/Kernel/IOCPU.cpp					optional iokitcpp
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -394,4 +394,4 @@
+ {
+-#pragma unused (state, esr, far)
+-	panic_plain("Unhandled implementation specific error\n");
++	panic("Unhandled implementation specific error ESR=%#x FAR=%p PC=%p",
++	    esr, (void *)far, (void *)get_saved_state_pc(state));
+ }
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,8 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/* Qualcomm peripherals use permanent mappings for PCIe, GPU and audio. */
++#define IO_MAP_SIZE            (32ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+@@ -82,3 +83,11 @@
++/* UMI camera diagnostics must not overrun the permanent MMIO window. */
++uint64_t umi_camera_iomap_free(void);
++uint64_t
++umi_camera_iomap_free(void)
++{
++	return io_submap && io_submap->size < IO_MAP_SIZE ? IO_MAP_SIZE - io_submap->size : 0;
++}
++
+ /*
+  * Allocate and map memory for devices that may need to be mapped before
+  * Mach VM is running. Allows caller to specify mapping protection
