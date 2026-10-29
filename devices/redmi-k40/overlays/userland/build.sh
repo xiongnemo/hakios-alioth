@@ -524,7 +524,21 @@ fi
 # the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
 # hakios_<maker>_<sensor>_<camera>.bin, in ../fw-camera (the vendor's: neither they nor the tables are in the
 # repository): camera-<sensor>.tab
-if [ "${DEVICE:-}" = umi ]; then
+if ls ../fw-camera/com.qti.sensormodule.alioth_*.bin >/dev/null 2>&1; then
+	# alioth (devices/redmi-k40): its four sensors' V2 module files, each sensor's from the maker this phone
+	# has fitted (Android's persist.vendor.camera.*.info: ../fw-camera/fitted, one module name a line) or
+	# else the first there is; camera-imx582.tab, camera-imx355.tab, camera-s5k3t2.tab, camera-s5k5e9.tab
+	mkdir -p root/fw
+	for sensor in imx582 imx355 s5k3t2 s5k5e9; do
+		module=
+		[ -f ../fw-camera/fitted ] && module=$(grep -m1 "_${sensor}" ../fw-camera/fitted)
+		[ -n "$module" ] && module=../fw-camera/com.qti.sensormodule.$module.bin
+		[ -f "$module" ] || module=$(ls ../fw-camera/com.qti.sensormodule.alioth_*_${sensor}*.bin 2>/dev/null | head -1)
+		[ -f "$module" ] || continue
+		python3 ../devices/redmi-k40/tools/alioth-camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null ||
+			echo "build.sh: $module: no camera table made"
+	done
+elif [ "${DEVICE:-}" = umi ]; then
 	module=../fw-camera/com.qti.sensormodule.umi_semco_s5khmx.bin
 	if [ -f "$module" ]; then
 		mkdir -p root/fw

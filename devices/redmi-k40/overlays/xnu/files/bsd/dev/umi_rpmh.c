@@ -504,6 +504,42 @@ out:
 	return error;
 }
 
+/*
+ * alioth: the PM8150A LDOs its cameras use (hakios.camera.c), by name and only at the device tree's
+ * voltages: L2C 1.2 V (the macro's VDIG; the display's DVDD too, which the camera driver never switches
+ * off), L3C 1.2 V (the ultra-wide's VDIG), L5C 1.8 V (the four sensors' VIO), L7C 2.856 V (the wide one's
+ * lens motor). PMIC5 LDO high power mode, enabled or not.
+ */
+int umi_rpmh_camera_ldo(const char *res, unsigned mv, bool enable);
+
+int
+umi_rpmh_camera_ldo(const char *res, unsigned mv, bool enable)
+{
+	static const struct { const char *resource; unsigned mv; } rails[] = {
+		{ "ldoc2", 1200 }, { "ldoc3", 1200 }, { "ldoc5", 1800 }, { "ldoc7", 2856 },
+	};
+	bool known = false;
+
+	for (unsigned i = 0; res != NULL && i < sizeof(rails) / sizeof(rails[0]); i++) {
+		known |= strcmp(res, rails[i].resource) == 0 && mv == rails[i].mv;
+	}
+	if (!known) {
+		printf("UMI RPMH: camera rail %s at %u mV is not one of alioth's\n", res ? res : "(none)", mv);
+		return EINVAL;
+	}
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	int error = EIO;
+	uint32_t address = 0;
+	if (rh_poisoned) goto out;
+	error = rh_map();
+	if (!error) error = rh_lookup(res, &address);
+	if (!error) error = rh_send_state(address, mv, true, enable);
+	printf("UMI RPMH: camera %s %u mV enable=%u error=%d\n", res, mv, enable, error);
+out:
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
+}
+
 int
 umi_rpmh_vreg_enable(const char *res, unsigned mv)
 {
