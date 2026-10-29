@@ -184,7 +184,8 @@ static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
  */
 static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
-static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
+/* fb_beat: 2 (default) the beat below unless frames are page-flipped, 1 always, 0 never */
+static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 2);
 /*
  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
  * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
@@ -366,6 +367,9 @@ public:
 	 * is shown at once, a beat would only make it later still -- and gives way by an eighth of
 	 * what a frame is early or late, so that frames are ready some six milliseconds before
 	 * their beat: neither a slow one nor a quick one then lands on the wrong side of it.
+	 * Not with page flips (the K40's): the engine takes a flip at the panel's own TE whenever it is issued
+	 * before it, and the beat -- a clock of this driver's, not the TE's -- only held frames back, at times
+	 * past their TE: a drag's frame intervals at the 120 Hz pace 48% with it, 70% without (2026-10-30).
 	 */
 	uint64_t        fBeat;                  /* the beat the last frame was shown on */
 	uint64_t        fDrawNs;
@@ -1437,7 +1441,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			fStatScanMissed++;
 		}
 		fBeat = began = mach_absolute_time();
-	} else if (!hakios_display_command_mode() && gOnTheBeat) {
+	} else if (!hakios_display_command_mode() && (gOnTheBeat == 1 || (gOnTheBeat == 2 && !fFlip))) {
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
