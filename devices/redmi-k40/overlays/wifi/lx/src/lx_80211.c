@@ -91,6 +91,9 @@ struct lx_radio {
 	uint8_t want[32], want_length;		/* the name of the network that is wanted ... */
 	unsigned width;				/* MHz of the channel joined: 20, or with wifi_wide=1 what the access point offers */
 	struct lx_target target;		/* ... and the best of it */
+	uint8_t refused[4][ETH_ALEN];		/* access points that refused us in this join (station_join()): not chosen again */
+	unsigned refused_count;
+	bool turned_away;			/* the last attempt was refused by its access point (authentication or association) */
 	uint32_t pairwise_cipher, group_cipher;	/* selected WPA2 suites: CCMP or legacy TKIP */
 
 	/* the network joined */
@@ -550,6 +553,32 @@ static const uint8_t wmm[4] = { 0x00, 0x50, 0xf2, 0x02 };	/* Microsoft's, which 
 /* ---- what the radio hears -------------------------------------------------------------------------- */
 
 /*
+ * Which access point of the network to take: the one heard best, a 5 GHz one counted BAND_5GHZ_BONUS dB better
+ * than it was heard. A router with the network on both bands turns a dual-band station away from 2.4 GHz
+ * (band steering): the K40's radio, which scans both bands, was refused authentication (status 1) by the
+ * network's 2.4 GHz access point, heard best at -25 dBm, and accepted by its 5 GHz one at -38 (2026-10-30).
+ * Those that refused us in this join are not taken again.
+ */
+#define BAND_5GHZ_BONUS		15
+
+static int
+preference(unsigned frequency, int signal)
+{
+	return signal + (frequency >= 4900 ? BAND_5GHZ_BONUS : 0);
+}
+
+static bool
+was_refused(const struct lx_radio *radio, const uint8_t *address)
+{
+	for (unsigned i = 0; i < radio->refused_count; i++) {
+		if (memcmp(radio->refused[i], address, ETH_ALEN) == 0) {
+			return (true);
+		}
+	}
+	return (false);
+}
+
+/*
  * A beacon or an answer to a probe (IEEE 802.11-2020, 9.3.3): after the 24 bytes every
  * management frame begins with -- the sender's network is the third address -- a time stamp, the
  * beacon interval, the capabilities, and then elements, of which the name (0), the channel the
@@ -564,7 +593,8 @@ heard(struct lx_radio *radio, const uint8_t *frame, unsigned length, unsigned fr
 
 	lx_os_lock();
 	if (name != NULL && radio->want_length != 0 && name[1] == radio->want_length &&
-	    memcmp(name + 2, radio->want, radio->want_length) == 0 && (!radio->target.found || signal > radio->target.signal) &&
+	    memcmp(name + 2, radio->want, radio->want_length) == 0 && !was_refused(radio, frame + 16) &&
+	    (!radio->target.found || preference(frequency, signal) > preference(radio->target.frequency, radio->target.signal)) &&
 	    length - 36 <= ELEMENTS_MOST && radio->sta == NULL) {
 		radio->target.found = true;
 		memcpy(radio->target.address, frame + 16, ETH_ALEN);
@@ -1605,7 +1635,7 @@ station_width(struct lx_radio *radio, struct linuxkpi_ieee80211_channel *primary
  * the last scan, if that heard the network, or one made now.
  */
 static int
-station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 {
 	const uint8_t *name = what->ssid;
 	unsigned name_length = what->ssid_length;
@@ -1649,7 +1679,8 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 
 		if (network->name_length == name_length && memcmp(network->name, name, name_length) == 0 && network->elements_length != 0 &&
 		    (is_zero_ether_addr(what->bssid) || memcmp(what->bssid, network->sender, ETH_ALEN) == 0) &&
-		    (!target->found || network->signal > target->signal)) {
+		    !was_refused(radio, network->sender) &&
+		    (!target->found || preference(network->frequency, network->signal) > preference(target->frequency, target->signal))) {
 			target->found = true;
 			memcpy(target->address, network->sender, ETH_ALEN);
 			target->frequency = network->frequency;
@@ -1779,6 +1810,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	    ANSWER_NONE ? "NO ANSWER from the access point to three requests" : "THE ACCESS POINT REFUSES", radio->answer_status);
 	if (answer != ANSWER_AUTHENTICATED || (ret = station_state(radio, IEEE80211_STA_NONE, IEEE80211_STA_AUTH)) != 0) {
 		error = answer == ANSWER_NONE ? ETIMEDOUT : ECONNREFUSED;
+		radio->turned_away = answer == ANSWER_REFUSED;
 		goto out;
 	}
 	radio->reached = IEEE80211_STA_AUTH;
@@ -1806,6 +1838,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	    "requests" : "THE ACCESS POINT REFUSES", radio->answer_status, radio->aid, radio->answer_length);
 	if (answer != ANSWER_ASSOCIATED) {
 		error = answer == ANSWER_NONE ? ETIMEDOUT : ECONNREFUSED;
+		radio->turned_away = answer == ANSWER_REFUSED;
 		goto out;
 	}
 	station_abilities(radio, radio->answer_elements, radio->answer_length);
@@ -1896,6 +1929,31 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	return (0);
 out:
 	station_leave(radio);
+	return (error);
+}
+
+/*
+ * A join, and if the access point taken turns us away (authentication or association refused: a router steering
+ * stations to its other band, an access point that is full), the next best of the network's that was heard, up to
+ * three more (see preference()).
+ */
+static int
+station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+{
+	int error;
+
+	radio->refused_count = 0;
+	for (;;) {
+		radio->turned_away = false;
+		error = station_join_once(radio, what);
+		if (error != ECONNREFUSED || !radio->turned_away || radio->refused_count >= sizeof(radio->refused) / ETH_ALEN) {
+			break;
+		}
+		memcpy(radio->refused[radio->refused_count++], radio->target.address, ETH_ALEN);
+		lx_tell("lx: that access point (%u MHz) turned us away: the next one of the network that was heard\n",
+		    radio->target.frequency);
+	}
+	radio->refused_count = 0;
 	return (error);
 }
 

@@ -109,3 +109,17 @@ phone's own speaker 29.5 dB quieter arrives 28 dB quieter (linear); `record_test
 input applies automatic gain: room noise at -53 dBFS in the kernel is about -22 dBFS in an
 application. The test tools need `ldid` at build time for their entitlements (without it
 `record_test` is refused the microphone and `battery_test` cannot open URLs).
+
+## Default arguments (Redmi K40)
+
+`boot.args` is the set verified together on the phone (2026-10-30): the kernel on the prime core with
+seven cores (`bootcpu=7 cpus=7`: the loader keeps core 0 and its USB link), touch, keys, haptics, the
+audio DSP with speakers and microphone, the GPU with 120 Hz pacing (`fb_vsync=2`), CPU frequency, Wi-Fi
+(joining `fw-wifi/network`; `run.sh` adds `wifi_mac=` from `fw-wifi/mac`) and Bluetooth. The eight-core
+mode (`bootcpu=0 cpus=8`) froze this phone twice, with and without USB, and is not used.
+
+Wi-Fi: an access point of the network on 5 GHz is preferred by 15 dB (`lx_80211.c` `preference()`), and
+one that turns the station away is skipped for the next: a home network's 2.4 GHz access point refused
+authentication (status 1, band steering) while its 5 GHz one accepted. The address in `fw-wifi/mac` should
+be the one the router knows -- for a network Android joined, Android's randomized one for it
+(Settings > Wi-Fi > the network). `usb=2` adds the kernel's USB serial port (see Microphone/USB notes).
