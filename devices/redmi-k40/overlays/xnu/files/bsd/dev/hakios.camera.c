@@ -3989,7 +3989,10 @@ ios_select(unsigned index, uint32_t mode_n)
 			const struct ctab_mode *o = &ctab_modes[m];
 			uint64_t pixels = (uint64_t)o->width * o->height;
 
-			if (o->width * 3 == o->height * 4 && o->fps_milli <= 31000 && pixels <= 13000000 && pixels > best) {
+			/* (4:3 within 1 %: the S5K3T2's 2592x1940 is not quite) */
+			uint32_t w3 = o->width * 3, h4 = o->height * 4;
+
+			if ((w3 > h4 ? w3 - h4 : h4 - w3) * 100 <= w3 && o->fps_milli <= 31000 && pixels <= 13000000 && pixels > best) {
 				best = pixels;
 				mode_n = m;
 			}

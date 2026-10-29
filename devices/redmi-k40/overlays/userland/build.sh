@@ -537,6 +537,10 @@ if ls ../fw-camera/com.qti.sensormodule.alioth_*.bin >/dev/null 2>&1; then
 		[ -f "$module" ] || continue
 		python3 ../devices/redmi-k40/tools/alioth-camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null ||
 			echo "build.sh: $module: no camera table made"
+		# ... and its colour tuning beside it (com.qti.tuned.<the same name>.bin): camera-<sensor>.isp
+		tuned=${module/com.qti.sensormodule./com.qti.tuned.}
+		[ -f "$tuned" ] && { python3 ../devices/redmi-k40/tools/alioth-camtuning.py "$tuned" "root/fw/camera-$sensor.isp" >/dev/null ||
+			echo "build.sh: $tuned: no colour tuning made"; }
 	done
 elif [ "${DEVICE:-}" = umi ]; then
 	module=../fw-camera/com.qti.sensormodule.umi_semco_s5khmx.bin
