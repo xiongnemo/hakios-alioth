@@ -142,3 +142,10 @@
  /*
   * Allocate and map memory for devices that may need to be mapped before
   * Mach VM is running. Allows caller to specify mapping protection
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -107,3 +107,4 @@
+ osfmk/arm64/generic_arm64_support.c	optional nos_arm_asm
+ osfmk/arm64/loader_return.c	optional nos_arm_asm
++osfmk/arm64/hakios_prof.c	optional nos_arm_asm
+ osfmk/arm64/user_exception_trace.c	standard

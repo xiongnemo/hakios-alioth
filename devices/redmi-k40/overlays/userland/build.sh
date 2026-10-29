@@ -435,6 +435,13 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
+# The QCA6390 phones (Redmi K40, Mi 10) join fw/network too (umi_wifi.c -> hakios_wifi_join_file()), and have no
+# wpss.mdt: the network goes in all the same (not with SHARE=1). The access point may know the phone only by the
+# randomized address Android uses for it (Settings > Wi-Fi > the network): fw-wifi/mac should be that one.
+if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ] && [ ! -f root/fw/network ]; then
+	mkdir -p root/fw
+	install -m 0600 ../fw-wifi/network root/fw/network
+fi
 # UMI has a QCA6390 CNSS/PCIe radio, not Redwood's WCN6750/WPSS device. Keep its firmware
 # under its vendor directory so the future CNSS path can request the expected names.
 umi_firmware() {

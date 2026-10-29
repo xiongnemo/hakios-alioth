@@ -60,6 +60,7 @@
  * every frame (see frame_end()).
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
@@ -236,6 +237,7 @@ struct image {
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... and what it added up to */
+	unsigned changed;               /* ... the frame in which the sum last changed (or the texture was made) */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
 	GLsizei width, height;
@@ -360,6 +362,7 @@ static int copy_targets;
  */
 static int wait_for_frames = 1;
 static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
+static int early_flush;                 /* boot-arg glearly=1: CoreAnimation's glFlush submits the draws before the copies (frame_end()) */
 /*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
  * what CoreAnimation draws a number of things with where the library offers it: the shadows
@@ -647,10 +650,17 @@ surface_shared(struct eagl *e, struct image *image)
  * A surface that is shown goes on being drawn into after the texture has been made of it -- a
  * sign an application draws for one of its layers, a picture CoreAnimation has made a surface
  * around -- and not everybody who draws says so: often no seed moves, and the texture is not
- * made again. A GPU that has the memory itself shows what is there. A copy has to notice: once
- * a frame, when the texture is about to be drawn with, the memory is added up, and copied again
- * if the sum has changed.
+ * made again. A GPU that has the memory itself shows what is there. A copy has to notice: when
+ * the texture is about to be drawn with, the memory is added up, and copied again if the sum has
+ * changed -- once a frame while the surface changes, and once every STILL_EVERY frames once it
+ * has not changed for STILL_AFTER frames (a still picture, the wallpaper say, was added up every
+ * frame: 11 MB, 3-5 ms of the render server's frame, the most of any one function in a profile
+ * of scrolling; the kernel's prof=1). A surface that changes again is back to every frame from
+ * the first change seen.
  */
+#define STILL_AFTER     120             /* frames (a second at 120 Hz) without a change: still */
+#define STILL_EVERY     8               /* a still surface is looked at every 8th frame (67 ms at 120 Hz) */
+
 static bool
 surface_changed(struct eagl *e, struct image *image)
 {
@@ -658,21 +668,35 @@ surface_changed(struct eagl *e, struct image *image)
 	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
 	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
-	uint64_t sum = size, word;
+	uint64_t lane[4] = { size, 0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull }, sum, word[4];
+	size_t at;
 
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
 	}
-	image->looked = e->frames + 1;
-	for (size_t at = 0; at + 8 <= size; at += 8) {
-		memcpy(&word, base + at, 8);
-		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
-		sum ^= sum >> 29;
+	if (e->frames - image->changed > STILL_AFTER && (e->frames + (uintptr_t)image / 64) % STILL_EVERY != 0) {
+		return false;
 	}
+	image->looked = e->frames + 1;
+	/* four sums side by side: one chain of multiplications held the loop to a third of the memory's speed */
+	for (at = 0; at + 32 <= size; at += 32) {
+		memcpy(word, base + at, 32);
+		for (unsigned k = 0; k < 4; k++) {
+			lane[k] = (lane[k] ^ word[k]) * 0x9e3779b97f4a7c15ull;
+			lane[k] ^= lane[k] >> 29;
+		}
+	}
+	for (; at + 8 <= size; at += 8) {
+		memcpy(word, base + at, 8);
+		lane[0] = (lane[0] ^ word[0]) * 0x9e3779b97f4a7c15ull;
+		lane[0] ^= lane[0] >> 29;
+	}
+	sum = lane[0] ^ (lane[1] * 3) ^ (lane[2] * 5) ^ (lane[3] * 7);
 	if (sum == image->sum) {
 		return false;
 	}
 	image->sum = sum;
+	image->changed = e->frames;
 	return true;
 }
 
@@ -752,6 +776,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	free(flipped);
 	image->seed = IOSurfaceGetSeed(surface);
+	image->changed = e->frames;     /* (just filled: looked at every frame for a while, see surface_changed()) */
 	e->uploads++;
 	e->upload_bytes += row * (size_t)image->height;
 }
@@ -1034,6 +1059,7 @@ frame_end(struct eagl *e, bool finished)
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
+	bool blitted = false;
 
 	clear_now(e);
 	before = now_us();
@@ -1041,11 +1067,20 @@ frame_end(struct eagl *e, bool finished)
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
 			in_place++;
-			glFlush();                              /* (also after a glFinish: the copy is new since) */
+			blitted = true;
 		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
 			in_place++;
 		}
+	}
+	/*
+	 * One submission for the frame: its draws and the copies above together (the order of one context's commands
+	 * is kept without a flush between them). It was a glFlush for CoreAnimation's own (my_glFlush()), one after
+	 * each copy and the fence's below: about four submissions a frame, each a pass through Mesa's flush, the
+	 * buffers' list and a call into the kernel. (After a glFinish only the copies, which are new since.)
+	 */
+	if (!finished || blitted) {
+		glFlush();
 	}
 	if (in_place != 0 && !finished && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
@@ -3206,9 +3241,11 @@ my_glFlush(void *context)
 	}
 	clear_now(e);
 	began = now_us();
-	glFlush();
+	if (early_flush) {
+		glFlush();      /* boot-arg glearly=1: the frame's draws to the GPU now, the copies in a second submission */
+	}
+	frame_end(e, false);    /* (its one glFlush is this one too: see frame_end()) */
 	e->flushing += now_us() - began;
-	frame_end(e, false);
 	EAGL_LEAVE(e, 0x2d8);
 }
 
@@ -3844,6 +3881,14 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	say("hakios-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, hakios_gl_library(),
 	    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
 	    (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
+	{
+		/* where the libraries are in this process: for a profile's addresses (kernel boot-arg prof=1) */
+		Dl_info gl, own;
+
+		if (dladdr((const void *)glFlush, &gl) && dladdr((const void *)eagl_enter, &own)) {
+			say("hakios-gl: images: %s at %p, %s at %p\n", gl.dli_fname, gl.dli_fbase, own.dli_fname, own.dli_fbase);
+		}
+	}
 	return self;
 }
 
@@ -4161,6 +4206,7 @@ install(void)
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
+		early_flush = strstr(arguments, "glearly=1") != NULL;
 		copy_targets = strstr(arguments, "gltargetcopy=1") != NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (copy_targets) {

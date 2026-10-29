@@ -3387,8 +3387,40 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * (UDID) from the serial number, the chip ID and the two addresses; when one is missing it
 	 * asks its helper for the factory data, is refused and waits forever (and lsd with it).
 	 */
-	static const uint8_t wifi_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x01 };
+	uint8_t wifi_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x01 };
 	static const uint8_t bluetooth_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x02 };
+	/*
+	 * With "wifi_mac=AA:BB:CC:DD:EE:FF" the radio's own address (the one the kernel gives the radio, the one an
+	 * access point sees): what Settings > Wi-Fi > the network shows as "Wi-Fi Address" (MobileGestalt reads
+	 * this property), instead of the made-up one.
+	 */
+	for (const char *c = pi.cmdline; *c; c++) {
+		if (starts_with(c, "wifi_mac=") && (c == pi.cmdline || c[-1] == ' ')) {
+			uint8_t parsed[6];
+			const char *p = c + 9;
+			int good = 1;
+
+			for (int i = 0; i < 6 && good; i++) {
+				int v = 0;
+
+				for (int k = 0; k < 2; k++, p++) {
+					int d = *p >= '0' && *p <= '9' ? *p - '0' : *p >= 'a' && *p <= 'f' ? *p - 'a' + 10 :
+					    *p >= 'A' && *p <= 'F' ? *p - 'A' + 10 : -1;
+
+					good &= d >= 0;
+					v = v * 16 + (d >= 0 ? d : 0);
+				}
+				parsed[i] = (uint8_t)v;
+				if (i < 5) {
+					good &= *p == ':';
+					p++;
+				}
+			}
+			if (good) {
+				memcpy(wifi_address, parsed, sizeof(wifi_address));
+			}
+		}
+	}
 	static const uint8_t manifest_hash[48] = { 0x72, 0x65, 0x64, 0x77, 0x6f, 0x6f, 0x64 };
 	static const uint8_t no_behavior[16];
 	dt_prop_u64(&w, "unique-chip-id", 0x000052445730001ULL);

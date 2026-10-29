@@ -207,6 +207,7 @@ static const struct cdevsw touch_cdevsw = {
 
 extern void umi_touch_init(void);
 extern void umi_keys_init(void);
+extern void hakios_prof_init(void);
 
 void
 hakios_input_init(void)
@@ -232,4 +233,5 @@ hakios_input_init(void)
 	hakios_adsp_init();
 	hakios_mpss_init();
 	hakios_usb_init();
+	hakios_prof_init();     /* boot-arg prof=1: osfmk/arm64/hakios_prof.c */
 }

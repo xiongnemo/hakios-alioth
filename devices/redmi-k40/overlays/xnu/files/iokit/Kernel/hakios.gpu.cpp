@@ -935,6 +935,15 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		if (b == NULL) {
 			continue;
 		}
+		if (b->surface != NULL && b->surface->scanPhys != 0) {
+			/*
+			 * A surface in a scan-out slot (CoreAnimation's frames, the display's engine scans them out
+			 * as they are) is write-combined wherever it is mapped (MiniIOSurface addRef()): nothing of
+			 * it is ever in this processor's cache, and pushing its 11 MB out line by line on every
+			 * submission was the most of the render server's time in the kernel (prof=1).
+			 */
+			continue;
+		}
 		if (b->surface != NULL) {
 			uint32_t seed = b->surface->shared()->seed;
 
