@@ -50,6 +50,18 @@ extern "C" int hakios_display_wait_lines(uint32_t first, uint32_t last, uint64_t
 extern "C" uint64_t hakios_display_next_frame_ns(void);
 extern "C" int hakios_display_command_mode(void);
 extern "C" int hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns);
+/* Redmi K40 page flips and refresh rate (bsd/dev/alioth_dsi.c) */
+extern "C" int alioth_flip_probe(uint64_t fb_phys, uint32_t stride, uint32_t width, uint32_t height);
+extern "C" int alioth_flip_to(uint64_t phys, uint32_t timeout_us);
+extern "C" uint32_t alioth_flip_misr(unsigned frames);
+extern "C" void alioth_flip_misr_off(void);
+extern "C" void alioth_flip_set_ready(bool on);
+extern "C" uint32_t alioth_flip_latch_max_us(void);
+extern "C" void alioth_flip_issue(uint64_t phys);
+extern "C" int alioth_flip_wait(uint32_t timeout_us);
+extern "C" void alioth_panel_start(void);
+extern "C" uint32_t alioth_panel_rate(void);
+extern "C" uint64_t alioth_panel_frame_ns(void);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -125,6 +137,8 @@ static TUNABLE(uint32_t, gFBHeight, "fbheight", kFBDefaultHeight);
 static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
 /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
 static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
+/* Boot-arg fb_vsync=2: the vsync notification as {count, time, interval} (iOSPlus10), else {time, time, count}. */
+static TUNABLE(uint32_t, gVSyncLayout, "fb_vsync", 1);
 
 /*
  * A recording of the screen, for a machine one cannot look at while it runs (the phone is
@@ -245,6 +259,14 @@ public:
 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
 	IOBufferMemoryDescriptor * fComposeMemory;
 	uint8_t *       fComposeBase;           /* command-mode composition, away from display DMA */
+	bool            fFlip;                  /* alioth: frames drawn into the buffer not shown, then flipped */
+	unsigned        fFlipFront;             /* which of fFlipBase the display engine scans */
+	uint8_t *       fFlipBase[2];
+	uint64_t        fFlipPhys[2];
+	IOMemoryMap *   fFlipMap;
+	uint32_t        fFlipFlips, fFlipMissed;
+	bool            fFlipPending;           /* a flip issued, not yet seen taken: fComposeBase is still scanned */
+	bool aliothFlipStart(void);
 	uint64_t        fCopyNs;
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
@@ -357,6 +379,81 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
 #define kFBTimingID     1
 #define kFBColorID      1
 
+/*
+ * Redmi K40 (alioth): page flips. The panel's transfer is held to its scan for the whole frame
+ * (bsd/dev/alioth_dsi.c), so a frame copied into the buffer being scanned always tears; at 120 Hz there
+ * is no idle moment at all. So the frame is drawn into a second buffer and the display engine is pointed
+ * at it (alioth_flip_to(): VIG0's address, CTL0's flush, taken at the next frame). Both buffers lie in the
+ * memory the bootloader reserved for the display (cont_splash_region 0x9c000000 + 0x2300000).
+ *
+ * Before any of that is relied on it is tested: the interface's signature (MISR) of an exact copy of the
+ * shown frame must be the same, and of a copy with one pixel changed different. Then the panel goes to
+ * its 120 Hz timing (panel_hz=, default 120) and CoreAnimation is told that rate. fb_flip=0: none of it.
+ */
+bool
+IOMobileFramebuffer::aliothFlipStart(void)
+{
+	const uint64_t phys0 = 0x9C000000ULL, phys1 = 0x9CA00000ULL, room = 0xA00000ULL;
+	uint32_t on = 1;
+	size_t bytes = (size_t) fRowBytes * fPanelHeight;
+
+	PE_parse_boot_argn("fb_flip", &on, sizeof(on));
+	if (!on || bytes > room || !alioth_flip_probe(phys0, fRowBytes, fPanelWidth, fPanelHeight)) {
+		return false;
+	}
+	IOMemoryDescriptor * md = IOMemoryDescriptor::withPhysicalAddress(phys1, room, kIODirectionInOut);
+	if (md == NULL) {
+		return false;
+	}
+	fFlipMap = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+	md->release();
+	if (fFlipMap == NULL) {
+		hakios_tl("alioth flip: the second buffer (%#llx) cannot be mapped\n", phys1);
+		return false;
+	}
+	fFlipBase[0] = fBase;
+	fFlipPhys[0] = phys0;
+	fFlipBase[1] = (uint8_t *) fFlipMap->getVirtualAddress();
+	fFlipPhys[1] = phys1;
+
+	memcpy(fFlipBase[1], fFlipBase[0], bytes);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	uint32_t a = alioth_flip_misr(2);
+	int t1 = alioth_flip_to(phys1, 100000);
+	uint32_t b = alioth_flip_misr(2);
+	uint32_t * px = (uint32_t *) (fFlipBase[0] + (size_t) (fPanelHeight / 2) * fRowBytes + (fPanelWidth / 2) * 4);
+	uint32_t saved = *px;
+	*px = saved ^ 0x00ffffffu;                      /* one pixel in the middle, in the buffer not shown */
+	__asm__ volatile ("dsb sy" ::: "memory");
+	int t2 = alioth_flip_to(phys0, 100000);
+	uint32_t c = alioth_flip_misr(2);
+	*px = saved;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	uint32_t d = alioth_flip_misr(2);
+	bool pass = t1 && t2 && a != 0 && a == b && c != a && d == a;
+	hakios_tl("alioth flip: test: signature shown %#x, copy %#x (%s), changed copy %#x (%s), restored %#x; flips %s; %s\n",
+	    a, b, a == b ? "same" : "DIFFERENT", c, c != a ? "different" : "SAME", d, t1 && t2 ? "taken" : "NOT TAKEN",
+	    pass ? "the display engine reads our buffers: frames are flipped" : "no flips");
+	alioth_flip_misr_off();
+	if (!pass) {
+		alioth_flip_to(phys0, 100000);
+		fFlipMap->release();
+		fFlipMap = NULL;
+		return false;
+	}
+	alioth_flip_set_ready(true);
+	alioth_panel_start();
+	uint64_t frame_ns = alioth_panel_frame_ns();
+	memcpy(fFlipBase[1], fFlipBase[0], bytes);
+	int t3 = alioth_flip_to(phys1, 100000);
+	fFlipFront = 1;
+	fComposeBase = fFlipBase[0];
+	fFlip = true;
+	hakios_tl("alioth flip: on: panel at %u Hz (TE every %llu us), flip at that rate %s, longest wait %u us\n",
+	    alioth_panel_rate(), frame_ns / 1000, t3 ? "taken" : "NOT TAKEN", alioth_flip_latch_max_us());
+	return true;
+}
+
 void
 IOMobileFramebuffer::publishModes(void)
 {
@@ -399,6 +496,7 @@ IOMobileFramebuffer::publishModes(void)
 	timings->setObject(timing);
 
 	setProperty("TimingElements", timings);
+	hakios_tl("display: mode for CoreAnimation: %ux%u at %u Hz (SyncRate %#x)\n", fWidth, fHeight, refreshHz(), rate);
 	setProperty("ColorElements", colors);
 	OSSafeReleaseNULL(timings);
 	OSSafeReleaseNULL(colors);
@@ -414,6 +512,10 @@ IOMobileFramebuffer::start(IOService * provider)
 	thread_t thread;
 	fComposeMemory = NULL;
 	fComposeBase = NULL;
+	fFlip = false;
+	fFlipMap = NULL;
+	fFlipFlips = fFlipMissed = 0;
+	fFlipPending = false;
 	fCopyNs = 4000000;
 	fNextTicket = fCompletedTicket = 0;
 
@@ -502,7 +604,14 @@ IOMobileFramebuffer::start(IOService * provider)
 	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
 	setProperty("HakiosWaitsForGPU", kOSBooleanTrue);
 	/* the panel's scan, if it can be read: its rate is then the one published, unless fb_hz= is given */
-	if (hakios_display_scan_start()) {
+	if (aliothFlipStart()) {
+		uint32_t hz;
+
+		if (!PE_parse_boot_argn("fb_hz", &hz, sizeof(hz))) {
+			gScanHz = alioth_panel_rate();
+		}
+		IOLog("MiniIOMobileFramebuffer: frames are flipped, at %u a second\n", refreshHz());
+	} else if (hakios_display_scan_start()) {
 		uint32_t hz;
 		const struct hakios_display_scan * scan = hakios_display_scan();
 
@@ -523,6 +632,28 @@ IOMobileFramebuffer::start(IOService * provider)
 		}
 	}
 	publishModes();
+	{
+		/* CoreAnimation's heartbeat: one refresh, in mach time (boot-arg fb_carefresh=0: none, 1/60 s as before) */
+		uint32_t on = 1;
+		uint64_t step = 0;
+		OSDictionary * refresh = OSDictionary::withCapacity(2);
+
+		PE_parse_boot_argn("fb_carefresh", &on, sizeof(on));
+		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &step);
+		if (on && refresh != NULL) {
+			OSNumber * n = OSNumber::withNumber(step, 64);
+			OSNumber * m = OSNumber::withNumber((1ULL << 32) / refreshHz(), 32);  /* seconds in 2^-32: the field CA uses (fpsq, 2026-10-29) */
+			if (n != NULL && m != NULL) {
+				refresh->setObject("displayRefreshStepMachTime", n);
+				refresh->setObject("displayMinRefreshInterval", m);
+				setProperty("IOMFBDisplayRefresh", refresh);
+				hakios_tl("display: IOMFBDisplayRefresh: a refresh is %llu ticks (%u Hz)\n", step, refreshHz());
+			}
+			OSSafeReleaseNULL(n);
+			OSSafeReleaseNULL(m);
+		}
+		OSSafeReleaseNULL(refresh);
+	}
 	setName("disp0");
 	registerService();
 	return true;
@@ -1005,6 +1136,18 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	MiniIOSurface * recorded = NULL;
 	bool report, stagedReleased = false;
 
+	if (fFlip && fFlipPending) {
+		/* the buffer about to be drawn into is the one the last flip moved away from: once the engine has
+		 * taken that flip (at the next frame's start) it reads this one no more */
+		if (alioth_flip_wait(40000)) {
+			fFlipFlips++;
+		} else {
+			fFlipMissed++;
+			fStatScanMissed++;
+		}
+		fFlipPending = false;
+	}
+
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
@@ -1148,7 +1291,19 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		const struct hakios_display_scan * scan = hakios_display_scan();
 		fStatScanWaits++;
-		if (scan != NULL && hakios_display_wait_copy(fCopyNs, scan->frame_ns * 3 / 2)) {
+		if (fFlip) {
+			unsigned back = fFlipFront ^ 1;
+
+			shown = mach_absolute_time();
+			alioth_flip_issue(fFlipPhys[back]);
+			fFlipPending = true;
+			fFlipFront = back;
+			fComposeBase = fFlipBase[back ^ 1];
+			if (fSwapsShown < 3 || (fFlipFlips + fFlipMissed) % 1200 == 0) {
+				hakios_tl("display: flip %u: %u taken, %u not, longest wait %u us\n", fSwapsShown, fFlipFlips,
+				    fFlipMissed, alioth_flip_latch_max_us());
+			}
+		} else if (scan != NULL && hakios_display_wait_copy(fCopyNs, scan->frame_ns * 3 / 2)) {
 			uint64_t copy_start = mach_absolute_time(), copy_ns;
 			shown = copy_start;
 			memcpy(fBase, fComposeBase, (size_t)fRowBytes * fPanelHeight);
@@ -1403,12 +1558,24 @@ IOMobileFramebufferUserClient::vsync(void)
 	} else {
 		fVSyncCount++;
 		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
-		args[0] = (uint32_t) now;
-		args[1] = now >> 32;
-		args[2] = (uint32_t) now;
-		args[3] = now >> 32;
-		args[4] = (uint32_t) fVSyncCount;
-		args[5] = fVSyncCount >> 32;
+		if (gVSyncLayout == 2) {
+			uint64_t interval;
+
+			nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &interval);
+			args[0] = (uint32_t) fVSyncCount;
+			args[1] = fVSyncCount >> 32;
+			args[2] = (uint32_t) now;
+			args[3] = now >> 32;
+			args[4] = (uint32_t) interval;
+			args[5] = interval >> 32;
+		} else {
+			args[0] = (uint32_t) now;
+			args[1] = now >> 32;
+			args[2] = (uint32_t) now;
+			args[3] = now >> 32;
+			args[4] = (uint32_t) fVSyncCount;
+			args[5] = fVSyncCount >> 32;
+		}
 		send = true;
 		armVSync();
 	}

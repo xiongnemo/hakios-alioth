@@ -3991,6 +3991,14 @@ fb_command(char *cmd)
 				return;
 			}
 			staged_data = (const char *)(uintptr_t)SCREEN.base;
+#ifdef LOADER_ALIOTH
+			{
+				/* the kernel flips VIG0 (0xae05014) between buffers in the display's reserved memory */
+				uint64_t scanned = *(volatile uint32_t *)(uintptr_t)0x0ae05014ULL;
+				if (scanned >= 0x9C000000ULL && scanned + (uint64_t)SCREEN.stride * SCREEN.height <= 0x9E300000ULL)
+					staged_data = (const char *)(uintptr_t)scanned;
+			}
+#endif
 			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem recording")) {

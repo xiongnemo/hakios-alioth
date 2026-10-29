@@ -80,6 +80,10 @@ static lck_mtx_t *dsi_lock;
 static bool dsi_dead;
 static unsigned dsi_failures, mdp_waits;
 static uint32_t panel_rate;              /* what the panel was last switched to, 0 = the UEFI's */
+static bool flip_ready;                  /* the framebuffer presents by page flips (no copy into the scanned buffer) */
+
+bool alioth_flip_ready(void) { return flip_ready; }
+void alioth_flip_set_ready(bool on) { flip_ready = on; }
 
 static inline uint32_t dsi_rd(uint32_t off) { return dsi[off / 4]; }
 static inline void dsi_wr(uint32_t off, uint32_t v) { dsi[off / 4] = v; }
@@ -214,16 +218,31 @@ out:
 	return rc;
 }
 
-/* The panel's timings (the phone's DT, qcom,mdss-dsi-display-timings of the K11A panel). */
+/*
+ * The panel's timings (the phone's DT, qcom,mdss-dsi-display-timings of the K11A panel) and the tear
+ * check's vsync_count for each. The count is the length of one line of the check's model of the panel
+ * scan (19.2 MHz clocks), and the display engine's transfer is held to that model (the write may not
+ * get ahead of it): 2400 lines must fit in one TE period with room to spare, or the next TE comes while
+ * the transfer still runs. Measured on this phone (2026-10-29): the UEFI's 60 Hz uses 133 (2406 lines
+ * a frame); at 120 Hz the panel's TE comes every 8.23 ms (121.5 Hz), so Android's 66 (= 19.2 MHz /
+ * (2416 * 120)) gives 2394 lines a TE -- less than the 2400 to send. 64 gives 2469, the transfer 8.0 ms.
+ */
 struct k11a_timing {
-	uint32_t hz, vtotal;
+	uint32_t hz, vsync_count;
 	uint8_t rate_60, d1;            /* "60 xx" and "D1 xx" of its timing-switch set */
 };
 static const struct k11a_timing k11a_timings[] = {
-	{ 60, 2400 + 600 + 560 + 32, 0x00, 0x2e },      /* timing@0: v fp 600, bp 560, pw 32 */
-	{ 90, 2400 + 300 + 280 + 16, 0x10, 0x6e },      /* timing@1: v fp 300, bp 280, pw 16 */
-	{ 120, 2400 + 4 + 8 + 4, 0x10, 0x2e },          /* timing@2: v fp 4, bp 8, pw 4 */
+	{ 60, 133, 0x00, 0x2e },        /* timing@0 */
+	{ 90, 87, 0x10, 0x6e },         /* timing@1 */
+	{ 120, 64, 0x10, 0x2e },        /* timing@2 */
 };
+
+/* what the panel runs at now, by the tear check's count (a run before this one may have switched it) */
+static uint32_t
+rate_from_count(uint32_t count)
+{
+	return count >= 110 ? 60 : count >= 76 ? 90 : 120;
+}
 
 static int
 send_switch(const struct k11a_timing *t)
@@ -250,15 +269,14 @@ send_switch(const struct k11a_timing *t)
 int
 alioth_panel_set_rate(uint32_t hz)
 {
-	const struct k11a_timing *t = NULL, *cur = NULL;
+	const struct k11a_timing *t = NULL;
 
 	for (unsigned i = 0; i < sizeof(k11a_timings) / sizeof(k11a_timings[0]); i++) {
 		if (k11a_timings[i].hz == hz) t = &k11a_timings[i];
-		if (k11a_timings[i].hz == (panel_rate ? panel_rate : 60)) cur = &k11a_timings[i];
 	}
-	if (t == NULL || cur == NULL || !dsi_init()) return 0;
+	if (t == NULL || !dsi_init()) return 0;
 	uint32_t sync = intf_rd(TEAR_SYNC_CONFIG_VSYNC), count = sync & 0x7ffff;
-	uint32_t want = (uint32_t)((19200000ULL + (uint64_t)t->vtotal * hz / 2) / ((uint64_t)t->vtotal * hz));
+	uint32_t want = t->vsync_count, now_hz = rate_from_count(count);
 	printf("alioth panel: tear check sync %#x (vsync_count %u, %s), height %#x, init %u, count %#x, autorefresh %#x\n",
 	    sync, count, (sync & (1u << 20)) ? "TE pin" : "internal", intf_rd(TEAR_SYNC_CONFIG_HEIGHT),
 	    intf_rd(TEAR_VSYNC_INIT_VAL), intf_rd(TEAR_INT_COUNT_VAL), intf_rd(TEAR_AUTOREFRESH_CONFIG));
@@ -266,14 +284,19 @@ alioth_panel_set_rate(uint32_t hz)
 		printf("alioth panel: the tear check is not counting: refresh left alone\n");
 		return 0;
 	}
+	if (now_hz == hz && count == want) {
+		panel_rate = hz;
+		printf("alioth panel: already at %u Hz (vsync_count %u)\n", hz, count);
+		return 1;
+	}
 	int rc = send_switch(t);
 	if (rc != 0) {
-		printf("alioth panel: switch to %u Hz failed (%d); panel left at %u Hz\n", hz, rc, cur->hz);
+		printf("alioth panel: switch to %u Hz failed (%d); panel left at %u Hz\n", hz, rc, now_hz);
 		return 0;
 	}
 	intf_wr(TEAR_SYNC_CONFIG_VSYNC, (sync & ~0x7ffffu) | (want & 0x7ffff));
 	panel_rate = hz;
-	printf("alioth panel: switched to %u Hz (vtotal %u): vsync_count %u -> %u\n", hz, t->vtotal, count, want);
+	printf("alioth panel: %u Hz -> %u Hz: vsync_count %u -> %u\n", now_hz, hz, count, want);
 	return 1;
 }
 
@@ -329,17 +352,18 @@ alioth_dpu_probe(void)
 void
 alioth_panel_start(void)
 {
-	uint32_t hz = 120, dcs = 1;
+	/* 60 until the display flips buffers (alioth_flip.c): at 120 Hz the transfer fills the whole frame and
+	 * a copy into the scanned-out buffer has no idle window left (measured, see k11a_timings). */
+	uint32_t hz = alioth_flip_ready() ? 120 : 60, dcs = 1;
 
 	if (!hakios_board_is_alioth()) return;
 	alioth_dpu_probe();
 	PE_parse_boot_argn("panel_dcs", &dcs, sizeof(dcs));
 	PE_parse_boot_argn("panel_hz", &hz, sizeof(hz));
 	if (!dcs || hz == 0) {
-		printf("alioth panel: refresh left as the UEFI set it (panel_hz=%u panel_dcs=%u)\n", hz, dcs);
+		printf("alioth panel: refresh left as it is (panel_hz=%u panel_dcs=%u)\n", hz, dcs);
 		return;
 	}
-	if (hz == 60 && panel_rate == 0) return;        /* the UEFI's */
 	if (alioth_panel_set_rate(hz)) {
 		/* let a few TEs of the new timing pass before anyone measures them */
 		delay_for_interval(50, NSEC_PER_MSEC);
@@ -350,4 +374,186 @@ uint32_t
 alioth_panel_rate(void)
 {
 	return panel_rate ? panel_rate : 60;
+}
+
+/*
+ * Page flips. The UEFI scans the framebuffer with source pipe VIG0 (SRC0_ADDR 0x9c000000, stride 4320,
+ * 1080 x 2400, through CTL0 and LM0 -- read at boot by alioth_dpu_probe()), and the transfer is held to the
+ * panel's scan model for the whole frame (see k11a_timings), so nothing written into the scanned buffer
+ * can avoid tearing. Instead the frame is drawn into another buffer and the pipe is pointed at it:
+ * SRC0_ADDR is double-buffered; CTL_FLUSH's VIG0 bit (sde_hw_ctl.c, DPU 6.x: VIG0 bit 0) makes the new
+ * address take effect at the start of the next frame (each TE with the UEFI's auto-refresh) and clears
+ * itself when it has. The buffers stay inside the cont_splash_region the bootloader reserved for the
+ * display (0x9c000000 + 0x2300000, live DT), which nothing else uses.
+ *
+ * Whether the display engine really reads a buffer of ours is checked, not assumed: INTF_1's MISR (a
+ * signature of what leaves the interface, every frame; sde_hw_intf.c INTF_MISR_CTRL 0x180 / SIGNATURE
+ * 0x184) must be the same for an exact copy of the shown frame and differ for a copy with one pixel changed.
+ */
+#define VIG0_OFF                0x5000
+#define SSPP_SRC_SIZE           0x00
+#define SSPP_SRC0_ADDR          0x14
+#define SSPP_SRC_YSTRIDE0       0x24
+#define CTL0_OFF                0x2000
+#define CTL_LAYER0              0x00
+#define CTL_FLUSH               0x18
+#define CTL_FLUSH_VIG0          (1u << 0)
+#define INTF_MISR_CTRL          0x180
+#define INTF_MISR_SIGNATURE     0x184
+#define MISR_ENABLE             (1u << 8)
+#define MISR_STATUS             (1u << 9)
+#define MISR_STATUS_CLEAR       (1u << 10)
+#define MISR_INPUT_SEL_DATA     (1u << 24)
+#define MISR_FREE_RUN           (1u << 31)
+
+static vm_offset_t mdss;
+static uint32_t flip_latch_us_max, flip_timeouts;
+int alioth_flip_to(uint64_t phys, uint32_t timeout_us);
+
+static inline uint32_t md_rd(uint32_t off) { return *(volatile uint32_t *)(mdss + off); }
+static inline void
+md_wr(uint32_t off, uint32_t v)
+{
+	__asm__ volatile("dsb sy" ::: "memory");       /* the pixels before the address */
+	*(volatile uint32_t *)(mdss + off) = v;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* The pipe, the path and the panel as the flip needs them; 1 when they are. */
+int
+alioth_flip_probe(uint64_t fb_phys, uint32_t stride, uint32_t width, uint32_t height)
+{
+	if (!hakios_board_is_alioth() || !dsi_init()) return 0;
+	if (mdss == 0) mdss = ml_io_map(MDSS_PHYS, 0x90000);
+	if (mdss == 0) return 0;
+	if (md_rd(VIG0_OFF + SSPP_SRC0_ADDR) == (uint32_t)fb_phys + 0xA00000u) {
+		/* a kernel before this one (same loader session) left the second buffer shown: back to the first */
+		printf("alioth flip: the second buffer is shown (an earlier run's); back to the first\n");
+		alioth_flip_to(fb_phys, 100000);
+	}
+	uint32_t addr = md_rd(VIG0_OFF + SSPP_SRC0_ADDR), ys = md_rd(VIG0_OFF + SSPP_SRC_YSTRIDE0) & 0xffff;
+	uint32_t size = md_rd(VIG0_OFF + SSPP_SRC_SIZE), layer = md_rd(CTL0_OFF + CTL_LAYER0);
+	uint32_t refresh = intf_rd(TEAR_AUTOREFRESH_CONFIG);
+	printf("alioth flip: VIG0 addr %#x stride %u size %ux%u, CTL0 layer0 %#x flush %#x, autorefresh %#x\n",
+	    addr, ys, size & 0xffff, size >> 16, layer, md_rd(CTL0_OFF + CTL_FLUSH), refresh);
+	if (addr != (uint32_t)fb_phys || ys != stride || (size & 0xffff) != width || (size >> 16) != height ||
+	    (layer & 7) == 0 || !(refresh & 0x80000000u)) {
+		printf("alioth flip: the display engine is not set up as expected: no flips\n");
+		return 0;
+	}
+	return 1;
+}
+
+/* Point VIG0 at `phys` and wait until the engine has taken it (the flush bit clears). 1 when it has. */
+int
+alioth_flip_to(uint64_t phys, uint32_t timeout_us)
+{
+	uint64_t start = mach_absolute_time(), ns;
+
+	if (mdss == 0) return 0;
+	md_wr(VIG0_OFF + SSPP_SRC0_ADDR, (uint32_t)phys);
+	md_wr(CTL0_OFF + CTL_FLUSH, CTL_FLUSH_VIG0);
+	for (;;) {
+		if (!(md_rd(CTL0_OFF + CTL_FLUSH) & CTL_FLUSH_VIG0)) {
+			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+			if (ns / 1000 > flip_latch_us_max) flip_latch_us_max = (uint32_t)(ns / 1000);
+			return 1;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+		if (ns / 1000 >= timeout_us) {
+			if (flip_timeouts++ < 8) printf("alioth flip: %#llx not taken after %u us (flush %#x)\n", phys, timeout_us,
+				    md_rd(CTL0_OFF + CTL_FLUSH));
+			return 0;
+		}
+		uint64_t left = timeout_us - ns / 1000;
+		delay_for_interval(left > 2000 ? 500 : 50, NSEC_PER_USEC);
+	}
+}
+
+uint32_t alioth_flip_latch_max_us(void) { return flip_latch_us_max; }
+
+/* The same in two halves: point VIG0 at `phys` now, and (before drawing into the old buffer) wait for it. */
+static uint64_t flip_issued;
+
+void
+alioth_flip_issue(uint64_t phys)
+{
+	if (mdss == 0) return;
+	md_wr(VIG0_OFF + SSPP_SRC0_ADDR, (uint32_t)phys);
+	md_wr(CTL0_OFF + CTL_FLUSH, CTL_FLUSH_VIG0);
+	flip_issued = mach_absolute_time();
+}
+
+/* 1 when the flip issued last has been taken (at once if it has already), 0 after timeout_us without */
+int
+alioth_flip_wait(uint32_t timeout_us)
+{
+	uint64_t start = mach_absolute_time(), ns;
+
+	if (mdss == 0) return 0;
+	for (;;) {
+		if (!(md_rd(CTL0_OFF + CTL_FLUSH) & CTL_FLUSH_VIG0)) {
+			absolutetime_to_nanoseconds(mach_absolute_time() - flip_issued, &ns);
+			if (ns / 1000 > flip_latch_us_max) flip_latch_us_max = (uint32_t)(ns / 1000);
+			return 1;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+		if (ns / 1000 >= timeout_us) {
+			if (flip_timeouts++ < 8) printf("alioth flip: not taken after %u us more (flush %#x)\n", timeout_us,
+				    md_rd(CTL0_OFF + CTL_FLUSH));
+			return 0;
+		}
+		delay_for_interval(timeout_us - ns / 1000 > 2000 ? 300 : 50, NSEC_PER_USEC);
+	}
+}
+
+/* The interface's signature of the frame it sends, after `frames` more frames have gone out. */
+uint32_t
+alioth_flip_misr(unsigned frames)
+{
+	static bool on;
+
+	if (intf == 0) return 0;
+	if (!on) {
+		intf_wr(INTF_MISR_CTRL, MISR_STATUS_CLEAR);
+		intf_wr(INTF_MISR_CTRL, MISR_ENABLE | MISR_FREE_RUN | MISR_INPUT_SEL_DATA | 1);
+		on = true;
+		frames++;
+	}
+	for (unsigned i = 0; i < frames; i++) {
+		/* a frame at 60 Hz is 16.5 ms; the signature then belongs to a frame wholly from the buffer now set */
+		delay_for_interval(20, NSEC_PER_MSEC);
+	}
+	return intf_rd(INTF_MISR_SIGNATURE);
+}
+
+void
+alioth_flip_misr_off(void)
+{
+	if (intf) intf_wr(INTF_MISR_CTRL, MISR_STATUS_CLEAR);
+}
+
+/* The TE period now, from the tear check's line counter wrapping (ns), 0 if it does not move. */
+uint64_t
+alioth_panel_frame_ns(void)
+{
+	uint64_t start = mach_absolute_time(), first = 0, last = 0, ns;
+	uint32_t prev = intf_rd(TEAR_INT_COUNT_VAL) & 0xffff;
+	unsigned wraps = 0;
+
+	if (intf == 0) return 0;
+	while (wraps < 9) {
+		delay_for_interval(50, NSEC_PER_USEC);
+		uint32_t raw = intf_rd(TEAR_INT_COUNT_VAL) & 0xffff;
+		uint64_t now = mach_absolute_time();
+		if (raw < prev) {
+			if (wraps++ == 0) first = now;
+			last = now;
+		}
+		prev = raw;
+		absolutetime_to_nanoseconds(now - start, &ns);
+		if (ns > 300000000) return 0;
+	}
+	absolutetime_to_nanoseconds(last - first, &ns);
+	return ns / (wraps - 1);
 }

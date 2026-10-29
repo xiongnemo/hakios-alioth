@@ -203,24 +203,53 @@ hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns)
 	}
 }
 
+/* why the calibration gave up, and the numbers it had: one line, then the first samples */
+static uint32_t diag_raw[48], diag_written[48];
+static unsigned diag_n;
+
+static int
+scan_fail(const char *why, unsigned wraps, uint64_t line_count, unsigned busy, unsigned idle, uint64_t elapsed)
+{
+	printf("display: command TE calibration: %s (wraps %u, lines counted %llu, busy %u idle %u, %llu us, "
+	    "frame %llu ns, line %llu ns)\n", why, wraps, line_count, busy, idle, elapsed / 1000, scan.frame_ns, scan.line_ns);
+	for (unsigned i = 0; i < diag_n; i += 8) {
+		printf("display:   samples %2u: %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u %u/%u\n", i,
+		    diag_raw[i], diag_written[i], diag_raw[i + 1], diag_written[i + 1], diag_raw[i + 2], diag_written[i + 2],
+		    diag_raw[i + 3], diag_written[i + 3], diag_raw[i + 4], diag_written[i + 4], diag_raw[i + 5], diag_written[i + 5],
+		    diag_raw[i + 6], diag_written[i + 6], diag_raw[i + 7], diag_written[i + 7]);
+	}
+	scan.frame_ns = scan.line_ns = 0;
+	return 0;
+}
+
 static int
 command_scan_start(void)
 {
 	uint32_t config = rd(intf, 0x288), refresh = rd(intf, 0x2b4);
 	te_initial = rd(intf, 0x294) & 0xffff;
 	if (!umi || !(rd(intf, 0x284) & 1) || (config & 0x180000) != 0x180000 ||
-	    refresh != 0x80000001 || te_initial != hakios_board_panel_height()) return 0;
+	    refresh != 0x80000001 || te_initial != hakios_board_panel_height()) {
+		printf("display: command TE: not the expected setup (enable %#x config %#x autorefresh %#x initial %u, want %u)\n",
+		    rd(intf, 0x284), config, refresh, te_initial, hakios_board_panel_height());
+		return 0;
+	}
 	uint64_t start = mach_absolute_time(), previous_time = start, first_wrap = 0, last_wrap = 0;
-	uint64_t line_time = 0, line_count = 0, elapsed;
+	uint64_t line_time = 0, line_count = 0, elapsed = 0;
 	uint32_t previous = rd(intf, 0x298) & 0xffff, busy_last = 0;
 	unsigned wraps = 0, busy_samples = 0, idle_samples = 0;
+	diag_n = 0;
 	while (wraps < 4) {
 		delay_for_interval(50, NSEC_PER_USEC);
 		uint32_t raw = rd(intf, 0x298) & 0xffff;
 		uint32_t written = rd(intf, 0x2b0) & 0xffff;
 		uint64_t now = mach_absolute_time(), interval;
+		if (diag_n < 48) {
+			diag_raw[diag_n] = raw;
+			diag_written[diag_n++] = written;
+		}
 		absolutetime_to_nanoseconds(now - start, &elapsed);
-		if (elapsed > 150000000 || raw < te_initial) return 0;
+		if (elapsed > 150000000) return scan_fail("no 4 TEs in 150 ms", wraps, line_count, busy_samples, idle_samples, elapsed);
+		if (raw < te_initial) return scan_fail("line counter below its initial value", wraps, line_count, busy_samples, idle_samples, elapsed);
 		/* Do not pair the previous frame's read phase with a new DMA transfer. */
 		if ((rd(intf, 0x298) & 0xffff) < raw) continue;
 		if (raw < previous) {
@@ -239,16 +268,21 @@ command_scan_start(void)
 		previous = raw;
 		previous_time = now;
 	}
-	if (!line_count || !busy_samples || !idle_samples) return 0;
+	if (!line_count || !busy_samples || !idle_samples)
+		return scan_fail("no busy/idle DMA seen", wraps, line_count, busy_samples, idle_samples, elapsed);
 	absolutetime_to_nanoseconds(last_wrap - first_wrap, &elapsed);
 	scan.frame_ns = elapsed / (wraps - 1);
 	scan.line_ns = line_time / line_count;
 	if (!scan.line_ns || scan.frame_ns < NSEC_PER_SEC / 130 ||
-	    scan.frame_ns > NSEC_PER_SEC / 30) return 0;
+	    scan.frame_ns > NSEC_PER_SEC / 30)
+		return scan_fail("implausible frame time", wraps, line_count, busy_samples, idle_samples, elapsed);
 	scan.lines = (uint32_t)(scan.frame_ns / scan.line_ns);
 	scan.shown = te_initial;
 	te_idle_start = busy_last + 32; /* margin after the last observed active DMA line */
-	if (scan.lines < scan.shown || scan.lines > 8192 || te_idle_start >= scan.lines) return 0;
+	if (scan.lines < scan.shown || scan.lines > 8192 || te_idle_start >= scan.lines) {
+		printf("display: command TE: %u lines a frame, %u shown, idle after %u\n", scan.lines, scan.shown, te_idle_start);
+		return scan_fail("frame lines do not fit", wraps, line_count, busy_samples, idle_samples, elapsed);
+	}
 	scan.millihz = (uint32_t)(1000000000000ULL / scan.frame_ns);
 	command_mode = true;
 	scan.ok = 1;

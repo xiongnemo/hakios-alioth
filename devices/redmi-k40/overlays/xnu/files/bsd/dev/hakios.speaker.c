@@ -1450,6 +1450,7 @@ umi_cs35l41_region(uint32_t type, uint32_t offset, uint32_t length, bool coeff, 
 
 struct umi_cs_algorithm { uint32_t id, xm, ym; };
 static uint32_t umi_halo_xm[2], umi_cspl_xm[2];
+static uint32_t umi_halo_fw_version[2];   /* 0x300 Mi 10, 0xd00 Redmi K40 */
 static bool umi_runtime_preparing;
 
 static bool
@@ -1529,6 +1530,7 @@ umi_cs35l41_preload(uint8_t address)
 		if (alg[i].xm > 4082 || alg[i].ym > 2046) return false;
 	}
 	umi_halo_xm[address == UMI_AMP_RCV_ADDR] = 0x02800000 + 4 * alg[0].xm;
+	umi_halo_fw_version[address == UMI_AMP_RCV_ADDR] = umi_be32(header + 16);
 	for (uint32_t i = 1; i <= algorithms; i++) {
 		if (alg[i].id == 0xcd) umi_cspl_xm[address == UMI_AMP_RCV_ADDR] = 0x02800000 + 4 * alg[i].xm;
 	}
@@ -1768,6 +1770,15 @@ umi_cs35l41_dsp_boot(uint8_t a)
 	    !umi_cs35l41_read(a, cspl_xm + 8, &cspl_state) || !umi_cs35l41_read(a, cspl_xm + 12, &cspl_error)) return false;
 	say("umi-audio: amp %#x HALO heartbeat %u -> %u; CSPL state %u, error %#x\n", a,
 	    heartbeat1, heartbeat2, cspl_state, cspl_error);
+	if (umi_halo_fw_version[a == UMI_AMP_RCV_ADDR] == 0xd00) {
+		/* K11A firmware: no mailbox while GLOBAL_EN is zero (the vendor driver asks only after setting it).
+		 * It has run if it brought the amplifier to its power-up state itself; umi_speaker_start() then
+		 * proves the mailbox, mutes on, before any output. */
+		bool ran = (amp & 0xffff) == 0x3321 && cspl_error == 0;
+		say("umi-audio: amp %#x K11A protection firmware %s (amplifier power %#x, CSPL error %#x); mailbox checked at start\n",
+		    a, ran ? "running" : "NOT RUNNING", amp, cspl_error);
+		return ran;
+	}
 	/* Audio-frame heartbeat may pause while GLOBAL_EN is zero; mailbox ACK/state changes prove execution. */
 	return umi_cs35l41_mailbox(a, 1, 1) && umi_cs35l41_mailbox(a, 2, 0);
 }
