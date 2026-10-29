@@ -149,3 +149,60 @@
  osfmk/arm64/loader_return.c	optional nos_arm_asm
 +osfmk/arm64/hakios_prof.c	optional nos_arm_asm
  osfmk/arm64/user_exception_trace.c	standard
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5949,6 +5949,53 @@
+ 		imgp->ip_argspace -= new_ptr_size;
+ 		imgp->ip_envc++;
+ 	}
++	/*
++	 * (redmi-k40) ... and for everybody what the boot-arg exec_env=NAME=VALUE[,NAME=VALUE...] says:
++	 * CA_FRAME_RATE_POLICY=2, by which CoreAnimation gives an iPhone with this 120 Hz panel the default
++	 * frame rates of the iPads' (80-120 Hz, not 60-80) in every program, applications that
++	 * RunningBoard starts included, where no launchd plist reaches. A program's own value comes
++	 * first in its environment and wins.
++	 */
++	{
++		static char exec_env[256];
++		static int exec_env_parsed;
++		const char *p;
++
++		if (!exec_env_parsed) {
++			if (!PE_parse_boot_arg_str("exec_env", exec_env, sizeof(exec_env))) {
++				exec_env[0] = 0;
++			}
++			exec_env_parsed = 1;
++		}
++		for (p = exec_env; *p != 0;) {
++			char one[128];
++			size_t n = 0;
++
++			while (*p != 0 && *p != ',' && n < sizeof(one) - 1) {
++				one[n++] = *p++;
++			}
++			one[n] = 0;
++			while (*p != 0 && *p != ',') {
++				p++;
++			}
++			if (*p == ',') {
++				p++;
++			}
++			if (n == 0 || strchr(one, '=') == NULL) {
++				continue;
++			}
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(one), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
+ 
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
