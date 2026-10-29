@@ -632,7 +632,7 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 		}
 	}
 	if (b == NULL || (b->address = hakios_gpu_address(size)) == 0) {
-		IOLog("HakiosGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
+		hakios_tl("HakiosGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
 		return NULL;
 	}
 	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
@@ -645,7 +645,7 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	if (!mapped) {
 		hakios_gpu_unmap(b->address, size);
 		hakios_gpu_address_free(b->address, size);
-		IOLog("HakiosGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
+		hakios_tl("HakiosGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
 		return NULL;
 	}
 	b->size = size;
@@ -769,7 +769,7 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
 	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
 	if (memory == NULL) {
-		IOLog("HakiosGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
+		hakios_tl("HakiosGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
 		    fBufferBytes >> 20);
 		return kIOReturnNoMemory;
 	}
@@ -1141,6 +1141,11 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		return kIOReturnBadArgument;
 	}
 	if (!hakios_gpu_ready() && selector != kHakiosShow) {
+		static uint32_t unready;
+
+		if (unready++ < 8) {
+			hakios_tl("HakiosGPU: request %#x while the GPU is not ready: refused\n", selector);
+		}
 		return kIOReturnNotReady;                       /* given back: the run is ending */
 	}
 	bzero(&r, sizeof(r));
@@ -1221,6 +1226,19 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		IOLog("HakiosGPU: request %#x (%zu bytes) is not known here\n", selector, size);
 		ret = kIOReturnUnsupported;
 		break;
+	}
+	if (ret != kIOReturnSuccess && selector != kMsmGemCpuPrep && selector != kMsmWaitFence) {
+		static uint32_t refusals;
+
+		/* (a refusal freedreno does not expect is a crash in the program: backboardd's fd_bo_ref(NULL), 2026-10-30) */
+		if (refusals++ < 32) {
+			char name[32];
+
+			proc_selfname(name, sizeof(name));
+			hakios_tl("HakiosGPU: %s: request %#x refused (%#x)%s%llu bytes, flags %#x; %u buffers, %llu MB\n", name, selector, ret,
+			    selector == kMsmGemNew ? ": a new buffer of " : ": ", selector == kMsmGemNew ? (unsigned long long) r.gemNew.size : 0ULL,
+			    selector == kMsmGemNew ? r.gemNew.flags : 0, fBufferCount, fBufferBytes >> 20);
+		}
 	}
 	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
 		if (args->structureOutputSize > size) {

@@ -23,6 +23,7 @@
 #include <string.h>
 #include <os/atomic_private.h>
 #include <stdarg.h>
+#include <vm/vm_shared_region.h>
 
 extern void loader_log_putc(char c);
 extern kern_return_t thread_terminate(thread_t);
@@ -256,4 +257,50 @@ hakios_prof_init(void)
 		return;
 	}
 	thread_deallocate(thread);
+}
+
+/*
+ * A user process's fault that is about to become a signal (bsd/uxkern/ux_exception.c): where it was --
+ * its pc, lr, sp and the address -- the shared cache's slide (pc - slide is the cache's own address, for
+ * `ipsw dyld a2s`), and the return addresses of its frame chain. The data volume is a RAM disk, so iOS's
+ * own crash reports are gone with the run; this is in the loader's log. The first 24 of a run.
+ */
+extern struct arm_saved_state *get_user_regs(thread_t);
+void hakios_user_fault(thread_t thread, int signal, int64_t code, int64_t subcode, const char *name);
+
+void
+hakios_user_fault(thread_t thread, int signal, int64_t code, int64_t subcode, const char *name)
+{
+	static uint32_t count;
+	arm_saved_state_t *state = get_user_regs(thread);
+	vm_shared_region_t sr;
+	uint64_t slide = 0, fp;
+	char line[300];
+	int n;
+
+	if (state == NULL || os_atomic_inc_orig(&count, relaxed) >= 24) {
+		return;
+	}
+	sr = vm_shared_region_get(get_threadtask(thread));
+	if (sr != NULL) {
+		slide = sr->sr_slide;
+		vm_shared_region_deallocate(sr);
+	}
+	fp = get_saved_state_fp(state);
+	prof_say("fault: %s signal %d code %#llx address %#llx pc %#llx lr %#llx sp %#llx fp %#llx; the shared cache's slide %#llx\n",
+	    name, signal, code, subcode, get_saved_state_pc(state), get_saved_state_lr(state), get_saved_state_sp(state), fp, slide);
+	if (thread != current_thread()) {
+		return;
+	}
+	n = snprintf(line, sizeof(line), "fault: %s frames:", name);
+	for (int i = 0; i < 16 && fp != 0 && n < (int)sizeof(line) - 24; i++) {
+		uint64_t frame[2];
+
+		if (copyin((user_addr_t)fp, (char *)frame, sizeof(frame)) != 0) {
+			break;
+		}
+		n += snprintf(line + n, sizeof(line) - (size_t)n, " %#llx", frame[1]);
+		fp = frame[0];
+	}
+	prof_say("%s\n", line);
 }
