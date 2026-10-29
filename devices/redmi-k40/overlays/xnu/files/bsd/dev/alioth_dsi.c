@@ -70,8 +70,12 @@ extern void hakios_tl(const char *, ...) __printflike(1, 2);
 #define TEAR_SYNC_CONFIG_VSYNC  0x288   /* [18:0] vsync_count, 19 counter enable, 20 TE from pin */
 #define TEAR_SYNC_CONFIG_HEIGHT 0x28c
 #define TEAR_VSYNC_INIT_VAL     0x294
-#define TEAR_INT_COUNT_VAL      0x298
+#define TEAR_INT_COUNT_VAL      0x298   /* [15:0] read pointer line, [31:16] TEs counted */
+#define TEAR_SYNC_THRESH        0x29c
+#define TEAR_START_POS          0x2a0
+#define TEAR_LINE_COUNT         0x2b0   /* [15:0] write pointer: lines sent of this frame */
 #define TEAR_AUTOREFRESH_CONFIG 0x2b4
+#define INTF_FRAME_COUNT        0x0ac   /* frames the interface has sent (dpu_hw_intf.c) */
 
 static volatile uint32_t *dsi;
 static vm_offset_t intf;
@@ -263,6 +267,174 @@ send_switch(const struct k11a_timing *t)
 }
 
 /*
+ * Whether every TE carries a frame: TEs counted by the tear check against frames the interface sent,
+ * over half a second, and of a few frames where in the TE period the transfer ran (write pointer
+ * against TE). With the display clock controller's sources of the MDP and DSI clocks (Linux
+ * dispcc-sm8250.c: DISP_CC 0xaf00000, PLL0 0x0, PLL1 0x1000 (Lucid: L 0x4, ALPHA 0x40), RCGs mdp 0x20c8,
+ * pclk0 0x2098, byte0 0x2110, vsync 0x20f8; CFG = RCGR + 4: [4:0] half-integer divider, [10:8] source).
+ * Boot-arg panel_check=0: not done.
+ */
+#define DISP_CC_PHYS            0x0af00000UL
+static vm_offset_t dispcc;
+
+static uint64_t
+lucid_hz(uint32_t pll)
+{
+	uint32_t l = *(volatile uint32_t *)(dispcc + pll + 0x4) & 0xffff, a = *(volatile uint32_t *)(dispcc + pll + 0x40) & 0xffff;
+	return (19200000ULL * l) + (19200000ULL * a >> 16);
+}
+
+static void
+print_rcg(const char *name, uint32_t rcgr, bool mnd)
+{
+	volatile uint32_t *r = (volatile uint32_t *)(dispcc + rcgr);
+	uint32_t cmd = r[0], cfg = r[1], src = cfg >> 8 & 7, div2 = (cfg & 0x1f) + 1;
+
+	if (mnd) {
+		printf("alioth clocks: %s cmd %#x cfg %#x (source %u, divider %u/2) m %#x n %#x d %#x\n", name, cmd, cfg, src, div2,
+		    r[2], r[3], r[4]);
+	} else {
+		printf("alioth clocks: %s cmd %#x cfg %#x (source %u, divider %u/2)\n", name, cmd, cfg, src, div2);
+	}
+}
+
+static void
+alioth_panel_check(uint32_t hz)
+{
+	uint32_t on = 1, te0, te1, f0, f1;
+	uint64_t t0, t1, ns;
+
+	PE_parse_boot_argn("panel_check", &on, sizeof(on));
+	if (!on || intf == 0) return;
+	if (dispcc == 0) dispcc = ml_io_map(DISP_CC_PHYS, 0x10000);
+	if (dispcc != 0) {
+		uint64_t p0 = lucid_hz(0x0), p1 = lucid_hz(0x1000);
+		uint32_t mdp = *(volatile uint32_t *)(dispcc + 0x20cc), src = mdp >> 8 & 7, div2 = (mdp & 0x1f) + 1;
+		uint64_t parent = src == 1 ? p0 : src == 4 ? p1 : src == 0 ? 19200000 : 0;
+
+		printf("alioth clocks: disp_cc PLL0 %llu Hz (mode %#x), PLL1 %llu Hz (mode %#x); MDP %llu Hz\n", p0,
+		    *(volatile uint32_t *)(dispcc + 0x0), p1, *(volatile uint32_t *)(dispcc + 0x1000), parent * 2 / div2);
+		print_rcg("mdp", 0x20c8, false);
+		print_rcg("pclk0", 0x2098, true);
+		print_rcg("byte0", 0x2110, false);
+		print_rcg("vsync", 0x20f8, false);
+	}
+	printf("alioth panel %u Hz: tear check thresh %#x start %u init %u height %#x, autorefresh %#x\n", hz,
+	    intf_rd(TEAR_SYNC_THRESH), intf_rd(TEAR_START_POS), intf_rd(TEAR_VSYNC_INIT_VAL), intf_rd(TEAR_SYNC_CONFIG_HEIGHT),
+	    intf_rd(TEAR_AUTOREFRESH_CONFIG));
+
+	/* a few frames, sampled every few microseconds: TE, and when the write pointer starts and stops */
+	{
+		uint32_t prev_te = intf_rd(TEAR_INT_COUNT_VAL) >> 16, prev_wr = intf_rd(TEAR_LINE_COUNT) & 0xffff;
+		uint64_t start = mach_absolute_time(), te_at = 0, last_move = 0;
+		uint32_t shown = 0, max_wr = 0;
+		bool writing = false;
+		char line[480];
+		int n = 0;
+
+		for (;;) {
+			uint64_t now = mach_absolute_time(), us;
+			uint32_t rd = intf_rd(TEAR_INT_COUNT_VAL), wr = intf_rd(TEAR_LINE_COUNT) & 0xffff;
+
+			absolutetime_to_nanoseconds(now - start, &ns);
+			us = ns / 1000;
+			if (us > 60000 || n > (int)sizeof(line) - 40) break;
+			if ((rd >> 16) != prev_te) {
+				prev_te = rd >> 16;
+				te_at = us;
+				n += snprintf(line + n, sizeof(line) - (size_t)n, " TE@%llu", us);
+			}
+			if (wr != prev_wr) {
+				if (!writing && wr < 64) {
+					writing = true;
+					n += snprintf(line + n, sizeof(line) - (size_t)n, " w+%llu", us - te_at);
+				}
+				max_wr = wr > max_wr ? wr : max_wr;
+				last_move = us;
+				prev_wr = wr;
+			} else if (writing && us - last_move > 300) {
+				writing = false;
+				n += snprintf(line + n, sizeof(line) - (size_t)n, " w-%llu(%u)", last_move - te_at, max_wr);
+				max_wr = 0;
+				shown++;
+			}
+			for (uint64_t until = now + 48; mach_absolute_time() < until;) {   /* ~2 us */
+			}
+		}
+		line[n] = 0;
+		printf("alioth panel %u Hz: 60 ms of TEs (TE@us) and transfers (w+start/w-end us after TE, lines):%s\n", hz, line);
+	}
+
+	te0 = intf_rd(TEAR_INT_COUNT_VAL) >> 16;
+	f0 = intf_rd(INTF_FRAME_COUNT);
+	t0 = mach_absolute_time();
+	delay_for_interval(500, NSEC_PER_MSEC);
+	te1 = intf_rd(TEAR_INT_COUNT_VAL) >> 16;
+	f1 = intf_rd(INTF_FRAME_COUNT);
+	t1 = mach_absolute_time();
+	absolutetime_to_nanoseconds(t1 - t0, &ns);
+	printf("alioth panel %u Hz: in %llu ms %u TEs, %u frames sent (INTF frame count %#x -> %#x)\n", hz, ns / 1000000,
+	    (te1 - te0) & 0xffff, f1 - f0, f0, f1);
+}
+
+/*
+ * The MDP's clock for 120 Hz. The UEFI runs it at 300 MHz (PLL1 600 MHz / 2), and the engine moves one
+ * pixel a clock: a line of 1080 takes 3.6 us, a frame 8.64 ms (measured: the write pointer) -- longer
+ * than the panel's 8.23 ms at 120 Hz, so the auto-refresh misses every other TE and only 60 frames a
+ * second reach the panel. Android raises it for the 120 Hz timing (Linux sm8250 mdp_opp_table: 345 MHz at
+ * SVS_L1, 460 at NOM). Here: PLL1 / 1.5 = 400 MHz (PLL0, which 345 and 460 would need, is not running),
+ * after an ACTIVE vote of the display's power domain (MMCX) for NOM; without the vote, no change.
+ * Boot-arg mdp_clk=400 (or 300: as the UEFI left it); default 400 at 120 Hz.
+ */
+#define RCG_CMD_UPDATE          (1u << 0)
+extern int umi_rpmh_arc_level(const char *res, unsigned corner);
+extern int umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y);
+
+static void
+alioth_mdp_clock(uint32_t hz)
+{
+	uint32_t mhz = hz == 120 ? 400 : 0, cfg, want, i;
+
+	PE_parse_boot_argn("mdp_clk", &mhz, sizeof(mhz));
+	if (mhz != 400 && mhz != 300) return;
+	if (dispcc == 0) dispcc = ml_io_map(DISP_CC_PHYS, 0x10000);
+	if (dispcc == 0) return;
+	volatile uint32_t *rcg = (volatile uint32_t *)(dispcc + 0x20c8);
+	cfg = rcg[1];
+	if ((cfg >> 8 & 7) != 4 || lucid_hz(0x1000) != 600000000ULL) {
+		printf("alioth clocks: MDP not from a 600 MHz PLL1 (cfg %#x): left alone\n", cfg);
+		return;
+	}
+	want = (cfg & ~0x1fu) | (mhz == 400 ? 2u : 3u);         /* half-integer divider: 2 * 1.5 - 1, 2 * 2 - 1 */
+	if (mhz > 300) {
+		/* (also when an earlier kernel of this loader session left the clock raised: votes are this kernel's to make) */
+		int rc = umi_rpmh_arc_level("mmcx.lvl", 256);   /* NOM */
+		uint32_t ddr = 1;
+
+		if (rc != 0) {
+			printf("alioth clocks: no MMCX vote (%d): MDP left at 300 MHz\n", rc);
+			return;
+		}
+		/*
+		 * Boot-arg ddr_vote=0: none. The processors' scaling of a frame took 1-2 ms or, every other frame, 7-9 ms;
+		 * nothing of ours asks for memory bandwidth, so the DDR's clock is whatever others ask for.
+		 */
+		PE_parse_boot_argn("ddr_vote", &ddr, sizeof(ddr));
+		if (ddr) {
+			(void) umi_rpmh_bcm_vote("MC0", 0x3fff, 0x3fff);
+			(void) umi_rpmh_bcm_vote("SH0", 0x3fff, 0x3fff);
+		}
+	}
+	if (want == cfg) return;
+	rcg[1] = want;
+	__asm__ volatile("dsb sy" ::: "memory");
+	rcg[0] = rcg[0] | RCG_CMD_UPDATE;
+	for (i = 0; i < 500 && (rcg[0] & RCG_CMD_UPDATE); i++) delay_for_interval(1, NSEC_PER_USEC);
+	printf("alioth clocks: MDP %u MHz (cfg %#x -> %#x, update %s)\n", mhz, cfg, rcg[1],
+	    (rcg[0] & RCG_CMD_UPDATE) ? "STILL PENDING" : "taken");
+}
+
+/*
  * Switch the panel to `hz` (60, 90, 120) and the tear check with it. 1 when done. Called with the
  * display's bus clocks running (hakios.display.c, before its TE calibration).
  */
@@ -277,6 +449,7 @@ alioth_panel_set_rate(uint32_t hz)
 	if (t == NULL || !dsi_init()) return 0;
 	uint32_t sync = intf_rd(TEAR_SYNC_CONFIG_VSYNC), count = sync & 0x7ffff;
 	uint32_t want = t->vsync_count, now_hz = rate_from_count(count);
+	PE_parse_boot_argn("panel_vsync", &want, sizeof(want));        /* (a test: another line length) */
 	printf("alioth panel: tear check sync %#x (vsync_count %u, %s), height %#x, init %u, count %#x, autorefresh %#x\n",
 	    sync, count, (sync & (1u << 20)) ? "TE pin" : "internal", intf_rd(TEAR_SYNC_CONFIG_HEIGHT),
 	    intf_rd(TEAR_VSYNC_INIT_VAL), intf_rd(TEAR_INT_COUNT_VAL), intf_rd(TEAR_AUTOREFRESH_CONFIG));
@@ -287,6 +460,8 @@ alioth_panel_set_rate(uint32_t hz)
 	if (now_hz == hz && count == want) {
 		panel_rate = hz;
 		printf("alioth panel: already at %u Hz (vsync_count %u)\n", hz, count);
+		alioth_mdp_clock(hz);
+		alioth_panel_check(hz);
 		return 1;
 	}
 	int rc = send_switch(t);
@@ -297,6 +472,9 @@ alioth_panel_set_rate(uint32_t hz)
 	intf_wr(TEAR_SYNC_CONFIG_VSYNC, (sync & ~0x7ffffu) | (want & 0x7ffff));
 	panel_rate = hz;
 	printf("alioth panel: %u Hz -> %u Hz: vsync_count %u -> %u\n", now_hz, hz, count, want);
+	alioth_mdp_clock(hz);
+	delay_for_interval(50, NSEC_PER_MSEC);
+	alioth_panel_check(hz);
 	return 1;
 }
 
@@ -408,7 +586,9 @@ alioth_panel_rate(void)
 
 static vm_offset_t mdss;
 static uint32_t flip_latch_us_max, flip_timeouts;
+static uint64_t flip_issued;
 int alioth_flip_to(uint64_t phys, uint32_t timeout_us);
+int alioth_flip_wait(uint32_t timeout_us);
 
 static inline uint32_t md_rd(uint32_t off) { return *(volatile uint32_t *)(mdss + off); }
 static inline void
@@ -419,6 +599,28 @@ md_wr(uint32_t off, uint32_t v)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/*
+ * VIG0 as the UEFI sets it: the framebuffer at `fb_phys`, the panel's size, unscaled (the scaler off, the
+ * pixel extension asking for the source's size -- the UEFI's own values, read on this phone). Taken at the
+ * next frame.
+ */
+#define VIG0_SCALER_OP          (VIG0_OFF + 0xa00 + 0x04)
+static void
+scan_restore(uint64_t fb_phys, uint32_t stride, uint32_t width, uint32_t height)
+{
+	md_wr(VIG0_OFF + SSPP_SRC_SIZE, height << 16 | width);
+	md_wr(VIG0_OFF + 0x08, 0);                                      /* SRC_XY */
+	md_wr(VIG0_OFF + SSPP_SRC_YSTRIDE0, stride);
+	for (unsigned c = 0; c < 3; c++) {
+		md_wr(VIG0_OFF + 0x100 + 0x10 * c, 0);                  /* pixel extension LR, TB, requested pixels */
+		md_wr(VIG0_OFF + 0x104 + 0x10 * c, 0);
+		md_wr(VIG0_OFF + 0x108 + 0x10 * c, height << 16 | width);
+	}
+	md_wr(VIG0_SCALER_OP, 0);
+	md_wr(VIG0_OFF + SSPP_SRC0_ADDR, (uint32_t)fb_phys);
+	md_wr(CTL0_OFF + CTL_FLUSH, CTL_FLUSH_VIG0);
+}
+
 /* The pipe, the path and the panel as the flip needs them; 1 when they are. */
 int
 alioth_flip_probe(uint64_t fb_phys, uint32_t stride, uint32_t width, uint32_t height)
@@ -426,10 +628,18 @@ alioth_flip_probe(uint64_t fb_phys, uint32_t stride, uint32_t width, uint32_t he
 	if (!hakios_board_is_alioth() || !dsi_init()) return 0;
 	if (mdss == 0) mdss = ml_io_map(MDSS_PHYS, 0x90000);
 	if (mdss == 0) return 0;
-	if (md_rd(VIG0_OFF + SSPP_SRC0_ADDR) == (uint32_t)fb_phys + 0xA00000u) {
-		/* a kernel before this one (same loader session) left the second buffer shown: back to the first */
-		printf("alioth flip: the second buffer is shown (an earlier run's); back to the first\n");
-		alioth_flip_to(fb_phys, 100000);
+	{
+		uint32_t at = md_rd(VIG0_OFF + SSPP_SRC0_ADDR), sz = md_rd(VIG0_OFF + SSPP_SRC_SIZE);
+
+		if (at >= (uint32_t)fb_phys && at < (uint32_t)fb_phys + 0x2300000u &&
+		    (at != (uint32_t)fb_phys || sz != (height << 16 | width) || (md_rd(VIG0_SCALER_OP) & 1))) {
+			/* a kernel before this one (same loader session) left another buffer or a surface shown: the UEFI's again */
+			printf("alioth flip: an earlier run left VIG0 at %#x (%ux%u, stride %u, scaler op %#x): back to the UEFI's setting\n",
+			    at, sz & 0xffff, sz >> 16, md_rd(VIG0_OFF + SSPP_SRC_YSTRIDE0) & 0xffff, md_rd(VIG0_SCALER_OP));
+			scan_restore(fb_phys, stride, width, height);
+			flip_issued = mach_absolute_time();
+			(void)alioth_flip_wait(100000);
+		}
 	}
 	uint32_t addr = md_rd(VIG0_OFF + SSPP_SRC0_ADDR), ys = md_rd(VIG0_OFF + SSPP_SRC_YSTRIDE0) & 0xffff;
 	uint32_t size = md_rd(VIG0_OFF + SSPP_SRC_SIZE), layer = md_rd(CTL0_OFF + CTL_LAYER0);
@@ -472,8 +682,10 @@ alioth_flip_to(uint64_t phys, uint32_t timeout_us)
 
 uint32_t alioth_flip_latch_max_us(void) { return flip_latch_us_max; }
 
+/* The engine's write pointer: how many lines of the frame being sent have gone (0 or all when it is idle). */
+uint32_t alioth_panel_line(void) { return intf != 0 ? intf_rd(TEAR_LINE_COUNT) & 0xffff : 0; }
+
 /* The same in two halves: point VIG0 at `phys` now, and (before drawing into the old buffer) wait for it. */
-static uint64_t flip_issued;
 
 void
 alioth_flip_issue(uint64_t phys)
@@ -503,21 +715,134 @@ alioth_flip_wait(uint32_t timeout_us)
 				    md_rd(CTL0_OFF + CTL_FLUSH));
 			return 0;
 		}
-		delay_for_interval(timeout_us - ns / 1000 > 2000 ? 300 : 50, NSEC_PER_USEC);
+		/* (100 us: when the flip was taken is when the TE came, which the framebuffer keeps its refreshes to) */
+		delay_for_interval(timeout_us - ns / 1000 > 2000 ? 100 : 50, NSEC_PER_USEC);
+	}
+}
+
+/*
+ * Scan-out of a surface as CoreAnimation drew it (1125 x 2436, the iPhone X's size) onto the 1080 x 2400
+ * panel: VIG0's source is the surface, and its scaler -- QSEED3 v3.0 at VIG + 0xa00 (Linux dpu catalog,
+ * dpu_vig_sblk_qseed3_3_0) -- makes the panel's size of it, bilinear, without coefficient tables, as
+ * mainline Linux programs it (dpu_plane.c _dpu_plane_setup_scaler3, dpu_hw_util.c dpu_hw_setup_scaler3):
+ * phase steps src/dst in 2^-21, preloads 4 and 2 (QSEED4 defaults, version >= 0x3000), OP_MODE enable |
+ * BIL << 16 | not-DX (14) | blend (31); the pixel extension asks for the source's size (dpu_hw_sspp.c
+ * setup_pe_config). Everything is double-buffered and taken with the flush, at the next frame.
+ */
+#define SSPP_SRC_XY             0x08
+#define SSPP_OUT_SIZE           0x0c
+#define SSPP_SRC_OP_MODE        0x38
+#define SSPP_PE_C0_LR           0x100   /* then TB 0x104, REQ_PIXELS 0x108; C1C2 at 0x110, C3 at 0x120 */
+#define VIG0_SCALER             (VIG0_OFF + 0xa00)
+#define QS_HW_VERSION           0x00
+#define QS_OP_MODE              0x04
+#define QS_PHASE_STEP_Y_H       0x10
+#define QS_PHASE_STEP_Y_V       0x14
+#define QS_PHASE_STEP_UV_H      0x18
+#define QS_PHASE_STEP_UV_V      0x1c
+#define QS_PRELOAD              0x20
+#define QS_SRC_SIZE_Y_RGB_A     0x40
+#define QS_SRC_SIZE_UV          0x44
+#define QS_DST_SIZE             0x48
+#define QS_PHASE_INIT_Y_H       0x90    /* Y_V 0x94, UV_H 0x98, UV_V 0x9c */
+
+static bool scan_saved;
+static uint32_t uefi_src_size, uefi_stride, uefi_qs_op, uefi_src_op, uefi_pe[9];
+static const uint32_t pe_regs[9] = { 0x100, 0x104, 0x108, 0x110, 0x114, 0x118, 0x120, 0x124, 0x128 };
+
+static void
+scan_save(void)
+{
+	if (scan_saved || mdss == 0) return;
+	uefi_src_size = md_rd(VIG0_OFF + SSPP_SRC_SIZE);
+	uefi_stride = md_rd(VIG0_OFF + SSPP_SRC_YSTRIDE0);
+	uefi_qs_op = md_rd(VIG0_SCALER + QS_OP_MODE);
+	uefi_src_op = md_rd(VIG0_OFF + SSPP_SRC_OP_MODE);
+	for (unsigned i = 0; i < 9; i++) uefi_pe[i] = md_rd(VIG0_OFF + pe_regs[i]);
+	scan_saved = true;
+	printf("alioth scan: VIG0 as the UEFI left it: src %#x stride %u out %#x op %#x scaler v%#x op %#x, pixel extension %#x %#x %#x\n",
+	    uefi_src_size, uefi_stride, md_rd(VIG0_OFF + SSPP_OUT_SIZE), uefi_src_op, md_rd(VIG0_SCALER + QS_HW_VERSION), uefi_qs_op,
+	    uefi_pe[0], uefi_pe[1], uefi_pe[2]);
+}
+
+/*
+ * VIG0 to scan `phys` (w x h, `stride` bytes a row) onto the panel's whole size, scaled if it is not that
+ * size; w = 0: back to the UEFI's own setting (the panel's size, no scaling) at `phys`. Taken at the next
+ * frame, like a flip (alioth_flip_wait()).
+ */
+void
+alioth_scan_source(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride)
+{
+	uint32_t out, ow, oh;
+
+	if (mdss == 0) return;
+	scan_save();
+	out = md_rd(VIG0_OFF + SSPP_OUT_SIZE);
+	ow = out & 0xffff;
+	oh = out >> 16;
+	if (w == 0 || (w == ow && h == oh)) {
+		md_wr(VIG0_OFF + SSPP_SRC_SIZE, w == 0 ? uefi_src_size : (h << 16 | w));
+		md_wr(VIG0_OFF + SSPP_SRC_YSTRIDE0, w == 0 ? uefi_stride : stride);
+		for (unsigned i = 0; i < 9; i++) md_wr(VIG0_OFF + pe_regs[i], uefi_pe[i]);
+		md_wr(VIG0_SCALER + QS_OP_MODE, uefi_qs_op);
+	} else {
+		uint32_t step_x = (uint32_t)(((uint64_t)w << 21) / ow), step_y = (uint32_t)(((uint64_t)h << 21) / oh);
+
+		md_wr(VIG0_OFF + SSPP_SRC_SIZE, h << 16 | w);
+		md_wr(VIG0_OFF + SSPP_SRC_XY, 0);
+		md_wr(VIG0_OFF + SSPP_SRC_YSTRIDE0, stride);
+		for (unsigned c = 0; c < 3; c++) {
+			md_wr(VIG0_OFF + SSPP_PE_C0_LR + 0x10 * c, 0);
+			md_wr(VIG0_OFF + SSPP_PE_C0_LR + 0x10 * c + 4, 0);
+			md_wr(VIG0_OFF + SSPP_PE_C0_LR + 0x10 * c + 8, h << 16 | w);
+		}
+		md_wr(VIG0_SCALER + QS_PHASE_INIT_Y_H, 0);
+		md_wr(VIG0_SCALER + QS_PHASE_INIT_Y_H + 4, 0);
+		md_wr(VIG0_SCALER + QS_PHASE_INIT_Y_H + 8, 0);
+		md_wr(VIG0_SCALER + QS_PHASE_INIT_Y_H + 12, 0);
+		md_wr(VIG0_SCALER + QS_PHASE_STEP_Y_H, step_x & 0xffffff);
+		md_wr(VIG0_SCALER + QS_PHASE_STEP_Y_V, step_y & 0xffffff);
+		md_wr(VIG0_SCALER + QS_PHASE_STEP_UV_H, step_x & 0xffffff);
+		md_wr(VIG0_SCALER + QS_PHASE_STEP_UV_V, step_y & 0xffffff);
+		md_wr(VIG0_SCALER + QS_PRELOAD, 4u | 2u << 8 | 4u << 16 | 2u << 24);
+		md_wr(VIG0_SCALER + QS_SRC_SIZE_Y_RGB_A, h << 16 | w);
+		md_wr(VIG0_SCALER + QS_SRC_SIZE_UV, h << 16 | w);
+		md_wr(VIG0_SCALER + QS_DST_SIZE, oh << 16 | ow);
+		md_wr(VIG0_SCALER + QS_OP_MODE, 1u << 0 | 3u << 16 | 1u << 14 | 1u << 31);
+	}
+	md_wr(VIG0_OFF + SSPP_SRC0_ADDR, (uint32_t)phys);
+	md_wr(CTL0_OFF + CTL_FLUSH, CTL_FLUSH_VIG0);
+	flip_issued = mach_absolute_time();
+}
+
+/*
+ * On the way back to the loader (osfmk/arm64/loader_return.c): VIG0 as the UEFI had it, on its framebuffer,
+ * whatever this kernel last showed -- a buffer of its own or one of CoreAnimation's surfaces, scaled -- so
+ * that what the loader draws is seen. No waiting: it is taken at the next frame.
+ */
+void
+alioth_display_quiesce(void)
+{
+	if (mdss == 0) return;
+	if (scan_saved) {
+		scan_restore(0x9c000000ULL, uefi_stride, uefi_src_size & 0xffff, uefi_src_size >> 16);
+	} else if (md_rd(VIG0_OFF + SSPP_SRC0_ADDR) != 0x9c000000u) {
+		md_wr(VIG0_OFF + SSPP_SRC0_ADDR, 0x9c000000u);          /* (flips only: the first buffer, the UEFI's) */
+		md_wr(CTL0_OFF + CTL_FLUSH, CTL_FLUSH_VIG0);
 	}
 }
 
 /* The interface's signature of the frame it sends, after `frames` more frames have gone out. */
+static bool misr_on;
+
 uint32_t
 alioth_flip_misr(unsigned frames)
 {
-	static bool on;
-
 	if (intf == 0) return 0;
-	if (!on) {
+	if (!misr_on) {
 		intf_wr(INTF_MISR_CTRL, MISR_STATUS_CLEAR);
 		intf_wr(INTF_MISR_CTRL, MISR_ENABLE | MISR_FREE_RUN | MISR_INPUT_SEL_DATA | 1);
-		on = true;
+		misr_on = true;
 		frames++;
 	}
 	for (unsigned i = 0; i < frames; i++) {
@@ -531,6 +856,7 @@ void
 alioth_flip_misr_off(void)
 {
 	if (intf) intf_wr(INTF_MISR_CTRL, MISR_STATUS_CLEAR);
+	misr_on = false;
 }
 
 /* The TE period now, from the tear check's line counter wrapping (ns), 0 if it does not move. */

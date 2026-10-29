@@ -163,8 +163,9 @@ rh_map(void)
 	return 0;
 }
 
+/* A resource of cmd-db: its address, and (ARC) where its levels are. VRM: rh_lookup(). */
 static int
-rh_lookup(const char *res, uint32_t *address)
+rh_lookup_slave(const char *res, unsigned want, uint32_t *address, uint32_t *aux_at, uint32_t *aux_len)
 {
 	uint32_t key[2] = {0, 0};
 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
@@ -191,11 +192,13 @@ rh_lookup(const char *res, uint32_t *address)
 				continue;
 			}
 			uint32_t addr = rh_read(rh_db, e + 16);
-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
+			if (slave != want || (addr >> 16) != want || (addr & 15u) ||
 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
-				printf("UMI RPMH: invalid VRM entry for %s\n", res);
+				printf("UMI RPMH: invalid entry for %s (slave %u, wanted %u)\n", res, slave, want);
 				return EINVAL;
 			}
+			if (aux_at != NULL) *aux_at = aux + rh_db16(e + 22);
+			if (aux_len != NULL) *aux_len = rh_db16(e + 20);
 			/* UMI's firmware repeats some VRM entries across slave headers.
 			 * An alias is harmless only when it resolves to the same register. */
 			if (matches && *address != addr) {
@@ -216,6 +219,12 @@ rh_lookup(const char *res, uint32_t *address)
 	return 0;
 }
 
+static int
+rh_lookup(const char *res, uint32_t *address)
+{
+	return rh_lookup_slave(res, RH_VRM, address, NULL, NULL);
+}
+
 static bool
 rh_free(unsigned t)
 {
@@ -230,8 +239,9 @@ rh_free(unsigned t)
 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
 }
 
+/* One ACTIVE request of up to three commands (address + offsets[c] = values[c]) to one resource. */
 static int
-rh_send_state_locked(uint32_t address, unsigned mv, bool set_ldo_mode, bool enable)
+rh_send_cmds_locked(uint32_t address, const uint32_t *offsets, const uint32_t *values, unsigned commands)
 {
 	int chosen = -1;
 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
@@ -280,14 +290,9 @@ rh_send_state_locked(uint32_t address, unsigned mv, bool set_ldo_mode, bool enab
 	}
 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
 	rh_poisoned = true;
-	/* Touch's PMIC5 LDO needs HPM. Wi-Fi's shared SMPS/LDO rails retain
-	 * their inherited mode; a PMIC5 LDO mode must not be applied to an SMPS. */
-	const uint32_t offsets[3] = {0, set_ldo_mode ? 8u : 4u, 4};
-	const uint32_t values[3] = {mv, set_ldo_mode ? 7u : (uint32_t)enable, (uint32_t)enable};
-	unsigned commands = set_ldo_mode ? 3 : 2;
 	uint32_t command_mask = (1u << commands) - 1;
-	printf("UMI RPMH: TCS%u ACTIVE %u mV commands=%u enable=%u irq-enable=%#x\n",
-	    t, mv, commands, enable, irq_en);
+	printf("UMI RPMH: TCS%u ACTIVE %#x = %u commands=%u second=%u irq-enable=%#x\n",
+	    t, address, values[0], commands, commands > 1 ? values[1] : 0, irq_en);
 	for (unsigned c = 0; c < commands; ++c) {
 		uint32_t cmd = b + c * RH_CMD_STRIDE;
 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
@@ -353,14 +358,14 @@ rh_send_state_locked(uint32_t address, unsigned mv, bool set_ldo_mode, bool enab
 }
 
 static int
-rh_send_state(uint32_t address, unsigned mv, bool set_ldo_mode, bool enable)
+rh_send_cmds(uint32_t address, const uint32_t *offsets, const uint32_t *values, unsigned commands)
 {
 	/* Share the sequencer lock with ADSP/MPSS. Panic cleanup cannot wait for
 	 * a mutex held by another stopped CPU.
 	 */
 	if (ml_get_interrupts_enabled()) lck_mtx_lock(&hakios_rsc_lock);
 	else if (!lck_mtx_try_lock(&hakios_rsc_lock)) return EBUSY;
-	int error = rh_send_state_locked(address, mv, set_ldo_mode, enable);
+	int error = rh_send_cmds_locked(address, offsets, values, commands);
 	if (rh_poisoned && rh_uncertain_irq) {
 		uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
 		if (irq_en != 0xffffffffu) (void)rh_sync(RH_IRQ_EN, irq_en & ~rh_uncertain_irq);
@@ -371,9 +376,101 @@ rh_send_state(uint32_t address, unsigned mv, bool set_ldo_mode, bool enable)
 }
 
 static int
+rh_send_state(uint32_t address, unsigned mv, bool set_ldo_mode, bool enable)
+{
+	/* Touch's PMIC5 LDO needs HPM. Wi-Fi's shared SMPS/LDO rails retain
+	 * their inherited mode; a PMIC5 LDO mode must not be applied to an SMPS. */
+	const uint32_t offsets[3] = {0, set_ldo_mode ? 8u : 4u, 4};
+	const uint32_t values[3] = {mv, set_ldo_mode ? 7u : (uint32_t)enable, (uint32_t)enable};
+	return rh_send_cmds(address, offsets, values, set_ldo_mode ? 3 : 2);
+}
+
+static int
 rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
 {
 	return rh_send_state(address, mv, set_ldo_mode, true);
+}
+
+/*
+ * An ACTIVE vote for a power domain's level (an ARC resource of cmd-db, "mmcx.lvl", say): the lowest of
+ * its levels (cmd-db's aux data, 16-bit corners: 64 low SVS, 128 SVS, 192 SVS L1, 256 NOM, 384 turbo) that
+ * is at least `corner`, sent as that level's index -- as Linux rpmhpd does. Held until reset; a vote
+ * only raises the domain (the levels of the other voters still count).
+ */
+#define RH_ARC          3u
+int umi_rpmh_arc_level(const char *res, unsigned corner);
+int umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y);
+
+/*
+ * An ACTIVE vote of a bus clock manager (a BCM resource of cmd-db: "MC0" the DDR, "SH0" the system
+ * cache's fabric): x the average, y the peak, in the BCM's own units, 14 bits each (Linux
+ * include/soc/qcom/tcs.h BCM_TCS_CMD: commit 30, valid 29, x << 14, y). 0x3fff each asks for the most
+ * the bus has. Held until reset.
+ */
+#define RH_BCM          5u
+
+int
+umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y)
+{
+	uint32_t address = 0, aux = 0, len = 0;
+	int error = EIO;
+
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (rh_poisoned) goto out;
+	error = rh_map();
+	if (!error) error = rh_lookup_slave(res, RH_BCM, &address, &aux, &len);
+	if (!error) {
+		const uint32_t offsets[1] = {0};
+		const uint32_t values[1] = {1u << 30 | 1u << 29 | (vote_x & 0x3fffu) << 14 | (vote_y & 0x3fffu)};
+
+		printf("UMI RPMH: %s BCM unit data %#x %#x\n", res, len >= 4 ? rh_read(rh_db, aux & ~3u) : 0, len);
+		error = rh_send_cmds(address, offsets, values, 1);
+	}
+out:
+	printf("UMI RPMH: %s ACTIVE bus vote %#x/%#x: error %d\n", res, vote_x, vote_y, error);
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
+}
+
+int
+umi_rpmh_arc_level(const char *res, unsigned corner)
+{
+	uint32_t address = 0, aux = 0, len = 0, level = 0;
+	int error = EIO;
+	char levels[96];
+	int n = 0;
+	bool found = false;
+
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (rh_poisoned) goto out;
+	error = rh_map();
+	if (!error) error = rh_lookup_slave(res, RH_ARC, &address, &aux, &len);
+	if (!error && (len < 2 || len > 32 || (len & 1u))) {
+		printf("UMI RPMH: %s has %u bytes of levels\n", res, len);
+		error = EINVAL;
+	}
+	for (uint32_t i = 0; !error && i < len / 2; i++) {
+		unsigned c = rh_db16(aux + 2 * i);
+
+		n += snprintf(levels + n, sizeof(levels) - (size_t)n, " %u", c);
+		if (!found && c >= corner) {
+			level = i;
+			found = true;
+		}
+	}
+	if (!error) {
+		printf("UMI RPMH: %s levels:%s; corner %u is level %u\n", res, levels, corner, found ? level : 99);
+		if (!found) error = ERANGE;
+	}
+	if (!error) {
+		const uint32_t offsets[1] = {0}, values[1] = {level};
+
+		error = rh_send_cmds(address, offsets, values, 1);
+	}
+out:
+	printf("UMI RPMH: %s ACTIVE corner %u: error %d\n", res, corner, error);
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
 }
 
 /* Camera owns these three PM8009 supplies. Wi-Fi, Bluetooth and touch use

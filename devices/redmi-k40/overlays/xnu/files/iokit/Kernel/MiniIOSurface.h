@@ -125,12 +125,14 @@ public:
 	uint32_t                        useCount[2];
 	uint32_t                        purgeable;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
+	uint64_t                        scanPhys;       /* the pixels' physical address if the display can scan them out (one piece below 4 GB), else 0 */
 
 	virtual bool
 	init(void) APPLE_KEXT_OVERRIDE
 	{
 		drawn = 0;
 		gpu_written = false;
+		scanPhys = 0;
 		return OSObject::init();
 	}
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
@@ -169,6 +171,12 @@ void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (hakios.gpu.cpp). */
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
+/*
+ * Surfaces of this size with 4-byte pixels get their pixels in one of `slots` pieces of `slotBytes` from
+ * `phys` on -- memory the display's engine can scan out as it is (scanPhys) -- while one is free; the
+ * framebuffer says where (width 0: none).
+ */
+void            MiniIOSurfaceSetScanout(uint32_t width, uint32_t height, uint64_t phys, uint64_t slotBytes, unsigned slots);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);

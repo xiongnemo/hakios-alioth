@@ -62,6 +62,10 @@ extern "C" int alioth_flip_wait(uint32_t timeout_us);
 extern "C" void alioth_panel_start(void);
 extern "C" uint32_t alioth_panel_rate(void);
 extern "C" uint64_t alioth_panel_frame_ns(void);
+extern "C" void alioth_scan_source(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride);
+extern "C" uint32_t alioth_panel_line(void);
+extern "C" void hakios_gpu_to_memory(void * start, uint64_t size);
+extern "C" uint64_t gPhysBase, gPhysSize;       /* (osfmk/arm: the physical memory XNU has) */
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -185,6 +189,15 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  * to 10 (the phone, 15 October; fb_threads=1 is how it was).
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
+/*
+ * Boot-arg fb_bind=0: the helpers run wherever the scheduler puts them. By default the first three are
+ * bound to XNU's cpus 1-3 (the A77s; cpu 0 is the prime A77, cpus 4-6 the A55s): woken, a helper left
+ * to the scheduler often started only once the presenter had scaled most of the frame alone (~9 ms).
+ */
+static TUNABLE(uint32_t, gBind, "fb_bind", 1);
+extern "C" processor_t thread_bind(processor_t processor);
+extern "C" processor_t cpu_to_processor(int cpu);
+extern "C" unsigned int processor_count;
 #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
 static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
 static inline unsigned
@@ -216,6 +229,23 @@ refreshHz(void)
 {
 	if (gScanHz != 0) return gScanHz;
 	return gRefreshHz >= 1 && gRefreshHz <= 240 ? gRefreshHz : kFBRefreshHz;
+}
+
+/*
+ * The panel's own refresh, measured (alioth flips): its TE comes every 8.20-8.25 ms at "120 Hz", not
+ * 8.33. Refreshes told at 120.0 a second drift through the panel's by a tenth of a millisecond a frame,
+ * and CoreAnimation's frames, which start on those, landed now early in a TE period and now late --
+ * fitting before the next TE or missing it by turns (2026-10-29). So the period told is the measured one,
+ * and the refresh notifications keep to the TEs the flips are seen to be taken at (gTEAt).
+ */
+static uint64_t gTENs;                  /* the TE period, ns (0: not measured: 1 s / refreshHz()) */
+static TUNABLE(uint32_t, gVSyncLead, "fb_vsync_lead", 3000);   /* us: refreshes told this much before the TE (armVSync()) */
+static uint64_t gTEAt;                  /* a moment a TE came (a flip taken just then), mach time; 0: none seen */
+
+static inline uint64_t
+refreshNs(void)
+{
+	return gTENs != 0 ? gTENs : NSEC_PER_SEC / refreshHz();
 }
 static inline uint32_t
 recStep(void)
@@ -263,7 +293,16 @@ public:
 	unsigned        fFlipFront;             /* which of fFlipBase the display engine scans */
 	uint8_t *       fFlipBase[2];
 	uint64_t        fFlipPhys[2];
-	IOMemoryMap *   fFlipMap;
+	IOMemoryMap *   fFlipMap, * fFlipMap0;
+	/* direct scan-out (aliothDirectTest()): the engine reads CoreAnimation's surface and scales it */
+	bool            fDirect, fDirectOn;     /* allowed (tested); VIG0 is on a surface now */
+	bool            fSingle;                /* (with fDirect) frames that are drawn here go into the first buffer only */
+	IOMemoryMap *   fSlotMap;               /* the display's memory past the first buffer, for the test */
+	MiniIOSurface * fDirectHeld;            /* the surface being scanned out: not CoreAnimation's to draw into */
+	uint32_t        fDirectStride, fDirectWidth, fDirectHeight;     /* the source geometry VIG0 has now */
+	uint32_t        fStatDirect;
+	bool aliothDirectTest(void);
+	MiniIOSurface * directSurface(const uint8_t * swap, MiniIOSurface ** surfaces);
 	uint32_t        fFlipFlips, fFlipMissed;
 	bool            fFlipPending;           /* a flip issued, not yet seen taken: fComposeBase is still scanned */
 	bool aliothFlipStart(void);
@@ -351,6 +390,10 @@ public:
 	unsigned        fThreads;
 	IOLock *        fHelperLock;
 	const struct RowJob * fHelperJob;
+	volatile SInt32 fRowNext;               /* the next chunk of rows nobody has taken yet (takeRows()) */
+	void takeRows(const struct RowJob * job, uint32_t * blendRow, unsigned drawer);
+	uint64_t        fJobBegan;              /* (touch_lat=1: of the last frame, each drawer's chunks and when it began) */
+	uint16_t        fJobChunks[8], fJobStartUs[8];
 	uint64_t        fHelperGeneration;
 	unsigned        fHelpersBusy, fHelpersStarted;
 	uint32_t *      fHelperBlend[7];
@@ -390,6 +433,14 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
  * shown frame must be the same, and of a copy with one pixel changed different. Then the panel goes to
  * its 120 Hz timing (panel_hz=, default 120) and CoreAnimation is told that rate. fb_flip=0: none of it.
  */
+/*
+ * The memory the bootloader keeps for the display (live DT cont_splash_region): the first buffer (the UEFI's
+ * picture) at its start, the second 10 MB on -- or, with direct scan-out, from there two slots for the
+ * surfaces CoreAnimation draws into (MiniIOSurfaceSetScanout()).
+ */
+static const uint64_t kDisplayPhys = 0x9C000000ULL, kDisplayBytes = 0x2300000ULL;
+static const uint64_t kSlotsPhys = 0x9CA00000ULL, kSlotBytes = 0xC80000ULL;
+
 bool
 IOMobileFramebuffer::aliothFlipStart(void)
 {
@@ -411,7 +462,20 @@ IOMobileFramebuffer::aliothFlipStart(void)
 		hakios_tl("alioth flip: the second buffer (%#llx) cannot be mapped\n", phys1);
 		return false;
 	}
+	/*
+	 * The first buffer too through a write-combined mapping of its own: the boot console's (fBase) is device
+	 * memory, and every other frame -- the ones drawn into it -- took 7-9 ms to scale instead of 1-2 ms
+	 * (2026-10-29). The console draws no more once a picture is up.
+	 */
 	fFlipBase[0] = fBase;
+	md = IOMemoryDescriptor::withPhysicalAddress(phys0, room, kIODirectionInOut);
+	if (md != NULL) {
+		fFlipMap0 = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+		md->release();
+	}
+	if (fFlipMap0 != NULL) {
+		fFlipBase[0] = (uint8_t *) fFlipMap0->getVirtualAddress();
+	}
 	fFlipPhys[0] = phys0;
 	fFlipBase[1] = (uint8_t *) fFlipMap->getVirtualAddress();
 	fFlipPhys[1] = phys1;
@@ -439,19 +503,143 @@ IOMobileFramebuffer::aliothFlipStart(void)
 		alioth_flip_to(phys0, 100000);
 		fFlipMap->release();
 		fFlipMap = NULL;
+		OSSafeReleaseNULL(fFlipMap0);
 		return false;
 	}
 	alioth_flip_set_ready(true);
 	alioth_panel_start();
 	uint64_t frame_ns = alioth_panel_frame_ns();
+	if (frame_ns >= 6000000 && frame_ns <= 20000000) {
+		gTENs = frame_ns;               /* (refreshNs(): the period told, by CoreAnimation's mode and refresh notifications) */
+	}
+	/* how fast each buffer takes a frame's worth of writes (the one not shown; then the picture back in it) */
+	uint64_t w1 = mach_absolute_time(), w0;
+	memset(fFlipBase[1], 0, bytes);
+	w1 = mach_absolute_time() - w1;
 	memcpy(fFlipBase[1], fFlipBase[0], bytes);
 	int t3 = alioth_flip_to(phys1, 100000);
+	w0 = mach_absolute_time();
+	memset(fFlipBase[0], 0, bytes);
+	w0 = mach_absolute_time() - w0;
+	memcpy(fFlipBase[0], fFlipBase[1], bytes);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	hakios_tl("alioth flip: buffers at %p (%s) and %p (boot console's %p): a frame of writes takes %llu us and %llu us\n",
+	    fFlipBase[0], fFlipMap0 != NULL ? "own mapping" : "the console's", fFlipBase[1], fBase, micros(w0), micros(w1));
 	fFlipFront = 1;
 	fComposeBase = fFlipBase[0];
 	fFlip = true;
 	hakios_tl("alioth flip: on: panel at %u Hz (TE every %llu us), flip at that rate %s, longest wait %u us\n",
 	    alioth_panel_rate(), frame_ns / 1000, t3 ? "taken" : "NOT TAKEN", alioth_flip_latch_max_us());
+	if (aliothDirectTest()) {
+		/* the display's memory past the first buffer: two slots for CoreAnimation's surfaces of the display's size */
+		fDirect = fSingle = true;
+		fFlipFront = 0;
+		fComposeBase = fFlipBase[0];
+		MiniIOSurfaceSetScanout(fWidth, fHeight, kSlotsPhys, kSlotBytes, 2);
+	}
 	return true;
+}
+
+static void
+fillPixels(uint8_t * base, uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t value)
+{
+	for (uint32_t y = 0; y < height; y++) {
+		uint32_t * row = (uint32_t *) (base + (size_t) y * rowBytes);
+
+		for (uint32_t x = 0; x < width; x++) {
+			row[x] = value;
+		}
+	}
+}
+
+/*
+ * Direct scan-out (boot-arg fb_direct=0: none). Scaling each frame to the panel's size on the processors cost
+ * 1-2 ms, and every other frame 7-9 ms (2026-10-29): the display engine can do it, reading the surface
+ * CoreAnimation drew into where it is (MiniIOSurface gives surfaces of the display's size memory in one
+ * piece below 4 GB) and scaling it with VIG0's scaler (alioth_scan_source()). Tested before it is used,
+ * by the interface's signature: a buffer of the display's size all of one colour, scaled, must give the
+ * signature of the panel's size all of that colour; of another colour another.
+ */
+bool
+IOMobileFramebuffer::aliothDirectTest(void)
+{
+	const uint32_t colour = 0xff3a6ea5, other = 0xffa53a6e;
+	uint32_t on = 1, stride = (fWidth * 4 + 63) & ~63u;
+	size_t bytes = (size_t) stride * fHeight, panel = (size_t) fRowBytes * fPanelHeight;
+
+	PE_parse_boot_argn("fb_direct", &on, sizeof(on));
+	if (!on || bytes > kSlotBytes || panel > kSlotBytes || kSlotsPhys + 2 * kSlotBytes > kDisplayPhys + kDisplayBytes) {
+		return false;
+	}
+	/* the picture into the first buffer and that shown: the second one's place is the slots' */
+	memcpy(fFlipBase[0], fFlipBase[fFlipFront], panel);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	alioth_flip_to(fFlipPhys[0], 100000);
+	fFlipFront = 0;
+	IOMemoryDescriptor * md = IOMemoryDescriptor::withPhysicalAddress(kSlotsPhys, 2 * kSlotBytes, kIODirectionInOut);
+	if (md != NULL) {
+		fSlotMap = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+		md->release();
+	}
+	if (fSlotMap == NULL) {
+		hakios_tl("alioth scan: the display's memory past the first buffer cannot be mapped: no direct scan-out\n");
+		return false;
+	}
+	uint8_t * ref = (uint8_t *) fSlotMap->getVirtualAddress(), * src = ref + kSlotBytes;
+
+	/* the panel's size all of one colour, shown as it is */
+	fillPixels(ref, fRowBytes, fPanelWidth, fPanelHeight, colour);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	alioth_flip_to(kSlotsPhys, 100000);
+	uint32_t a = alioth_flip_misr(2);
+	/* the display's size all of that colour, scaled by the engine */
+	fillPixels(src, stride, fWidth, fHeight, colour);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	alioth_scan_source(kSlotsPhys + kSlotBytes, fWidth, fHeight, stride);
+	int taken = alioth_flip_wait(100000);
+	uint32_t b = alioth_flip_misr(2);
+	fillPixels(src, stride, fWidth, fHeight, other);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	uint32_t c = alioth_flip_misr(2);
+	/* back to the picture, as it was */
+	alioth_scan_source(fFlipPhys[0], 0, 0, 0);
+	int back_taken = alioth_flip_wait(100000);
+	uint32_t d = alioth_flip_misr(2);
+	alioth_flip_misr_off();
+	bool pass = taken && back_taken && a != 0 && b == a && c != a && d != a;
+	if (!pass) {
+		/* (the second buffer is drawn into again, for the next frame, as before) */
+		fComposeBase = fFlipBase[1];
+	}
+	hakios_tl("alioth scan: test: one colour %ux%u -> %ux%u: panel-size %#x, scaled %#x (%s), other colour %#x (%s), back %#x; %s\n",
+	    fWidth, fHeight, fPanelWidth, fPanelHeight, a, b, b == a ? "same" : "DIFFERENT", c, c != a ? "different" : "SAME", d,
+	    pass ? "frames are scanned out of CoreAnimation's surfaces" : "no direct scan-out");
+	return pass;
+}
+
+/* The swap's surface, if it can be scanned out as it is: one layer, of the display's size, all of it shown. */
+MiniIOSurface *
+IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfaces)
+{
+	MiniIOSurface * s = surfaces[0];
+	int32_t src[4], dst[4];
+
+	if (!fDirect || fRecBase != NULL || fDiff || s == NULL || s->scanPhys == 0) {
+		return NULL;
+	}
+	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
+		if (swapWord(swap, SWAP_SURFACE(layer)) != 0) {
+			return NULL;
+		}
+	}
+	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
+	memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
+	if (s->info.width != fWidth || s->info.height != fHeight || s->info.bytesPerElement != 4 || s->info.planeCount != 0 ||
+	    (src[2] > 0 && (src[0] != 0 || src[1] != 0 || (uint32_t) src[2] != fWidth || (uint32_t) src[3] != fHeight)) ||
+	    (dst[2] > 0 && (dst[0] != 0 || dst[1] != 0 || (uint32_t) dst[2] != fWidth || (uint32_t) dst[3] != fHeight))) {
+		return NULL;
+	}
+	return s;
 }
 
 void
@@ -463,7 +651,7 @@ IOMobileFramebuffer::publishModes(void)
 	OSDictionary * color = OSDictionary::withCapacity(8);
 	OSArray * timings = OSArray::withCapacity(1);
 	OSArray * colors = OSArray::withCapacity(1);
-	const uint32_t rate = refreshHz() << 16;                /* 16.16 fixed point */
+	const uint32_t rate = (uint32_t) ((65536ULL * NSEC_PER_SEC + refreshNs() / 2) / refreshNs());     /* 16.16 fixed point */
 
 	if (timing == NULL || horizontal == NULL || vertical == NULL || color == NULL || timings == NULL || colors == NULL) {
 		return;
@@ -639,10 +827,10 @@ IOMobileFramebuffer::start(IOService * provider)
 		OSDictionary * refresh = OSDictionary::withCapacity(2);
 
 		PE_parse_boot_argn("fb_carefresh", &on, sizeof(on));
-		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &step);
+		nanoseconds_to_absolutetime(refreshNs(), &step);
 		if (on && refresh != NULL) {
 			OSNumber * n = OSNumber::withNumber(step, 64);
-			OSNumber * m = OSNumber::withNumber((1ULL << 32) / refreshHz(), 32);  /* seconds in 2^-32: the field CA uses (fpsq, 2026-10-29) */
+			OSNumber * m = OSNumber::withNumber((refreshNs() << 32) / NSEC_PER_SEC, 32);  /* seconds in 2^-32: the field CA uses (fpsq, 2026-10-29) */
 			if (n != NULL && m != NULL) {
 				refresh->setObject("displayRefreshStepMachTime", n);
 				refresh->setObject("displayMinRefreshInterval", m);
@@ -851,6 +1039,34 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 	}
 }
 
+/*
+ * The rows of a job in chunks, taken in turn by whoever of the drawers is free. Fixed shares made a
+ * frame wait for the slowest of them: of the phone's seven processors three are A55s (XNU's cpus 4-6,
+ * 1.8 GHz), and a share that landed on one took the scaling from 2-3 ms to 8-11 ms (2026-10-29).
+ */
+#define ROW_CHUNK       48
+
+void
+IOMobileFramebuffer::takeRows(const RowJob * job, uint32_t * blendRow, unsigned drawer)
+{
+	uint16_t chunks = 0;
+
+	for (;;) {
+		int32_t y = OSAddAtomic(ROW_CHUNK, &fRowNext);
+
+		if (y >= job->py1) {
+			break;
+		}
+		if (chunks++ == 0 && drawer < 8) {
+			fJobStartUs[drawer] = (uint16_t) micros(mach_absolute_time() - fJobBegan);
+		}
+		drawRows(job, y, y + ROW_CHUNK < job->py1 ? y + ROW_CHUNK : job->py1, blendRow);
+	}
+	if (drawer < 8) {
+		fJobChunks[drawer] = chunks;
+	}
+}
+
 /* A helper of the scaling (fb_threads): waits for rows to do, does them, says so. */
 void
 IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
@@ -862,10 +1078,12 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 	IOLockLock(fb->fHelperLock);
 	index = fb->fHelpersStarted++;
 	IOLockUnlock(fb->fHelperLock);
+	if (gBind && index < 3 && index + 1 < processor_count) {
+		thread_bind(cpu_to_processor((int) index + 1));
+		thread_block(THREAD_CONTINUE_NULL);
+	}
 	for (;;) {
 		const RowJob * job;
-		int32_t rows, y0, y1;
-		uint32_t * blend;
 
 		IOLockLock(fb->fHelperLock);
 		while (fb->fHelperGeneration == done) {
@@ -874,12 +1092,7 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 		done = fb->fHelperGeneration;
 		job = fb->fHelperJob;
 		IOLockUnlock(fb->fHelperLock);
-		/* share index + 1 of fThreads (the presenter takes share 0) */
-		rows = job->py1 - job->py0;
-		y0 = job->py0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
-		y1 = job->py0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
-		blend = fb->fHelperBlend[index];
-		fb->drawRows(job, y0, y1, blend);
+		fb->takeRows(job, fb->fHelperBlend[index], index + 1);
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
 		if (fb->fHelpersBusy == 0) {
@@ -979,14 +1192,18 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		drawRows(&job, py0, py1, fBlendRow);
 		return;
 	}
-	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
+	/* shared out: this thread and the helpers take chunks of rows until none are left, then it waits for them */
 	IOLockLock(fHelperLock);
 	fHelperJob = &job;
+	fRowNext = py0;
+	fJobBegan = mach_absolute_time();
+	bzero(fJobChunks, sizeof(fJobChunks));
+	bzero(fJobStartUs, sizeof(fJobStartUs));
 	fHelpersBusy = fThreads - 1;
 	fHelperGeneration++;
 	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
 	IOLockUnlock(fHelperLock);
-	drawRows(&job, py0, py0 + (int32_t) ((int64_t) (py1 - py0) / fThreads), fBlendRow);
+	takeRows(&job, fBlendRow, 0);
 	IOLockLock(fHelperLock);
 	while (fHelpersBusy != 0) {
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
@@ -1041,7 +1258,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	uint64_t now = mach_absolute_time(), period, pause;
 
 	/* (a frame that is late on the panel was late here already, or it was not: for telling whose it is) */
-	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz() * 5 / 4, &period);
+	nanoseconds_to_absolutetime(refreshNs() * 5 / 4, &period);
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
 	if (gTouchLat) {
@@ -1139,8 +1356,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (fFlip && fFlipPending) {
 		/* the buffer about to be drawn into is the one the last flip moved away from: once the engine has
 		 * taken that flip (at the next frame's start) it reads this one no more */
+		uint64_t asked = mach_absolute_time();
+
 		if (alioth_flip_wait(40000)) {
+			uint64_t taken = mach_absolute_time();
+
 			fFlipFlips++;
+			if (micros(taken - asked) > 150) {
+				gTEAt = taken;
+			}
 		} else {
 			fFlipMissed++;
 			fStatScanMissed++;
@@ -1156,6 +1380,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
+	uint32_t line_ready = alioth_panel_line();      /* (touch_lat: where the engine's transfer was as the scaling began) */
 	if (hakios_display_scan() != NULL && !hakios_display_command_mode()) {
 		/*
 		 * Where the copy may start (fb_scan): every band of rows (fThreads of them, drawn side by side, each top
@@ -1211,8 +1436,52 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	shown = began;
+	/*
+	 * Direct scan-out: the engine is pointed at the surface itself (scaled by it), and the swap is over once it
+	 * has taken it -- from then on the surface shown before is read no more, and CoreAnimation, which draws into
+	 * its surfaces in turn, may draw into that one again. Nothing is drawn here.
+	 */
+	MiniIOSurface * direct = directSurface(swap, surfaces);
+	if (direct != NULL) {
+		/*
+		 * The engine's source geometry is the surface's own: surfaces of the display's size come with rows of
+		 * different lengths (the framebuffer's default one 4608 bytes, CoreAnimation's 4544), and a flip of the
+		 * address alone onto a surface of other rows showed it sheared (2026-10-29).
+		 */
+		if (!fDirectOn || direct->info.bytesPerRow != fDirectStride || direct->info.width != fDirectWidth ||
+		    direct->info.height != fDirectHeight) {
+			alioth_scan_source(direct->scanPhys, direct->info.width, direct->info.height, direct->info.bytesPerRow);
+			fDirectOn = true;
+			fDirectStride = direct->info.bytesPerRow;
+			fDirectWidth = direct->info.width;
+			fDirectHeight = direct->info.height;
+		} else {
+			alioth_flip_issue(direct->scanPhys);
+		}
+		shown = mach_absolute_time();
+		if (alioth_flip_wait(40000)) {
+			uint64_t taken = mach_absolute_time();
+
+			fFlipFlips++;
+			if (micros(taken - shown) > 150) {
+				gTEAt = taken;          /* (taken while waited for: a TE came just now) */
+			}
+		} else {
+			fFlipMissed++;
+			fStatScanMissed++;
+		}
+		if (fDirectHeld != NULL) {
+			MiniIOSurfaceDrop(fDirectHeld);
+		}
+		fDirectHeld = MiniIOSurfaceCopy(direct->sid);
+		completeSwap();
+		stagedReleased = true;
+		fStatDirect++;
+		bzero(fJobChunks, sizeof(fJobChunks));
+		bzero(fJobStartUs, sizeof(fJobStartUs));
+	}
 	/* Staged sources stay owned until the CPU has consumed every layer. */
-	if (fComposeBase == NULL) completeSwap();
+	if (fComposeBase == NULL && direct == NULL) completeSwap();
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
@@ -1231,7 +1500,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
-	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+	layers = direct != NULL ? 1u : 0u;
+	for (unsigned layer = 0; direct == NULL && layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
 		MiniIOSurface * s;
@@ -1279,7 +1549,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
-	if (fComposeBase != NULL) {
+	if (fComposeBase != NULL && direct == NULL) {
 		/* Only this presenter writes fComposeBase. All source pixels have now
 		 * been consumed, so CoreAnimation may render its next frame while we
 		 * wait for TE and copy this private buffer to the panel. Recordings
@@ -1292,13 +1562,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		const struct hakios_display_scan * scan = hakios_display_scan();
 		fStatScanWaits++;
 		if (fFlip) {
-			unsigned back = fFlipFront ^ 1;
+			/* (fSingle: the second buffer's place is the scan-out slots'; frames drawn here all go into the first) */
+			unsigned back = fSingle ? 0 : fFlipFront ^ 1;
 
 			shown = mach_absolute_time();
-			alioth_flip_issue(fFlipPhys[back]);
-			fFlipPending = true;
+			if (fDirectOn) {
+				/* from a surface back to our own buffers: the engine's own setting again, and the surface let go once taken */
+				alioth_scan_source(fFlipPhys[back], 0, 0, 0);
+				fDirectOn = false;
+				(void) alioth_flip_wait(40000);
+				if (fDirectHeld != NULL) {
+					MiniIOSurfaceDrop(fDirectHeld);
+					fDirectHeld = NULL;
+				}
+				fFlipPending = false;
+			} else {
+				alioth_flip_issue(fFlipPhys[back]);
+				fFlipPending = true;
+			}
 			fFlipFront = back;
-			fComposeBase = fFlipBase[back ^ 1];
+			fComposeBase = fFlipBase[fSingle ? 0 : back ^ 1];
 			if (fSwapsShown < 3 || (fFlipFlips + fFlipMissed) % 1200 == 0) {
 				hakios_tl("display: flip %u: %u taken, %u not, longest wait %u us\n", fSwapsShown, fFlipFlips,
 				    fFlipMissed, alioth_flip_latch_max_us());
@@ -1327,8 +1610,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fSwapsShown++;
 	if (gTouchLat) {
-		hakios_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
-		    micros(drawn));
+		/* (and the surface, and of the scaling: each drawer's chunks of rows @ when it took its first, us) */
+		hakios_tl("tl: v %u ready %llu shown %llu done %llu surface %u rows %u@%u %u@%u %u@%u %u@%u line %u %u\n",
+		    swapWord(swap, SWAP_ID), micros(ready), micros(shown), micros(drawn), swapWord(swap, SWAP_SURFACE(0)), fJobChunks[0],
+		    fJobStartUs[0], fJobChunks[1], fJobStartUs[1], fJobChunks[2], fJobStartUs[2], fJobChunks[3], fJobStartUs[3],
+		    line_ready, alioth_panel_line());
 	}
 	if (layers != fLayersShown) {
 		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
@@ -1353,11 +1639,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
 		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
-		    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
-		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
+		    "%u gave up; %u swaps came a refresh late themselves; %u scanned out of the surface itself\n", fStatFrames,
+		    nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
-		    fStatHeld, fStatLost, fStatSwapsLate);
+		    fStatHeld, fStatLost, fStatSwapsLate, fStatDirect);
 		fStatSwapsLate = 0;
+		fStatDirect = 0;
 		if (fStatScanWaits != 0) {
 			IOLog("MiniIOMobileFramebuffer: the scan (fb_scan): %u frames started where it let them land whole, %u did not "
 			    "get there in time; %llu us to put a frame into the panel's memory\n", fStatScanWaits - fStatScanMissed,
@@ -1522,7 +1809,24 @@ IOMobileFramebufferUserClient::armVSync(void)
 	uint64_t period, now = mach_absolute_time();
 
 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
-	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+	nanoseconds_to_absolutetime(refreshNs(), &period);
+	if (gTEAt != 0 && gTEAt <= now && period != 0) {
+		/*
+		 * The panel's TEs, as the last flip taken showed one: the next of them (gTENs) -- told early by
+		 * fb_vsync_lead microseconds (default 3000). CoreAnimation starts a frame so as to have it done just
+		 * before the refresh it is told of, by its own guess of what drawing takes; the GPU's part and the
+		 * flip, which must be in before the TE, it does not count, and frames started 3.5-6 ms after a flip
+		 * was taken missed the next TE by turns (2026-10-29).
+		 */
+		uint64_t lead = 0, base = gTEAt;
+
+		nanoseconds_to_absolutetime((uint64_t) gVSyncLead * NSEC_PER_USEC, &lead);
+		lead %= period;
+		base = gTEAt > lead ? gTEAt - lead : gTEAt;
+		fVSyncTime = base + ((now - base) / period + 1) * period;
+		thread_call_enter_delayed(fVSyncCall, fVSyncTime);
+		return;
+	}
 	if (hakios_display_scan() != NULL) {
 		/* fb_scan: when the panel's next frame begins, by its scan -- locked to it, never drifting */
 		uint64_t ahead;
@@ -1561,7 +1865,7 @@ IOMobileFramebufferUserClient::vsync(void)
 		if (gVSyncLayout == 2) {
 			uint64_t interval;
 
-			nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &interval);
+			nanoseconds_to_absolutetime(refreshNs(), &interval);
 			args[0] = (uint32_t) fVSyncCount;
 			args[1] = fVSyncCount >> 32;
 			args[2] = (uint32_t) now;

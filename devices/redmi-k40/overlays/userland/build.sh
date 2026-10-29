@@ -280,7 +280,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.gl.dylib -Iobj -framework CoreFoundation \
 				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libhakios.gl.dylib \
-				src/eagl.c src/gl_osmesa.c
+				src/eagl.c src/gl_osmesa.c src/ca_probe.c
 			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
 			# ... and what this GPU makes of an unsigned integer turned into a float (src/u2f_test.c)
 			$DYN $M/libOSMesa.8.dylib -o obj/u2f_test src/u2f_test.c

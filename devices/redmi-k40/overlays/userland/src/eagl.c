@@ -143,6 +143,7 @@ static int latency_lines;               /* boot-arg touch_lat=1: when every fram
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
 static uint64_t now_us(void);
+void ca_probe_start(const char *arguments, void (*printer)(const char *format, ...));     /* src/ca_probe.c */
 static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void eagl_trace_floats(const float *values, int count);
 static void eagl_enter(struct eagl *e, unsigned offset);
@@ -4170,6 +4171,8 @@ install(void)
 		}
 		say("hakios-gl: a frame is waited for %s\n", wait_for_frames ? "here, before it is handed to the display" :
 		    "by the display's driver, not here");
+		/* ca_probe=N, ca_poke=...: what CoreAnimation's render server makes of the refresh (src/ca_probe.c) */
+		ca_probe_start(arguments, say);
 		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
 			char setting[128];
 			size_t length = strcspn(argument + 6, " ");

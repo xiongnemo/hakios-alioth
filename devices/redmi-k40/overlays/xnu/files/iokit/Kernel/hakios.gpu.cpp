@@ -811,13 +811,16 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
-	if (s->client != NULL) {
+	if (s->client != NULL && s->scanPhys == 0) {
 		/* (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes) */
 		MiniIOSurfaceDrop(s);
 		return kIOReturnUnsupported;
 	}
+	/* (a scan-out surface's pixels are a piece of the display's memory of their own, from its start: MiniIOSurface.cpp) */
+	IOMemoryDescriptor * pixels = s->scanPhys != 0 ? s->client : s->memory;
+	uint64_t from = s->scanPhys != 0 ? 0 : PAGE_SIZE;
 	size = round_page_64(s->info.allocSize);
-	memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
+	memory = IOSubMemoryDescriptor::withSubRange(pixels, from, size, kIODirectionInOut);
 	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
 		OSSafeReleaseNULL(memory);
 		MiniIOSurfaceDrop(s);
@@ -848,9 +851,9 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 	if (b != NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
-	} else if ((b = newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
+	} else if ((b = newBuffer(pixels, from, size, 0, &request->handle)) != NULL) {
 		b->memory = memory;
-		b->kernel = s->kbase + PAGE_SIZE;
+		b->kernel = s->kpixels;
 		b->surface = s;
 		gGPUStat.surfaces++;
 	}
