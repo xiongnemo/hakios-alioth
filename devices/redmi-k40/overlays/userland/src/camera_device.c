@@ -1371,9 +1371,11 @@ worker(void *context)
 
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
-		if (f->sensor != tuned_for) {
-			tuned_for = f->sensor;
-			load_tuning(&isp, f->sensor);
+		/* (redmi-k40: the sensor itself, which iOS's back camera may be any of: reserved[0], its index + 1) */
+		uint32_t physical = f->reserved[0] ? f->reserved[0] - 1 : f->sensor;
+		if (physical != tuned_for) {
+			tuned_for = physical;
+			load_tuning(&isp, physical);
 		}
 		/*
 		 * Slowly, a second or so: the colour temperature is guessed from the white balance, the tuning it

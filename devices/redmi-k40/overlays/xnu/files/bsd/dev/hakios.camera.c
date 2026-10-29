@@ -257,6 +257,7 @@ static const struct sensor_hw sensors[] = {
 };
 static const struct sensor_hw *hw = &sensors[1];
 static unsigned hw_index = 1;
+static unsigned back_physical = 1;      /* the sensor iOS's back camera is (boot-arg cam_back=) */
 
 static void
 show_pin(unsigned pin, const char *what)
@@ -3829,7 +3830,9 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.frame_lines_min = ios_mode->frame_length;
 	f.frame_lines_max = FRAME_LINES_MAX;
 	f.margin = EXPOSURE_MARGIN;
-	f.sensor = hw_index;
+	/* (iOS's index -- 1 its back camera, whichever sensor cam_back makes that -- and the sensor itself, + 1) */
+	f.sensor = hw_index == back_physical ? 1 : hw_index;
+	f.reserved[0] = hw_index + 1;
 	f.focus = af_position;
 	lck_mtx_unlock(&ios_lock);
 
@@ -3937,7 +3940,7 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		}
 		lck_mtx_lock(&ios_lock);
 		ios_switch_mode = c.b;
-		ios_switch_to = c.a + 1;
+		ios_switch_to = (c.a == 1 ? back_physical : c.a) + 1;  /* (iOS's back camera: cam_back's sensor) */
 		lck_mtx_unlock(&ios_lock);
 		wakeup(&ios_open);
 		return 0;
@@ -4147,7 +4150,16 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level == 5) {
 		camdev_make();
 	}
-	select_sensor(1);
+	/*
+	 * cam_back=wide|ultra|macro: the sensor iOS's back camera is (the iPhone X's Camera.app has a back and a
+	 * front camera, no ultra-wide or macro of its own); the wide one without it.
+	 */
+	if (PE_parse_boot_arg_str("cam_back", which, sizeof(which))) {
+		back_physical = strcmp(which, "ultra") == 0 ? 3 : strcmp(which, "macro") == 0 ? 0 : 1;
+		say("camera: iOS's back camera is the %s one (cam_back=%s)\n", sensors[back_physical].name, which);
+		which[0] = '\0';
+	}
+	select_sensor(back_physical);
 	if (PE_parse_boot_arg_str("cam_sensor", which, sizeof(which))) {
 		all = strcmp(which, "all") == 0;
 		for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {

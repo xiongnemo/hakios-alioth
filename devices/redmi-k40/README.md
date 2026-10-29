@@ -120,9 +120,15 @@ through the SMMU (streams 0x800/0x840). The sensors' tables come from Android's 
 IMX582, OFilm IMX355, Sunny S5K3T2, Sunny S5K5E9). Bring-up levels: `cam=2 cam_sensor=all` (each sensor's
 power and ID), `cam=3` (the CSID's test pattern into memory), `cam=4 cam_sensor=wide cam_mode=N
 [cam_pattern=2]` (the sensor's frames, or its own colour bars, into memory: `fastboot oem recording` +
-`get_staged`, `tools/camraw.py`). Verified: the IMX582, S5K3T2 and IMX355 answer with their IDs; the
-IMX582's colour bars and a scene at 4000x3000; Camera.app's preview from it with the DW9800 lens motor
-focusing. The macro (S5K5E9) holds its bus low: not working yet.
+`get_staged`, `tools/camraw.py`). Verified: all four sensors answer with their IDs (the macro's bus needs
+PM8150A L2 on, which is voted and left on); the IMX582's colour bars and a scene at 4000x3000; Camera.app's
+preview from it with the DW9800 lens motor focusing, and from the front S5K3T2 (the app's switch button).
+
+The iPhone X's Camera.app has a back and a front camera only: `cam_back=ultra` (IMX355) or `cam_back=macro`
+(S5K5E9, fixed focus at a few centimetres) makes another sensor its back camera (the frames' header still says
+1, `reserved[0]` the sensor itself + 1, by which the media library picks its colour tuning,
+`camera-<sensor>.isp` from `tools/alioth-camtuning.py`). Verified: both in Camera.app's preview, with their
+own tuning.
 
 `torch=3`: Control Center's flashlight (the PM8150L flash module at SID 5 0xd300, `hakios.torch.c`, at most
 125 mA, 30 s at a time). Verified: on and off from Control Center.
