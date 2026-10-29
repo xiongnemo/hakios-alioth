@@ -106,12 +106,111 @@ count_fingers(uint32_t type, uint32_t finger)
 	}
 }
 
+/*
+ * Finger moves in step with the panel (boot-arg touch_sync=1, default 0; touch_sync_lead=US, default 2500): a
+ * driver's move is held, the newest of each finger kept, and handed on TOUCH_SYNC_LEAD before the panel's next
+ * TE (hakios_display_next_te(), the display driver's). The digitizer reports every 8.0 ms and the panel shows a
+ * frame every 8.245: what a move changed was committed at a phase that drifted through CoreAnimation's frame
+ * clock, and a commit that came just after a frame began waited a whole refresh -- about half the frames of a
+ * drag 16 ms apart, with the render server idle and the commit in hand (tools/prof/gap_cause.py). A finger
+ * coming down or lifting is handed on at once, after the moves held for it. Measured (2026-10-30, rc.jobs.k40fps):
+ * the moves did arrive every 8.25 ms at the chosen phase, with a lead of 2.5 or 6 ms, and the share of frames
+ * at the 120 Hz pace did not change (45-49%): SpringBoard's commits come in bursts of their own (its main thread
+ * busy at times), not in step with the touches. So it is off by default.
+ */
+#define TOUCH_FINGERS   10
+static uint32_t touch_sync = 2, touch_sync_lead = 2500;        /* (2: not yet looked up) */
+static struct { bool held; uint32_t x, y; } touch_held[TOUCH_FINGERS];
+static thread_call_t touch_sync_call;
+static bool touch_sync_armed;
+extern uint64_t hakios_display_next_te(uint64_t now);
+static void touch_enqueue(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver);
+
+/* With touch_lock held: the moves held for one finger (or all, finger >= TOUCH_FINGERS) into the queue. */
+static bool
+touch_release(uint32_t finger)
+{
+	bool any = false;
+
+	for (uint32_t f = 0; f < TOUCH_FINGERS; f++) {
+		if (touch_held[f].held && (finger >= TOUCH_FINGERS || f == finger)) {
+			touch_held[f].held = false;
+			touch_enqueue(HAKIOS_TOUCH_MOVE, f, touch_held[f].x, touch_held[f].y, true);
+			any = true;
+		}
+	}
+	return any;
+}
+
+static void
+touch_sync_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	bool any;
+
+	lck_mtx_lock(&touch_lock);
+	touch_sync_armed = false;
+	any = touch_release(TOUCH_FINGERS);
+	lck_mtx_unlock(&touch_lock);
+	if (any) {
+		wakeup(&touch_queue);
+	}
+}
+
+/* With touch_lock held: hold a driver's move until its moment; false if it is to go on now (no TE known, or off). */
+static bool
+touch_hold(uint32_t finger, uint32_t x, uint32_t y)
+{
+	uint64_t now = mach_absolute_time(), te, lead, deadline;
+
+	if (touch_sync == 2) {
+		touch_sync = 0;
+		PE_parse_boot_argn("touch_sync", &touch_sync, sizeof(touch_sync));
+		PE_parse_boot_argn("touch_sync_lead", &touch_sync_lead, sizeof(touch_sync_lead));
+	}
+	if (!touch_sync || finger >= TOUCH_FINGERS || touch_sync_call == NULL || (te = hakios_display_next_te(now)) == 0) {
+		return false;
+	}
+	touch_held[finger].held = true;
+	touch_held[finger].x = x;
+	touch_held[finger].y = y;
+	if (!touch_sync_armed) {
+		nanoseconds_to_absolutetime((uint64_t)touch_sync_lead * NSEC_PER_USEC, &lead);
+		deadline = te > lead ? te - lead : te;
+		if (deadline <= now) {
+			/* too late for this TE's moment: the next TE's (one period on) */
+			uint64_t next = hakios_display_next_te(te);
+
+			deadline = next > lead ? next - lead : next;
+		}
+		thread_call_enter_delayed_with_leeway(touch_sync_call, NULL, deadline, 0, THREAD_CALL_DELAY_LEEWAY | THREAD_CALL_DELAY_USER_CRITICAL);
+		touch_sync_armed = true;
+	}
+	return true;
+}
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
+	lck_mtx_lock(&touch_lock);
+	/* (a driver's moves and a program's alike: rwtouch's swipes stand for fingers in the frame-rate checks) */
+	if (type == HAKIOS_TOUCH_MOVE && touch_hold(finger, x, y)) {
+		lck_mtx_unlock(&touch_lock);
+		return;
+	}
+	if (finger < TOUCH_FINGERS) {
+		touch_release(finger);          /* (a finger's moves held go before its lifting) */
+	}
+	touch_enqueue(type, finger, x, y, from_driver);
+	lck_mtx_unlock(&touch_lock);
+	wakeup(&touch_queue);
+}
+
+/* With touch_lock held. */
+static void
+touch_enqueue(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
+{
 	struct hakios_touch *t;
 
-	lck_mtx_lock(&touch_lock);
 	if (touch_tail - touch_head == TOUCH_QUEUE) {
 		touch_head++;                   /* nobody reads: drop the oldest */
 	}
@@ -130,8 +229,6 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	if (from_driver) {
 		count_fingers(type, finger);
 	}
-	lck_mtx_unlock(&touch_lock);
-	wakeup(&touch_queue);
 }
 
 void
@@ -218,6 +315,7 @@ hakios_input_init(void)
 		printf("hakios-touch: cannot create the device\n");
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	touch_sync_call = thread_call_allocate_with_priority(touch_sync_elapsed, NULL, THREAD_CALL_PRIORITY_HIGH);
 	hakios_cpufreq_init();
 	hakios_virtio_input_init();
 	umi_touch_init();

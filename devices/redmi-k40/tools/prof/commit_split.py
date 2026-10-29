@@ -29,9 +29,10 @@ for path in sys.argv[1:]:
         if t.startswith('tl: a '):
             if sample is None:
                 sample = t
-            nums = [int(x) for x in re.findall(r'\b(\d{6,})\b', t)]
-            if nums:
-                commits.append(max(nums))
+            f = t.split()
+            # woke, commit, done: only commits that took a while (layers changed), as gesture_tl.py shows them
+            if len(f) >= 5 and f[2].isdigit() and f[4].isdigit() and int(f[4]) - int(f[3]) > 300:
+                commits.append(int(f[4]))
 touches.sort()
 print('a sample commit line:', sample)
 

@@ -248,6 +248,25 @@ refreshNs(void)
 	return gTENs != 0 ? gTENs : NSEC_PER_SEC / refreshHz();
 }
 
+/*
+ * The panel's next TE after `now` (mach time), by the last one a flip was seen taken at and the measured period;
+ * 0 when none has been seen yet. For the touch path (bsd/dev/hakios.input.c), which hands finger moves on in step
+ * with the panel so that what they move is committed before CoreAnimation's next frame begins.
+ */
+extern "C" uint64_t hakios_display_next_te(uint64_t now);
+
+extern "C" uint64_t
+hakios_display_next_te(uint64_t now)
+{
+	uint64_t at = gTEAt, period;
+
+	if (at == 0 || at > now) {
+		return 0;
+	}
+	nanoseconds_to_absolutetime(refreshNs(), &period);
+	return period == 0 ? 0 : at + ((now - at) / period + 1) * period;
+}
+
 /* A frame is on the panel (its flip taken at `when`): to whoever asked for frame info (the user client, below). */
 static void frameInfoPresented(uint32_t swapID, uint64_t when);
 static inline uint32_t
