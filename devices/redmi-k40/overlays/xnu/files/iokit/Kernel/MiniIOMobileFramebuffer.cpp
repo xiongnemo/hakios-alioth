@@ -16,6 +16,8 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSDictionary.h>
@@ -1711,6 +1713,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
+static void backlightDisplayPower(bool on);     /* (the panel's brightness: AppleARMBacklight, below) */
+
 class IOMobileFramebufferUserClient : public IOUserClient
 {
 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
@@ -2101,7 +2105,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
-	case kFBMethodRequestPowerChange:
+		return kIOReturnSuccess;
+	case kFBMethodRequestPowerChange:               /* in: the display's power, 0 off (iOSPlus10's reading) */
+		if (args->scalarInputCount >= 1) {
+			backlightDisplayPower(in[0] != 0);
+		}
 		return kIOReturnSuccess;
 
 	case kFBMethodChangeFrameInfo:                  /* in: notification type (3), the mask of frame info tags wanted */
@@ -2267,6 +2275,308 @@ publishAccelerator(IOService * provider)
 }
 
 /*
+ * alioth: the panel's brightness for iOS. CoreBrightness (in backboardd) looks for a service that
+ * conforms to AppleARMBacklight and has "backlight-control"; without "new-backlight-architecture" it
+ * takes the legacy path and sets "brightness" (a device level within IODisplayParameters' min..max) and
+ * "FadePeriod" (seconds, 16.16) through IORegistryEntrySetCFProperties -- as the OnePlus 10 Pro port
+ * found and does (iOSPlus10, patch 0250, NegroniBacklight.cpp; its notes: never block in setProperties,
+ * and never publish "digital-dimming-min-nits", which turns on per-frame dimming). The level is the
+ * K11A panel's DBV, DCS 0x51 with two bytes high first (the phone's DT: bl-dcs big-endian, 1..0x7ff,
+ * 0x133 at power-up), written through DSI0's command DMA (alioth_dsi.c) from a work loop of its own;
+ * a fade is steps of 33 ms (a DCS write waits for the MDP's frame transfer to end: up to 20 ms at
+ * 120 Hz). The display's power (the framebuffer's RequestPowerChange) takes the panel to 0 and back.
+ * Boot-args: panel_bl=0 (none), panel_bl_init=N (the level set at start, iOS's scale; 1023),
+ * panel_bl_curve=1 (iOS's level to the panel as it is, not squared).
+ */
+extern "C" int alioth_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lp, uint8_t force_type);
+extern "C" bool hakios_board_is_alioth(void);
+
+#define ALIOTH_BL_MAX           0x7ff
+#define ALIOTH_BL_INIT          1023            /* (iOS's scale: half way, a quarter of the panel's light squared) */
+#define ALIOTH_BL_STEP_MS       33
+#define ALIOTH_BL_FADE_MAX_MS   5000
+
+class AppleARMBacklight : public IOService
+{
+	OSDeclareDefaultStructors(AppleARMBacklight);
+
+	IOWorkLoop *            fWL;
+	IOTimerEventSource *    fTimer;
+	IOSimpleLock *          fState;         /* the requests below */
+	uint32_t                fTarget, fFadeFrom, fLastLit;
+	uint64_t                fFadeStart, fFadePeriod;
+	bool                    fDisplayOn, fPowerEdge;
+	uint32_t                fLogged;
+	/* the work loop's */
+	bool                    fKnown, fBctrl;
+	uint32_t                fLevel, fChanges, fWrites;
+	uint64_t                fLastLog;
+
+	static void timerFired(OSObject * owner, IOTimerEventSource * sender);
+	void step(void);
+	void apply(uint32_t level, bool final);
+	void publish(uint32_t level);
+
+public:
+	bool                    fCurve;
+
+	bool startBacklight(uint32_t initial);
+	IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+	void displayPower(bool on);
+};
+
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+
+static AppleARMBacklight * gBacklight;
+
+void
+AppleARMBacklight::publish(uint32_t level)
+{
+	OSDictionary * b = OSDictionary::withCapacity(3), * p = OSDictionary::withCapacity(1);
+
+	if (b != NULL && p != NULL) {
+		OSNumber * n;
+
+		/* (min 0: with 1 there, CoreBrightness sent nothing but "brightness -1") */
+		n = OSNumber::withNumber(0ULL, 32); b->setObject("min", n); OSSafeReleaseNULL(n);
+		n = OSNumber::withNumber(ALIOTH_BL_MAX, 32); b->setObject("max", n); OSSafeReleaseNULL(n);
+		n = OSNumber::withNumber(level, 32); b->setObject("value", n); OSSafeReleaseNULL(n);
+		p->setObject("brightness", b);
+		setProperty("IODisplayParameters", p);
+	}
+	OSSafeReleaseNULL(b);
+	OSSafeReleaseNULL(p);
+}
+
+bool
+AppleARMBacklight::startBacklight(uint32_t initial)
+{
+	fState = IOSimpleLockAlloc();
+	fWL = IOWorkLoop::workLoop();
+	fTimer = IOTimerEventSource::timerEventSource(this, &AppleARMBacklight::timerFired);
+	if (fState == NULL || fWL == NULL || fTimer == NULL || fWL->addEventSource(fTimer) != kIOReturnSuccess) {
+		return false;
+	}
+	fDisplayOn = true;
+	fTarget = fLastLit = fFadeFrom = initial;
+	setProperty("backlight-control", true);
+	publish(initial);
+	registerService();
+	hakios_tl("backlight: AppleARMBacklight up: the panel's DBV 0..%u by DCS 0x51; %u to start with (iOS's scale)\n", ALIOTH_BL_MAX,
+	    initial);
+	/*
+	 * Set now: CoreBrightness asks for no level of its own until the slider is moved ("brightness -1"), and
+	 * the UEFI leaves the panel bright -- too bright in a dark room.
+	 */
+	fTimer->setTimeoutUS(1);
+	return true;
+}
+
+/* (the work loop) final: the end of a fade */
+void
+AppleARMBacklight::apply(uint32_t level, bool final)
+{
+	if (fKnown && level == fLevel) {
+		return;
+	}
+	if (!fBctrl) {
+		/* WRITE_CTRL_DISPLAY: brightness control on (BCTRL), as the panel's own power-up has it */
+		const uint8_t c53[2] = { 0x53, 0x20 };
+
+		fBctrl = alioth_dsi_dcs_write(c53, 2, true, 0) == 0;
+	}
+	const uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
+	int rc = alioth_dsi_dcs_write(cmd, 3, true, 0);
+	uint64_t now = mach_absolute_time(), second;
+
+	fChanges++;
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+	if (rc != 0 || !fKnown || fWrites++ < 8 || (final && now - fLastLog >= second / 4) || now - fLastLog >= second) {
+		hakios_tl("backlight: panel DBV %u%s (%u writes since the last line)\n", level, rc == 0 ? "" : " FAILED", fChanges);
+		fLastLog = now;
+		fChanges = 0;
+	}
+	if (rc == 0) {
+		fKnown = true;
+		fLevel = level;
+	}
+}
+
+void
+AppleARMBacklight::step(void)
+{
+	uint64_t now = mach_absolute_time();
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
+	bool on = fDisplayOn, edge = fPowerEdge;
+	uint32_t to = fTarget, from = fFadeFrom, lit = fLastLit;
+	uint64_t t = now - fFadeStart, period = fFadePeriod;
+
+	fPowerEdge = false;
+	IOSimpleLockUnlockEnableInterrupt(fState, is);
+
+	if (!on) {
+		if (edge) {
+			apply(0, true);
+			hakios_tl("backlight: the display off: panel DBV 0\n");
+		}
+		return;
+	}
+	uint32_t level = to;
+	bool more = false;
+
+	if (period != 0 && t < period) {
+		level = (uint32_t)((int64_t)from + ((int64_t)to - (int64_t)from) * (int64_t)t / (int64_t)period);
+		more = true;
+	}
+	if (edge) {
+		level = to != 0 ? to : lit;     /* the level from before the display went off, until iOS sets one */
+		more = false;
+		hakios_tl("backlight: the display on: panel DBV %u\n", level);
+	}
+	/*
+	 * iOS's level to the panel's: squared (boot-arg panel_bl_curve=1: as it is). The data volume is new at
+	 * every boot, so iOS starts at its default, half way (1055): linear that was too bright in a dark
+	 * room; squared it is a quarter of the panel's light, and the slider's lower half has finer steps.
+	 */
+	if (level != 0 && fCurve) {
+		level = (uint32_t)((uint64_t)level * level / ALIOTH_BL_MAX);
+	}
+	level = level == 0 ? 1 : level;         /* (the display is on: never dark) */
+	apply(level, !more);
+	if (more) {
+		fTimer->setTimeoutMS(ALIOTH_BL_STEP_MS);
+	}
+}
+
+void
+AppleARMBacklight::timerFired(OSObject * owner, IOTimerEventSource * sender)
+{
+	(void) sender;
+	((AppleARMBacklight *) owner)->step();
+}
+
+IOReturn
+AppleARMBacklight::setProperties(OSObject * properties)
+{
+	OSDictionary * d = OSDynamicCast(OSDictionary, properties);
+
+	if (d == NULL) {
+		return kIOReturnBadArgument;
+	}
+	OSNumber * b = OSDynamicCast(OSNumber, d->getObject("brightness"));
+	OSNumber * f = OSDynamicCast(OSNumber, d->getObject("FadePeriod"));
+	OSNumber * nits = OSDynamicCast(OSNumber, d->getObject("brightness-nits"));
+
+	if (fLogged < 24) {
+		char name[32];
+
+		fLogged++;
+		proc_selfname(name, sizeof(name));
+		hakios_tl("backlight: %s sets %u keys: brightness %d FadePeriod %#x brightness-nits %#x\n", name, d->getCount(),
+		    b ? (int) b->unsigned32BitValue() : -1, f ? f->unsigned32BitValue() : 0, nits ? nits->unsigned32BitValue() : 0);
+	}
+	uint32_t to;
+
+	if (b != NULL) {
+		int32_t v = (int32_t) b->unsigned32BitValue();
+
+		if (v < 0) {
+			return kIOReturnSuccess;        /* ("brightness -1": no level asked for) */
+		}
+		/* (the slider's bottom is the dimmest light, not none: 0 is for the display going off) */
+		to = v < 1 ? 1 : MIN((uint32_t) v, (uint32_t) ALIOTH_BL_MAX);
+	} else if (nits != NULL) {
+		/* nits in 16.16 (CoreBrightness's _SetBLDriverNitsValue), against the panel's 500 at the top */
+		int64_t v = (int32_t) nits->unsigned32BitValue();
+
+		if (v <= 0) {
+			return kIOReturnSuccess;
+		}
+		to = (uint32_t) MIN((uint64_t) v * ALIOTH_BL_MAX / (500ULL << 16), (uint64_t) ALIOTH_BL_MAX);
+		to = to == 0 ? 1 : to;
+	} else {
+		return kIOReturnSuccess;
+	}
+	uint64_t ms = f != NULL ? ((uint64_t) f->unsigned32BitValue() * 1000) >> 16 : 0, period, now = mach_absolute_time();
+
+	nanoseconds_to_absolutetime(MIN(ms, (uint64_t) ALIOTH_BL_FADE_MAX_MS) * NSEC_PER_MSEC, &period);
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
+	uint32_t cur = fTarget;
+
+	if (fFadePeriod != 0 && now - fFadeStart < fFadePeriod) {
+		cur = (uint32_t)((int64_t)fFadeFrom + ((int64_t)fTarget - (int64_t)fFadeFrom) * (int64_t)(now - fFadeStart) /
+		    (int64_t)fFadePeriod);
+	}
+	fFadeFrom = cur;
+	fTarget = to;
+	fFadeStart = now;
+	fFadePeriod = period;
+	if (to != 0 && fDisplayOn) {
+		fLastLit = to;
+	}
+	IOSimpleLockUnlockEnableInterrupt(fState, is);
+	publish(to);
+	fTimer->setTimeoutUS(1);
+	return kIOReturnSuccess;
+}
+
+void
+AppleARMBacklight::displayPower(bool on)
+{
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
+	bool changed = fDisplayOn != on;
+
+	if (changed) {
+		fDisplayOn = on;
+		fPowerEdge = true;
+	}
+	IOSimpleLockUnlockEnableInterrupt(fState, is);
+	if (changed) {
+		fTimer->setTimeoutUS(1);
+	}
+}
+
+static void
+publishBacklight(IOService * provider)
+{
+	uint32_t on = 1, initial = ALIOTH_BL_INIT, curve = 2;
+
+	PE_parse_boot_argn("panel_bl", &on, sizeof(on));
+	PE_parse_boot_argn("panel_bl_init", &initial, sizeof(initial));
+	PE_parse_boot_argn("panel_bl_curve", &curve, sizeof(curve));
+	if (!hakios_board_is_alioth() || !on || gBacklight != NULL) {
+		return;
+	}
+	AppleARMBacklight * bl = OSTypeAlloc(AppleARMBacklight);
+
+	if (bl == NULL || !bl->init() || !bl->attach(provider)) {
+		OSSafeReleaseNULL(bl);
+		return;
+	}
+	bl->fCurve = curve != 1;
+	if (!bl->startBacklight(MIN(initial, (uint32_t) ALIOTH_BL_MAX))) {
+		hakios_tl("backlight: not set up\n");
+		bl->detach(provider);
+		bl->release();
+		return;
+	}
+	gBacklight = bl;                /* (keeps the reference) */
+}
+
+static void
+backlightDisplayPower(bool on)
+{
+	static uint32_t logged;
+
+	if (logged++ < 16) {
+		hakios_tl("backlight: the framebuffer's power change: %s\n", on ? "on" : "off");
+	}
+	if (gBacklight != NULL) {
+		gBacklight->displayPower(on);
+	}
+}
+
+/*
  * A picture from inside the kernel (the GPU driver's first ones): rows of 32-bit pixels, put at
  * the top left corner of the panel as they are and cut to its size.
  */
@@ -2297,6 +2607,7 @@ MiniIOMobileFramebufferStart(IOService * provider)
 	if (fb->start(provider)) {
 		publishDisplayNode();
 		publishAccelerator(provider);
+		publishBacklight(fb);
 	} else {
 		fb->detach(provider);
 	}

@@ -1,1 +1,1 @@
-bootcpu=7 cpus=7 touchscreen=1 umi_keys=1 umi_haptic=5 adsp=1 adsp_umi=1 sound=4 mic=4 gpu=1 fb_threads=4 fb_filter=0 fb_vsync=2 cpufreq=1 wifi=1 umi_bt=1
+bootcpu=7 cpus=7 touchscreen=1 umi_keys=1 umi_haptic=5 adsp=1 adsp_umi=1 sound=4 mic=4 gpu=1 fb_threads=4 fb_filter=0 fb_vsync=2 cpufreq=1 wifi=1 umi_bt=1 cam=5 torch=3

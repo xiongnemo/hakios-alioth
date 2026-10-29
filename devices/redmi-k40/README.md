@@ -110,13 +110,37 @@ input applies automatic gain: room noise at -53 dBFS in the kernel is about -22 
 application. The test tools need `ldid` at build time for their entitlements (without it
 `record_test` is refused the microphone and `battery_test` cannot open URLs).
 
+## Cameras, flashlight, brightness
+
+`cam=5`: Camera.app on the wide camera (Sony IMX582) through `overlays/xnu/files/bsd/dev/hakios.camera.c`,
+whose hardware path is this phone's: the PM8008 on QUP SE16 (GPIO 48/49, reset GPIO 77), PM8150A L2/L3/L5/L7
+through RPMh, camcc's Kona clocks and PLL0, CSIPHY 0-4, CSID-lite 0 and IFE-lite 0 (Titan 480) into memory
+through the SMMU (streams 0x800/0x840). The sensors' tables come from Android's module files in
+`fw-camera/` (`tools/alioth-camsensor.py`; `fw-camera/fitted` names the modules this phone has: Sunny
+IMX582, OFilm IMX355, Sunny S5K3T2, Sunny S5K5E9). Bring-up levels: `cam=2 cam_sensor=all` (each sensor's
+power and ID), `cam=3` (the CSID's test pattern into memory), `cam=4 cam_sensor=wide cam_mode=N
+[cam_pattern=2]` (the sensor's frames, or its own colour bars, into memory: `fastboot oem recording` +
+`get_staged`, `tools/camraw.py`). Verified: the IMX582, S5K3T2 and IMX355 answer with their IDs; the
+IMX582's colour bars and a scene at 4000x3000; Camera.app's preview from it with the DW9800 lens motor
+focusing. The macro (S5K5E9) holds its bus low: not working yet.
+
+`torch=3`: Control Center's flashlight (the PM8150L flash module at SID 5 0xd300, `hakios.torch.c`, at most
+125 mA, 30 s at a time). Verified: on and off from Control Center.
+
+Brightness: `AppleARMBacklight` in `MiniIOMobileFramebuffer.cpp` takes CoreBrightness's level (0..2047) to
+the panel's DBV by DCS 0x51 (`alioth_dsi.c`), squared (`panel_bl_curve=1`: linear), starting at half of
+iOS's scale (a quarter of the panel's light; `panel_bl_init=N`) since the data volume is new at every boot.
+Verified: Control Center's slider changes the panel's brightness. There is no automatic brightness: the
+ambient light sensor is the sensor DSP's (SLPI), which is not running.
+
 ## Default arguments (Redmi K40)
 
 `boot.args` is the set verified together on the phone (2026-10-30): the kernel on the prime core with
 seven cores (`bootcpu=7 cpus=7`: the loader keeps core 0 and its USB link), touch, keys, haptics, the
 audio DSP with speakers and microphone, the GPU with 120 Hz pacing (`fb_vsync=2`), CPU frequency, Wi-Fi
-(joining `fw-wifi/network`; `run.sh` adds `wifi_mac=` from `fw-wifi/mac`) and Bluetooth. The eight-core
-mode (`bootcpu=0 cpus=8`) froze this phone twice, with and without USB, and is not used.
+(joining `fw-wifi/network`; `run.sh` adds `wifi_mac=` from `fw-wifi/mac`), Bluetooth, the camera and the
+flashlight. The eight-core mode (`bootcpu=0 cpus=8`) froze this phone twice, with and without USB, and is
+not used.
 
 Wi-Fi: an access point of the network on 5 GHz is preferred by 15 dB (`lx_80211.c` `preference()`), and
 one that turns the station away is skipped for the next: a home network's 2.4 GHz access point refused
