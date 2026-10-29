@@ -3863,8 +3863,11 @@ usb_start(void)
 /*
  * Pump controller events until a transfer on `endpoint` finishes.
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
- * state changed. Keeps the watchdog fed while idle.
+ * state changed, -2 if usb_wait_limit (ticks, when not 0) went by first.
+ * Keeps the watchdog fed while idle.
  */
+static uint64_t usb_wait_limit;
+
 static int64_t
 usb_wait(uint8_t endpoint)
 {
@@ -3885,6 +3888,9 @@ usb_wait(uint8_t endpoint)
 		/* with a kernel running, a host that went away must not keep this core from watching it */
 		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
 			return -1;
+		}
+		if (usb_wait_limit != 0 && READ_SYSREG(CNTVCT_EL0) - began > usb_wait_limit) {
+			return -2;
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
 			return data.transfer.status == UsbDeviceTransferStatusCompleteOK ? (int64_t)data.transfer.bytes_completed : -1;
@@ -3907,6 +3913,33 @@ usb_rx(uint8_t *buf, uint64_t len)
 		return -1;
 	}
 	return usb_wait(USB_EP_OUT);
+}
+
+/*
+ * An idle receive taken back (to be queued afresh): the controller's word that it is cancelled is waited
+ * for, 20 ms at most, so that it is not taken for the next receive's. A command that came in just then is
+ * not lost: its length is returned (the bytes in usb_rx_buf), 0 otherwise.
+ */
+static int64_t
+usb_rx_cancel(void)
+{
+	uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
+
+	(void)USB->abort_xfer(USB_EP_OUT);
+	usb_rx_queued = 0;
+	while (READ_SYSREG(CNTVCT_EL0) - began < freq / 50) {
+		uint32_t msg = UsbDeviceEventNoEvent;
+		uint64_t size = 0;
+		usb_device_event_data data;
+
+		USB->handle_event(&msg, &size, &data);
+		if (msg == UsbDeviceEventDeviceStateChange) {
+			usb_connected = (data.device_state == UsbDeviceStateConnected);
+		} else if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == USB_EP_OUT) {
+			return data.transfer.status == UsbDeviceTransferStatusCompleteOK ? (int64_t)data.transfer.bytes_completed : 0;
+		}
+	}
+	return 0;
 }
 
 static int64_t
@@ -4171,9 +4204,12 @@ usb_poll_command(void)
 	 * write of the host timed out from then on ("AdbWriteEndpointSync failed", 2026-10-30). So an idle
 	 * receive is queued afresh every few seconds, and one is tried even without a "connected" event.
 	 */
-	if (usb_rx_queued && now - rx_since > 5 * freq) {
-		(void)USB->abort_xfer(USB_EP_OUT);
-		usb_rx_queued = 0;
+	if (usb_rx_queued && now - rx_since > 5 * freq && (n = (uint64_t)usb_rx_cancel()) != 0) {
+		n = n < sizeof(cmd) - 1 ? n : sizeof(cmd) - 1;
+		memcpy(cmd, usb_rx_buf, (size_t)n);
+		cmd[n] = 0;
+		fb_command(cmd);
+		return;
 	}
 	if (!usb_rx_queued && (usb_connected || now - last_try > 2 * freq)) {
 		last_try = now;
@@ -4261,7 +4297,13 @@ usb_command_loop(void)
 			usb_wait(0xff); /* returns on the next cable state change */
 			continue;
 		}
+		/* (an idle receive queued afresh every 5 s: one a cable put back left dead is not waited on forever) */
+		usb_wait_limit = 5 * READ_SYSREG(CNTFRQ_EL0);
 		n = usb_rx(usb_rx_buf, 511);
+		usb_wait_limit = 0;
+		if (n == -2) {
+			n = usb_rx_cancel();
+		}
 		if (n <= 0) {
 			continue;
 		}
