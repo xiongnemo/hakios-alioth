@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,6 +112,18 @@
+@@ -112,6 +112,19 @@
  bsd/dev/hakios.input.c		standard
  bsd/dev/hakios.virtio_input.c	standard
  bsd/dev/hakios.goodix.c	standard
@@ -16,10 +16,11 @@
 +bsd/dev/umi_camera_dma.c		standard
 +bsd/dev/hakios.usb.c		standard
 +bsd/dev/hakios.dwc3.c		standard
++bsd/dev/hakios.slpi.c		standard
  bsd/dev/hakios.buttons.c	standard
  bsd/dev/hakios.battery.c	standard
  bsd/dev/hakios.ufs.c	standard
-@@ -639,3 +649,9 @@
+@@ -639,3 +650,9 @@
  bsd/skywalk/packet/pbufpool.c			optional skywalk
  bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
  bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
