@@ -365,6 +365,16 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	rm -f root/etc/var.skel.bak
 	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
 	cp -r var root/var
+	# (and the directories they are in that iOS's template has not: init copies a file only into a directory that is
+	# there, and makes a directory only once -- one made twice stops the list -- so only those missing are added:
+	# var/preferences/SystemConfiguration, for configd's preferences.plist with the device's name, which
+	# bluetoothd names the phone by; without it Settings > Bluetooth said 'discoverable as "(null)"')
+	(cd var && find . -mindepth 1 -type d | sed 's|^\./||' | sort) | while read -r d; do
+		if ! awk -F'\t' -v p="/private/var/$d" '$1 == "d" && $5 == p { found = 1 } END { exit !found }' root/etc/var.skel; then
+			case $d in mobile*) owner=501 ;; *) owner=0 ;; esac
+			printf 'd\t755\t%s\t%s\t/private/var/%s\n' $owner $owner "$d" >> root/etc/var.skel
+		fi
+	done
 	(cd var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>System</key>
+	<dict>
+		<key>System</key>
+		<dict>
+			<key>ComputerName</key>
+			<string>iPhone</string>
+			<key>ComputerNameEncoding</key>
+			<integer>0</integer>
+		</dict>
+		<key>Network</key>
+		<dict>
+			<key>HostNames</key>
+			<dict>
+				<key>LocalHostName</key>
+				<string>iPhone</string>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>
