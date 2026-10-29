@@ -58,6 +58,24 @@ static unsigned rh_lock;
 static bool rh_poisoned;
 static uint32_t rh_uncertain_irq;
 
+/*
+ * The one TCS is every voter's here (the GPU's and the bus's votes, the cameras' rails, the radios'),
+ * and they come from different threads at boot: wait a while for it rather than fail. Bluetooth, finding
+ * it taken by the cameras' rails at cam=5, gave up for the whole boot ("power/clock setup failed errno=16").
+ */
+static bool
+rh_take(void)
+{
+	for (unsigned waited = 0; waited < 500; waited++) {
+		if (!__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+			return true;
+		}
+		delay(1000);
+	}
+	printf("UMI RPMH: the TCS stayed busy for 500 ms\n");
+	return false;
+}
+
 static uint32_t
 rh_read(vm_offset_t base, uint32_t off)
 {
@@ -415,7 +433,7 @@ umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y)
 	uint32_t address = 0, aux = 0, len = 0;
 	int error = EIO;
 
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (!rh_take()) return EBUSY;
 	if (rh_poisoned) goto out;
 	error = rh_map();
 	if (!error) error = rh_lookup_slave(res, RH_BCM, &address, &aux, &len);
@@ -441,7 +459,7 @@ umi_rpmh_arc_level(const char *res, unsigned corner)
 	int n = 0;
 	bool found = false;
 
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (!rh_take()) return EBUSY;
 	if (rh_poisoned) goto out;
 	error = rh_map();
 	if (!error) error = rh_lookup_slave(res, RH_ARC, &address, &aux, &len);
@@ -486,7 +504,7 @@ umi_rpmh_camera_vreg(unsigned rail, bool enable)
 	};
 	static bool owned[3];
 	if (rail >= sizeof(rails) / sizeof(rails[0])) return EINVAL;
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (!rh_take()) return EBUSY;
 	int error = 0;
 	uint32_t address = 0;
 	if (owned[rail] == enable) goto out;
@@ -527,7 +545,7 @@ umi_rpmh_camera_ldo(const char *res, unsigned mv, bool enable)
 		printf("UMI RPMH: camera rail %s at %u mV is not one of alioth's\n", res ? res : "(none)", mv);
 		return EINVAL;
 	}
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (!rh_take()) return EBUSY;
 	int error = EIO;
 	uint32_t address = 0;
 	if (rh_poisoned) goto out;
@@ -549,7 +567,7 @@ umi_rpmh_vreg_enable(const char *res, unsigned mv)
 		printf("UMI RPMH: expected ldoc1 at 1800 mV\n");
 		return EINVAL;
 	}
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+	if (!rh_take()) {
 		return EBUSY;
 	}
 	int error = EIO;
@@ -588,7 +606,7 @@ umi_rpmh_wifi_power(void)
 		{ "ldoa9", 1200 }, /* PCIe vreg-1p8: DT actually requests 1.2 V */
 		{ "ldoa5", 880 },  /* PCIe vreg-0p9 */
 	};
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (!rh_take()) return EBUSY;
 	int error = EIO;
 	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
 	if (rh_poisoned) goto out;
@@ -615,7 +633,7 @@ umi_rpmh_bluetooth_power(void)
 		{ "smpc8", 1350 }, /* RFA2 */
 		{ "ldoa16", 3025 },/* ASD, minimum of stock 3025-3300 mV range */
 	};
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (!rh_take()) return EBUSY;
 	int error = EIO;
 	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
 	if (rh_poisoned) goto out;
