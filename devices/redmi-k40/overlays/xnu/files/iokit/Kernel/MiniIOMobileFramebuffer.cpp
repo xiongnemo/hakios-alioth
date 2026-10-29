@@ -247,6 +247,9 @@ refreshNs(void)
 {
 	return gTENs != 0 ? gTENs : NSEC_PER_SEC / refreshHz();
 }
+
+/* A frame is on the panel (its flip taken at `when`): to whoever asked for frame info (the user client, below). */
+static void frameInfoPresented(uint32_t swapID, uint64_t when);
 static inline uint32_t
 recStep(void)
 {
@@ -300,6 +303,7 @@ public:
 	IOMemoryMap *   fSlotMap;               /* the display's memory past the first buffer, for the test */
 	MiniIOSurface * fDirectHeld;            /* the surface being scanned out: not CoreAnimation's to draw into */
 	uint32_t        fDirectStride, fDirectWidth, fDirectHeight;     /* the source geometry VIG0 has now */
+	uint32_t        fPendingSwapID;         /* the swap whose (drawn) frame the pending flip shows */
 	uint32_t        fStatDirect;
 	bool aliothDirectTest(void);
 	MiniIOSurface * directSurface(const uint8_t * swap, MiniIOSurface ** surfaces);
@@ -1365,6 +1369,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			if (micros(taken - asked) > 150) {
 				gTEAt = taken;
 			}
+			frameInfoPresented(fPendingSwapID, taken);      /* (the frame drawn here last: now on the panel) */
 		} else {
 			fFlipMissed++;
 			fStatScanMissed++;
@@ -1466,6 +1471,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			if (micros(taken - shown) > 150) {
 				gTEAt = taken;          /* (taken while waited for: a TE came just now) */
 			}
+			frameInfoPresented(swapWord(swap, SWAP_ID), taken);
 		} else {
 			fFlipMissed++;
 			fStatScanMissed++;
@@ -1579,6 +1585,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			} else {
 				alioth_flip_issue(fFlipPhys[back]);
 				fFlipPending = true;
+				fPendingSwapID = swapWord(swap, SWAP_ID);
 			}
 			fFlipFront = back;
 			fComposeBase = fFlipBase[fSingle ? 0 : back ^ 1];
@@ -1700,12 +1707,14 @@ class IOMobileFramebufferUserClient : public IOUserClient
 	uint64_t                fVSyncTime;             /* when the refresh being waited for is due */
 	bool                    fVSyncRunning;
 	bool                    fClosed;
+	uint32_t                fFrameInfoMask;         /* the frame info tags asked for (kFrameInfoTags, by bit) */
 
 	static void vsyncFired(thread_call_param_t self, thread_call_param_t unused);
 	void vsync(void);
 	void armVSync(void);
 
 public:
+	void frameInfo(uint32_t swapID, uint64_t when, uint64_t delta);
 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
@@ -1716,6 +1725,92 @@ public:
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+
+/*
+ * Frame info (IOMobileFramebufferFrameInfo, as IOMobileFramebuffer.framework asks for it): which tags there
+ * are -- selector 74, one at a time by index: their number, and the name in 64 bytes --, which of them a
+ * client wants -- selector 73: {3, a mask of their indexes} --, and for every frame put on the panel a
+ * notification of type 3: {mask, swap ID, a 64-bit value for every tag in the mask, in index order}, which
+ * the framework makes a dictionary of (FrameInfoNotifyFunc). CoreAnimation's render server asks for these
+ * eight and takes Presentation_time for the phase of its frame timer (IOMFBServer::frame_info_callback ->
+ * IOMFBDisplay::add_timing): without them that timer kept to no refresh of the panel's at all, and its
+ * frames started anywhere in a TE period (2026-10-29). Times are mach absolute time, periods mach ticks.
+ */
+#define kFBNotifyFrameInfo      3
+static const char * const kFrameInfoTags[] = {
+	"Presentation_time", "Presentation_delta", "Requested_presentation", "Performance_headroom",
+	"Thermal_throttle", "Min_FrameTime", "Max_FrameTime", "Vbl_FrameTime",
+};
+#define kFrameInfoTagCount      (sizeof(kFrameInfoTags) / sizeof(kFrameInfoTags[0]))
+static IOLock * gFrameInfoLock;
+static IOMobileFramebufferUserClient * gFrameInfoClient;        /* (retained) the client that asked last */
+static uint64_t gFrameInfoLast;                                 /* (presenter thread) when the last frame was put up */
+
+/*
+ * Boot-arg fb_present_lead=US (default 0): frames are said to have gone up that much before they did. With frame
+ * info CoreAnimation starts its frames 1-3 ms after one went up (its timer keeps to Presentation_time); told
+ * earlier, it starts sooner, with that much more of the TE period left for drawing (an experiment).
+ */
+static TUNABLE(uint32_t, gPresentLead, "fb_present_lead", 0);
+
+static void
+frameInfoPresented(uint32_t swapID, uint64_t when)
+{
+	IOMobileFramebufferUserClient * client;
+	uint64_t delta = gFrameInfoLast != 0 && when > gFrameInfoLast ? when - gFrameInfoLast : 0;
+
+	if (gPresentLead != 0) {
+		uint64_t lead;
+
+		nanoseconds_to_absolutetime((uint64_t) gPresentLead * NSEC_PER_USEC, &lead);
+		when = when > lead ? when - lead : when;
+	}
+
+	gFrameInfoLast = when;
+	if (gFrameInfoLock == NULL) {
+		return;
+	}
+	IOLockLock(gFrameInfoLock);
+	client = gFrameInfoClient;
+	if (client != NULL) {
+		client->retain();
+	}
+	IOLockUnlock(gFrameInfoLock);
+	if (client != NULL) {
+		client->frameInfo(swapID, when, delta);
+		client->release();
+	}
+}
+
+void
+IOMobileFramebufferUserClient::frameInfo(uint32_t swapID, uint64_t when, uint64_t delta)
+{
+	OSAsyncReference64 ref;
+	io_user_reference_t args[2 + kFrameInfoTagCount];
+	uint32_t n = 0;
+	uint64_t period;
+	bool send = false;
+
+	nanoseconds_to_absolutetime(refreshNs(), &period);
+	IOLockLock(fLock);
+	if (!fClosed && fFrameInfoMask != 0 && fCallbacks[kFBNotifyFrameInfo] != 0 && fPorts[kFBNotifyFrameInfo] != NULL) {
+		setAsyncReference64(ref, fPorts[kFBNotifyFrameInfo], fCallbacks[kFBNotifyFrameInfo], fRefcons[kFBNotifyFrameInfo], fTask);
+		args[n++] = fFrameInfoMask;
+		args[n++] = swapID;
+		for (uint32_t tag = 0; tag < kFrameInfoTagCount; tag++) {
+			static const uint8_t kind[kFrameInfoTagCount] = { 0, 1, 0, 2, 2, 3, 3, 3 };   /* when, delta, 0, a period */
+
+			if (fFrameInfoMask & (1u << tag)) {
+				args[n++] = kind[tag] == 0 ? when : kind[tag] == 1 ? delta : kind[tag] == 3 ? period : 0;
+			}
+		}
+		send = true;
+	}
+	IOLockUnlock(fLock);
+	if (send) {
+		sendAsyncResult64WithOptions(ref, kIOReturnSuccess, args, n, kIOUserNotifyOptionCanDrop);
+	}
+}
 
 bool
 IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
@@ -1736,6 +1831,13 @@ IOMobileFramebufferUserClient::start(IOService * provider)
 	}
 	fLock = IOLockAlloc();
 	fVSyncCall = thread_call_allocate(&IOMobileFramebufferUserClient::vsyncFired, this);
+	if (gFrameInfoLock == NULL) {
+		IOLock * lock = IOLockAlloc();
+
+		if (lock != NULL && !OSCompareAndSwapPtr(NULL, lock, &gFrameInfoLock)) {
+			IOLockFree(lock);
+		}
+	}
 	return fLock != NULL && fVSyncCall != NULL;
 }
 
@@ -1746,6 +1848,14 @@ IOMobileFramebufferUserClient::clientClose(void)
 		IOLockLock(fLock);
 		fClosed = true;
 		IOLockUnlock(fLock);
+	}
+	if (gFrameInfoLock != NULL) {
+		IOLockLock(gFrameInfoLock);
+		if (gFrameInfoClient == this) {
+			gFrameInfoClient = NULL;
+			release();
+		}
+		IOLockUnlock(gFrameInfoLock);
 	}
 	if (fVSyncCall != NULL) {
 		thread_call_cancel_wait(fVSyncCall);
@@ -1973,7 +2083,32 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
 	case kFBMethodRequestPowerChange:
-	case kFBMethodChangeFrameInfo:
+		return kIOReturnSuccess;
+
+	case kFBMethodChangeFrameInfo:                  /* in: notification type (3), the mask of frame info tags wanted */
+		if (args->scalarInputCount >= 2 && in[0] == kFBNotifyFrameInfo) {
+			uint32_t mask = (uint32_t) in[1] & ((1u << kFrameInfoTagCount) - 1);
+
+			IOLockLock(fLock);
+			fFrameInfoMask = mask;
+			IOLockUnlock(fLock);
+			if (gFrameInfoLock != NULL) {
+				IOMobileFramebufferUserClient * old = NULL;
+
+				IOLockLock(gFrameInfoLock);
+				if (mask != 0 && gFrameInfoClient != this) {
+					old = gFrameInfoClient;
+					retain();
+					gFrameInfoClient = this;
+				} else if (mask == 0 && gFrameInfoClient == this) {
+					old = this;
+					gFrameInfoClient = NULL;
+				}
+				IOLockUnlock(gFrameInfoLock);
+				OSSafeReleaseNULL(old);
+			}
+			IOLog("MiniIOMobileFramebuffer: frame info: tags %#x asked for\n", mask);
+		}
 		return kIOReturnSuccess;
 
 	case kFBMethodNotifications:                    /* in: callback (0 = off), its argument, type, 0 */
@@ -1990,13 +2125,18 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		IOLockUnlock(fLock);
 		return kIOReturnSuccess;
 
-	case kFBMethodSupportedFrameInfo:               /* in: type; out: how many, and their tags: none */
+	case kFBMethodSupportedFrameInfo:               /* in: a tag's index; out: how many tags, and that one's name (64 bytes) */
 		if (args->scalarOutputCount >= 1) {
-			out[0] = 0;
+			out[0] = kFrameInfoTagCount;
 			args->scalarOutputCount = 1;
 		}
 		if (args->structureOutput != NULL) {
+			uint64_t index = args->scalarInputCount >= 1 ? in[0] : 0;
+
 			bzero(args->structureOutput, args->structureOutputSize);
+			if (index < kFrameInfoTagCount && args->structureOutputSize > 0) {
+				strlcpy((char *) args->structureOutput, kFrameInfoTags[index], args->structureOutputSize);
+			}
 		}
 		return kIOReturnSuccess;
 

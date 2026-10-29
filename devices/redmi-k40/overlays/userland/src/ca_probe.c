@@ -167,6 +167,20 @@ look_at_display(unsigned index, id display)
 	say("ca-probe: display %u: server: next render %g, vsyncs: last %llu, @0x2d8 %llu, @0x308 %u, @0x30d %#x\n", index,
 	    *(double *)(server + 0x2b0), *(unsigned long long *)(server + 0x2e0), *(unsigned long long *)(server + 0x2d8),
 	    *(uint32_t *)(server + 0x308), server[0x30d]);
+	{
+		/* the framebuffer as CoreAnimation has it (display + 0x318) and its frame info: what the server set up */
+		void *fb = *(void **)(d + 0x318);
+		const char **(*supported)(void *) = (const char **(*)(void *))dlsym(RTLD_DEFAULT, "IOMobileFramebufferSupportedFrameInfo");
+		const char **tags = fb != NULL && supported != NULL ? supported(fb) : NULL;
+		char line[400];
+		int n = snprintf(line, sizeof(line), "ca-probe: display %u: framebuffer %p, vsync source %p, frame info source %p; tags:",
+		    index, fb, *(void **)(server + 0x270), *(void **)(server + 0x2a8));
+
+		for (unsigned i = 0; tags != NULL && tags[i] != NULL && i < 16 && n < (int)sizeof(line) - 40; i++) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", tags[i]);
+		}
+		say("%s%s\n", line, tags == NULL ? " (none)" : "");
+	}
 }
 
 static void *
