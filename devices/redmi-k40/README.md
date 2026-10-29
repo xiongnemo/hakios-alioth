@@ -89,3 +89,23 @@ iOS images booted on UMI; touch initialized, the GPU rendered apps at its
 587 MHz setting, and the audio DSP and Wi-Fi interface initialized. The user
 confirmed that the build works, while scrolling skips/freezes remain. This
 source migration does not claim to resolve that remaining performance issue.
+
+## Microphone
+
+`mic=4` (with `adsp=1 adsp_umi=1`) gives iOS the bottom microphone: HakiosAudio.driver's "Codec"
+input, which VirtualAudio makes the built-in "iPhone Microphone". The kernel side,
+`overlays/xnu/files/bsd/dev/hakios.mic.c`, is generated from the upstream driver by
+`tools/patch-mic-alioth.py` with kona's values: WCD938x reset on GPIO32 (TLMM south tile),
+three LPASS SoundWire pins, a v1.5.1 TX SoundWire master, bolero 1.x, Xiaomi's main-mic path
+(ADC1, "ADC1 Volume" 20, TX SMIC MUX0 ADC0, decimator 0, TX_CDC_DMA_TX_3) and sm8250.dtsi's
+port 2 timing (sample interval 1, offset 1, lane 0). `mic=1..3` are the bring-up levels
+(look; codec enumerated; `mic_secs` of listening, with `rec_sound=N rec_sound_mic=1` keeping
+the samples for `xl sound` / `tools/sound.py`).
+
+Measured on the phone: the codec enumerates (0x000d01170223); a 2 s on / 2 s off 1 kHz beep
+from a nearby PC shows in the kernel's recording 35 dB above its absence; a tone from the
+phone's own speaker 29.5 dB quieter arrives 28 dB quieter (linear); `record_test`
+(AVAudioRecorder) gets 6.00 s of 6.00 and Voice Memos records with a moving waveform. iOS's
+input applies automatic gain: room noise at -53 dBFS in the kernel is about -22 dBFS in an
+application. The test tools need `ldid` at build time for their entitlements (without it
+`record_test` is refused the microphone and `battery_test` cannot open URLs).
