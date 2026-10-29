@@ -90,8 +90,12 @@ BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, .
 # sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
 # system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
+# Of Apple's own HAL plug-ins (System/Library/Audio/Plug-Ins/HAL: USB, AirPlay, CarPlay, the AOP's, the
+# baseband's ... left out, they look for hardware of an iPhone's) the Bluetooth one: the client bluetoothd's
+# audio server waits for (com.apple.BTAudioHALPlugin.xpc), which makes A2DP and HFP devices into audio
+# devices for the virtual audio device's Bluetooth ports. Without it a connected speaker is never a route.
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
-         'System/Library/Audio/UISounds/')
+         'System/Library/Audio/UISounds/', 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
 

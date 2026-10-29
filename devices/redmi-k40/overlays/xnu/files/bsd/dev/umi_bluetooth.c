@@ -238,7 +238,7 @@ static int bt_qca_download(vm_offset_t uart, const uint8_t *tlv, size_t size, bo
 static uint16_t bt_le16(const uint8_t *p) { return p[0] | (uint16_t)p[1] << 8; }
 static uint32_t bt_le32(const uint8_t *p) { return bt_le16(p) | (uint32_t)bt_le16(p + 2) << 16; }
 /*
- * The UART's rate (boot-arg umi_bt_baud=921600, else 115200): the QUPv3 root at 7.3728 MHz (384/15625 of
+ * The UART's rate (boot-arg umi_bt_baud=, 921600 by default, 115200 as before): the QUPv3 root at 7.3728 MHz (384/15625 of
  * GPLL0-even's 300 MHz) or 14.7456 MHz (768/15625, Linux gcc-sm8250's table), the GENI's divider 4 or 1,
  * 16 samples a bit (qcom_geni_serial.c). A2DP's audio (SBC, some 330 kbit/s) does not fit through 115200
  * baud (92 kbit/s of bytes). The controller is told first: EDL 0xfc48 with enum qca_baudrate's index
@@ -246,7 +246,7 @@ static uint32_t bt_le32(const uint8_t *p) { return bt_le16(p) | (uint32_t)bt_le1
  * that the controller keeps the rate after its reset.
  */
 static vm_offset_t bt_gcc;
-static uint32_t bt_baud = 115200;
+static uint32_t bt_baud = 921600;      /* (A2DP verified at it: a PC as the speaker, 2026-10-30) */
 static bool bt_uart_rate(vm_offset_t uart, uint32_t baud)
 {
     uint32_t m = baud == 921600 ? 768 : 384, div = baud == 921600 ? 1 : 4;
