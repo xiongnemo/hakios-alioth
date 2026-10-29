@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,6 +112,16 @@
+@@ -112,6 +112,18 @@
  bsd/dev/hakios.input.c		standard
  bsd/dev/hakios.virtio_input.c	standard
  bsd/dev/hakios.goodix.c	standard
@@ -14,6 +14,8 @@
 +bsd/dev/umi_pcie.c		standard
 +bsd/dev/umi_camera.c		standard
 +bsd/dev/umi_camera_dma.c		standard
++bsd/dev/hakios.usb.c		standard
++bsd/dev/hakios.dwc3.c		standard
  bsd/dev/hakios.buttons.c	standard
  bsd/dev/hakios.battery.c	standard
  bsd/dev/hakios.ufs.c	standard

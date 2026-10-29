@@ -746,7 +746,11 @@ umi_wifi_firmware_diagnostic(void *context)
 			if (!error) {
 				error = hakios_lx_start();
 				if (!error && umi_normal_session) {
+					extern void hakios_wifi_join_file(void);
+
 					hakios_tl("UMI Wi-Fi: station ready for iOS Wi-Fi requests\n");
+					/* the network of fw/network (wifi-fw/network: name, passphrase), if the image has one */
+					hakios_wifi_join_file();
 					while (os_atomic_load(&umi_service_wanted, acquire) &&
 					    !os_atomic_load(&umi_poll_finished, acquire)) {
 						struct timespec pause = { .tv_sec = 0, .tv_nsec = 100 * NSEC_PER_MSEC };

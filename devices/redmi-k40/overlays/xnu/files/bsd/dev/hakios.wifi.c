@@ -4400,6 +4400,18 @@ join_given(uint64_t began)
 }
 
 /*
+ * The same for the Redmi K40's radio (QCA6390 over PCIe, umi_wifi.c), whose driver is brought up there
+ * and not by whole_thread(): called once its station is ready, so that fw/network is joined there too.
+ */
+void hakios_wifi_join_file(void);
+
+void
+hakios_wifi_join_file(void)
+{
+	join_given(now_us());
+}
+
+/*
  * wifi=1: the whole of it on a thread of its own, so that the system starts meanwhile (the
  * firmware's calibration alone takes seven seconds). The steps that only look are left out.
  */

@@ -60,6 +60,7 @@ extern void hakios_camera_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void alioth_display_quiesce(void);      /* bsd/dev/alioth_dsi.c (Redmi K40 overlay) */
+extern void hakios_usb_quiesce(void);          /* bsd/dev/hakios.usb.c (Redmi K40 overlay) */
 extern void hakios_var_save_on_return(void);   /* bsd/dev/hakios.ufs.c: the data volume into the flash */
 void loader_checkpoint(uint64_t n);
 
@@ -71,6 +72,14 @@ static bool     loader_return_entered;
 /* One L1 table and one L2 table are enough to map a single 2 MB block. */
 static uint64_t loader_l1[512] __attribute__((aligned(4096)));
 static uint64_t loader_l2[512] __attribute__((aligned(4096)));
+
+/*
+ * A copy of every character for the USB serial console (bsd/dev/hakios.usb.c, usb=2), which takes them
+ * from here at its own pace: loader_log_tee_total characters so far, the last LOADER_LOG_TEE of them kept.
+ */
+#define LOADER_LOG_TEE (64 * 1024)
+char loader_log_tee[LOADER_LOG_TEE];
+volatile uint64_t loader_log_tee_total;
 
 static uint32_t loader_log_ring_at;      /* where the next character goes in the ring */
 static bool     loader_log_wrapped;
@@ -139,6 +148,8 @@ loader_log_line(const char *line)
 static void
 loader_log_put_locked(char c)
 {
+	loader_log_tee[loader_log_tee_total % LOADER_LOG_TEE] = c;
+	os_atomic_store(&loader_log_tee_total, loader_log_tee_total + 1, release);
 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
 		if (loader_log_len < LOADER_LOG_SIZE) {
 			loader_log[loader_log_len++] = c;
@@ -382,7 +393,8 @@ loader_return(void)
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
 	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
-	alioth_display_quiesce();      /* the display engine on the UEFI's framebuffer again, unscaled, for the loader's picture */
+	hakios_usb_quiesce();          /* the USB controller stopped, if this kernel drove it (usb=2): the loader restarts its link */
+	alioth_display_quiesce();     /* the display engine on the UEFI's framebuffer again, unscaled, for the loader's picture */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that

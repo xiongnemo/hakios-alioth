@@ -72,6 +72,7 @@ struct hakios_battery_state {
 };
 void hakios_battery_report(const struct hakios_battery_state *state);
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
+void hakios_usb_init(void);            /* boot-arg usb=N: the USB controller for iOS (hakios.usb.c) */
 void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 int hakios_cpufreq_top(uint32_t domain);
 uint32_t hakios_cpufreq_khz(uint32_t domain, int row);

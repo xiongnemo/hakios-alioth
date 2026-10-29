@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.usbsh</string>
+	<!-- with usb=2 among the kernel's arguments: commands from the computer over the phone's USB serial port
+	     (src/usbsh.c, the kernel's /dev/hakios-usb); without, it ends at once -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/usbsh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

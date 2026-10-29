@@ -985,6 +985,15 @@ static int wdt_armed;
 static const struct kernel_live *running_live;
 static uint64_t running_slide;
 static void usb_poll_command(void);
+#if defined(LOADER_ALIOTH)
+static void alioth_usb_note(void);
+static void alioth_usb_take_back(void);
+#endif
+/* (the USB link's state, defined with it below: run_kernel() may lend the controller to the kernel) */
+static usb_device_protocol *USB;
+static int usb_connected;
+static int usb_rx_queued;
+static int usb_lent;            /* this run has the controller (usb=2 with the kernel on another core): no USB until it is back */
 
 static uint64_t
 seconds_since(uint64_t then)
@@ -2993,6 +3002,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("no kernel in payload\n");
 		return 0;
 	}
+#if defined(LOADER_ALIOTH)
+	alioth_usb_note();
+#endif
 	if (!have_checkpoint) {
 		checkpoint = pi.checkpoint;
 	}
@@ -3241,6 +3253,28 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ba->commandLine[n++] = *c;
 		}
 	}
+#if defined(LOADER_ALIOTH)
+	/*
+	 * "usb=2" with the kernel on another core: the USB controller is lent to the kernel (hakios.usb.c: a
+	 * serial port for iOS) for the run. This link stops now, the kernel is told so ("usbfree=1"), and the
+	 * link is started again when the kernel is back (alioth_usb_take_back()). Meanwhile the host sees
+	 * the kernel's port instead of this one.
+	 */
+	usb_lent = 0;
+	for (const char *c = pi.cmdline; *c; c++) {
+		if (starts_with(c, "usb=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '2' && c[4] <= '9' && kernel_mpidr != this_mpidr &&
+		    USB != NULL && !usb_lent) {
+			print("usb: lent to the kernel for this run (usb=%c): this link stops until the kernel is back\n", (uint64_t)c[4]);
+			(void)USB->stop();
+			usb_connected = 0;
+			usb_rx_queued = 0;
+			usb_lent = 1;
+			for (const char *a = "usbfree=1 "; *a && n < BOOT_LINE_LENGTH - 1; a++) {
+				ba->commandLine[n++] = *a;
+			}
+		}
+	}
+#endif
 	/* the root is the first RAM disk unless the payload says otherwise */
 	int own_root = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
@@ -3592,6 +3626,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			if (status != 0) {
 				/* a kernel that hung may have left its own transfer list in the controller */
 				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" : "the kernel did not start");
+#if defined(LOADER_ALIOTH)
+				alioth_usb_take_back();         /* (and the USB controller, if it was lent: the host needs this link back) */
+#endif
 			}
 			if (status == OTHER_CPU_HUNG) {
 				/* the kernel still has that core; what it logged can be had all the same */
@@ -3619,6 +3656,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* --- the kernel came back ------------------------------------------- */
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
+#if defined(LOADER_ALIOTH)
+	alioth_usb_take_back();                 /* the link restarted if the kernel drove the USB controller (usb=2) */
+#endif
 	if (hc_known) {
 		flush_dcache((uint64_t)(uintptr_t)&block_shared.kernel_native,
 		    (uint64_t)(uintptr_t)&block_shared.kernel_native + sizeof(block_shared.kernel_native));
@@ -3778,8 +3818,9 @@ usb_start(void)
 		print("usb: start failed %x\n", s);
 		return 0;
 	}
-	if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
-	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
+	/* (once: a restart after the kernel drove the controller keeps the buffers it has) */
+	if ((usb_rx_buf == NULL && EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf))) ||
+	    (usb_tx_buf == NULL && EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf)))) {
 		print("usb: no transfer buffers\n");
 		return 0;
 	}
@@ -4086,8 +4127,8 @@ usb_poll_command(void)
 	usb_device_event_data data;
 	char cmd[128];
 
-	if (USB == NULL) {
-		return;         /* this run was not started over USB */
+	if (USB == NULL || usb_lent) {
+		return;         /* this run was not started over USB, or the kernel has the controller */
 	}
 	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
 		usb_rx_queued = 1;
@@ -4110,6 +4151,53 @@ usb_poll_command(void)
 	cmd[n] = 0;
 	fb_command(cmd);
 }
+
+#if defined(LOADER_ALIOTH)
+/*
+ * A kernel with all the cores may drive the USB controller itself (hakios.usb.c, usb=2: a serial port for
+ * iOS). The firmware's USB driver has then lost the controller, and this link comes back only by being
+ * started again. The kernel leaves its own event buffer in the controller (DWC3 GEVNTADRLO(0)), which is
+ * how that is seen here. If the restart fails: a cold reset -- Android boots and the phone is reachable
+ * again (adb), nothing is lost.
+ */
+#define ALIOTH_DWC3_GEVNTADRLO0 0x0a60c400ULL
+static uint32_t usb_event_buffer_before;
+
+static void
+alioth_usb_note(void)
+{
+	usb_event_buffer_before = *(volatile uint32_t *)(uintptr_t)ALIOTH_DWC3_GEVNTADRLO0;
+}
+
+static void
+alioth_usb_take_back(void)
+{
+	uint32_t now;
+
+	if (USB == NULL) {
+		return;
+	}
+	now = *(volatile uint32_t *)(uintptr_t)ALIOTH_DWC3_GEVNTADRLO0;
+	if (now == usb_event_buffer_before && !usb_lent) {
+		return;
+	}
+	print("usb: the kernel %s (event buffer %x, the firmware's was %x): restarting the link\n",
+	    now != usb_event_buffer_before ? "drove the controller" : "had the controller lent but left it as it was", (uint64_t)now,
+	    (uint64_t)usb_event_buffer_before);
+	if (!usb_lent) {
+		(void)USB->stop();
+	}
+	usb_lent = 0;
+	usb_connected = 0;
+	usb_rx_queued = 0;
+	if (!usb_start()) {
+		print("usb: THE LINK DID NOT COME BACK: cold reset (Android boots)\n");
+		BS->stall(200000);
+		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+	}
+	alioth_usb_note();
+}
+#endif
 
 static void
 usb_command_loop(void)

@@ -224,6 +224,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -o obj/shm_test src/shm_test.c
 		$DYN -o obj/apfs_mmap_test src/apfs_mmap_test.c
 		$DYN -o obj/vol_ls src/vol_ls.c
+		# commands from the computer over the USB serial port of usb=2 (bsd/dev/hakios.usb.c)
+		$DYN -o obj/usbsh src/usbsh.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
@@ -303,6 +305,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/shm_test ] && cp obj/shm_test root/bin/
 	[ -f obj/apfs_mmap_test ] && cp obj/apfs_mmap_test root/bin/
 	[ -f obj/vol_ls ] && cp obj/vol_ls root/bin/
+	[ -f obj/usbsh ] && cp obj/usbsh root/bin/
 	[ -f obj/snap_test ] && cp obj/snap_test root/bin/
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
@@ -406,6 +409,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
+	[ -f com.hakios.usbsh.plist ] && cp com.hakios.usbsh.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
