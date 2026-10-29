@@ -185,7 +185,10 @@ static struct {
 	uint32_t submissions, commands, buffers, surfaces, waits, over;
 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
 	uint64_t making;                        /* ... and the time it took to make the others */
+	uint32_t invalidated;                   /* surfaces the GPU wrote, out of this processor's cache before they are shown */
+	uint64_t invalidating;                  /* ... and the time that took */
 } gGPUStat;
+static TUNABLE(uint32_t, gInvalScan, "gpu_inval_scan", 0);
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -244,7 +247,19 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 		}
 		if (done && ready && !stable) done = false;
 		if (done && ready && stable && surface->gpu_written) {
-			hakios_gpu_from_memory(surface->kpixels, surface->info.allocSize);
+			/*
+			 * Not for a surface in a scan-out slot: that memory is write-combined wherever it is mapped (here and
+			 * in every program, MiniIOSurface.cpp), so no processor's cache holds a line of it, and the 170,000
+			 * lines of a display-sized one were gone through on the way of every frame to the panel.
+			 * Boot-arg gpu_inval_scan=1: as before.
+			 */
+			if (surface->scanPhys == 0 || gInvalScan) {
+				uint64_t began = mach_absolute_time();
+
+				hakios_gpu_from_memory(surface->kpixels, surface->info.allocSize);
+				gGPUStat.invalidating += mach_absolute_time() - began;
+				gGPUStat.invalidated++;
+			}
 			surface->gpu_written = false;
 		}
 		IOLockUnlock(gGPULock);
@@ -1044,8 +1059,13 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		uint64_t making;
 
 		absolutetime_to_nanoseconds(gGPUStat.making, &making);
-		IOLog("HakiosGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept)\n", gGPUStat.made,
-		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
+		uint64_t invalidating;
+
+		absolutetime_to_nanoseconds(gGPUStat.invalidating, &invalidating);
+		IOLog("HakiosGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept); %u surfaces out of the "
+		    "cache before they were shown, in %llu us each\n", gGPUStat.made,
+		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20,
+		    gGPUStat.invalidated, gGPUStat.invalidated ? invalidating / NSEC_PER_USEC / gGPUStat.invalidated : 0);
 		IOLog("HakiosGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
