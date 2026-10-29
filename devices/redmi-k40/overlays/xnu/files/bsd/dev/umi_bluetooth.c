@@ -237,6 +237,30 @@ static int bt_qca_download(vm_offset_t uart, const uint8_t *tlv, size_t size, bo
 }
 static uint16_t bt_le16(const uint8_t *p) { return p[0] | (uint16_t)p[1] << 8; }
 static uint32_t bt_le32(const uint8_t *p) { return bt_le16(p) | (uint32_t)bt_le16(p + 2) << 16; }
+/*
+ * The UART's rate (boot-arg umi_bt_baud=921600, else 115200): the QUPv3 root at 7.3728 MHz (384/15625 of
+ * GPLL0-even's 300 MHz) or 14.7456 MHz (768/15625, Linux gcc-sm8250's table), the GENI's divider 4 or 1,
+ * 16 samples a bit (qcom_geni_serial.c). A2DP's audio (SBC, some 330 kbit/s) does not fit through 115200
+ * baud (92 kbit/s of bytes). The controller is told first: EDL 0xfc48 with enum qca_baudrate's index
+ * (Linux hci_qca.c qca_set_baudrate(), then host_set_baudrate()), and the NVM's tag 17 says the same so
+ * that the controller keeps the rate after its reset.
+ */
+static vm_offset_t bt_gcc;
+static uint32_t bt_baud = 115200;
+static bool bt_uart_rate(vm_offset_t uart, uint32_t baud)
+{
+    uint32_t m = baud == 921600 ? 768 : 384, div = baud == 921600 ? 1 : 4;
+    if (!bt_gcc) return false;
+    bt_write(bt_gcc,0x17738,m);
+    bt_write(bt_gcc,0x1773c,~(15625u-m)&0xffff);
+    bt_write(bt_gcc,0x17740,~15625u&0xffff);
+    bt_write(bt_gcc,0x17734,0x2601); /* dual-edge M/N, GPLL0-even, /1 */
+    bt_write(bt_gcc,0x17730,1);
+    for (unsigned i=0;i<10000 && (bt_read(bt_gcc,0x17730)&1);i++) delay(1);
+    if (bt_read(bt_gcc,0x17730)&1) return false;
+    bt_write(uart,0x48,div<<4|1); bt_write(uart,0x4c,div<<4|1);
+    return true;
+}
 static int bt_qca_firmware(vm_offset_t uart)
 {
     uint8_t event[BT_EVENT_MAX]; unsigned length = 0;
@@ -258,9 +282,36 @@ static int bt_qca_firmware(vm_offset_t uart)
     unsigned mode = umi_bt_patch[14];
     if (mode != 0 && mode != 3) return EINVAL;
     if (umi_bt_nvm_size > sizeof(bt_nvm_work)) return E2BIG;
+    uint8_t baud_index = 0;
+    if (bt_baud == 921600) {
+        const uint8_t index = 10;       /* QCA_BAUDRATE_921600 */
+        error = bt_hci_command(uart, 0xfc48, &index, 1, false, event, &length);
+        if (!error) {
+            delay(10000);               /* (Linux gives the QCA6390 1-10 ms to change) */
+            if (!bt_uart_rate(uart, 921600)) error = ETIMEDOUT;
+        }
+        if (!error) {
+            /* what came while the two ends were at different rates is noise (an 0x11 was seen): dropped */
+            delay(5000);
+            for (unsigned i = 0; i < 16; i++) {
+                (void)bt_rx_capture(uart);
+                bt_rx_head = bt_rx_tail = 0;
+                delay(200);
+            }
+            memset(&bt_rx_packet, 0, sizeof(bt_rx_packet));
+        }
+        if (!error) error = bt_hci_command(uart, 0xfc00, &version_request, 1, true, event, &length);
+        if (!error && (length != 21 || event[7] != 0x19)) error = EILSEQ;
+        if (error) {
+            hakios_tl("UMI BT: 921600 baud failed (errno=%d)\n", error);
+            return error;
+        }
+        hakios_tl("UMI BT: the UART at 921600 baud: the controller answers at it\n");
+        baud_index = 10;
+    }
     memcpy(bt_nvm_work, umi_bt_nvm, umi_bt_nvm_size);
-    if (hakios_bt_qca6390_nvm_prepare(bt_nvm_work, umi_bt_nvm_size)) return EINVAL;
-    hakios_tl("UMI BT: loading htbtfw20/htnv20 at 115200 baud (Hastings tag17 byte1)\n");
+    if (hakios_bt_qca6390_nvm_prepare(bt_nvm_work, umi_bt_nvm_size, baud_index)) return EINVAL;
+    hakios_tl("UMI BT: loading htbtfw20/htnv20 at %u baud (Hastings tag17 byte1 %u)\n", bt_baud, baud_index);
     error = bt_qca_download(uart, umi_bt_patch, umi_bt_patch_size, mode == 3);
     if (error) return error;
     delay(10000);
@@ -413,11 +464,9 @@ static errno_t bt_control_setopt(kern_ctl_ref ref,uint32_t unit,void *info,int o
     uint32_t opt=(uint32_t)option;
     if(opt==(uint32_t)TIOCSETA || opt==(uint32_t)TIOCSETAW || opt==(uint32_t)TIOCSETAF) {
         if(length!=sizeof(struct termios) || !data) return EINVAL;
-        const struct termios *settings=data;
-        if((settings->c_ispeed && settings->c_ispeed!=115200) ||
-            (settings->c_ospeed && settings->c_ospeed!=115200)) return EINVAL;
+        /* (not a real line: the rate is the kernel's, umi_bt_baud; what the host asks for is kept and shown back) */
         lck_mtx_lock(&bt_control_lock);
-        bt_control_termios=*settings;
+        bt_control_termios=*(const struct termios *)data;
         lck_mtx_unlock(&bt_control_lock);
         return 0;
     }
@@ -453,6 +502,7 @@ static void bt_control_worker(void *unused,wait_result_t result)
         }
         lck_mtx_unlock(&bt_control_lock);
         int error=0;
+        bool worked=false;              /* a packet out or in this turn: the next turn at once, not a millisecond on */
         if(unit && !fault && tx.complete) {
             if(!bt_host_awake) {
                 if(!waking) {
@@ -471,11 +521,13 @@ static void bt_control_worker(void *unused,wait_result_t result)
                     hakios_tl("UMI BT: scan params type=%#x interval=%u window=%u own-address=%#x policy=%#x\n",tx.bytes[4],bt_le16(tx.bytes+5),bt_le16(tx.bytes+7),tx.bytes[9],tx.bytes[10]);
                 error=bt_uart_tx(bt_control_uart,tx.bytes,tx.used);
                 memset(&tx,0,sizeof(tx));
+                worked=true;
             }
         }
         if(!error && !receive_length) {
             int state=bt_rx_frame(bt_control_uart,receive,sizeof(receive),&receive_length,false);
             if(state<0) error=-state;
+            if(state>0) worked=true;
             if(state>0 && receive_length>=7 && receive[0]==4 && receive[1]==0x0e && receive[6])
                 hakios_tl("UMI BT: HCI command rejected opcode=%#x status=%#x\n",bt_le16(receive+4),receive[6]);
         }
@@ -490,7 +542,7 @@ static void bt_control_worker(void *unused,wait_result_t result)
             int queued=unit?ctl_enqueuedata(bt_control,unit,receive,receive_length,0):ENOTCONN;
             if(queued!=ENOBUFS) receive_length=0;
         }
-        delay(1000);
+        delay(worked ? 20 : 1000);
     }
 }
 static int bt_control_start(vm_offset_t uart)
@@ -506,7 +558,7 @@ static int bt_control_start(vm_offset_t uart)
     registration.ctl_getopt=bt_control_getopt;
     registration.ctl_setopt=bt_control_setopt;
     bt_control_termios.c_cflag=CS8|CREAD|CLOCAL;
-    bt_control_termios.c_ispeed=bt_control_termios.c_ospeed=115200;
+    bt_control_termios.c_ispeed=bt_control_termios.c_ospeed=bt_baud;
     int error=ctl_register(&registration,&bt_control);
     if(error) return error;
     error=umi_bluetooth_publish(bt_public_address,bt_supported_commands);
@@ -562,6 +614,7 @@ static int bt_uart_quiesce(vm_offset_t uart)
  * asserted. Firmware download is a separate step after this ROM handshake. */
 static bool bt_hci_probe(vm_offset_t gcc,vm_offset_t gpio,vm_offset_t uart,bool firmware,bool runtime)
 {
+    bt_gcc=gcc;
     uint32_t root[5]={bt_read(gcc,0x17730),bt_read(gcc,0x17734),bt_read(gcc,0x17738),bt_read(gcc,0x1773c),bt_read(gcc,0x17740)};
     uint32_t pin21=bt_read(gpio,21*0x1000),io21=bt_read(gpio,21*0x1000+4),pin124=bt_read(gpio,124*0x1000),io124=bt_read(gpio,124*0x1000+4);
     uint32_t pins[4]; for(unsigned p=0;p<4;p++) pins[p]=bt_read(gpio,(16+p)*0x1000);
@@ -641,6 +694,10 @@ void umi_bluetooth_init(void)
     if (runtime && diagnostic) { hakios_tl("UMI BT: choose runtime or diagnostic mode\n"); return; }
     if (runtime) probe = 5;
     else if (!diagnostic || probe < 1 || probe > 5) return;
+    if (PE_parse_boot_argn("umi_bt_baud", &bt_baud, sizeof(bt_baud)) && bt_baud != 115200 && bt_baud != 921600) {
+        hakios_tl("UMI BT: umi_bt_baud=%u: 115200 or 921600 only; 115200\n", bt_baud);
+        bt_baud = 115200;
+    }
     if (!umi_wifi_is_board()) { hakios_tl("UMI BT: board identity mismatch\n"); return; }
     vm_offset_t gcc = ml_io_map(0x00100000, 0x80000);
     vm_offset_t gpio = ml_io_map(0x0f900000, 0x80000);
