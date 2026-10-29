@@ -9,6 +9,10 @@
  * back as it writes them; Ctrl-C interrupts it (twice: kills it). "log" gives the port back to the
  * log, until the next thing typed. Started by launchd at boot (com.hakios.usbsh); without usb=2
  * there is no port and it ends at once.
+ *
+ * "usbsh -l PORT" (test images only: rc.jobs): the same over TCP on the phone's Wi-Fi, for a computer
+ * that has the USB link busy with the loader (screenshots). A connection's first line must be the
+ * token in /redwood/fw/netsh-token, else it is closed; one connection at a time.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -19,8 +23,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
@@ -34,6 +40,8 @@ extern char **environ;
 
 static int port = -1;
 static int talking;                     /* the computer has typed since the log last had the port */
+static int network;                     /* -l: port is a TCP connection ("log" ends it) */
+static int hang_up;
 static char cwd[1024] = "/";
 
 /* To the port, '\n' as "\r\n" (a terminal on the other side). */
@@ -237,6 +245,7 @@ run(char **argv)
 	posix_spawn_file_actions_t actions;
 	int pipefd[2], status = 0, interrupts = 0;
 	pid_t pid;
+	int watch = 1;                  /* (a connection that hangs up: no more Ctrl-C to look for) */
 
 	if (path == NULL) {
 		out("%s: no such program (help: what there is)\n", argv[0]);
@@ -267,14 +276,20 @@ run(char **argv)
 
 		FD_ZERO(&r);
 		FD_SET(pipefd[0], &r);
-		FD_SET(port, &r);
+		if (watch) {
+			FD_SET(port, &r);
+		}
 		if (select((pipefd[0] > port ? pipefd[0] : port) + 1, &r, NULL, NULL, NULL) < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
 			break;
 		}
-		if (FD_ISSET(port, &r) && (n = read(port, buf, sizeof(buf))) > 0) {
+		if (watch && FD_ISSET(port, &r)) {
+			n = read(port, buf, sizeof(buf));
+			if (n <= 0 && network) {
+				watch = 0;
+			}
 			for (ssize_t i = 0; i < n; i++) {
 				if (buf[i] == 3) {
 					kill(pid, ++interrupts > 1 ? SIGKILL : SIGINT);
@@ -304,7 +319,7 @@ static void
 help(void)
 {
 	out("usbsh: commands over USB, run on iOS\n"
-	    "  ls [DIR]  cat FILE  cd DIR  pwd  uname  ps  kill [-SIG] PID  log  help\n"
+	    "  ls [DIR]  cat FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
 	    "  anything else: a program and its arguments; names are looked for in\n"
 	    "  /redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec -- e.g. battery_test, vol_ls /, net_test\n"
 	    "  Ctrl-C interrupts a program; 'log' gives the port back to the kernel's log\n");
@@ -321,6 +336,8 @@ execute(char *line)
 	}
 	if (!strcmp(argv[0], "help") || !strcmp(argv[0], "?")) {
 		help();
+	} else if (network && (!strcmp(argv[0], "log") || !strcmp(argv[0], "exit"))) {
+		hang_up = 1;
 	} else if (!strcmp(argv[0], "log") || !strcmp(argv[0], "exit")) {
 		out("usbsh: the log again (type anything to come back)\n");
 		ioctl(port, HAKIOS_USB_LOG);
@@ -340,6 +357,10 @@ execute(char *line)
 		}
 	} else if (!strcmp(argv[0], "pwd")) {
 		out("%s\n", cwd);
+	} else if (!strcmp(argv[0], "getenv") && argc > 1) {
+		const char *value = getenv(argv[1]);
+
+		out("%s=%s\n", argv[1], value ? value : "(not set)");
 	} else if (!strcmp(argv[0], "uname")) {
 		cmd_uname();
 	} else if (!strcmp(argv[0], "ps")) {
@@ -359,20 +380,13 @@ execute(char *line)
 	}
 }
 
-int
-main(void)
+/* What comes from the computer, a line at a time: over USB for ever, over the network until it hangs up. */
+static int
+serve(void)
 {
 	char line[1024];
 	size_t len = 0;
 
-	signal(SIGPIPE, SIG_IGN);
-	port = open("/dev/hakios-usb", O_RDWR);
-	if (port < 0) {
-		printf("usbsh: no USB serial port (%s): the kernel has not got the controller (usb=2)\n", strerror(errno));
-		return 0;
-	}
-	printf("usbsh: the USB serial port is ours to share with the kernel's log\n");
-	chdir("/");
 	for (;;) {
 		char buf[256];
 		ssize_t n = read(port, buf, sizeof(buf));
@@ -383,6 +397,9 @@ main(void)
 			}
 			printf("usbsh: the port: %s\n", strerror(errno));
 			return 1;
+		}
+		if (n == 0 && network) {
+			return 0;
 		}
 		for (ssize_t i = 0; i < n; i++) {
 			char c = buf[i];
@@ -405,6 +422,9 @@ main(void)
 				line[len] = 0;
 				execute(line);
 				len = 0;
+				if (hang_up) {
+					return 0;
+				}
 				if (talking) {
 					prompt();
 				}
@@ -423,4 +443,105 @@ main(void)
 			}
 		}
 	}
+}
+
+/* A line from a connection, within so many seconds: 0 if it did not come. */
+static int
+read_line(int fd, char *buf, size_t size, int seconds)
+{
+	size_t len = 0;
+	time_t until = time(NULL) + seconds;
+
+	while (len < size - 1) {
+		fd_set r;
+		struct timeval tv = { .tv_sec = 1 };
+		char c;
+
+		if (time(NULL) > until) {
+			return 0;
+		}
+		FD_ZERO(&r);
+		FD_SET(fd, &r);
+		if (select(fd + 1, &r, NULL, NULL, &tv) <= 0) {
+			continue;
+		}
+		if (read(fd, &c, 1) != 1) {
+			return 0;
+		}
+		if (c == '\n') {
+			break;
+		}
+		if (c != '\r') {
+			buf[len++] = c;
+		}
+	}
+	buf[len] = 0;
+	return 1;
+}
+
+/* -l PORT: the same over TCP, for whoever starts with the token. */
+static int
+listen_on(int tcp_port)
+{
+	char token[128] = "", got[128];
+	int f = open("/redwood/fw/netsh-token", O_RDONLY), s, one = 1;
+	ssize_t n = f >= 0 ? read(f, token, sizeof(token) - 1) : -1;
+	struct sockaddr_in a = { .sin_len = sizeof(a), .sin_family = AF_INET, .sin_port = htons((uint16_t)tcp_port) };
+
+	if (f >= 0) {
+		close(f);
+	}
+	while (n > 0 && (token[n - 1] == '\n' || token[n - 1] == '\r')) {
+		n--;
+	}
+	if (n < 16) {
+		printf("usbsh: no token (/redwood/fw/netsh-token): not listening\n");
+		return 1;
+	}
+	token[n] = 0;
+	s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0 || setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+	    bind(s, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(s, 2) != 0) {
+		printf("usbsh: TCP port %d: %s\n", tcp_port, strerror(errno));
+		return 1;
+	}
+	printf("usbsh: listening on TCP port %d\n", tcp_port);
+	network = 1;
+	for (;;) {
+		int c = accept(s, NULL, NULL);
+
+		if (c < 0) {
+			if (errno != EINTR) {
+				sleep(1);
+			}
+			continue;
+		}
+		if (read_line(c, got, sizeof(got), 10) && strcmp(got, token) == 0) {
+			port = c;
+			talking = 1;
+			hang_up = 0;
+			out("usbsh over the network: 'help' for commands, 'exit' to hang up\n");
+			prompt();
+			serve();
+			port = -1;
+		}
+		close(c);
+	}
+}
+
+int
+main(int argc, char **argv)
+{
+	signal(SIGPIPE, SIG_IGN);
+	chdir("/");
+	if (argc > 2 && !strcmp(argv[1], "-l")) {
+		return listen_on(atoi(argv[2]));
+	}
+	port = open("/dev/hakios-usb", O_RDWR);
+	if (port < 0) {
+		printf("usbsh: no USB serial port (%s): the kernel has not got the controller (usb=2)\n", strerror(errno));
+		return 0;
+	}
+	printf("usbsh: the USB serial port is ours to share with the kernel's log\n");
+	return serve();
 }
