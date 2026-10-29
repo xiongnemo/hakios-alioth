@@ -42,7 +42,9 @@ struct dwc3 {
     int failed;
     uint32_t events, commands, last_event;
     uint64_t dropped;
-    uint8_t device_descriptor[18], manufacturer[64], product[64], serial[64];
+    uint8_t device_descriptor[18], manufacturer[130], product[130], serial[130];
+    uint8_t mux;                /* hakios: the iPhone's usbmux interface, packets (see dwc3_identity) */
+    uint8_t qualifier[10];
 };
 
 _Static_assert(sizeof(struct dwc3) <= DWC3_CONTEXT_BYTES,
@@ -68,13 +70,30 @@ static const uint8_t config_hs[] = {CONFIG_BYTES(0, 2, 2)};
 static const uint8_t config_fs[] = {CONFIG_BYTES(64, 0, 2)};
 static const uint8_t other_hs[] = {CONFIG_BYTES(0, 2, 7)};
 static const uint8_t other_fs[] = {CONFIG_BYTES(64, 0, 7)};
+/* hakios: what an iPhone shows to a computer's usbmux (usbmuxd, Apple Mobile Device Service): its interface 1,
+ * vendor class 0xff, subclass 0xfe, protocol 2, two bulk endpoints; Windows' Apple driver takes ...&MI_01.
+ * Interface 0 (an iPhone's PTP camera) is there empty, to keep the mux at number 1. Four configurations
+ * alike, as an iPhone has four and the computer's side may choose any. */
+#define MUX_CONFIG_BYTES(mpslo, mpshi, dtype, value) \
+    9, dtype, 41, 0, 2, value, 0, 0xc0, 250, \
+    9, 4, 0, 0, 0, 0xff, 0, 0, 0, \
+    9, 4, 1, 0, 2, 0xff, 0xfe, 2, 0, \
+    7, 5, 0x02, 2, mpslo, mpshi, 0, \
+    7, 5, 0x82, 2, mpslo, mpshi, 0
+static const uint8_t mux_config[2][2][4][41] = {
+    { { {MUX_CONFIG_BYTES(0, 2, 2, 1)}, {MUX_CONFIG_BYTES(0, 2, 2, 2)}, {MUX_CONFIG_BYTES(0, 2, 2, 3)}, {MUX_CONFIG_BYTES(0, 2, 2, 4)} },
+      { {MUX_CONFIG_BYTES(64, 0, 2, 1)}, {MUX_CONFIG_BYTES(64, 0, 2, 2)}, {MUX_CONFIG_BYTES(64, 0, 2, 3)}, {MUX_CONFIG_BYTES(64, 0, 2, 4)} } },
+    { { {MUX_CONFIG_BYTES(0, 2, 7, 1)}, {MUX_CONFIG_BYTES(0, 2, 7, 2)}, {MUX_CONFIG_BYTES(0, 2, 7, 3)}, {MUX_CONFIG_BYTES(0, 2, 7, 4)} },
+      { {MUX_CONFIG_BYTES(64, 0, 7, 1)}, {MUX_CONFIG_BYTES(64, 0, 7, 2)}, {MUX_CONFIG_BYTES(64, 0, 7, 3)}, {MUX_CONFIG_BYTES(64, 0, 7, 4)} } },
+};
+#define MUX_CONFIGS 4u
 static const uint8_t language[] = {4, 3, 9, 4};
 /* Per-instance fixed storage; identity does not retain caller pointers. */
 static size_t identity_chars(const char *text)
 {
     size_t n;
     if (!text) return 0;
-    for (n = 0; n < 32u; ++n) {
+    for (n = 0; n < 64u; ++n) {
         unsigned char c = (unsigned char)text[n];
         if (!c) return n;
         if (c < 32u || c > 126u) return 0;
@@ -247,11 +266,14 @@ const void *dwc3_descriptor(const struct dwc3 *d, unsigned type, unsigned index,
     const uint8_t *p = 0;
     size_t n = 0;
     if (!d || !d->initialized) { if (length) *length = 0; return 0; }
-    if (index == 0) {
+    if (d->mux && (type == 2 || type == 7) && index < MUX_CONFIGS) {
+        /* (other-speed: the descriptor of the speed we are not at) */
+        p = mux_config[type == 7][type == 7 ? !fs : !!fs][index]; n = sizeof(mux_config[0][0][0]);
+    } else if (index == 0) {
         switch (type) {
         case 1: p = d->device_descriptor; n = sizeof(d->device_descriptor); break;
         case 2: p = fs ? config_fs : config_hs; n = sizeof(config_hs); break;
-        case 6: p = qualifier; n = sizeof(qualifier); break;
+        case 6: p = d->qualifier; n = sizeof(d->qualifier); break;
         case 7: p = fs ? other_hs : other_fs; n = sizeof(other_hs); break;
         }
     }
@@ -269,10 +291,16 @@ const void *dwc3_descriptor(const struct dwc3 *d, unsigned type, unsigned index,
 
 static int set_configuration(struct dwc3 *d, unsigned value)
 {
-    if (value > 1) return -1;
+    if (value > (d->mux ? MUX_CONFIGS : 1u)) return -1;
     if (d->configured && end_noncontrol(d)) return -4;
     d->configured = (uint8_t)value;
     d->dtr = 0;
+    if (d->mux) {
+        /* (a new configuration is a new session: what was queued for the last one is not sent) */
+        d->tx_head = d->tx_tail = d->tx_used = 0;
+        wr(d, DWC3_DALEPENA, 3u | (value ? ((1u << EP_OUT) | (1u << EP_IN)) : 0u));
+        return 0;
+    }
     wr(d, DWC3_DALEPENA, 3u | (value ? ((1u << EP_NOTIFY) | (1u << EP_OUT) |
                                        (1u << EP_IN)) : 0u));
     return 0;
@@ -301,7 +329,7 @@ static int setup_request(struct dwc3 *d)
         wr(d, DWC3_DCFG, (rd(d, DWC3_DCFG) & ~DWC3_DCFG_DEVADDR_MASK) |
                          DWC3_DCFG_DEVADDR(value));
         ok = 1;
-    } else if (s[0] == 0 && s[1] == 9 && index == 0 && length == 0 && value <= 1) {
+    } else if (s[0] == 0 && s[1] == 9 && index == 0 && length == 0 && value <= (d->mux ? MUX_CONFIGS : 1u)) {
         int ret = set_configuration(d, value);
         if (ret) return ret;
         ok = 1;
@@ -379,10 +407,36 @@ static int control_complete(struct dwc3 *d, unsigned ep, uint32_t residual)
     default: return stall(d);
     }
 }
+/* hakios: a byte of the TX ring, i bytes past its tail */
+static uint8_t tx_at(const struct dwc3 *d, uint32_t i) { return d->tx[(d->tx_tail + i) % TX_BYTES]; }
+/* hakios, mux mode: the OUT endpoint armed only with room for a whole transfer in the RX ring (nothing the
+ * host sends is dropped: it waits, NAKed, until the reader has taken some); one queued packet per IN
+ * transfer, its length the 2 bytes before it in the ring; a zero-length transfer after a packet that is
+ * a multiple of the packet size, which is how the host knows where it ends. */
+static int pump_mux(struct dwc3 *d)
+{
+    uint32_t n, i;
+    if (!d->active[EP_OUT] && DWC3_RX_BYTES - d->rx_used >= EP_BUFFER_BYTES &&
+        transfer(d, EP_OUT, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
+    if (d->active[EP_IN]) return 0;
+    if (d->zlp_pending) {
+        d->zlp_pending = 0;
+        d->in_length = 0;
+        return transfer(d, EP_IN, DWC3_TRBCTL_NORMAL, 0);
+    }
+    if (d->tx_used < 2) return 0;
+    n = (uint32_t)tx_at(d, 0) | ((uint32_t)tx_at(d, 1) << 8);
+    if (n == 0 || n > DWC3_PACKET_MAX || n + 2 > d->tx_used) return -8;
+    for (i = 0; i < n; i++) buffer(d, EP_IN)[i] = tx_at(d, 2 + i);
+    if (transfer(d, EP_IN, DWC3_TRBCTL_NORMAL, n)) return -4;
+    d->in_length = n;
+    return 0;
+}
 static int pump(struct dwc3 *d)
 {
     uint32_t n, i;
     if (!d->configured) return 0;
+    if (d->mux) return pump_mux(d);
     /* Keep one bulk-OUT transfer armed. Completed bytes are copied into the
      * finite RX ring by handle_event before this function rearms it. */
     if (!d->active[EP_OUT] && transfer(d, EP_OUT, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
@@ -401,6 +455,7 @@ static int device_event(struct dwc3 *d, unsigned event)
     if (event == DWC3_DEVT_USBRST || event == DWC3_DEVT_DISCONN) {
         d->configured = d->dtr = d->zlp_pending = 0;
         rx_reset(d);
+        if (d->mux) d->tx_head = d->tx_tail = d->tx_used = 0;  /* hakios: packets of a session that is over */
         if (end_noncontrol(d)) return -4;
         /* EP0 SETUP/STATUS have special hardware rules; only an active DATA
          * transfer needs ENDTRANSFER before resetting the control state. */
@@ -467,7 +522,16 @@ static int handle_event(struct dwc3 *d, uint32_t event)
             sync(d, buffer(d, EP_OUT), EP_BUFFER_BYTES, DWC3_FROM_DEVICE);
             rx_push(d, buffer(d, EP_OUT), EP_BUFFER_BYTES - residual);
         }
-        if (ep == EP_IN) {
+        if (ep == EP_IN && d->mux) {
+            /* a packet is sent whole or the transfer fails; a zero-length one carried nothing of the ring */
+            if (residual) return -8;
+            if (d->in_length) {
+                d->tx_tail = (d->tx_tail + 2u + d->in_length) % TX_BYTES;
+                d->tx_used -= 2u + d->in_length;
+                d->zlp_pending = (d->in_length % d->packet_size) == 0;
+            }
+            d->in_length = 0;
+        } else if (ep == EP_IN) {
             if (residual > d->in_length) return -8;
             d->tx_tail = (d->tx_tail + d->in_length - residual) % TX_BYTES;
             d->tx_used -= d->in_length - residual;
@@ -503,10 +567,21 @@ int dwc3_init(void *context, size_t context_bytes,
         !(serial_chars = identity_chars(identity->serial))) return -1;
     zero(d, sizeof(*d)); copy(&d->io, platform, sizeof(*platform));
     copy(d->device_descriptor, device_descriptor, sizeof(device_descriptor));
+    copy(d->qualifier, qualifier, sizeof(qualifier));
     d->device_descriptor[8] = (uint8_t)identity->vid;
     d->device_descriptor[9] = (uint8_t)(identity->vid >> 8);
     d->device_descriptor[10] = (uint8_t)identity->pid;
     d->device_descriptor[11] = (uint8_t)(identity->pid >> 8);
+    if (identity->mux) {
+        /* hakios: class per interface (not the CDC device class), the device's release, four configurations */
+        d->mux = 1;
+        d->device_descriptor[4] = 0;
+        d->device_descriptor[12] = (uint8_t)identity->bcd_device;
+        d->device_descriptor[13] = (uint8_t)(identity->bcd_device >> 8);
+        d->device_descriptor[17] = (uint8_t)MUX_CONFIGS;
+        d->qualifier[4] = 0;
+        d->qualifier[8] = (uint8_t)MUX_CONFIGS;
+    }
     string_descriptor(d->manufacturer, identity->manufacturer, manufacturer_chars);
     string_descriptor(d->product, identity->product, product_chars);
     string_descriptor(d->serial, identity->serial, serial_chars);
@@ -660,7 +735,22 @@ size_t dwc3_read(struct dwc3 *d, void *bytes, size_t count)
     d->rx_used -= (uint32_t)n;
     return n;
 }
-int dwc3_ready(const struct dwc3 *d) { return d && d->running && !d->failed && d->configured && d->dtr; }
+int dwc3_ready(const struct dwc3 *d) { return d && d->running && !d->failed && d->configured && (d->dtr || d->mux); }
+int dwc3_packet_room(const struct dwc3 *d, size_t count)
+{
+    return d && d->mux && count >= 1 && count <= DWC3_PACKET_MAX && TX_BYTES - d->tx_used >= count + 2u;
+}
+int dwc3_send_packet(struct dwc3 *d, const void *bytes, size_t count)
+{
+    const uint8_t *p = bytes;
+    size_t i;
+    if (!d || !d->initialized || !bytes || !dwc3_packet_room(d, count)) return -1;
+    d->tx[d->tx_head] = (uint8_t)count; d->tx_head = (d->tx_head + 1) % TX_BYTES;
+    d->tx[d->tx_head] = (uint8_t)(count >> 8); d->tx_head = (d->tx_head + 1) % TX_BYTES;
+    for (i = 0; i < count; i++) { d->tx[d->tx_head] = p[i]; d->tx_head = (d->tx_head + 1) % TX_BYTES; }
+    d->tx_used += (uint32_t)count + 2u;
+    return 0;
+}
 size_t dwc3_queued(const struct dwc3 *d) { return d ? d->tx_used : 0; }
 uint64_t dwc3_dropped(const struct dwc3 *d) { return d ? d->dropped : 0; }
 size_t dwc3_rx_pending(const struct dwc3 *d) { return d ? d->rx_used : 0; }

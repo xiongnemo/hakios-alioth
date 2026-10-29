@@ -9,15 +9,22 @@
 #define DWC3_DMA_BYTES 32768u
 #define DWC3_DMA_ALIGNMENT 4096u
 #define DWC3_CONTEXT_ALIGNMENT 8u
-#define DWC3_CONTEXT_BYTES 20480u
+#define DWC3_CONTEXT_BYTES 40960u
 #define DWC3_TX_BYTES 16384u
-#define DWC3_RX_BYTES 512u
+#define DWC3_RX_BYTES 16384u
+/* hakios: in mux mode one packet (what one dwc3_send_packet() gives) is one USB transfer, at most this long */
+#define DWC3_PACKET_MAX 4096u
 
 /* Copied at init; no SoC configuration, OS headers or platform IDs here.
- * Each string must contain 1..31 printable ASCII characters. */
+ * Each string must contain 1..63 printable ASCII characters (hakios: 63, for a 40-character UDID).
+ * hakios: mux != 0 -- not the serial port but what an iPhone shows: one vendor interface (class 0xff,
+ * subclass 0xfe, protocol 2: Apple's usbmux) as interface 1 beside an empty interface 0, bulk OUT 0x02
+ * and IN 0x82, configurations 1 to 4 alike, and packets (dwc3_send_packet()) instead of a byte stream. */
 struct dwc3_identity {
     uint16_t vid, pid;
     const char *manufacturer, *product, *serial;
+    int mux;
+    uint16_t bcd_device;
 };
 
 enum dwc3_sync_direction {
@@ -64,6 +71,10 @@ int dwc3_start(struct dwc3 *dev);
 int dwc3_poll(struct dwc3 *dev, unsigned int budget);
 /* Nonblocking ring; accepts early messages before the host opens the port. */
 size_t dwc3_queue(struct dwc3 *dev, const void *bytes, size_t count);
+/* hakios, mux mode: one packet (1..DWC3_PACKET_MAX bytes) queued whole, or not at all: returns 0 or -1 (no room). */
+int dwc3_send_packet(struct dwc3 *dev, const void *bytes, size_t count);
+/* hakios, mux mode: room for one more packet of that size */
+int dwc3_packet_room(const struct dwc3 *dev, size_t count);
 /* Nonblocking bulk-OUT receive ring. The caller must serialize this with poll
  * on the same CPU. A device reset/disconnect clears pending RX bytes and
  * advances rx_generation so a protocol parser can invalidate its state. */

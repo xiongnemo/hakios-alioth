@@ -18,6 +18,13 @@
  *           otherwise it is the loader's link and is left alone. At the run's end the controller
  *           is stopped (hakios_usb_quiesce()) and the loader restarts its own link
  *           (devices/redmi-k40/loader: alioth_usb_take_back()).
+ *   usb=3   the same controller, but what an iPhone is to a computer: 05ac:12a8 "iPhone" by "Apple Inc.",
+ *           its serial the UDID, and Apple's usbmux interface (class 0xff/0xfe/2: hakios.dwc3.c), which
+ *           the computer's usbmuxd -- Apple Mobile Device Service on Windows, usbmuxd elsewhere -- talks to.
+ *           Nothing shows until a program (userland usbmux, which speaks the device's side of usbmux and
+ *           hands its connections to lockdownd and the rest on 127.0.0.1) opens /dev/hakios-usb and gives
+ *           the UDID (ioctl HAKIOS_USB_IPHONE); from then on the port carries its packets only: read()
+ *           gives what the computer sent as it came, each write() is one packet, one USB transfer.
  *
  * Addresses: Linux sm8250.dtsi (usb_1, usb_1_dwc3, apps_smmu), gcc-sm8250.c (USB30_PRIM
  * branches and GDSC), dwc3-qcom.c (QSCRATCH), drivers/usb/dwc3/core.h (the DWC3's own
@@ -231,7 +238,7 @@ look_smmu(void)
 #define USB_VID                 0x1209u         /* pid.codes' test VID with the PID m1n1 and QcomXnuUsbDebug use */
 #define USB_PID                 0x316du
 #define POLL_US                 1000            /* the controller is polled (its interrupt stays masked) */
-#define RX_RING                 4096            /* what the computer sent, kept for /dev/hakios-usb */
+#define RX_RING                 65536           /* what the computer sent, kept for /dev/hakios-usb */
 #define LOG_BACKLOG             (16 * 1024)     /* how much of the log a newly opened port gets first */
 
 static uint8_t usb_dma[DWC3_DMA_BYTES] __attribute__((aligned(16384)));
@@ -256,6 +263,14 @@ static char usb_name[32] = "HakiOS K40";        /* boot-arg usb_name=Your_Name: 
 
 /* ioctl on /dev/hakios-usb: the log to the port again (until the computer next sends something) */
 #define HAKIOS_USB_LOG          _IO('u', 1)
+/* usb=3: show the computer an iPhone with this serial (the UDID) and its usbmux interface */
+struct hakios_usb_iphone {
+	char serial[48];
+};
+#define HAKIOS_USB_IPHONE       _IOW('u', 2, struct hakios_usb_iphone)
+static volatile bool usb_taken;         /* /dev/hakios-usb is there, the thread runs */
+static volatile bool mux_asked;         /* usb=3: a program gave the serial: the device side may start */
+static char mux_serial[48];
 
 static uint32_t
 io_read(__unused void *cookie, uint32_t offset)
@@ -385,6 +400,13 @@ bring_up(void)
 	struct dwc3_identity identity = {
 		.vid = USB_VID, .pid = USB_PID, .manufacturer = "HakiOS", .product = usb_name, .serial = "hakios-alioth",
 	};
+	if (level == 3) {
+		/* an iPhone X (iPhone10,3: PID 0x12a8, as Apple's Windows driver lists it) */
+		identity = (struct dwc3_identity){
+			.vid = 0x05ac, .pid = 0x12a8, .manufacturer = "Apple Inc.", .product = "iPhone", .serial = mux_serial,
+			.mux = 1, .bcd_device = 0x1006,
+		};
+	}
 	int r = dwc3_init(usb_context, sizeof(usb_context), &io, &identity, usb_dma, usb_dma_pa, sizeof(usb_dma));
 
 	if (r == 0) {
@@ -412,6 +434,16 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	int r;
 
+	if (level == 3) {
+		say("usb: usb=3: an iPhone to the computer once a program gives its UDID on /dev/hakios-usb\n");
+		while (!mux_asked && !usb_stopping) {
+			(void)tsleep((void *)&mux_asked, PZERO, "hakios-usb-mux", 100);       /* (ticks: a second or so) */
+		}
+		if (usb_stopping) {
+			thread_terminate(current_thread());
+			return;
+		}
+	}
 	lck_mtx_lock(&usb_lock);
 	r = bring_up();
 	lck_mtx_unlock(&usb_lock);
@@ -420,12 +452,18 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
-	say("usb: THE CONTROLLER IS THE KERNEL'S: a serial port (%04x:%04x \"%s\") from here on; its DMA at %#llx\n",
-	    USB_VID, USB_PID, usb_name, usb_dma_pa);
+	if (level == 3) {
+		say("usb: THE CONTROLLER IS THE KERNEL'S: an iPhone (05ac:12a8, serial %s) with Apple's usbmux interface; DMA at %#llx\n",
+		    mux_serial, usb_dma_pa);
+		log_mode = false;
+	} else {
+		say("usb: THE CONTROLLER IS THE KERNEL'S: a serial port (%04x:%04x \"%s\") from here on; its DMA at %#llx\n",
+		    USB_VID, USB_PID, usb_name, usb_dma_pa);
+	}
 	log_at = loader_log_tee_total > LOG_BACKLOG ? loader_log_tee_total - LOG_BACKLOG : 0;
 	while (!usb_stopping) {
 		bool readable = false, writable;
-		uint8_t buf[256];
+		uint8_t buf[2048];
 		size_t n;
 
 		lck_mtx_lock(&usb_lock);
@@ -453,7 +491,7 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 		}
 		if (!user_open) {
-			log_mode = true;
+			log_mode = level != 3;
 			while (dwc3_read(usb_dev, buf, sizeof(buf)) > 0) {
 				/* what the computer sends with no program to take it is dropped */
 			}
@@ -473,7 +511,7 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 			/* (what is not sent while the program has the port is not sent later either) */
 			log_at = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
 		}
-		writable = dwc3_queued(usb_dev) < DWC3_TX_BYTES / 2;
+		writable = level == 3 ? dwc3_packet_room(usb_dev, DWC3_PACKET_MAX) : dwc3_queued(usb_dev) < DWC3_TX_BYTES / 2;
 		lck_mtx_unlock(&usb_lock);
 		if (readable) {
 			wakeup(rx_ring);
@@ -491,7 +529,8 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 static int
 usbdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
 {
-	if (!usb_owned) {
+	/* (usb=3: before the device side is up too -- the program that opens it is what starts it) */
+	if (!usb_owned && !(level == 3 && usb_taken && !usb_stopping)) {
 		return ENXIO;
 	}
 	if (!OSCompareAndSwap(0, 1, &user_open)) {
@@ -508,8 +547,8 @@ static int
 usbdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
 {
 	user_open = 0;
-	log_mode = true;
-	say("usb: the program let the port go: the log again\n");
+	log_mode = level != 3;
+	say("usb: the program let the port go%s\n", level == 3 ? "" : ": the log again");
 	return 0;
 }
 
@@ -520,7 +559,7 @@ usbdev_read(__unused dev_t dev, struct uio *uio, int ioflag)
 
 	lck_mtx_lock(&usb_lock);
 	while (rx_head == rx_tail) {
-		if (!usb_owned || usb_stopping) {
+		if (usb_stopping || (!usb_owned && level != 3)) {
 			lck_mtx_unlock(&usb_lock);
 			return EIO;
 		}
@@ -549,11 +588,53 @@ usbdev_read(__unused dev_t dev, struct uio *uio, int ioflag)
 	return error;
 }
 
+/* usb=3: the write is one packet, sent as one transfer (the computer's usbmux takes a transfer as a packet) */
+static int
+usbdev_write_packet(struct uio *uio, int ioflag)
+{
+	static uint8_t packet[DWC3_PACKET_MAX];         /* (under usb_write_lock) */
+	static LCK_MTX_DECLARE(usb_write_lock, &usb_lck_grp);
+	user_ssize_t n = uio_resid(uio);
+	int error;
+
+	if (n <= 0 || n > (user_ssize_t)DWC3_PACKET_MAX) {
+		return EMSGSIZE;
+	}
+	lck_mtx_lock(&usb_write_lock);
+	error = uiomove((caddr_t)packet, (int)n, uio);
+	while (error == 0) {
+		bool sent;
+
+		lck_mtx_lock(&usb_lock);
+		if (!usb_owned || usb_stopping) {
+			lck_mtx_unlock(&usb_lock);
+			error = EIO;
+			break;
+		}
+		sent = dwc3_send_packet(usb_dev, packet, (size_t)n) == 0;
+		lck_mtx_unlock(&usb_lock);
+		if (sent) {
+			break;
+		}
+		if (ioflag & IO_NDELAY) {
+			error = EWOULDBLOCK;
+			break;
+		}
+		error = tsleep(&usb_wchan, PZERO | PCATCH, "hakios-usb-w", 1);
+		error = error == EWOULDBLOCK ? 0 : error;
+	}
+	lck_mtx_unlock(&usb_write_lock);
+	return error;
+}
+
 static int
 usbdev_write(__unused dev_t dev, struct uio *uio, int ioflag)
 {
 	int error = 0;
 
+	if (level == 3) {
+		return usbdev_write_packet(uio, ioflag);
+	}
 	while (uio_resid(uio) > 0 && error == 0) {
 		uint8_t buf[512];
 		size_t n = (size_t)MIN((user_ssize_t)sizeof(buf), uio_resid(uio)), done = 0;
@@ -586,7 +667,7 @@ usbdev_select(__unused dev_t dev, int which, void *wql, struct proc *p)
 	int ready = 0;
 
 	lck_mtx_lock(&usb_lock);
-	if (!usb_owned || usb_stopping) {
+	if (usb_stopping || (!usb_owned && level != 3)) {
 		ready = 1;
 	} else if (which == FREAD) {
 		ready = rx_head != rx_tail;
@@ -594,7 +675,8 @@ usbdev_select(__unused dev_t dev, int which, void *wql, struct proc *p)
 			selrecord(p, &usb_rsel, wql);
 		}
 	} else if (which == FWRITE) {
-		ready = dwc3_queued(usb_dev) < DWC3_TX_BYTES - 512;
+		ready = !usb_owned ? 0 : level == 3 ? dwc3_packet_room(usb_dev, DWC3_PACKET_MAX) :
+		    dwc3_queued(usb_dev) < DWC3_TX_BYTES - 512;
 		if (!ready) {
 			selrecord(p, &usb_wsel, wql);
 		}
@@ -621,6 +703,26 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 		*(int *)data = (int)(rx_head - rx_tail);
 		lck_mtx_unlock(&usb_lock);
 		return 0;
+	case HAKIOS_USB_IPHONE: {
+		const struct hakios_usb_iphone *ask = (const struct hakios_usb_iphone *)(void *)data;
+		size_t len = strnlen(ask->serial, sizeof(ask->serial));
+
+		if (level != 3) {
+			return ENOTSUP;
+		}
+		if (len == 0 || len >= sizeof(ask->serial) || mux_asked) {
+			return mux_asked ? EALREADY : EINVAL;
+		}
+		for (size_t i = 0; i < len; i++) {
+			if (ask->serial[i] < 0x21 || ask->serial[i] > 0x7e) {
+				return EINVAL;
+			}
+		}
+		strlcpy(mux_serial, ask->serial, sizeof(mux_serial));
+		mux_asked = true;
+		wakeup((void *)&mux_asked);
+		return 0;
+	}
 	default:
 		return ENOTTY;
 	}
@@ -704,6 +806,7 @@ take_controller(void)
 		return;
 	}
 	thread_deallocate(thread);
+	usb_taken = true;
 }
 
 void hakios_usb_init(void);

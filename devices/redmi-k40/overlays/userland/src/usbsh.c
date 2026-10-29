@@ -537,6 +537,16 @@ main(int argc, char **argv)
 	if (argc > 2 && !strcmp(argv[1], "-l")) {
 		return listen_on(atoi(argv[2]));
 	}
+	{
+		/* usb=3: the port is an iPhone's usbmux, userland usbmux's: not ours to open */
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && (strncmp(args, "usb=3", 5) == 0 || strstr(args, " usb=3"))) {
+			printf("usbsh: usb=3: the USB port is an iPhone's (userland usbmux has it)\n");
+			return 0;
+		}
+	}
 	port = open("/dev/hakios-usb", O_RDWR);
 	if (port < 0) {
 		printf("usbsh: no USB serial port (%s): the kernel has not got the controller (usb=2)\n", strerror(errno));

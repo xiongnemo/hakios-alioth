@@ -126,6 +126,8 @@ IOS_JOBS=${JOBS-"
 # AudioSession and CoreHaptics need mediaserverd; its AVAudioSession setup waits for NanoRegistry's
 # paired-device Mach service. Keep both jobs in every image so the server and its clients can start.
 IOS_JOBS="$IOS_JOBS com.apple.mediaserverd com.apple.nanoregistryd"
+# lockdownd: what a computer talks to through usbmux (usb=3, src/usbmux.c), on 127.0.0.1:62078
+IOS_JOBS="$IOS_JOBS com.apple.mobile.lockdown"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -226,6 +228,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -o obj/vol_ls src/vol_ls.c
 		# commands from the computer over the USB serial port of usb=2 (bsd/dev/hakios.usb.c)
 		$DYN -o obj/usbsh src/usbsh.c
+		# the phone's side of Apple's usbmux over usb=3's iPhone-shaped port (bsd/dev/hakios.usb.c)
+		$DYN -framework CoreFoundation -lMobileGestalt -o obj/usbmux src/usbmux.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
@@ -306,6 +310,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/apfs_mmap_test ] && cp obj/apfs_mmap_test root/bin/
 	[ -f obj/vol_ls ] && cp obj/vol_ls root/bin/
 	[ -f obj/usbsh ] && cp obj/usbsh root/bin/
+	[ -f obj/usbmux ] && cp obj/usbmux root/bin/
 	[ -f obj/snap_test ] && cp obj/snap_test root/bin/
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
@@ -425,6 +430,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
 	[ -f com.hakios.usbsh.plist ] && cp com.hakios.usbsh.plist root/LaunchDaemons/
+	[ -f com.hakios.usbmux.plist ] && cp com.hakios.usbmux.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS

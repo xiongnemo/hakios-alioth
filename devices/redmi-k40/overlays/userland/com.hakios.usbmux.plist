@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.usbmux</string>
+	<!-- with usb=3 among the kernel's arguments: the phone is an iPhone to the computer it is plugged into
+	     (src/usbmux.c: the phone's side of Apple's usbmux, its connections to lockdownd and the rest on
+	     127.0.0.1); without, it ends at once -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/usbmux</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>
