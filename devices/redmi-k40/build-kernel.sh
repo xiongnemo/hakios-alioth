@@ -9,4 +9,4 @@ python3 "$DEVICE_DIR/tools/embed-firmware.py" \
   --output "$XNU_SRC/bsd/dev/umi_bt_firmware.inc"
 mkdir -p "$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT"
 [ ! -f "$ROOT/xnu-deps/build/ath11k/src/ath11k/qmi.c" ] || "$ROOT/tools/mk-wlfw.sh"
-exec "$ROOT/xnu-build.sh" "${@:--j8}"
+exec bash "$ROOT/xnu-build.sh" "${@:--j8}"

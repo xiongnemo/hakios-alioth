@@ -251,6 +251,15 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework Security -o obj/wifipw_test src/wifipw_test.c &&
 			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
+		# applications from IPAs, past installd (src/ipainstall.m; the job com.hakios.apps): lsd registers them only
+		# for a caller with its entitlements, and its Info.plist lets it fetch IPAs from the computer over http
+		$DYN -fobjc-arc -framework Foundation -framework MobileCoreServices -lz \
+			-sectcreate __TEXT __info_plist src/ipainstall-Info.plist -o obj/ipainstall src/ipainstall.m &&
+			{ ${LDID:-ldid} -Ssrc/ipainstall.entitlements obj/ipainstall 2>/dev/null ||
+			  echo "build.sh: no ldid: ipainstall is unsigned, and lsd will not register applications for it"; }
+		# and its face on the phone, the application IPA 安装 (src/installer: it asks, the service does)
+		$DYN -fobjc-arc -framework UIKit -framework Foundation -framework UniformTypeIdentifiers \
+			-o obj/IPAInstaller src/installer/main.m
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libhakios.dylib src/inject.c
@@ -289,7 +298,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			M=../xnu-deps/build/mesa/out
 			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/hakios-drm/* | sha256sum)" ] ||
 				../tools/mk-mesa.sh
-			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
+			python3 mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.gl.dylib -Iobj -framework CoreFoundation \
 				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libhakios.gl.dylib \
 				src/eagl.c src/gl_osmesa.c src/ca_probe.c
@@ -330,6 +339,20 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/camera_test ] && cp obj/camera_test root/bin/
 	[ -f obj/camera_avtest ] && cp obj/camera_avtest root/bin/
 	[ -f obj/record_test ] && cp obj/record_test root/bin/
+	[ -f obj/ipainstall ] && cp obj/ipainstall root/bin/
+	# (the applications that come with this image, unpacked from ../apps/*.ipa: the job com.hakios.apps
+	# registers them at boot; those of the release's apps\ folder come from the computer instead)
+	mkdir -p root/apps
+	ls ../apps/*.ipa >/dev/null 2>&1 && python3 -I unpack-ipa.py root/apps ../apps/*.ipa
+	if [ -f obj/IPAInstaller ]; then
+		A=root/apps/IPAInstaller.app
+		mkdir -p $A
+		cp obj/IPAInstaller $A/
+		cp src/installer/Info.plist $A/
+		cp -r src/installer/en.lproj src/installer/zh-Hans.lproj $A/
+		printf 'APPL????' > $A/PkgInfo
+		python3 -I mkicon.py $A
+	fi
 	for f in $EXTRA; do cp "$f" root/bin/; done
 	# /dev and /private/var exist so that this image can also be the root on its own:
 	# devfs is mounted on /dev, and init puts a ramfs on /private/var
@@ -438,9 +461,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
 	[ -f com.hakios.usbsh.plist ] && cp com.hakios.usbsh.plist root/LaunchDaemons/
 	[ -f com.hakios.usbmux.plist ] && cp com.hakios.usbmux.plist root/LaunchDaemons/
+	[ -f root/bin/ipainstall ] && cp com.hakios.apps.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
-	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
+	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} python3 mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
 # (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/hakios.adreno.c, finds it in fw/

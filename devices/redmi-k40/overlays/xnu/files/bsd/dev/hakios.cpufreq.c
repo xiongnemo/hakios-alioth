@@ -12,6 +12,7 @@
  * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c ("epss" variant).
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
@@ -140,19 +141,36 @@ hakios_cpufreq_khz(uint32_t domain, int row)
 	return epss_khz[domain][row];
 }
 
+/*
+ * Two may want a group slower: the thermal service (its cap, hakios_cpufreq_cap()) and the display being off
+ * (hakios_screen_power()). A group runs at the lower of the two rows; the lock keeps one of them from
+ * writing a row computed with what the other had before it changed.
+ */
+static int thermal_row[EPSS_DOMAINS] = { 0x7fffffff, 0x7fffffff, 0x7fffffff };
+static int screen_row[EPSS_DOMAINS] = { 0x7fffffff, 0x7fffffff, 0x7fffffff };
+static LCK_GRP_DECLARE(cpufreq_lock_grp, "hakios.cpufreq");
+static LCK_SPIN_DECLARE(cpufreq_lock, &cpufreq_lock_grp);
+
+static int
+apply_row_locked(uint32_t domain)
+{
+	int row = MIN(thermal_row[domain], screen_row[domain]);
+
+	row = MAX(0, MIN(row, epss_top[domain]));
+	*(volatile uint32_t *)(epss_base[domain] + EPSS_PERF_STATE) = (uint32_t)row;
+	return row;
+}
+
 void
 hakios_cpufreq_cap(uint32_t domain, int row)
 {
 	if (domain >= EPSS_DOMAINS || epss_top[domain] < 0) {
 		return;
 	}
-	if (row < 0) {
-		row = 0;
-	}
-	if (row > epss_top[domain]) {
-		row = epss_top[domain];
-	}
-	*(volatile uint32_t *)(epss_base[domain] + EPSS_PERF_STATE) = (uint32_t)row;
+	lck_spin_lock(&cpufreq_lock);
+	thermal_row[domain] = row;
+	apply_row_locked(domain);
+	lck_spin_unlock(&cpufreq_lock);
 }
 
 /*
@@ -479,6 +497,7 @@ ddr_slots(void)
 static vm_offset_t ddr_rsc;
 static uint32_t ddr_mc0, ddr_sh0, ddr_acv;
 static bool ddr_voted;
+static uint32_t ddr_on_vote;     /* the vote made at boot, for hakios_screen_power() to put back */
 
 static uint32_t
 cmd_db_address(const char *name)
@@ -575,6 +594,7 @@ ddr_raise(void)
 	}
 	ddr_rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
 	ddr_voted = ddr_vote(vote);
+	ddr_on_vote = vote;             /* (what hakios_screen_power() puts back when the display comes on) */
 	tell("ddr: memory bandwidth vote %u on MC0 (%#x) and SH0 (%#x)%s\n", vote, ddr_mc0, ddr_sh0, ddr_voted ? "" : ": FAILED");
 }
 
@@ -597,6 +617,63 @@ hakios_ddr_quiesce(void)
 	data[0] = data[1] = rest != 0 ? BCM_VOTE(rest, rest) : BCM_COMMIT;     /* 0: no request */
 	done = ddr_rpmh_write(address, data, 2);
 	tell("ddr: memory bandwidth vote %u for the loader: %s\n", rest, done ? "done" : "FAILED");
+}
+
+/*
+ * The display's power, as iOS asks for it (iokit/Kernel/MiniIOMobileFramebuffer.cpp, kFBMethodRequestPowerChange).
+ * With the screen off nothing wants the cores at their top nor the memory at its widest, and nothing else ever
+ * lowers either (cpufreq=1 raises them once and for all, see above; the thermal service steps in only at 95 C):
+ * the phone stayed hot in a pocket. So, off: each group at most at the fastest row of its table that is not
+ * above screen_off_mhz (default 1000), and the memory's vote down to ddr_off (default DDR_REST, what the loader
+ * is left with -- which keeps the panel's scan-out fed, the loader shows a picture with it); on: both as they
+ * were. The vote goes through umi_rpmh (umi_rpmh_bcm_vote): at boot ddr_raise() has the command slots to
+ * itself, by now the GPU's, the cameras' and the radios' votes share them under umi_rpmh's lock.
+ * Boot-arg screen_power=0: none of this.
+ */
+int umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y);
+
+void
+hakios_screen_power(bool on)
+{
+	static bool was_off;
+	uint32_t enabled = 1, mhz = 1000, off_vote = DDR_REST, vote;
+	int rows[EPSS_DOMAINS] = { -1, -1, -1 };
+	int error = 0;
+
+	PE_parse_boot_argn("screen_power", &enabled, sizeof(enabled));
+	if (!enabled || on == !was_off) {
+		return;
+	}
+	was_off = !on;
+	PE_parse_boot_argn("screen_off_mhz", &mhz, sizeof(mhz));
+	PE_parse_boot_argn("ddr_off", &off_vote, sizeof(off_vote));
+	lck_spin_lock(&cpufreq_lock);
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		if (epss_top[d] < 0) {
+			continue;
+		}
+		screen_row[d] = 0x7fffffff;
+		if (!on) {
+			screen_row[d] = 0;
+			for (int r = 0; r <= epss_top[d]; r++) {
+				if (epss_khz[d][r] <= mhz * 1000) {
+					screen_row[d] = r;
+				}
+			}
+		}
+		rows[d] = apply_row_locked(d);
+	}
+	lck_spin_unlock(&cpufreq_lock);
+	vote = on ? ddr_on_vote : MIN(off_vote, 0x3fff);
+	if (ddr_voted && vote != 0) {
+		error = umi_rpmh_bcm_vote("MC0", vote, vote);
+		if (error == 0) {
+			error = umi_rpmh_bcm_vote("SH0", vote, vote);
+		}
+	}
+	tell("power: the display %s: cores at rows %d %d %d (%u %u %u MHz), memory vote %u%s\n", on ? "on" : "off",
+	    rows[0], rows[1], rows[2], hakios_cpufreq_khz(0, rows[0]) / 1000, hakios_cpufreq_khz(1, rows[1]) / 1000,
+	    hakios_cpufreq_khz(2, rows[2]) / 1000, ddr_voted ? vote : 0, error ? ": the vote FAILED" : "");
 }
 
 void

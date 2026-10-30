@@ -65,9 +65,10 @@ SKIP_APP_EXT = ('.mov', '.mp4', '.m4a', '.caf', '.wav', '.heic', '.aiff', '.meta
 MAX_ASSET_CATALOG = 4 << 20
 # fonts: all but the very big ones; those two -- the colour emoji, 130 MB, and PingFang, the Chinese faces, 74 MB --
 # are taken and made smaller after extraction (fetch.sh, ../tools/font_trim.py): the emoji without their biggest
-# bitmaps (59 MB), PingFang with the regular and semibold faces for simplified, traditional and Hong Kong Chinese,
-# both those programs name and the hidden ones (".PingFangSC-Regular") the system font falls back to
-# (26 MB). Without them Safari and the rest drew emoji and Chinese characters as boxes with a question mark.
+# bitmaps (59 MB), PingFang with the light, regular, medium and semibold faces for simplified, traditional and Hong
+# Kong Chinese, both those programs name and the hidden ones (".PingFangSC-Regular") the system font falls back to
+# (52 MB). Without them Safari and the rest drew emoji and Chinese characters as boxes with a question mark; with
+# regular and semibold alone (26 MB) text of the other weights still did -- SpringBoard's icon labels among it.
 MAX_FONT = 25 << 20
 TRIMMED_FONTS = ('System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc',
                  'System/Library/Fonts/LanguageSupport/PingFang.ttc')
@@ -161,6 +162,13 @@ def wanted_file(path, size):
             return size <= MAX_STRING_TABLE
         if path.startswith(DATA_FRAMEWORKS) and path.lower().endswith(('.dat', '.bin')):
             return size <= SMALL
+        # the program of an app extension, right inside NAME.appex, as big as the helpers above may be: an
+        # extension whose program is not there is no extension at all. Five are over SMALL, 31 MB, all of the
+        # Files machinery -- among them the document picker's (DocumentManagerUICore's
+        # com.apple.DocumentManager.Service: "The requested app extension could not be found" in every
+        # application that opened one) and "On My iPhone" (LocalStorageFileProvider)
+        if re.search(r'/PlugIns/[^/]+\.appex/[^/]+$', path) and not path.lower().endswith(SKIP_EXT):
+            return size <= 32 << 20
         return size <= SMALL and not path.lower().endswith(SKIP_EXT) and '.mlmodelc/' not in path
     return path.startswith(WHOLE)
 

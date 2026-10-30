@@ -1,0 +1,3 @@
+/* the name under the icon, and the kind of file it opens, in Simplified Chinese */
+"CFBundleDisplayName" = "IPA 安装";
+"iOS App" = "iOS 应用";

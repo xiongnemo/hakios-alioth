@@ -1,0 +1,2 @@
+/* the name under the icon (English is the base language: the words in main.m are English already) */
+"CFBundleDisplayName" = "IPA Installer";

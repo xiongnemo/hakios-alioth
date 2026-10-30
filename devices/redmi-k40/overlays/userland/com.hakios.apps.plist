@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- applications from IPAs at every boot (src/ipainstall.m -d): those that came with this image
+	     (/redwood/apps), then those the computer serves while the phone starts (boot-arg apps_url=, start.ps1
+	     and the release's apps\ folder), then requests left in the spool. /private/var, where LaunchServices
+	     keeps its database and the applications their files, starts empty -->
+	<key>Label</key>
+	<string>com.hakios.apps</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/ipainstall</string>
+		<string>-d</string>
+		<string>/redwood/apps</string>
+		<string>/private/var/mobile/Library/HakiosInstall</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

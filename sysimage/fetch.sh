@@ -60,7 +60,7 @@ if [ ! -f .done-rootfs ] || [ select-system.py -nt .done-rootfs ]; then
 	python3 ../tools/font_trim.py emoji rootfs/System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc \
 		rootfs/System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc 40,64,96
 	python3 ../tools/font_trim.py faces rootfs/System/Library/Fonts/LanguageSupport/PingFang.ttc \
-		rootfs/System/Library/Fonts/LanguageSupport/PingFang.ttc '^\.?PingFang(SC|TC|HK)-(Regular|Semibold)$'
+		rootfs/System/Library/Fonts/LanguageSupport/PingFang.ttc '^\.?PingFang(SC|TC|HK)-(Light|Regular|Medium|Semibold)$'
 	touch .done-rootfs
 	[ -n "$KEEP" ] || rm -f rootfs.dmg
 fi

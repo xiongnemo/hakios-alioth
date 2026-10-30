@@ -40,6 +40,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+extern "C" void hakios_screen_power(bool on);           /* bsd/dev/hakios.cpufreq.c */
 /* the panel's scan (bsd/dev/hakios.display.c; sys/hakios.display.h, which iokit/ does not see) */
 struct hakios_display_scan {
 	int ok;
@@ -2625,6 +2626,8 @@ backlightDisplayPower(bool on)
 	if (gBacklight != NULL) {
 		gBacklight->displayPower(on);
 	}
+	/* (the cores and the memory slower while nobody looks: there is nothing else that lowers them) */
+	hakios_screen_power(on);
 }
 
 /*
