@@ -9,14 +9,19 @@
 //   ipainstall -a DIR          every DIR/*.ipa and DIR/*.app, as above
 //   ipainstall -u BUNDLE-ID    uninstall
 //   ipainstall -l              the applications that are not the image's own
-//   ipainstall -d APPS SPOOL   the service (job com.hakios.apps, root): APPS as -a at boot, then the IPAs the
-//                              boot-arg apps_url=http://HOST:PORT/ names (start.ps1 serves the release's apps\
-//                              folder there: HOST:PORT/index.txt, one file name a line), then the requests the
-//                              application "IPA 安装" (src/installer) leaves in SPOOL/queue, forever
+//   ipainstall -d APPS SPOOL   the service (job com.hakios.apps, root): APPS as -a at boot; with boot-arg
+//                              apps_token= the IPAs the computer pushes (start.ps1, the release's apps\ folder:
+//                              listen_for_computer() below); and the requests the application IPA Installer
+//                              (src/installer) leaves in SPOOL/queue, forever
 // /private/var is a RAM file system here: what is installed lasts until the phone restarts.
 #import <Foundation/Foundation.h>
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
 #include <sys/event.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -579,45 +584,6 @@ boot_arg(const char *name)
 	return nil;
 }
 
-// apps_url=http://HOST:PORT/: the computer serves the release's apps\ folder while the phone starts; its
-// index.txt names the IPAs. The network comes up a while after this job does, so keep asking for a few minutes.
-static void
-install_from_computer(void)
-{
-	NSString *base = boot_arg("apps_url");
-
-	if (base.length == 0) {
-		return;
-	}
-	if (![base hasSuffix:@"/"]) {
-		base = [base stringByAppendingString:@"/"];
-	}
-	NSString *index = nil;
-
-	for (int i = 0; i < 60 && index == nil; i++) {
-		index = [NSString stringWithContentsOfURL:[NSURL URLWithString:[base stringByAppendingString:@"index.txt"]]
-		    encoding:NSUTF8StringEncoding error:NULL];
-		if (index == nil) {
-			sleep(5);
-		}
-	}
-	if (index == nil) {
-		say("ipainstall: %sindex.txt: no answer in 5 minutes\n", base.UTF8String);
-		return;
-	}
-	for (NSString *line in [index componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
-		NSString *name = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-
-		if (name.length > 0) {
-			install_ipa([base stringByAppendingString:
-			    [name stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet]]);
-		}
-	}
-	// (the computer stops serving when it hears this)
-	[NSString stringWithContentsOfURL:[NSURL URLWithString:[base stringByAppendingString:@"done"]]
-	    encoding:NSUTF8StringEncoding error:NULL];
-}
-
 static void
 write_plist(id object, NSString *path)
 {
@@ -626,6 +592,159 @@ write_plist(id object, NSString *path)
 
 	[data writeToFile:path atomically:YES];
 	chmod(path.fileSystemRepresentation, 0644);
+}
+
+// one installation at a time, whoever asks (the application's spool, the computer); and where the list goes
+static pthread_mutex_t work_lock = PTHREAD_MUTEX_INITIALIZER;
+static NSString *installed_list;
+
+// ---------------------------------------------------------------- IPAs from the computer
+//
+// boot-arg apps_token=HEX (start.ps1 makes one for every boot and puts it on the kernel's command line): the
+// release's apps\ folder, pushed by the computer, which finds the phone on its network by this port. The
+// computer only connects out, so its firewall has nothing to let in (serving the folder from the computer
+// instead waited on a Windows Firewall question nobody was there to answer). One connection at a time:
+//   phone: "hakios-apps 1"
+//   computer: "TOKEN HEX"                       phone: "OK", or "NO" and it closes
+//   computer: "FILE SIZE NAME", SIZE bytes      phone: what ipainstall says, a line "| ..." each, then "DONE 1|0"
+//   computer: "END"
+#define APPS_PORT 48620
+static NSString *apps_token;
+
+static BOOL
+read_line(int fd, char *buf, size_t max)
+{
+	size_t n = 0;
+
+	while (n + 1 < max) {
+		char c;
+
+		if (read(fd, &c, 1) != 1) {
+			return NO;
+		}
+		if (c == '\n') {
+			break;
+		}
+		buf[n++] = c;
+	}
+	buf[n] = 0;
+	if (n > 0 && buf[n - 1] == '\r') {
+		buf[n - 1] = 0;
+	}
+	return YES;
+}
+
+static void
+send_text(int fd, const char *text)
+{
+	size_t len = strlen(text);
+
+	while (len > 0) {
+		ssize_t w = write(fd, text, len);
+
+		if (w <= 0) {
+			return;
+		}
+		text += w;
+		len -= (size_t)w;
+	}
+}
+
+static void
+push_session(int fd)
+{
+	static char buf[1 << 16];
+	char line[1024];
+
+	send_text(fd, "hakios-apps 1\n");
+	if (!read_line(fd, line, sizeof(line)) || strncmp(line, "TOKEN ", 6) != 0 || apps_token == nil ||
+	    ![@(line + 6) isEqualToString:apps_token]) {
+		send_text(fd, "NO\n");
+		printf("ipainstall: a connection on port %d without the token: refused\n", APPS_PORT);
+		return;
+	}
+	send_text(fd, "OK\n");
+	while (read_line(fd, line, sizeof(line)) && strncmp(line, "FILE ", 5) == 0) {
+		char *end = NULL;
+		unsigned long long size = strtoull(line + 5, &end, 10), got = 0;
+		NSString *name = end != NULL && *end == ' ' ? @(end + 1) : @"?.ipa";
+		NSString *path = [@"/private/var/tmp" stringByAppendingPathComponent:
+		    [NSString stringWithFormat:@"push-%@.ipa", NSUUID.UUID.UUIDString]];
+		int out = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+		while (out >= 0 && got < size) {
+			ssize_t r = read(fd, buf, (size_t)MIN((unsigned long long)sizeof(buf), size - got));
+
+			if (r <= 0 || write(out, buf, (size_t)r) != r) {
+				break;
+			}
+			got += (unsigned long long)r;
+		}
+		if (out >= 0) {
+			close(out);
+		}
+		if (got != size) {
+			unlink(path.fileSystemRepresentation);
+			printf("ipainstall: %s from the computer: %llu of %llu bytes, the connection ended\n", name.UTF8String, got, size);
+			return;
+		}
+		pthread_mutex_lock(&work_lock);
+		request_log = [NSMutableString string];
+		__block NSUInteger sent = 0;
+		request_progress = ^{
+			NSString *more = [request_log substringFromIndex:sent];
+
+			sent = request_log.length;
+			for (NSString *l in [more componentsSeparatedByString:@"\n"]) {
+				if (l.length > 0) {
+					send_text(fd, [NSString stringWithFormat:@"| %@\n", l].UTF8String);
+				}
+			}
+		};
+		say("ipainstall: %s from the computer, %.1f MB\n", name.UTF8String, size / 1e6);
+		BOOL ok = install_ipa(path);
+
+		request_progress = nil;
+		request_log = nil;
+		if (installed_list != nil) {
+			write_plist(installed(), installed_list);
+		}
+		pthread_mutex_unlock(&work_lock);
+		unlink(path.fileSystemRepresentation);
+		send_text(fd, ok ? "DONE 1\n" : "DONE 0\n");
+	}
+}
+
+static void *
+listen_for_computer(__unused void *arg)
+{
+	int s = socket(AF_INET, SOCK_STREAM, 0), on = 1;
+	struct sockaddr_in a = {
+		.sin_len = sizeof(a), .sin_family = AF_INET, .sin_port = htons(APPS_PORT), .sin_addr.s_addr = htonl(INADDR_ANY),
+	};
+
+	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	if (s < 0 || bind(s, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(s, 4) != 0) {
+		printf("ipainstall: port %d: %s\n", APPS_PORT, strerror(errno));
+		return NULL;
+	}
+	printf("ipainstall: waiting for the computer on port %d\n", APPS_PORT);
+	fflush(stdout);
+	for (;;) {
+		int c = accept(s, NULL, NULL);
+		struct timeval patience = { .tv_sec = 60 };
+
+		if (c < 0) {
+			continue;
+		}
+		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof(patience));
+		setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+		@autoreleasepool {
+			push_session(c);
+		}
+		close(c);
+	}
+	return NULL;
 }
 
 // SPOOL/queue/ID.plist {Action: install|uninstall, Source: path or URL, BundleID} from the application, served
@@ -646,6 +765,7 @@ serve(NSString *spool)
 	chmod(spool.fileSystemRepresentation, 0755);
 	chmod(queue.fileSystemRepresentation, 0755);
 	chmod(results.fileSystemRepresentation, 0755);
+	installed_list = list;
 	write_plist(installed(), list);
 
 	int kq = kqueue(), fd = open(queue.fileSystemRepresentation, O_EVTONLY);
@@ -670,6 +790,7 @@ serve(NSString *spool)
 				BOOL ok = NO;
 
 				[fm removeItemAtPath:path error:NULL];
+				pthread_mutex_lock(&work_lock);
 				request_log = [NSMutableString string];
 				__block NSDate *last = NSDate.distantPast;
 				request_progress = ^{
@@ -691,6 +812,7 @@ serve(NSString *spool)
 				write_plist(installed(), list);
 				write_plist(@{ @"Done": @YES, @"OK": @(ok), @"Log": request_log }, result);
 				request_log = nil;
+				pthread_mutex_unlock(&work_lock);
 			}
 		}
 		struct kevent event;
@@ -725,9 +847,15 @@ main(int argc, char *argv[])
 			return install_dir(@(argv[2])) ? 1 : 0;
 		}
 		if (argc >= 4 && strcmp(argv[1], "-d") == 0) {
+			pthread_t listener;
+
+			signal(SIGPIPE, SIG_IGN);
 			wait_for_launchservices();
 			install_dir(@(argv[2]));
-			install_from_computer();
+			apps_token = boot_arg("apps_token");
+			if (apps_token.length >= 16) {
+				pthread_create(&listener, NULL, listen_for_computer, NULL);
+			}
 			serve(@(argv[3]));
 			return 0;
 		}
