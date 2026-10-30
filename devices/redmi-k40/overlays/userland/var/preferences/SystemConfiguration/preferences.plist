@@ -7,7 +7,7 @@
 		<key>System</key>
 		<dict>
 			<key>ComputerName</key>
-			<string>iPhone</string>
+			<string>nemo-alioth-a1865</string>
 			<key>ComputerNameEncoding</key>
 			<integer>0</integer>
 		</dict>
@@ -16,7 +16,7 @@
 			<key>HostNames</key>
 			<dict>
 				<key>LocalHostName</key>
-				<string>iPhone</string>
+				<string>nemo-alioth-a1865</string>
 			</dict>
 		</dict>
 	</dict>

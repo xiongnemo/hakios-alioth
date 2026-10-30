@@ -106,6 +106,14 @@ static vm_offset_t gcc, dwc, smmu;
 static volatile bool usb_leaving;
 static void say(const char *format, ...) __printflike(1, 2);
 
+/*
+ * What was said, kept again in a ring of its own and said once more at the run's end (hakios_usb_quiesce()):
+ * a long run's log keeps its first 256 KB and its last 1 MB, and the port's first seconds -- the computer
+ * finding it -- fall in between (2026-10-30, usb=3).
+ */
+static char usb_history[8192];
+static uint32_t usb_history_at;
+
 static void
 say(const char *format, ...)
 {
@@ -117,6 +125,7 @@ say(const char *format, ...)
 	va_end(list);
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
+		usb_history[usb_history_at++ % sizeof(usb_history)] = *c;
 	}
 	if (!usb_leaving && ml_get_interrupts_enabled()) {
 		printf("%s", line);
@@ -268,9 +277,26 @@ struct hakios_usb_iphone {
 	char serial[48];
 };
 #define HAKIOS_USB_IPHONE       _IOW('u', 2, struct hakios_usb_iphone)
+/* usb=3: the computer's usbmux has come (1) or gone (0) -- for AppleUSBDeviceMux's clients (iokit/Kernel/hakios.usbmux.cpp) */
+#define HAKIOS_USB_HOST         _IOW('u', 3, int)
+extern int hakios_usbmux_publish(void);
+extern void hakios_usbmux_host(bool connected);
 static volatile bool usb_taken;         /* /dev/hakios-usb is there, the thread runs */
 static volatile bool mux_asked;         /* usb=3: a program gave the serial: the device side may start */
 static char mux_serial[48];
+static volatile int mux_pid = -1;       /* ... that program, the phone's USB mux, while it has the port */
+
+/*
+ * The process that is this phone's USB mux (usb=3), or -1: bsd/netinet/tcp_usrreq.c tells lockdownd that a
+ * connection of its is the kernel's (TCP_PEER_PID 0), as an iPhone's AppleUSBDeviceMux, in its kernel, is.
+ */
+int hakios_usb_mux_pid(void);
+
+int
+hakios_usb_mux_pid(void)
+{
+	return level == 3 ? mux_pid : -1;
+}
 
 static uint32_t
 io_read(__unused void *cookie, uint32_t offset)
@@ -456,6 +482,8 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 		say("usb: THE CONTROLLER IS THE KERNEL'S: an iPhone (05ac:12a8, serial %s) with Apple's usbmux interface; DMA at %#llx\n",
 		    mux_serial, usb_dma_pa);
 		log_mode = false;
+		r = hakios_usbmux_publish();
+		say("usb: AppleUSBDeviceMux for lockdownd: %s (%d)\n", r == 0 ? "published" : "NOT PUBLISHED", r);
 	} else {
 		say("usb: THE CONTROLLER IS THE KERNEL'S: a serial port (%04x:%04x \"%s\") from here on; its DMA at %#llx\n",
 		    USB_VID, USB_PID, usb_name, usb_dma_pa);
@@ -547,6 +575,10 @@ static int
 usbdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
 {
 	user_open = 0;
+	if (level == 3 && mux_pid >= 0) {
+		hakios_usbmux_host(false);
+	}
+	mux_pid = -1;
 	log_mode = level != 3;
 	say("usb: the program let the port go%s\n", level == 3 ? "" : ": the log again");
 	return 0;
@@ -703,12 +735,28 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 		*(int *)data = (int)(rx_head - rx_tail);
 		lck_mtx_unlock(&usb_lock);
 		return 0;
+	case HAKIOS_USB_HOST: {
+		static unsigned said;
+
+		if (level != 3 || mux_pid != proc_selfpid()) {
+			return level != 3 ? ENOTSUP : EPERM;
+		}
+		if (said++ < 8) {
+			say("usb: the mux says the computer's usbmux has %s\n", *(const int *)(const void *)data ? "come" : "gone");
+		}
+		hakios_usbmux_host(*(const int *)(const void *)data != 0);
+		return 0;
+	}
 	case HAKIOS_USB_IPHONE: {
 		const struct hakios_usb_iphone *ask = (const struct hakios_usb_iphone *)(void *)data;
 		size_t len = strnlen(ask->serial, sizeof(ask->serial));
 
 		if (level != 3) {
 			return ENOTSUP;
+		}
+		if (mux_asked && len != 0 && len < sizeof(ask->serial) && strcmp(ask->serial, mux_serial) == 0) {
+			mux_pid = proc_selfpid();       /* (the mux again, after it has ended and been started anew) */
+			return EALREADY;
 		}
 		if (len == 0 || len >= sizeof(ask->serial) || mux_asked) {
 			return mux_asked ? EALREADY : EINVAL;
@@ -719,6 +767,8 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 			}
 		}
 		strlcpy(mux_serial, ask->serial, sizeof(mux_serial));
+		mux_pid = proc_selfpid();
+		say("usb: the USB mux is process %d: its connections are the kernel's to lockdownd\n", mux_pid);
 		mux_asked = true;
 		wakeup((void *)&mux_asked);
 		return 0;
@@ -747,6 +797,18 @@ hakios_usb_quiesce(void)
 	int r;
 
 	usb_leaving = true;
+	if (usb_history_at != 0) {
+		uint32_t from = usb_history_at > sizeof(usb_history) ? usb_history_at - (uint32_t)sizeof(usb_history) : 0;
+		static const char banner[] = "\n--- usb: what the port said during the run, again ---\n";
+
+		for (const char *c = banner; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+		for (uint32_t i = from; i < usb_history_at; i++) {
+			loader_log_putc(usb_history[i % sizeof(usb_history)]);
+		}
+		usb_history_at = 0;
+	}
 	if (!usb_owned) {
 		return;
 	}

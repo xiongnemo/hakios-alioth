@@ -38,6 +38,12 @@
 
 extern char **environ;
 
+/* csops(2): what the kernel says of a process's code signature (sys/codesign.h) */
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define CS_OPS_STATUS                   0
+#define CS_OPS_ENTITLEMENTS_BLOB        7
+#define CS_OPS_DER_ENTITLEMENTS_BLOB    16
+
 static int port = -1;
 static int talking;                     /* the computer has typed since the log last had the port */
 static int network;                     /* -l: port is a TCP connection ("log" ends it) */
@@ -361,6 +367,26 @@ execute(char *line)
 		const char *value = getenv(argv[1]);
 
 		out("%s=%s\n", argv[1], value ? value : "(not set)");
+	} else if (!strcmp(argv[0], "cs") && argc > 1) {
+		/* cs PID [NAME]: the process's code-signing flags and both entitlement blobs, as programs get them */
+		pid_t pid = (pid_t)atoi(argv[1]);
+		uint32_t flags = 0;
+		static uint8_t blob[64 * 1024];
+		int r = csops(pid, CS_OPS_STATUS, &flags, sizeof(flags));
+
+		out("cs %d: status %s, flags %#x\n", pid, r == 0 ? "ok" : strerror(errno), flags);
+		for (int kind = 0; kind < 2; kind++) {
+			unsigned op = kind == 0 ? CS_OPS_ENTITLEMENTS_BLOB : CS_OPS_DER_ENTITLEMENTS_BLOB;
+			uint32_t length;
+
+			memset(blob, 0, sizeof(blob));
+			r = csops(pid, op, blob, sizeof(blob));
+			length = (uint32_t)blob[4] << 24 | (uint32_t)blob[5] << 16 | (uint32_t)blob[6] << 8 | blob[7];
+			out("  %s entitlements: %s, magic %02x%02x%02x%02x, %u bytes%s\n", kind == 0 ? "XML" : "DER",
+			    r == 0 ? "ok" : strerror(errno), blob[0], blob[1], blob[2], blob[3], length,
+			    argc > 2 && length <= sizeof(blob) && memmem(blob, length, argv[2], strlen(argv[2])) != NULL ?
+			    ", has the name" : "");
+		}
 	} else if (!strcmp(argv[0], "uname")) {
 		cmd_uname();
 	} else if (!strcmp(argv[0], "ps")) {

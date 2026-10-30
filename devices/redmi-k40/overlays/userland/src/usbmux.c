@@ -34,8 +34,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 extern CFTypeRef MGCopyAnswer(CFStringRef key);
@@ -44,6 +46,18 @@ struct hakios_usb_iphone {
 	char serial[48];
 };
 #define HAKIOS_USB_IPHONE       _IOW('u', 2, struct hakios_usb_iphone)
+/* the computer's usbmux has come (1) or gone (0): for lockdownd, through the kernel's AppleUSBDeviceMux */
+#define HAKIOS_USB_HOST         _IOW('u', 3, int)
+
+static int port = -1;
+
+static void
+host_here(int here)
+{
+	if (port >= 0 && ioctl(port, HAKIOS_USB_HOST, &here) != 0) {
+		fprintf(stderr, "usbmux: HAKIOS_USB_HOST: %s\n", strerror(errno));
+	}
+}
 
 #define PACKET_MAX      4096                    /* the kernel's DWC3_PACKET_MAX: one USB transfer */
 #define HEADER_V1       8
@@ -66,7 +80,6 @@ struct conn {
 	uint32_t window_said;           /* the room we last told the computer of */
 };
 
-static int port = -1;
 static int v2;                          /* the 16-byte header (from the setup packet on) */
 static uint16_t tx_seq, rx_seq;
 static struct conn conns[CONNS];
@@ -78,13 +91,25 @@ static void say(const char *format, ...) __printflike(1, 2);
 static void
 say(const char *format, ...)
 {
+	/* (and into /var/tmp/usbmux.log: a run's console log may lose its middle; that file can be read over the network) */
+	static FILE *copy;
 	va_list list;
 
+	if (copy == NULL) {
+		copy = fopen("/var/tmp/usbmux.log", "a");
+	}
 	va_start(list, format);
 	fputs("usbmux: ", stderr);
 	vfprintf(stderr, format, list);
 	fputc('\n', stderr);
 	va_end(list);
+	if (copy != NULL) {
+		va_start(list, format);
+		vfprintf(copy, format, list);
+		fputc('\n', copy);
+		fflush(copy);
+		va_end(list);
+	}
 }
 
 static uint32_t
@@ -221,12 +246,22 @@ tcp_open(const struct tcphdr *th)
 			slot = &conns[i];
 		}
 	}
+	/*
+	 * TCP to 127.0.0.1, as an iPhone's AppleUSBDeviceMux connects: lockdownd takes such a connection for one
+	 * over USB when its peer is the kernel (TCP_PEER_PID 0), which the kernel says of this process (the
+	 * holder of the iPhone port, bsd/netinet/tcp_usrreq.c of the device patch). Its unix socket,
+	 * /var/run/lockdown.sock, is for programs on the phone and wants entitlements of them.
+	 */
 	fd = slot != NULL ? socket(AF_INET, SOCK_STREAM, 0) : -1;
-	if (fd < 0 || connect(fd, (struct sockaddr *)&to, sizeof(to)) != 0) {
+	if (fd >= 0 && connect(fd, (struct sockaddr *)&to, sizeof(to)) != 0) {
+		int failed = errno;
+
+		close(fd);
+		fd = -1;
+		errno = failed;
+	}
+	if (fd < 0) {
 		say("connection %u -> %u refused (%s)", host_port, our_port, slot == NULL ? "too many" : strerror(errno));
-		if (fd >= 0) {
-			close(fd);
-		}
 		(void)send_tcp(NULL, host_port, our_port, 0, ntohl(th->th_seq) + 1, TH_RST, NULL, 0);
 		return;
 	}
@@ -245,6 +280,9 @@ tcp_open(const struct tcphdr *th)
 	if (slot->out == NULL) {
 		conn_close(slot, 1, "no memory");
 		return;
+	}
+	if (our_port == 62078) {
+		host_here(1);   /* (said again: lockdownd may have begun to listen for it after the first time) */
 	}
 	(void)send_tcp(slot, host_port, our_port, slot->seq, slot->host_next, TH_SYN | TH_ACK, NULL, 0);
 	slot->seq++;            /* (the SYN counts one) */
@@ -334,7 +372,14 @@ packet_input(const uint8_t *p, size_t len, size_t hdr)
 {
 	uint32_t protocol = be32(p);
 
-	packets_in++;
+	if (packets_in++ < 12) {
+		char hex[3 * 48 + 1] = "";
+
+		for (size_t i = 0; i < len && i < 48; i++) {
+			snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ", p[i]);
+		}
+		say("from the computer: %zu bytes: %s", len, hex);
+	}
 	if (hdr == HEADER_V2) {
 		rx_seq = (uint16_t)(p[12] << 8 | p[13]);        /* the computer's tx_seq: what we have seen */
 	}
@@ -346,12 +391,20 @@ packet_input(const uint8_t *p, size_t len, size_t hdr)
 			return;
 		}
 		close_all("a new session");
-		say("the computer's usbmux, version %u.%u: answered 2.0", be32(p + hdr), be32(p + hdr + 4));
+		/*
+		 * The version the computer asks for, if we know it: Apple's own usbmuxd on Windows asks for 1.0 (2026-10-30),
+		 * and after an answer of 2.0 it sent nothing more. 1: 8-byte headers throughout, no setup packet;
+		 * 2: the setup packet, then 16-byte headers (libimobiledevice's device.c).
+		 */
+		uint32_t major = be32(p + hdr) == 1 ? 1 : 2;
+
+		say("the computer's usbmux, version %u.%u: answered %u.0", be32(p + hdr), be32(p + hdr + 4), major);
 		memset(answer, 0, sizeof(answer));
-		put32(answer, 2);
+		put32(answer, major);
 		put32(answer + 4, 0);
 		v2 = 0;
 		(void)send_packet(PROTO_VERSION, answer, sizeof(answer), NULL, 0, 1);
+		host_here(1);           /* (lockdownd: a USB host is connected -- what lets it ask "Trust This Computer?") */
 		break;
 	}
 	case PROTO_SETUP:
@@ -439,12 +492,24 @@ main(int argc, char **argv)
 	}
 	say("an iPhone to the computer, serial %s: waiting for its usbmux", ask.serial);
 	for (;;) {
+		/*
+		 * select(), not poll(): XNU's poll() takes no character device (it answers POLLNVAL at once), and with
+		 * poll() this loop span without ever reading the port -- the computer's usbmux got no answer and let the
+		 * device go after 15 s (2026-10-30). The rest is put into poll()'s terms for the code below.
+		 */
 		struct pollfd fds[1 + CONNS];
 		struct conn *which[1 + CONNS];
 		nfds_t n = 0;
+		fd_set readable, writable;
+		int top = port;
+		struct timeval second = { 1, 0 };
 
+		FD_ZERO(&readable);
+		FD_ZERO(&writable);
 		fds[n].fd = port;
 		fds[n].events = POLLIN;
+		fds[n].revents = 0;
+		FD_SET(port, &readable);
 		which[n++] = NULL;
 		for (int i = 0; i < CONNS; i++) {
 			struct conn *c = &conns[i];
@@ -456,14 +521,25 @@ main(int argc, char **argv)
 			in_flight = c->seq - c->host_acked;
 			fds[n].fd = c->fd;
 			fds[n].events = (c->host_window > in_flight ? POLLIN : 0) | (c->out_used ? POLLOUT : 0);
+			fds[n].revents = 0;
+			if (fds[n].events & POLLIN) {
+				FD_SET(c->fd, &readable);
+			}
+			if (fds[n].events & POLLOUT) {
+				FD_SET(c->fd, &writable);
+			}
+			top = c->fd > top ? c->fd : top;
 			which[n++] = c;
 		}
-		if (poll(fds, n, 1000) < 0) {
+		if (select(top + 1, &readable, &writable, NULL, &second) < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
-			say("poll: %s", strerror(errno));
+			say("select: %s", strerror(errno));
 			return 1;
+		}
+		for (nfds_t k = 0; k < n; k++) {
+			fds[k].revents = (FD_ISSET(fds[k].fd, &readable) ? POLLIN : 0) | (FD_ISSET(fds[k].fd, &writable) ? POLLOUT : 0);
 		}
 		if (fds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
 			ssize_t r = read(port, in + used, sizeof(in) - used);
