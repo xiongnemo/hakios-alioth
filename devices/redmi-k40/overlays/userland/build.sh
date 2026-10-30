@@ -587,6 +587,13 @@ for tuned in ../fw-camera/com.qti.tuned.hakios_*.bin; do
 	mkdir -p root/fw
 	../tools/camtuning.py "$tuned" "root/fw/camera-$sensor.isp" >/dev/null
 done
+# ... and the sensor DSP's firmware and the files its sensors' process reads through us (bsd/dev/hakios.slpi.c,
+# slpi=1: the light, auto-brightness, rotation), ../fw-sensors as work/wsl/mk-fw-sensors.sh lays it out: slpi.mdt,
+# slpi.bNN and sensors/ (2 MB with the firmware's 6 MB)
+if [ -f ../fw-sensors/slpi.mdt ]; then
+	mkdir -p root/fw
+	cp -r ../fw-sensors/. root/fw/
+fi
 # ... and with ADSP=1 the image of the audio DSP, from the same place into ../fw-audio (bsd/dev/hakios.adsp.c):
 # adsp.mdt and adsp.b02 to adsp.b36, 20 MB. Only when asked for: beside GL=1 the payload would be more than the 64 MB
 # the loader takes.
@@ -599,7 +606,7 @@ fi
 # git worktree add has none of it, and neither has one whose tools/new-workspace.sh predates the fw-*
 # loop there. Say what went in and what was not there to go in; what each one is for is above.
 fwhave= fwnone=
-for d in gpu wifi haptic camera audio; do
+for d in gpu wifi haptic camera audio sensors; do
 	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
 done
 echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
