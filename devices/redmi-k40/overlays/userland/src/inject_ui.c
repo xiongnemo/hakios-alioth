@@ -379,7 +379,16 @@ static double *d_of(id d) { return (double *)((char *)d + motion_values); }
 static id *d_attitude(id d) { return (id *)((char *)d + motion_attitude); }
 
 static hk_quaternion get_quaternion(id self, SEL c) { (void)c; double *v = a_of(self); return (hk_quaternion){ v[A_QX], v[A_QY], v[A_QZ], v[A_QW] }; }
-static hk_matrix get_matrix(id self, SEL c) { (void)c; hk_matrix m; memcpy(&m, a_of(self) + A_M, sizeof(m)); return m; }
+/* (the rotation matrix the other way: reference to device, as Apple's pARk sample uses it -- the transpose of
+ * the quaternion's own matrix, which composable-core-motion found of Apple's too) */
+static hk_matrix
+get_matrix(id self, SEL c)
+{
+	const double *a = a_of(self) + A_M;
+
+	(void)c;
+	return (hk_matrix){ a[0], a[3], a[6], a[1], a[4], a[7], a[2], a[5], a[8] };
+}
 static double get_roll(id self, SEL c) { (void)c; return a_of(self)[A_ROLL]; }
 static double get_pitch(id self, SEL c) { (void)c; return a_of(self)[A_PITCH]; }
 static double get_yaw(id self, SEL c) { (void)c; return a_of(self)[A_YAW]; }
@@ -473,10 +482,11 @@ quaternion_from(double *a)
 /*
  * The attitude from the rotation vector. Android's R (from x, y, z, w) turns device vectors into east, north, up;
  * the reference frame here is north, west, up, so the device-to-reference matrix is M R with M taking (e, n, u)
- * to (n, -e, u). CMAttitude's quaternion and rotation matrix are that rotation, device to reference: gravity
- * in the device's axes is minus its third row (CoreMotion's own gravity from a quaternion, 2(xz - wy),
- * 2(wx + yz), ...), pitch asin(m32). (The transpose, tried first on 2026-10-31, gave a phone held upright a
- * pitch of 45 degrees instead of 70.)
+ * to (n, -e, u). CMAttitude's quaternion is that rotation, device to reference, and its rotationMatrix the
+ * transpose, reference to device (get_matrix()): gravity in the device's axes is minus that matrix's third
+ * column, pitch asin(m23), roll atan2(-m13, m33), yaw atan2(-m21, m22) -- worked out here on A itself. (Euler
+ * angles taken from the transpose, tried first on 2026-10-31, gave a phone held upright a pitch of 45 degrees
+ * instead of 70.)
  */
 static bool
 attitude_from(const struct hakios_rotv *r, double *a, double *gravity)
@@ -751,6 +761,15 @@ compass_hooks(const struct mach_header *header, intptr_t image_slide)
 
 	(void)header;
 	(void)image_slide;
+	if (!motion_done) {
+		/* boot-arg motion_hook=0: CoreMotion left as it is (to tell what is ours from what is not) */
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "motion_hook=0") != NULL) {
+			motion_done = true;
+		}
+	}
 	if (!motion_done && (motion = objc_getClass("CMMotionManager")) != Nil) {
 		motion_done = true;
 		hook(motion, false, "isDeviceMotionAvailable", (IMP)dm_available);
