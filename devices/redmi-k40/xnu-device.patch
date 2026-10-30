@@ -20,7 +20,7 @@
  bsd/dev/hakios.buttons.c	standard
  bsd/dev/hakios.battery.c	standard
  bsd/dev/hakios.ufs.c	standard
-@@ -639,3 +650,10 @@
+@@ -639,3 +650,11 @@
  bsd/skywalk/packet/pbufpool.c			optional skywalk
  bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
  bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
@@ -31,6 +31,7 @@
 +bsd/dev/hakios.display.c standard
 +bsd/dev/alioth_dsi.c standard
 +bsd/dev/alioth_mdm.c standard
++bsd/dev/alioth_mhi.c standard
 --- a/bsd/conf/Makefile.arm64
 +++ b/bsd/conf/Makefile.arm64
 @@ -1,3 +1,7 @@
