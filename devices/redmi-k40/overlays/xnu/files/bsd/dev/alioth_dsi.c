@@ -479,6 +479,61 @@ alioth_panel_set_rate(uint32_t hz)
 }
 
 /*
+ * The panel asleep while the display is off, awake again with it (MiniIOMobileFramebuffer.cpp, iOS's display
+ * power): brightness 0 alone left the panel, the DSI link and the display engine at 120 Hz behind a black screen.
+ * Off is the K11A's own off set (the phone's DT, qcom,mdss-dsi-off-command): display off, 20 ms, brightness
+ * control to its default, sleep in, 120 ms. Sleep in keeps the panel's power and registers (the compression's
+ * PPS, the window, the dimming of the on set: 128 bytes the command FIFO could not send anyway), and stops its TE,
+ * so the engine's auto-refresh, which waits on it, stops too. On: sleep out, 120 ms, TE on (the on set's first
+ * common setting), the refresh rate's switch set again, display on. Only with boot-arg panel_sleep=1 until it is
+ * known on the phone that the panel comes back (2026-10-31); a DCS that fails leaves it as it was.
+ */
+int
+alioth_panel_power(bool on)
+{
+	static bool asleep;
+	static const uint8_t display_off[] = { 0x28, 0x00 }, control[] = { 0x53, 0x20 }, sleep_in[] = { 0x10, 0x00 };
+	static const uint8_t sleep_out[] = { 0x11, 0x00 }, te_on[] = { 0x35, 0x00 }, display_on[] = { 0x29, 0x00 };
+	uint32_t enabled = 0;
+	int rc;
+
+	PE_parse_boot_argn("panel_sleep", &enabled, sizeof(enabled));
+	if (!enabled || on == !asleep || !dsi_init()) {
+		return 0;
+	}
+	if (!on) {
+		rc = alioth_dsi_dcs_write(display_off, 2, true, 0x05);
+		delay_for_interval(20, NSEC_PER_MSEC);
+		if (rc == 0) {
+			rc = alioth_dsi_dcs_write(control, 2, true, 0x39);
+		}
+		if (rc == 0) {
+			rc = alioth_dsi_dcs_write(sleep_in, 2, true, 0x05);
+		}
+		delay_for_interval(120, NSEC_PER_MSEC);
+		asleep = rc == 0;
+		printf("alioth panel: asleep with the display off%s (%d)\n", rc == 0 ? "" : ": NOT ALL OF IT", rc);
+		return rc;
+	}
+	rc = alioth_dsi_dcs_write(sleep_out, 2, true, 0x05);
+	delay_for_interval(120, NSEC_PER_MSEC);
+	if (rc == 0) {
+		rc = alioth_dsi_dcs_write(te_on, 2, true, 0x39);
+	}
+	for (unsigned i = 0; rc == 0 && panel_rate != 0 && i < sizeof(k11a_timings) / sizeof(k11a_timings[0]); i++) {
+		if (k11a_timings[i].hz == panel_rate) {
+			rc = send_switch(&k11a_timings[i]);
+		}
+	}
+	if (rc == 0) {
+		rc = alioth_dsi_dcs_write(display_on, 2, true, 0x05);
+	}
+	asleep = false;
+	printf("alioth panel: awake at %u Hz%s (%d)\n", panel_rate, rc == 0 ? "" : ": SOMETHING FAILED", rc);
+	return rc;
+}
+
+/*
  * Read-only look at the display engine as the UEFI left it (kona DPU 6.0, live DT qcom,sde-*-off relative to
  * MDSS 0xae00000): which source pipe scans the framebuffer, its stride and size, and the control path's
  * flush and layer state -- what a page flip (SRC0_ADDR + CTL_FLUSH) would have to touch. Registers:

@@ -41,6 +41,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 extern "C" void hakios_screen_power(bool on);           /* bsd/dev/hakios.cpufreq.c */
+extern "C" int alioth_panel_power(bool on);             /* bsd/dev/alioth_dsi.c */
 /* the panel's scan (bsd/dev/hakios.display.c; sys/hakios.display.h, which iokit/ does not see) */
 struct hakios_display_scan {
 	int ok;
@@ -2623,8 +2624,15 @@ backlightDisplayPower(bool on)
 	if (logged++ < 16) {
 		hakios_tl("backlight: the framebuffer's power change: %s\n", on ? "on" : "off");
 	}
+	/* (the panel awake before its brightness comes back, asleep after it has gone: bsd/dev/alioth_dsi.c) */
+	if (on) {
+		alioth_panel_power(true);
+	}
 	if (gBacklight != NULL) {
 		gBacklight->displayPower(on);
+	}
+	if (!on) {
+		alioth_panel_power(false);
 	}
 	/* (the cores and the memory slower while nobody looks: there is nothing else that lowers them) */
 	hakios_screen_power(on);

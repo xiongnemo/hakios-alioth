@@ -2328,7 +2328,7 @@ static int64_t
 run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const struct kernel_live *live, uint64_t slide,
     uint64_t budget)
 {
-	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
+	uint64_t daif = 0, group1 = 0, cntkctl = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
 	int64_t status;
 	int arrived = 0, watching_only = 0;
 
@@ -2383,6 +2383,14 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			__asm__ volatile ("msr daifset, #0xf");
 			group1 = READ_SYSREG(S3_0_C12_C12_7);          /* ICC_IGRPEN1_EL1 */
 			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
+			/*
+			 * The pause between two looks is a WFE from here on, not a loop: the generic timer's event
+			 * stream wakes this core every 2^(9+1) ticks of the counter (53 us at 19.2 MHz, about what the
+			 * loop took) -- a busy core at its top speed for the whole run was one of the things that kept
+			 * the phone warm with its screen off (work/TODO.md, Power). EVNTEN bit 2, EVNTI bits 7:4.
+			 */
+			cntkctl = READ_SYSREG(CNTKCTL_EL1);
+			__asm__ volatile ("msr cntkctl_el1, %0\nisb" : : "r" ((cntkctl & ~(uint64_t)0xf4) | 1u << 2 | 9u << 4));
 		}
 		/* both are written by a core with its caches off: look at memory, not at our copy */
 		flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
@@ -2437,6 +2445,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				for (volatile int i = 0; i < 300; i++) {
 				}
 			}
+		} else if (watching_only) {
+			__asm__ volatile ("wfe");               /* (until the event stream's next tick, above) */
 		} else {
 			for (volatile int i = 0; i < 20000; i++) {
 			}
@@ -2445,6 +2455,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	running_live = NULL;
 
 	if (watching_only) {
+		__asm__ volatile ("msr cntkctl_el1, %0\nisb" : : "r" (cntkctl));
 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
 		__asm__ volatile ("msr daif, %0" : : "r" (daif));
 	}

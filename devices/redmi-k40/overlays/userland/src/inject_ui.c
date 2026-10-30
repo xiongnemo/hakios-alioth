@@ -369,10 +369,14 @@ typedef struct { double x, y, z; } hk_vector;
 typedef struct { hk_vector field; int accuracy; } hk_calibrated_field;
 
 enum { A_QX, A_QY, A_QZ, A_QW, A_M, A_ROLL = A_M + 9, A_PITCH, A_YAW, A_COUNT };
-enum { D_GX, D_GY, D_GZ, D_FX, D_FY, D_FZ, D_ACCURACY, D_HEADING, D_TIME, D_COUNT };
+enum { D_GX, D_GY, D_GZ, D_FX, D_FY, D_FZ, D_ACCURACY, D_HEADING, D_TIME, D_RX, D_RY, D_RZ, D_UX, D_UY, D_UZ, D_COUNT };
 
-static Class attitude_class, motion_class;
-static ptrdiff_t attitude_values, motion_values, motion_attitude;
+static Class attitude_class, motion_class, accel_class, gyro_class;
+static ptrdiff_t attitude_values, motion_values, motion_attitude, accel_values, gyro_values;
+/* CMAccelerometerData's and CMGyroData's: x, y, z, the time */
+static double *v_of(id o) { return (double *)((char *)o + (object_getClass(o) == accel_class ? accel_values : gyro_values)); }
+static hk_vector get_vector(id self, SEL c) { (void)c; double *v = v_of(self); return (hk_vector){ v[0], v[1], v[2] }; }
+static double get_vector_time(id self, SEL c) { (void)c; return v_of(self)[3]; }
 
 static double *a_of(id a) { return (double *)((char *)a + attitude_values); }
 static double *d_of(id d) { return (double *)((char *)d + motion_values); }
@@ -394,7 +398,8 @@ static double get_pitch(id self, SEL c) { (void)c; return a_of(self)[A_PITCH]; }
 static double get_yaw(id self, SEL c) { (void)c; return a_of(self)[A_YAW]; }
 static id get_attitude(id self, SEL c) { (void)c; return *d_attitude(self); }
 static hk_vector get_gravity(id self, SEL c) { (void)c; double *v = d_of(self); return (hk_vector){ v[D_GX], v[D_GY], v[D_GZ] }; }
-static hk_vector get_zero(id self, SEL c) { (void)self; (void)c; return (hk_vector){ 0, 0, 0 }; }
+static hk_vector get_rate(id self, SEL c) { (void)c; double *v = d_of(self); return (hk_vector){ v[D_RX], v[D_RY], v[D_RZ] }; }
+static hk_vector get_user(id self, SEL c) { (void)c; double *v = d_of(self); return (hk_vector){ v[D_UX], v[D_UY], v[D_UZ] }; }
 static hk_calibrated_field get_field(id self, SEL c) { (void)c; double *v = d_of(self); return (hk_calibrated_field){ { v[D_FX], v[D_FY], v[D_FZ] }, (int)v[D_ACCURACY] }; }
 static double get_motion_heading(id self, SEL c) { (void)c; return d_of(self)[D_HEADING]; }
 static double get_motion_time(id self, SEL c) { (void)c; return d_of(self)[D_TIME]; }
@@ -564,11 +569,11 @@ make_motion_classes(void)
 
 	cls = objc_allocateClassPair(dm, "HakiosDeviceMotion", 0);
 	class_addIvar(cls, "hakios_attitude", sizeof(id), 3, "@");
-	class_addIvar(cls, "hakios_values", sizeof(double) * D_COUNT, 3, "[9d]");
+	class_addIvar(cls, "hakios_values", sizeof(double) * D_COUNT, 3, "[15d]");
 	class_addMethod(cls, sel_registerName("attitude"), (IMP)get_attitude, "@@:");
 	class_addMethod(cls, sel_registerName("gravity"), (IMP)get_gravity, "{?=ddd}@:");
-	class_addMethod(cls, sel_registerName("userAcceleration"), (IMP)get_zero, "{?=ddd}@:");
-	class_addMethod(cls, sel_registerName("rotationRate"), (IMP)get_zero, "{?=ddd}@:");
+	class_addMethod(cls, sel_registerName("userAcceleration"), (IMP)get_user, "{?=ddd}@:");
+	class_addMethod(cls, sel_registerName("rotationRate"), (IMP)get_rate, "{?=ddd}@:");
 	class_addMethod(cls, sel_registerName("magneticField"), (IMP)get_field, "{?={?=ddd}i}@:");
 	class_addMethod(cls, sel_registerName("heading"), (IMP)get_motion_heading, "d@:");
 	class_addMethod(cls, sel_registerName("timestamp"), (IMP)get_motion_time, "d@:");
@@ -581,23 +586,55 @@ make_motion_classes(void)
 	motion_attitude = ivar_getOffset(class_getInstanceVariable(cls, "hakios_attitude"));
 	motion_values = ivar_getOffset(class_getInstanceVariable(cls, "hakios_values"));
 	motion_class = cls;
+
+	for (int k = 0; k < 2; k++) {
+		Class base = objc_getClass(k == 0 ? "CMAccelerometerData" : "CMGyroData");
+
+		if (base == Nil) {
+			continue;
+		}
+		cls = objc_allocateClassPair(base, k == 0 ? "HakiosAccelerometerData" : "HakiosGyroData", 0);
+		class_addIvar(cls, "hakios_values", sizeof(double) * 4, 3, "[4d]");
+		class_addMethod(cls, sel_registerName(k == 0 ? "acceleration" : "rotationRate"), (IMP)get_vector, "{?=ddd}@:");
+		class_addMethod(cls, sel_registerName("timestamp"), (IMP)get_vector_time, "d@:");
+		class_addMethod(cls, sel_registerName("copyWithZone:"), (IMP)copy_retained, "@@:^v");
+		objc_registerClassPair(cls);
+		neutralize(cls, base);
+		if (k == 0) {
+			accel_values = ivar_getOffset(class_getInstanceVariable(cls, "hakios_values"));
+			accel_class = cls;
+		} else {
+			gyro_values = ivar_getOffset(class_getInstanceVariable(cls, "hakios_values"));
+			gyro_class = cls;
+		}
+	}
 	return true;
 }
 
+/*
+ * What a CMMotionManager is given, by kind: device motion (the rotation vector, and the gyroscope and the
+ * accelerometer for its rotation rate and the user's acceleration), the accelerometer, the gyroscope. One timer
+ * each, on the main queue, at the interval the application set (1/100 s at most often, 1 s at least).
+ */
+enum { FEED_MOTION, FEED_ACCEL, FEED_GYRO, FEEDS };
+static const char *const feed_name[FEEDS] = { "device motion", "accelerometer", "gyroscope" };
+static const char *const feed_interval[FEEDS] = { "deviceMotionUpdateInterval", "accelerometerUpdateInterval",
+	"gyroUpdateInterval" };
+
 static struct mover {
 	id manager;                     /* retained while it moves */
+	int kind;
 	dispatch_source_t timer;
 	uint32_t sequence;
-	uint64_t leased;
-	id motion;                      /* the last CMDeviceMotion, retained */
+	id data;                        /* the last CMDeviceMotion, CMAccelerometerData or CMGyroData, retained */
 	id handler, queue;              /* a copy of the block and the queue, retained, or nil */
-} movers[WATCHERS];
+} movers[WATCHERS * FEEDS];
 
 static struct mover *
-mover_of(id manager)
+mover_of(id manager, int kind)
 {
-	for (int i = 0; i < WATCHERS; i++) {
-		if (movers[i].manager == manager) {
+	for (int i = 0; i < WATCHERS * FEEDS; i++) {
+		if (movers[i].manager == manager && (manager == nil || movers[i].kind == kind)) {
 			return &movers[i];
 		}
 	}
@@ -618,32 +655,66 @@ msg_retain(id o)
 	return o != nil ? ((id (*)(id, SEL))objc_msgSend)(o, sel_registerName("retain")) : nil;
 }
 
-static void
-motion_tick(struct mover *v)
-{
-	static int shown;
-	struct hakios_rotv r;
-	size_t length = sizeof(r);
-	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-	double gravity[3], accuracy = -1, heading, *d;
-	id m, a;
+/*
+ * A stream of the kernel's (kern.hakios.NAME, bsd/dev/hakios.slpi.c), leased once a second while it is read: its
+ * last reading, and whether it is a new one since `*sequence`.
+ */
+static struct stream_state {
+	const char *name, *lease;
+	uint64_t leased;
+} stream_rotv = { "kern.hakios.rotv", "kern.hakios.rotv_lease", 0 },
+  stream_accel = { "kern.hakios.accel", "kern.hakios.accel_lease", 0 },
+  stream_gyro = { "kern.hakios.gyro", "kern.hakios.gyro_lease", 0 };
 
-	if (v->leased == 0 || now - v->leased > 1000000000ull) {
+static bool
+read_stream(struct stream_state *s, struct hakios_rotv *r, uint32_t *sequence)
+{
+	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	size_t length = sizeof(*r);
+
+	if (s->leased == 0 || now - s->leased > 1000000000ull) {
 		int one = 1;
 
-		sysctlbyname("kern.hakios.rotv_lease", NULL, NULL, &one, sizeof(one));
-		v->leased = now;
+		sysctlbyname(s->lease, NULL, NULL, &one, sizeof(one));
+		s->leased = now;
 	}
-	if (sysctlbyname("kern.hakios.rotv", &r, &length, NULL, 0) != 0 || r.sequence == v->sequence) {
-		return;
+	if (sysctlbyname(s->name, r, &length, NULL, 0) != 0 || r->count < 3) {
+		return false;
 	}
-	v->sequence = r.sequence;
-	a = class_createInstance(attitude_class, 0);
-	if (!attitude_from(&r, a_of(a), gravity)) {
+	if (sequence != NULL) {
+		if (r->sequence == *sequence) {
+			return false;
+		}
+		*sequence = r->sequence;
+	}
+	return true;
+}
+
+/* the first three floats of a reading, as doubles */
+static void
+vector_of(const struct hakios_rotv *r, double v[3])
+{
+	float f[3];
+
+	memcpy(f, r->value, sizeof(f));
+	v[0] = f[0], v[1] = f[1], v[2] = f[2];
+}
+
+#define STANDARD_GRAVITY 9.80665
+
+static id
+make_motion(const struct hakios_rotv *r)
+{
+	static int shown;
+	struct hakios_rotv acc, gyr;
+	double gravity[3], accuracy = -1, heading, *d, a3[3], g3[3];
+	id m, a = class_createInstance(attitude_class, 0);
+
+	if (!attitude_from(r, a_of(a), gravity)) {
 		msg_release(a);
-		return;
+		return nil;
 	}
-	heading = heading_from(&r, &accuracy);
+	heading = heading_from(r, &accuracy);
 	m = class_createInstance(motion_class, 0);
 	*d_attitude(m) = a;             /* (the motion holds it; released with it) */
 	d = d_of(m);
@@ -652,54 +723,103 @@ motion_tick(struct mover *v)
 	for (int i = 0; i < 3; i++) {
 		d[D_FX + i] = 25 * a_of(a)[A_M + i] + 50 * a_of(a)[A_M + 6 + i];
 	}
-	d[D_ACCURACY] = r.status >= 3 ? 2 : r.status == 2 ? 1 : r.status == 1 ? 0 : -1;
+	d[D_ACCURACY] = r->status >= 3 ? 2 : r->status == 2 ? 1 : r->status == 1 ? 0 : -1;
 	d[D_HEADING] = isnan(heading) ? -1 : heading;
-	d[D_TIME] = (double)now / 1e9;
-	msg_release(v->motion);
-	v->motion = m;
-	if (shown < 6) {
+	d[D_TIME] = (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+	/* the rotation rate is the gyroscope's; the user's acceleration what the accelerometer has beyond gravity (in g:
+	 * iOS's is minus Android's over g, touchHLE's reading of it) */
+	if (read_stream(&stream_gyro, &gyr, NULL)) {
+		vector_of(&gyr, g3);
+		d[D_RX] = g3[0], d[D_RY] = g3[1], d[D_RZ] = g3[2];
+	}
+	if (read_stream(&stream_accel, &acc, NULL)) {
+		vector_of(&acc, a3);
+		for (int i = 0; i < 3; i++) {
+			d[D_UX + i] = -a3[i] / STANDARD_GRAVITY - gravity[i];
+		}
+	}
+	if (shown < 4) {
 		double *q = a_of(a);
 
-		say("motion: attitude q (%.3f %.3f %.3f %.3f) roll %.1f pitch %.1f yaw %.1f, gravity (%.2f %.2f %.2f), heading %.1f\n",
-		    q[A_QX], q[A_QY], q[A_QZ], q[A_QW], q[A_ROLL] * 180 / M_PI, q[A_PITCH] * 180 / M_PI, q[A_YAW] * 180 / M_PI,
-		    gravity[0], gravity[1], gravity[2], heading);
+		say("motion: attitude q (%.3f %.3f %.3f %.3f) roll %.1f pitch %.1f yaw %.1f, gravity (%.2f %.2f %.2f), heading %.1f, "
+		    "rate (%.2f %.2f %.2f), user (%.2f %.2f %.2f)\n", q[A_QX], q[A_QY], q[A_QZ], q[A_QW], q[A_ROLL] * 180 / M_PI,
+		    q[A_PITCH] * 180 / M_PI, q[A_YAW] * 180 / M_PI, gravity[0], gravity[1], gravity[2], heading, d[D_RX], d[D_RY],
+		    d[D_RZ], d[D_UX], d[D_UY], d[D_UZ]);
 		shown++;
 	}
+	return m;
+}
+
+/* CMAccelerometerData (in g, iOS's way) or CMGyroData (rad/s) of a reading */
+static id
+make_vector_data(int kind, const struct hakios_rotv *r)
+{
+	static int shown[FEEDS];
+	id o = class_createInstance(kind == FEED_ACCEL ? accel_class : gyro_class, 0);
+	double *v = v_of(o);
+
+	vector_of(r, v);
+	if (kind == FEED_ACCEL) {
+		v[0] /= -STANDARD_GRAVITY, v[1] /= -STANDARD_GRAVITY, v[2] /= -STANDARD_GRAVITY;
+	}
+	v[3] = (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+	if (shown[kind]++ < 3) {
+		say("motion: %s (%.3f %.3f %.3f)\n", feed_name[kind], v[0], v[1], v[2]);
+	}
+	return o;
+}
+
+static void
+feed_tick(struct mover *v)
+{
+	struct hakios_rotv r;
+	id data;
+
+	if (v->kind == FEED_MOTION) {
+		if (!read_stream(&stream_rotv, &r, &v->sequence) || (data = make_motion(&r)) == nil) {
+			return;
+		}
+	} else if (!read_stream(v->kind == FEED_ACCEL ? &stream_accel : &stream_gyro, &r, &v->sequence)) {
+		return;
+	} else {
+		data = make_vector_data(v->kind, &r);
+	}
+	msg_release(v->data);
+	v->data = data;
 	if (v->handler != nil && v->queue != nil) {
-		id handler = v->handler, motion = msg_retain(m);
+		id handler = v->handler, given = msg_retain(data);
 
 		((void (*)(id, SEL, void (^)(void)))objc_msgSend)(v->queue, sel_registerName("addOperationWithBlock:"), ^{
-			((void (^)(id, id))(void *)handler)(motion, nil);
-			msg_release(motion);
+			((void (^)(id, id))(void *)handler)(given, nil);
+			msg_release(given);
 		});
 	}
 }
 
 static void
-start_motion(id self, id queue, id handler)
+start_feed(id self, int kind, id queue, id handler)
 {
-	struct mover *v = mover_of(self);
+	struct mover *v = mover_of(self, kind);
 	double interval;
 
 	if (!make_motion_classes() || !make_heading_class()) {
 		return;
 	}
-	if (v == NULL && (v = mover_of(nil)) == NULL) {
-		say("motion: more than %d motion managers; this one is not answered\n", WATCHERS);
+	if (v == NULL && (v = mover_of(nil, kind)) == NULL) {
+		say("motion: too many motion managers; this one is not answered\n");
 		return;
 	}
 	if (v->manager == nil) {
 		v->manager = msg_retain(self);
+		v->kind = kind;
 		v->sequence = 0;
-		v->leased = 0;
-		interval = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deviceMotionUpdateInterval"));
-		interval = interval < 1.0 / 60 ? 1.0 / 60 : interval > 1 ? 1 : interval;
+		interval = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName(feed_interval[kind]));
+		interval = interval < 1.0 / 100 ? 1.0 / 100 : interval > 1 ? 1 : interval;
 		v->timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
 		dispatch_source_set_timer(v->timer, DISPATCH_TIME_NOW, (uint64_t)(interval * NSEC_PER_SEC), NSEC_PER_MSEC * 2);
-		dispatch_source_set_event_handler(v->timer, ^{ motion_tick(v); });
+		dispatch_source_set_event_handler(v->timer, ^{ feed_tick(v); });
 		dispatch_resume(v->timer);
-		say("motion: device motion for %p, every %.0f ms, from the sensor DSP's rotation vector\n", (void *)self,
-		    interval * 1000);
+		say("motion: %s for %p, every %.0f ms, from the sensor DSP\n", feed_name[kind], (void *)self, interval * 1000);
 	}
 	if (v->handler != nil) {
 		_Block_release((const void *)v->handler);
@@ -709,17 +829,11 @@ start_motion(id self, id queue, id handler)
 	v->queue = msg_retain(queue);
 }
 
-static void dm_start(id self, SEL c) { (void)c; start_motion(self, nil, nil); }
-static void dm_start_frame(id self, SEL c, unsigned long frame) { (void)c; (void)frame; start_motion(self, nil, nil); }
-static void dm_start_queue(id self, SEL c, id queue, id handler) { (void)c; start_motion(self, queue, handler); }
-static void dm_start_frame_queue(id self, SEL c, unsigned long frame, id queue, id handler) { (void)c; (void)frame; start_motion(self, queue, handler); }
-
 static void
-dm_stop(id self, SEL c)
+stop_feed(id self, int kind)
 {
-	struct mover *v = mover_of(self);
+	struct mover *v = mover_of(self, kind);
 
-	(void)c;
 	if (v == NULL || self == nil) {
 		return;
 	}
@@ -735,8 +849,26 @@ dm_stop(id self, SEL c)
 	msg_release(self);
 }
 
-static id dm_motion(id self, SEL c) { struct mover *v = mover_of(self); (void)c; return v != NULL ? v->motion : nil; }
-static bool dm_active(id self, SEL c) { (void)c; return mover_of(self) != NULL; }
+static void dm_start(id self, SEL c) { (void)c; start_feed(self, FEED_MOTION, nil, nil); }
+static void dm_start_frame(id self, SEL c, unsigned long frame) { (void)c; (void)frame; start_feed(self, FEED_MOTION, nil, nil); }
+static void dm_start_queue(id self, SEL c, id queue, id handler) { (void)c; start_feed(self, FEED_MOTION, queue, handler); }
+static void dm_start_frame_queue(id self, SEL c, unsigned long frame, id queue, id handler) { (void)c; (void)frame; start_feed(self, FEED_MOTION, queue, handler); }
+static void dm_stop(id self, SEL c) { (void)c; stop_feed(self, FEED_MOTION); }
+static id dm_motion(id self, SEL c) { struct mover *v = mover_of(self, FEED_MOTION); (void)c; return v != NULL ? v->data : nil; }
+static bool dm_active(id self, SEL c) { (void)c; return mover_of(self, FEED_MOTION) != NULL; }
+
+static void ac_start(id self, SEL c) { (void)c; start_feed(self, FEED_ACCEL, nil, nil); }
+static void ac_start_queue(id self, SEL c, id queue, id handler) { (void)c; start_feed(self, FEED_ACCEL, queue, handler); }
+static void ac_stop(id self, SEL c) { (void)c; stop_feed(self, FEED_ACCEL); }
+static id ac_data(id self, SEL c) { struct mover *v = mover_of(self, FEED_ACCEL); (void)c; return v != NULL ? v->data : nil; }
+static bool ac_active(id self, SEL c) { (void)c; return mover_of(self, FEED_ACCEL) != NULL; }
+
+static void gy_start(id self, SEL c) { (void)c; start_feed(self, FEED_GYRO, nil, nil); }
+static void gy_start_queue(id self, SEL c, id queue, id handler) { (void)c; start_feed(self, FEED_GYRO, queue, handler); }
+static void gy_stop(id self, SEL c) { (void)c; stop_feed(self, FEED_GYRO); }
+static id gy_data(id self, SEL c) { struct mover *v = mover_of(self, FEED_GYRO); (void)c; return v != NULL ? v->data : nil; }
+static bool gy_active(id self, SEL c) { (void)c; return mover_of(self, FEED_GYRO) != NULL; }
+
 static bool dm_available(id self, SEL c) { (void)self; (void)c; return true; }
 static unsigned long dm_frames(id self, SEL c) { (void)self; (void)c; return 0xf; }
 
@@ -781,6 +913,18 @@ compass_hooks(const struct mach_header *header, intptr_t image_slide)
 		hook(motion, false, "startDeviceMotionUpdatesToQueue:withHandler:", (IMP)dm_start_queue);
 		hook(motion, false, "startDeviceMotionUpdatesUsingReferenceFrame:toQueue:withHandler:", (IMP)dm_start_frame_queue);
 		hook(motion, false, "stopDeviceMotionUpdates", (IMP)dm_stop);
+		hook(motion, false, "isAccelerometerAvailable", (IMP)dm_available);
+		hook(motion, false, "isAccelerometerActive", (IMP)ac_active);
+		hook(motion, false, "accelerometerData", (IMP)ac_data);
+		hook(motion, false, "startAccelerometerUpdates", (IMP)ac_start);
+		hook(motion, false, "startAccelerometerUpdatesToQueue:withHandler:", (IMP)ac_start_queue);
+		hook(motion, false, "stopAccelerometerUpdates", (IMP)ac_stop);
+		hook(motion, false, "isGyroAvailable", (IMP)dm_available);
+		hook(motion, false, "isGyroActive", (IMP)gy_active);
+		hook(motion, false, "gyroData", (IMP)gy_data);
+		hook(motion, false, "startGyroUpdates", (IMP)gy_start);
+		hook(motion, false, "startGyroUpdatesToQueue:withHandler:", (IMP)gy_start_queue);
+		hook(motion, false, "stopGyroUpdates", (IMP)gy_stop);
 	}
 	if (done || (manager = objc_getClass("CLLocationManager")) == Nil) {
 		return;
