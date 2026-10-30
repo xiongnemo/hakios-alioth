@@ -330,6 +330,10 @@ hakios_input_init(void)
 	hakios_wifi_init();
 	hakios_adsp_init();
 	hakios_slpi_init();          /* (slpi=1: the sensor DSP, hakios.slpi.c) */
+	{
+		extern void alioth_mdm_init(void);
+		alioth_mdm_init();   /* (mdm_step=N: the SDX55 modem's first steps, alioth_mdm.c) */
+	}
 	hakios_mpss_init();
 	hakios_usb_init();
 	hakios_prof_init();     /* boot-arg prof=1: osfmk/arm64/hakios_prof.c */
