@@ -171,7 +171,9 @@ struct hakios_show {
 #define GPU_SUBMIT_CMDS         128
 #define GPU_SUBMIT_BOS          8192
 #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
-#define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+#define GPU_ASK_AGAIN_US        50              /* while waiting for the core: how long between two looks at how far it is
+	                                                 * (200 put idle frames on two peaks 220 us apart: 0.1 ms on average
+	                                                 * of every frame's way to the flip, work/research/gpu-120hz.md) */
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */

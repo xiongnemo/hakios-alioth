@@ -73,6 +73,37 @@ extern void loader_log_putc(char c);
 static LCK_MTX_DECLARE(say_lock, &slpi_lock_group);
 static bool quiet;
 
+/*
+ * Every line kept again in a ring of its own, said once more when the run ends (hakios_slpi_stop()): with slpi=1
+ * the steps' lines go to the kernel's message buffer only, which a whole iOS overwrites long before the end, and
+ * the loader's log keeps only its first 256 KB and its last 1 MB (2026-10-30: "step 13 failed", and no line why).
+ */
+static char slpi_history[160 * 1024];
+static uint32_t slpi_history_at;
+
+static void
+history_put(const char *line)
+{
+	for (const char *c = line; *c != 0; c++) {
+		slpi_history[slpi_history_at++ % sizeof(slpi_history)] = *c;
+	}
+}
+
+static void
+history_tell(void)
+{
+	static const char banner[] = "\n--- slpi: what the sensor DSP's driver said during the run, again ---\n";
+	uint32_t from = slpi_history_at > sizeof(slpi_history) ? slpi_history_at - (uint32_t)sizeof(slpi_history) : 0;
+
+	for (const char *c = banner; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	for (uint32_t i = from; i < slpi_history_at; i++) {
+		loader_log_putc(slpi_history[i % sizeof(slpi_history)]);
+	}
+	slpi_history_at = 0;
+}
+
 static void
 say_line(const char *line, bool aloud)
 {
@@ -83,6 +114,7 @@ say_line(const char *line, bool aloud)
 		return;
 	}
 	lck_mtx_lock(&say_lock);
+	history_put(line);
 	if (!quiet || aloud) {
 		for (const char *c = line; *c != 0; c++) {
 			loader_log_putc(*c);
@@ -1188,7 +1220,9 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 	printf("slpi: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
-	for (int i = 0; i < 100; i++) {
+	/* (resumed until done, as Linux does: given up halfway, a call left TrustZone with it open and the next one
+	 * never came back -- see work/wsl/fix-scm-retry.py) */
+	for (int i = 0; i < 1000000; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
 		register uint64_t x2 __asm__("x2") = first;
@@ -1661,7 +1695,18 @@ step_our_item(void)
 	for (uint32_t word = 0; word < 4; word++) {
 		smem_poke(our_item + SMP2P_AT_NAME(0) + 4 * word, name[word]);
 	}
-	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | 1u << 16);
+	/*
+	 * ... and "sleepstate" (dt: the child sleepstate-out of qcom,smp2p-dsps, which qcom,smp2p_sleepstate drives),
+	 * bit 0 set: the AP is awake. Its sensors' framework holds back what it has for a sleeping AP: without the
+	 * entry the light sensor sent its first reading and then hardly another, at any rate asked (2026-10-30).
+	 */
+	bzero(name, sizeof(name));
+	strlcpy((char *)name, "sleepstate", sizeof(name));
+	for (uint32_t word = 0; word < 4; word++) {
+		smem_poke(our_item + SMP2P_AT_NAME(1) + 4 * word, name[word]);
+	}
+	smem_poke(our_item + SMP2P_AT_VALUE(1), 1);
+	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | 2u << 16);
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
 	settle();
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
@@ -3055,6 +3100,7 @@ rpc_call(uint32_t handle, uint32_t scalars, struct rpc_arg *args, bool kernel, i
 
 static struct rpc_file {
 	bool used, directory;
+	bool sink;                      /* opened to be written: what is written is taken and dropped (nothing on the phone changes) */
 	char path[200];                 /* ours */
 	off_t offset, size;
 	char *names;                    /* a directory: its entries, one after another with a 0 after each */
@@ -3077,10 +3123,51 @@ rpc_our_path(const char *theirs, const char *dir, char *ours, size_t size)
 	if (strncmp(p, "/system/vendor/", 15) == 0) {
 		p += 7;                         /* (the same vendor/ seen from two places) */
 	}
-	for (const char *c = p; *c != 0; c++) {
-		if (c[0] == '.' && c[1] == '.' && (c == p || c[-1] == '/') && (c[2] == 0 || c[2] == '/')) {
-			return false;
+	/*
+	 * "." and ".." taken out (the DSP names ".../registry/registry/../sns_reg_version"); a ".." above the root is
+	 * refused, so that nothing outside fw/sensors is ever named.
+	 */
+	{
+		char clean[256];
+		size_t at = 0;
+
+		clean[0] = 0;
+		while (*p != 0) {
+			const char *end;
+			size_t n;
+
+			while (*p == '/') {
+				p++;
+			}
+			end = p;
+			while (*end != 0 && *end != '/') {
+				end++;
+			}
+			n = (size_t)(end - p);
+			if (n == 0 || (n == 1 && p[0] == '.')) {
+				/* nothing */
+			} else if (n == 2 && p[0] == '.' && p[1] == '.') {
+				if (at == 0) {
+					return false;
+				}
+				while (at > 0 && clean[at - 1] != '/') {
+					at--;
+				}
+				at = at > 0 ? at - 1 : 0;
+				clean[at] = 0;
+			} else {
+				if (at + 1 + n >= sizeof(clean)) {
+					return false;
+				}
+				clean[at++] = '/';
+				memcpy(clean + at, p, n);
+				at += n;
+				clean[at] = 0;
+			}
+			p = end;
 		}
+		strlcpy(joined, at ? clean : "/", sizeof(joined));
+		p = joined;
 	}
 	if (strncmp(p, "/persist/", 9) == 0) {
 		snprintf(ours, size, "%s/mnt/vendor%s", RPC_FILES_ROOT, p);
@@ -3291,8 +3378,8 @@ rpc_note(const char *format, ...)
 	char line[300];
 	va_list list;
 
-	if (rpc_lines++ >= 400) {
-		return;                 /* (the first 400 are what tells how it went) */
+	if (rpc_lines++ >= 900) {
+		return;                 /* (the first 900 are what tells how it went) */
 	}
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
@@ -3379,8 +3466,18 @@ rpc_serve(uint32_t handle, uint32_t scalars, const struct rpc_in *ins, struct rp
 			return AEE_EBADPARM;
 		}
 		if (mode[0] == 'w' || mode[0] == 'a' || strchr(mode, '+') != NULL) {
-			rpc_note("open %s (%s) to write: not here", name, mode);
-			return AEE_EUNSUPPORTED;
+			/*
+			 * To be written (the registry it makes from the JSON files, temp.json, sns_reg_version): taken and
+			 * dropped -- refused, it asked again and again (2026-10-30). The files it reads stay those of the image.
+			 */
+			if ((fd = rpc_file_new()) < 0) {
+				return AEE_ENOMEMORY;
+			}
+			rpc_files[fd].sink = true;
+			strlcpy(rpc_files[fd].path, name, sizeof(rpc_files[fd].path));
+			rpc_note("open %s (%s) to write: taken, and what is written dropped (file %d)", name, mode, fd);
+			memcpy(o, &fd, 4);
+			return 0;
 		}
 		if (!rpc_our_path(name, strcmp(variable, "ADSP_AVS_CFG_PATH") == 0 ? "/vendor/etc/acdbdata" : "/usr/lib/qcom/adsp", path,
 		    sizeof(path)) || (fd = rpc_open_file(path)) < 0) {
@@ -3416,6 +3513,28 @@ rpc_serve(uint32_t handle, uint32_t scalars, const struct rpc_in *ins, struct rp
 		memcpy(o + 4, &eof, 4);
 		return 0;
 	}
+	case 1 << 8 | 5: {              /* fwrite(file, buffer, rout written, rout eof): into a sink, all of it */
+		uint32_t fd = rpc_word(&first, 0), length = n_in > 1 ? ins[1].length : 0;
+
+		WANT(1, 1);
+		o = rpc_out_take(&outs[0], 8);
+		if (o == NULL || fd >= RPC_FILES || !rpc_files[fd].used || !rpc_files[fd].sink) {
+			return AEE_EFAILED;
+		}
+		rpc_files[fd].offset += length;
+		memcpy(o, &length, 4);
+		return 0;
+	}
+	case 1 << 8 | 23:               /* fsync(file) */
+	case 1 << 8 | 24:               /* fremove(name) */
+	case 1 << 8 | 29:               /* mkdir(name, mode) */
+	case 1 << 8 | 32:               /* ftrunc(file, offset) */
+	case 1 << 8 | 33:               /* frename(old, new) */
+		if (method != 23 && method != 32) {
+			rpc_note("handle 1 method %u (%s): said to be done, nothing changed", method, n_in > 1 && rpc_string(&ins[1]) ?
+			    rpc_string(&ins[1]) : "");
+		}
+		return 0;
 	case 1 << 8 | 8:                /* ftell(file, rout position) */
 	case 1 << 8 | 10:               /* flen(file, rout length) */
 	case 1 << 8 | 12: {             /* feof(file, rout eof) */
@@ -4097,6 +4216,20 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, als_millilux, CTLFLAG_RD | CTLFLAG_LOCKED, &s
     "the ambient light, in thousandths of a lux (the sensor DSP's; -1: none yet)");
 SYSCTL_INT(_kern_hakios, OID_AUTO, als_events, CTLFLAG_RD | CTLFLAG_LOCKED, &see_events, 0, "how many readings of it so far");
 
+/*
+ * The device's orientation, Qualcomm's own "device_orient" sensor (on change, msg 514; its events msg 776,
+ * sns_device_orient_event { state = 1 }: -1 unknown, 0 upright, 1 turned a quarter counter-clockwise -- its X
+ * axis up --, 2 upside down, 3 a quarter clockwise; never face up or down), as a UIDeviceOrientation for
+ * backboardd (src/inject.c): 0 unknown, 1 portrait, 2 upside down, 3 landscape left (the top to the left: turned
+ * counter-clockwise), 4 landscape right. kern.hakios.orientation and orient_events, how many changes.
+ */
+#define SEE_MSG_ORIENT_EVENT    776
+static int see_orientation, see_orient_events;
+SYSCTL_INT(_kern_hakios, OID_AUTO, orientation, CTLFLAG_RD | CTLFLAG_LOCKED, &see_orientation, 0,
+    "the device's orientation, a UIDeviceOrientation (the sensor DSP's device_orient; 0: not known)");
+SYSCTL_INT(_kern_hakios, OID_AUTO, orient_events, CTLFLAG_RD | CTLFLAG_LOCKED, &see_orient_events, 0,
+    "how many orientations it has said so far");
+
 static struct {
 	uint32_t node, port;            /* the service's */
 	uint16_t transaction;
@@ -4105,6 +4238,8 @@ static struct {
 	uint64_t client;                /* its number for us */
 	uint64_t suid[4][2];            /* the light sensors it named */
 	volatile uint32_t suids;
+	uint64_t orient_suid[2];        /* ... and its device_orient */
+	volatile bool orient_named;
 	uint32_t reports, shown;
 } see;
 
@@ -4323,15 +4458,21 @@ see_event(const uint8_t *data, uint32_t length)
 		see.reports++;
 		if (msg_id == SEE_MSG_SUID_EVENT && payload != NULL) {
 			uint32_t pat = 0;
+			bool orient = false;
 
+			/* (the data type first, wherever it is in the buffer: the SUIDs are filed under it) */
+			while (pb_next(payload, payload_length, &pat, &g)) {
+				if (g.number == 1 && g.wire == 2) {
+					orient = g.length == 13 && memcmp(g.data, "device_orient", 13) == 0;
+					printf("slpi: see: sensors of the type \"%.*s\":\n", (int)(g.length < 40 ? g.length : 40), g.data);
+				}
+			}
+			pat = 0;
 			while (pb_next(payload, payload_length, &pat, &g)) {
 				struct pb_field h;
 				uint32_t hat = 0;
 				uint64_t low = 0, high = 0;
 
-				if (g.number == 1 && g.wire == 2) {
-					printf("slpi: see: sensors of the type \"%.*s\":\n", (int)(g.length < 40 ? g.length : 40), g.data);
-				}
 				if (g.number != 2 || g.wire != 2) {
 					continue;
 				}
@@ -4343,15 +4484,63 @@ see_event(const uint8_t *data, uint32_t length)
 					}
 				}
 				printf("slpi: see:   SUID %016llx%016llx\n", high, low);
-				if (see.suids < 4) {
+				if (orient && !see.orient_named) {
+					see.orient_suid[0] = low;
+					see.orient_suid[1] = high;
+					__asm__ volatile ("dmb ish" ::: "memory");
+					see.orient_named = true;
+				} else if (!orient && see.suids < 4) {
 					see.suid[see.suids][0] = low;
 					see.suid[see.suids][1] = high;
 					see.suids++;
 				}
 			}
+		} else if (msg_id == SEE_MSG_ORIENT_EVENT && payload != NULL) {
+			static const int orientation[4] = { 1, 3, 2, 4 };
+			uint32_t pat = 0;
+			int64_t state = -1;
+
+			while (pb_next(payload, payload_length, &pat, &g)) {
+				if (g.number == 1 && g.wire == 0) {
+					state = (int64_t)g.value;     /* (an enum: -1 is ten bytes of varint, all ones) */
+				}
+			}
+			see_orientation = state >= 0 && state < 4 ? orientation[state] : 0;
+			see_orient_events++;
+			if (see_orient_events <= 40) {
+				printf("slpi: see: THE ORIENTATION: state %lld, so UIDeviceOrientation %d\n", state, see_orientation);
+			}
 		} else if (msg_id == SEE_MSG_SENSOR_EVENT && payload != NULL) {
 			uint32_t pat = 0, first = 0, floats = 0;
 
+			if (see.shown < 40) {
+				/* (every value of the event, in thousandths, and its bytes: which one is the lux was a guess) */
+				char text[200];
+				size_t at = 0;
+				uint32_t qat = 0;
+				struct pb_field q;
+
+				text[0] = 0;
+				while (pb_next(payload, payload_length, &qat, &q) && at < sizeof(text) - 40) {
+					if (q.wire == 5) {
+						at += (size_t)snprintf(text + at, sizeof(text) - at, " f%u=%d", q.number, see_lux_milli((uint32_t)q.value));
+					} else if (q.wire == 2) {
+						for (uint32_t k = 0; k + 4 <= q.length && at < sizeof(text) - 20; k += 4) {
+							uint32_t bits = (uint32_t)q.data[k] | (uint32_t)q.data[k + 1] << 8 | (uint32_t)q.data[k + 2] << 16 |
+							    (uint32_t)q.data[k + 3] << 24;
+
+							at += (size_t)snprintf(text + at, sizeof(text) - at, " p%u[%u]=%d", q.number, k / 4, see_lux_milli(bits));
+						}
+					} else {
+						at += (size_t)snprintf(text + at, sizeof(text) - at, " v%u=%llu", q.number, q.value);
+					}
+				}
+				printf("slpi: see: event %u bytes:%s; bytes", payload_length, text);
+				for (uint32_t k = 0; k < payload_length && k < 24; k++) {
+					printf(" %02x", payload[k]);
+				}
+				printf("\n");
+			}
 			while (pb_next(payload, payload_length, &pat, &g)) {
 				if (g.number == 1 && g.wire == 5 && floats++ == 0) {
 					first = (uint32_t)g.value;
@@ -4438,6 +4627,46 @@ see_wait_answer(void)
 	return see.answered && see.result == 0;
 }
 
+/*
+ * The orientation, once the light is on (with the DSP's registry read by then, the lookup's first answer names
+ * it). What does not work here is said and left: the light is what step 13 is for.
+ */
+static void
+see_orient_on(void)
+{
+	uint8_t lookup[64];
+	struct pb q = { lookup, 0, sizeof(lookup), false };
+	int error;
+
+	pb_bytes(&q, 1, "device_orient", 13);
+	pb_bool(&q, 2, false);
+	pb_bool(&q, 3, true);
+	error = see_request(SEE_SUID_LOOKUP, SEE_SUID_LOOKUP, SEE_MSG_SUID_REQUEST, lookup, q.at);
+	if (error != 0 || !see_wait_answer()) {
+		printf("slpi: %u: the lookup for \"device_orient\" NOT TAKEN (%d, result %u, error %u): no orientation\n", step, error,
+		    see.result, see.error);
+		return;
+	}
+	for (unsigned ms = 0; ms < 20000 && !see.orient_named; ms++) {
+		sleep_ms(1);
+	}
+	if (!see.orient_named) {
+		printf("slpi: %u: NO device_orient NAMED in 20 s: no orientation\n", step);
+		return;
+	}
+	error = see_request(see.orient_suid[0], see.orient_suid[1], SEE_MSG_ON_CHANGE, NULL, 0);
+	if (error != 0 || !see_wait_answer()) {
+		printf("slpi: %u: device_orient %016llx%016llx NOT SWITCHED ON (%d, result %u, error %u)\n", step, see.orient_suid[1],
+		    see.orient_suid[0], error, see.result, see.error);
+		return;
+	}
+	for (unsigned ms = 0; ms < 3000 && see_orient_events == 0; ms++) {
+		sleep_ms(1);
+	}
+	printf("slpi: %u: the orientation is on (sysctl kern.hakios.orientation): %d, after %d events in the first 3 s\n", step,
+	    see_orientation, see_orient_events);
+}
+
 static bool
 step_see(void)
 {
@@ -4480,14 +4709,41 @@ step_see(void)
 		return false;
 	}
 	printf("slpi: %u: the service takes it: we are its client %llu\n", step, see.client);
-	for (unsigned ms = 0; ms < 3000 && see.suids == 0; ms++) {
+	/*
+	 * (the lookup asks for updates: a sensor that registers later is named then -- right after the start the DSP
+	 * is still reading its registry through us, and the first answer names none, 2026-10-30)
+	 */
+	for (unsigned ms = 0; ms < 60000 && see.suids == 0; ms++) {
 		sleep_ms(1);
 	}
 	if (see.suids == 0) {
-		printf("slpi: %u: NO LIGHT SENSOR NAMED in 3 s (%u reports)\n", step, see.reports);
+		printf("slpi: %u: NO LIGHT SENSOR NAMED in 60 s (%u reports; %u calls of the DSP's answered)\n", step, see.reports,
+		    rpc_count.served);
 		return false;
 	}
-	error = see_request(see.suid[0][0], see.suid[0][1], SEE_MSG_ON_CHANGE, NULL, 0);
+	printf("slpi: %u: %u light sensor%s named after %u reports\n", step, see.suids, see.suids == 1 ? "" : "s", see.reports);
+	/*
+	 * On change (msg 514), or at a rate (msg 513, sns_std_sensor_config { float sample_rate = 1 }): boot-arg
+	 * slpi_als_hz=N asks for N readings a second whatever the light does (on change alone, the readings
+	 * of 2026-10-30 never moved from the first).
+	 */
+	uint32_t hz = 0;
+
+	PE_parse_boot_argn("slpi_als_hz", &hz, sizeof(hz));
+	if (hz != 0 && hz <= 100) {
+		uint8_t rate[5] = { 0x0d };     /* field 1, a fixed32 */
+		uint32_t bits = 0, exponent = 31;
+
+		while (!(hz >> exponent)) {
+			exponent--;             /* (hz as a float: 2^exponent times 1.fraction) */
+		}
+		bits = (exponent + 127) << 23 | ((hz << (23 - exponent)) & 0x7fffff);
+		memcpy(rate + 1, &bits, 4);
+		printf("slpi: %u: the light sensor at %u readings a second (msg 513)\n", step, hz);
+		error = see_request(see.suid[0][0], see.suid[0][1], 513, rate, sizeof(rate));
+	} else {
+		error = see_request(see.suid[0][0], see.suid[0][1], SEE_MSG_ON_CHANGE, NULL, 0);
+	}
 	if (error != 0 || !see_wait_answer()) {
 		printf("slpi: %u: the light sensor %016llx%016llx NOT SWITCHED ON (%d, result %u, error %u)\n", step, see.suid[0][1],
 		    see.suid[0][0], error, see.result, see.error);
@@ -4498,6 +4754,7 @@ step_see(void)
 	}
 	printf("slpi: %u: the light sensor is on: %d readings in the first 3 s%s\n", step, see_events, see_events ? "" :
 	    " (an on-change sensor says nothing while the light stays the same)");
+	see_orient_on();
 	return true;
 }
 
@@ -4514,7 +4771,8 @@ static void
 steps_over(uint32_t done)
 {
 	lck_mtx_lock(&dsp_lock);
-	if (dsp_started && done == last_step && keep) {
+	/* (kept too when only the sensors' own step failed: the DSP runs and answers, a sensor may come later) */
+	if (dsp_started && keep && (done == last_step || done >= 12)) {
 		printf("slpi: THE SENSOR DSP STAYS ON while the system runs%s\n", link_runs ? ", and the link with it" : "");
 	} else if (dsp_started) {
 		dsp_shutdown("the steps are over");
@@ -4526,6 +4784,11 @@ steps_over(uint32_t done)
 void
 hakios_slpi_stop(void)
 {
+	if (slpi_history_at != 0) {
+		lck_mtx_lock(&say_lock);
+		history_tell();
+		lck_mtx_unlock(&say_lock);
+	}
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started) {
 		unsigned services = 0;
@@ -4584,6 +4847,16 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	/* (the firmware may be on the root file system, which is not mounted yet when this begins: a minute at most) */
 	for (unsigned waited = 0; waited < 300 && rootvnode == NULLVP; waited++) {
 		sleep_ms(200);
+	}
+	/*
+	 * The light sensor in the registry for MobileGestalt (iokit/Kernel/hakios.sensors.cpp) before launchd has started
+	 * anybody who asks -- its readings come once the DSP is up, some 20 s on.
+	 */
+	{
+		extern int hakios_als_publish(void);
+		int error = hakios_als_publish();
+
+		tell("slpi: the light sensor %s in the registry for the system (%d)\n", error == 0 ? "is" : "IS NOT", error);
 	}
 	run_steps();
 	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {

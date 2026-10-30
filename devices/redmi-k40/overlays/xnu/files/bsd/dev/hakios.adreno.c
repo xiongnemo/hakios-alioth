@@ -1585,7 +1585,9 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
 	hold(true);
-	for (int i = 0; i < 100; i++) {
+	/* (resumed until done, as Linux does: given up halfway, a call left TrustZone with it open and the next one
+	 * never came back -- see work/wsl/fix-scm-retry.py) */
+	for (int i = 0; i < 1000000; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
 		register uint64_t x2 __asm__("x2") = first;

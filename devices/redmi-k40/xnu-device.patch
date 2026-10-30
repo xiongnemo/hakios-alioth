@@ -102,12 +102,13 @@
  	@$(LOG_SUPPORTED_KPI) "$(CURRENT_ARCH_CONFIG_LC)"
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -87,6 +87,8 @@
+@@ -87,6 +87,9 @@
  iokit/Kernel/hakios.battery.cpp			optional iokitcpp
  iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
  iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
 +iokit/Kernel/hakios.bluetooth.cpp			optional iokitcpp
 +iokit/Kernel/hakios.usbmux.cpp			optional iokitcpp
++iokit/Kernel/hakios.sensors.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp
@@ -154,10 +155,46 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5949,6 +5949,53 @@
+@@ -5699,6 +5699,23 @@
+ SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
+     "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
+ 
++/*
++ * (redmi-k40) A NAME "*SUFFIX" in kern.exec_inject names every program whose directory's name ends in SUFFIX:
++ * "*.app" and "*.appex" are all the applications and their extensions, which RunningBoard starts from wherever
++ * they were installed. The path is the one looked up, its last component the program's file name.
++ */
++static bool
++exec_inject_in_bundle(struct image_params *imgp, const char *suffix, size_t length)
++{
++	const char *start = imgp->ip_ndp->ni_cnd.cn_pnbuf;
++	const char *name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++
++	if (start == NULL || name == NULL || length == 0 || name < start + length + 1 || name[-1] != '/') {
++		return false;
++	}
++	return strncmp(name - 1 - length, suffix, length) == 0;
++}
++
+ static bool
+ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5734,6 +5751,10 @@
+ 			if (!matched && (size_t)(p - word) == namelen && namelen != 0 && liblen != 0 &&
+ 			    strncmp(word, name, namelen) == 0) {
+ 				matched = true;         /* this group names this program; its library is added once */
++			}
++			if (!matched && liblen != 0 && p - word > 1 && word[0] == '*' &&
++			    exec_inject_in_bundle(imgp, word + 1, (size_t)(p - word) - 1)) {
++				matched = true;         /* (redmi-k40) "*.app": a program in such a bundle */
+ 			}
+ 		}
+ 		if (matched && liblen != 0 && used + 1 + liblen < size) {
+@@ -5948,6 +5969,53 @@
+ 		}
  		imgp->ip_argspace -= new_ptr_size;
  		imgp->ip_envc++;
- 	}
++	}
 +	/*
 +	 * (redmi-k40) ... and for everybody what the boot-arg exec_env=NAME=VALUE[,NAME=VALUE...] says:
 +	 * CA_FRAME_RATE_POLICY=2, by which CoreAnimation gives an iPhone with this 120 Hz panel the default
@@ -204,10 +241,9 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			imgp->ip_argspace -= new_ptr_size;
 +			imgp->ip_envc++;
 +		}
-+	}
+ 	}
  
  	/* Save space for envv[] NULL terminator */
- 	if (imgp->ip_argspace < new_ptr_size) {
 diff --git a/bsd/netinet/tcp_usrreq.c b/bsd/netinet/tcp_usrreq.c
 --- a/bsd/netinet/tcp_usrreq.c
 +++ b/bsd/netinet/tcp_usrreq.c

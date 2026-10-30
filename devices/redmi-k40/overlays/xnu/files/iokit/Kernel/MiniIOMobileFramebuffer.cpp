@@ -2298,6 +2298,7 @@ extern "C" bool hakios_board_is_alioth(void);
 #define ALIOTH_BL_MAX           0x7ff
 #define ALIOTH_BL_INIT          1023            /* (iOS's scale: half way, a quarter of the panel's light squared) */
 #define ALIOTH_BL_STEP_MS       33
+#define ALIOTH_BL_NITS_MAX      500             /* (the K11A's light at DBV 0x7ff, outside its high-brightness mode) */
 #define ALIOTH_BL_FADE_MAX_MS   5000
 
 class AppleARMBacklight : public IOService
@@ -2364,7 +2365,44 @@ AppleARMBacklight::startBacklight(uint32_t initial)
 	fDisplayOn = true;
 	fTarget = fLastLit = fFadeFrom = initial;
 	setProperty("backlight-control", true);
+	/*
+	 * The legacy path: CoreBrightness sends the slider's level ("brightness"). Its auto-brightness ramps, in nits,
+	 * end in its own model there (every step "brightness 0.5", 2026-10-30): backboardd hands them to us itself, as
+	 * "brightness-nits" (src/inject.c, ramp_to()). Boot-arg panel_bl_nits=1 publishes "new-backlight-architecture"
+	 * instead, on which CoreBrightness would send nits for everything -- but then it waits for display hardware this
+	 * phone has not ("Modules not ready") and the screen stopped drawing at the home screen (2026-10-30).
+	 */
+	uint32_t nits_path = 0;
+	PE_parse_boot_argn("panel_bl_nits", &nits_path, sizeof(nits_path));
+	if (nits_path) {
+		setProperty("new-backlight-architecture", true);
+	}
 	publish(initial);
+	/*
+	 * What the panel gives in nits, for CoreBrightness (_DisplayCreateWithID reads this dictionary off the
+	 * backlight, as floats): without it the panel's light is taken to be 0, 0.5 and 1 nit at the slider's bottom,
+	 * middle and top, hardwareAccessibleMaxNits is 1, and every auto-brightness target came out 1 nit whatever the
+	 * light -- under a torch at 4000 lux as in the dark (2026-10-30). The slider's level goes to the panel squared
+	 * (step() below), and the DBV is about linear in light: 500 nits at the top, a quarter of that half way, the
+	 * dimmest step about 2. The currents are only for CoreBrightness's power estimate (nits = mA x the factor).
+	 */
+	OSDictionary * cal = OSDictionary::withCapacity(10);
+	if (cal != NULL) {
+		static const struct { const char * key; uint32_t value; } values[] = {
+			{ "lMaxPanel", ALIOTH_BL_NITS_MAX }, { "lMidPanel", ALIOTH_BL_NITS_MAX / 4 }, { "lMinPanel", 2 },
+			{ "lMaxProduct", ALIOTH_BL_NITS_MAX }, { "lMidProduct", ALIOTH_BL_NITS_MAX / 4 }, { "lMinProduct", 2 },
+			{ "current-for-max-backlight", 20 }, { "current-for-mid-backlight", 5 },
+			{ "hardware-max-current-limit", 25 }, { "milliAmps2NitsScaleFactor", ALIOTH_BL_NITS_MAX / 20 },
+		};
+		/* (in 16.16: it divides what it reads by 65536 -- 500 plain was 0.0076 nits) */
+		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+			OSNumber * n = OSNumber::withNumber((unsigned long long) values[i].value << 16, 32);
+			cal->setObject(values[i].key, n);
+			OSSafeReleaseNULL(n);
+		}
+		setProperty("backlight-calibration-parameters", cal);
+		OSSafeReleaseNULL(cal);
+	}
 	registerService();
 	hakios_tl("backlight: AppleARMBacklight up: the panel's DBV 0..%u by DCS 0x51; %u to start with (iOS's scale)\n", ALIOTH_BL_MAX,
 	    initial);
@@ -2480,8 +2518,26 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		    b ? (int) b->unsigned32BitValue() : -1, f ? f->unsigned32BitValue() : 0, nits ? nits->unsigned32BitValue() : 0);
 	}
 	uint32_t to;
+	int64_t asked_nits = nits != NULL ? (int32_t) nits->unsigned32BitValue() : 0;
 
-	if (b != NULL) {
+	if (asked_nits > 0) {
+		/*
+		 * nits in 16.16 (CoreBrightness's _SetBLDriverNitsValue): the DBV is about linear in light, the panel's
+		 * 500 at the top (the calibration above); as a level of iOS's scale, which step() squares, its root
+		 */
+		uint64_t dbv = MIN((uint64_t) asked_nits * ALIOTH_BL_MAX / ((uint64_t) ALIOTH_BL_NITS_MAX << 16), (uint64_t) ALIOTH_BL_MAX);
+		uint64_t root = 0;
+
+		if (fCurve) {
+			for (uint64_t bit = 1ULL << 22; bit != 0; bit >>= 1) {
+				if ((root + bit) * (root + bit) <= dbv * ALIOTH_BL_MAX) {
+					root += bit;
+				}
+			}
+			dbv = root;
+		}
+		to = dbv == 0 ? 1 : (uint32_t) MIN(dbv, (uint64_t) ALIOTH_BL_MAX);
+	} else if (b != NULL) {
 		int32_t v = (int32_t) b->unsigned32BitValue();
 
 		if (v < 0) {
@@ -2489,15 +2545,6 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		}
 		/* (the slider's bottom is the dimmest light, not none: 0 is for the display going off) */
 		to = v < 1 ? 1 : MIN((uint32_t) v, (uint32_t) ALIOTH_BL_MAX);
-	} else if (nits != NULL) {
-		/* nits in 16.16 (CoreBrightness's _SetBLDriverNitsValue), against the panel's 500 at the top */
-		int64_t v = (int32_t) nits->unsigned32BitValue();
-
-		if (v <= 0) {
-			return kIOReturnSuccess;
-		}
-		to = (uint32_t) MIN((uint64_t) v * ALIOTH_BL_MAX / (500ULL << 16), (uint64_t) ALIOTH_BL_MAX);
-		to = to == 0 ? 1 : to;
 	} else {
 		return kIOReturnSuccess;
 	}
