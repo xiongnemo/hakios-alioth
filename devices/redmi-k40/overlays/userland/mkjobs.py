@@ -213,7 +213,9 @@ import sys
 # for ever, see «Sileo» in README.md.)
 # (mediaserverd is not among them, for all that there is neither sound nor a camera:
 # it is where VideoToolbox decodes for every other process, a HEIC picture included; see src/inject_media.c.)
-DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
+# (locationd is no longer among them: it is CoreLocation and CoreMotion, the compass and the motion sensors for
+# applications -- in the system image now, sysimage/select-system.py BIG_WANTED)
+DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties',

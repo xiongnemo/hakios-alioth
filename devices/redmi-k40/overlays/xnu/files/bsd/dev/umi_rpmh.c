@@ -49,6 +49,7 @@ int umi_rpmh_camera_vreg(unsigned rail, bool enable);
 #define RH_DB_ENTRY     24u
 #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
 #define RH_VRM          4u
+#define RH_BCM          5u       /* (a bus clock manager: umi_rpmh_bcm_vote) */
 #define RH_TIMEOUT_US   100000u
 
 static vm_offset_t rh_rsc, rh_tcs, rh_db, rh_gic;
@@ -210,7 +211,9 @@ rh_lookup_slave(const char *res, unsigned want, uint32_t *address, uint32_t *aux
 				continue;
 			}
 			uint32_t addr = rh_read(rh_db, e + 16);
-			if (slave != want || (addr >> 16) != want || (addr & 15u) ||
+			/* (a regulator's address is 16-byte aligned, a bus clock manager's only 4: MC0 is 0x50000, SH0 is
+			 * not -- its votes, the GPU's and the screen-off one, failed "invalid entry" until 2026-10-31) */
+			if (slave != want || (addr >> 16) != want || (addr & (want == RH_BCM ? 3u : 15u)) ||
 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
 				printf("UMI RPMH: invalid entry for %s (slave %u, wanted %u)\n", res, slave, want);
 				return EINVAL;
@@ -425,7 +428,6 @@ int umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y);
  * include/soc/qcom/tcs.h BCM_TCS_CMD: commit 30, valid 29, x << 14, y). 0x3fff each asks for the most
  * the bus has. Held until reset.
  */
-#define RH_BCM          5u
 
 int
 umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y)

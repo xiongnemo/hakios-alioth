@@ -4230,6 +4230,57 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, orientation, CTLFLAG_RD | CTLFLAG_LOCKED, &se
 SYSCTL_INT(_kern_hakios, OID_AUTO, orient_events, CTLFLAG_RD | CTLFLAG_LOCKED, &see_orient_events, 0,
     "how many orientations it has said so far");
 
+/*
+ * The device's rotation in the world: Qualcomm's "rotv" (the accelerometer, gyroscope and magnetometer fused and
+ * calibrated on the DSP; "geomag_rv", the same without the gyroscope, where there is no rotv) -- a quaternion
+ * x, y, z, w that turns the device's axes into east, north and up, as Android's rotation vector. It is the compass
+ * for applications (src/inject_ui.c: CLLocationManager's heading). A streaming sensor, so on only while somebody
+ * wants it: whoever does writes kern.hakios.rotv_lease (any value) at least every 3 s, and see_control() switches
+ * it on at ROTV_HZ readings a second and off 3 s after the last lease. kern.hakios.rotv is struct hakios_rotv:
+ * the floats' bits as they came -- the kernel does no floating point.
+ */
+#define ROTV_HZ                 20
+#define ROTV_TEXT               "20"
+#define ROTV_LEASE_US           3000000ull
+#define SEE_MSG_STREAM          513
+#define SEE_MSG_DISABLE         10
+
+struct hakios_rotv {
+	uint32_t sequence;              /* readings so far */
+	uint32_t count;                 /* floats in the last one */
+	uint32_t value[6];              /* their bits: x, y, z, w (and an accuracy, in radians, where there is one) */
+	int32_t status;                 /* sns_std_sensor_sample_status: 0 unreliable, 1 low, 2 medium, 3 high; -1 none */
+	uint32_t on;                    /* the sensor is switched on */
+	uint64_t timestamp;             /* the DSP's, in its ticks */
+};
+static struct hakios_rotv see_rotv = { .status = -1 };
+static volatile uint64_t rotv_lease_until;      /* now_us() */
+static uint64_t now_us(void);
+
+static int
+rotv_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	struct hakios_rotv copy = see_rotv;
+
+	return SYSCTL_OUT(req, &copy, sizeof(copy));
+}
+
+static int
+rotv_lease_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int leased = rotv_lease_until > now_us(), error = sysctl_handle_int(oidp, &leased, 0, req);
+
+	if (error == 0 && req->newptr != USER_ADDR_NULL) {
+		rotv_lease_until = now_us() + ROTV_LEASE_US;
+	}
+	return error;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, rotv, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, rotv_sysctl,
+    "S,hakios_rotv", "the device's rotation in the world, a quaternion from the sensor DSP (struct hakios_rotv)");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, rotv_lease, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    rotv_lease_sysctl, "I", "write anything to want the rotation for 3 s more; reads 1 while it is wanted");
+
 static struct {
 	uint32_t node, port;            /* the service's */
 	uint16_t transaction;
@@ -4240,6 +4291,9 @@ static struct {
 	volatile uint32_t suids;
 	uint64_t orient_suid[2];        /* ... and its device_orient */
 	volatile bool orient_named;
+	uint64_t rotv_suid[2];          /* ... and its rotation vector */
+	volatile bool rotv_named;
+	uint32_t rotv_shown;
 	uint32_t reports, shown;
 } see;
 
@@ -4438,14 +4492,27 @@ see_event(const uint8_t *data, uint32_t length)
 {
 	struct pb_field f, e, g;
 	uint32_t at = 0;
+	uint64_t from_low = 0, from_high = 0;   /* the sensor the events are from (field 1, before them) */
 
 	while (pb_next(data, length, &at, &f)) {
 		uint32_t msg_id = 0, eat = 0;
 		const uint8_t *payload = NULL;
 		uint32_t payload_length = 0;
 
+		if (f.number == 1 && f.wire == 2) {
+			uint32_t sat = 0;
+
+			while (pb_next(f.data, f.length, &sat, &e)) {
+				if (e.number == 1) {
+					from_low = e.value;
+				} else if (e.number == 2) {
+					from_high = e.value;
+				}
+			}
+			continue;
+		}
 		if (f.number != 2 || f.wire != 2) {
-			continue;       /* (field 1: the sensor's SUID) */
+			continue;
 		}
 		while (pb_next(f.data, f.length, &eat, &e)) {
 			if (e.number == 1 && e.wire == 5) {
@@ -4458,12 +4525,14 @@ see_event(const uint8_t *data, uint32_t length)
 		see.reports++;
 		if (msg_id == SEE_MSG_SUID_EVENT && payload != NULL) {
 			uint32_t pat = 0;
-			bool orient = false;
+			bool orient = false, rotv = false;
 
 			/* (the data type first, wherever it is in the buffer: the SUIDs are filed under it) */
 			while (pb_next(payload, payload_length, &pat, &g)) {
 				if (g.number == 1 && g.wire == 2) {
 					orient = g.length == 13 && memcmp(g.data, "device_orient", 13) == 0;
+					rotv = (g.length == 4 && memcmp(g.data, "rotv", 4) == 0) ||
+					    (g.length == 9 && memcmp(g.data, "geomag_rv", 9) == 0);
 					printf("slpi: see: sensors of the type \"%.*s\":\n", (int)(g.length < 40 ? g.length : 40), g.data);
 				}
 			}
@@ -4489,7 +4558,12 @@ see_event(const uint8_t *data, uint32_t length)
 					see.orient_suid[1] = high;
 					__asm__ volatile ("dmb ish" ::: "memory");
 					see.orient_named = true;
-				} else if (!orient && see.suids < 4) {
+				} else if (rotv && !see.rotv_named) {
+					see.rotv_suid[0] = low;
+					see.rotv_suid[1] = high;
+					__asm__ volatile ("dmb ish" ::: "memory");
+					see.rotv_named = true;
+				} else if (!orient && !rotv && see.suids < 4) {
 					see.suid[see.suids][0] = low;
 					see.suid[see.suids][1] = high;
 					see.suids++;
@@ -4509,6 +4583,34 @@ see_event(const uint8_t *data, uint32_t length)
 			see_orient_events++;
 			if (see_orient_events <= 40) {
 				printf("slpi: see: THE ORIENTATION: state %lld, so UIDeviceOrientation %d\n", state, see_orientation);
+			}
+		} else if (msg_id == SEE_MSG_SENSOR_EVENT && payload != NULL && see.rotv_named &&
+		    from_low == see.rotv_suid[0] && from_high == see.rotv_suid[1]) {
+			/* sns_std_sensor_event { repeated float data = 1 (packed or not); status = 2 }: the quaternion */
+			uint32_t pat = 0, n = 0, value[6] = { 0 };
+			int32_t status = -1;
+
+			while (pb_next(payload, payload_length, &pat, &g)) {
+				if (g.number == 1 && g.wire == 5 && n < 6) {
+					value[n++] = (uint32_t)g.value;
+				} else if (g.number == 1 && g.wire == 2) {
+					for (uint32_t k = 0; k + 4 <= g.length && n < 6; k += 4) {
+						value[n++] = (uint32_t)g.data[k] | (uint32_t)g.data[k + 1] << 8 | (uint32_t)g.data[k + 2] << 16 |
+						    (uint32_t)g.data[k + 3] << 24;
+					}
+				} else if (g.number == 2 && g.wire == 0) {
+					status = (int32_t)g.value;
+				}
+			}
+			memcpy(see_rotv.value, value, sizeof(value));
+			see_rotv.count = n;
+			see_rotv.status = status;
+			see_rotv.timestamp = 0;
+			__asm__ volatile ("dmb ish" ::: "memory");
+			see_rotv.sequence++;
+			if (see.rotv_shown++ < 10) {
+				tell("slpi: see: the rotation: %u floats %08x %08x %08x %08x %08x, status %d\n", n, value[0], value[1],
+				    value[2], value[3], value[4], status);
 			}
 		} else if (msg_id == SEE_MSG_SENSOR_EVENT && payload != NULL) {
 			uint32_t pat = 0, first = 0, floats = 0;
@@ -4667,6 +4769,85 @@ see_orient_on(void)
 	    see_orientation, see_orient_events);
 }
 
+/* A whole number as a float's bits (1 .. 2^24), without the FPU: 2^exponent times 1.fraction. */
+static uint32_t
+float_bits(uint32_t n)
+{
+	uint32_t exponent = 31;
+
+	if (n == 0) {
+		return 0;
+	}
+	while (!(n >> exponent)) {
+		exponent--;
+	}
+	return (exponent + 127) << 23 | ((exponent > 23 ? n >> (exponent - 23) : n << (23 - exponent)) & 0x7fffff);
+}
+
+/*
+ * The rotation vector named (not switched on: see_control() does that while it is wanted). "rotv" first, then
+ * "geomag_rv"; what is not there is said, and the rest goes on without it.
+ */
+static void
+see_rotv_lookup(void)
+{
+	static const char *const types[] = { "rotv", "geomag_rv" };
+
+	for (unsigned t = 0; t < 2 && !see.rotv_named; t++) {
+		uint8_t lookup[64];
+		struct pb q = { lookup, 0, sizeof(lookup), false };
+		int error;
+
+		pb_bytes(&q, 1, types[t], (uint32_t)strlen(types[t]));
+		pb_bool(&q, 2, true);           /* default_only: the one Android would use */
+		pb_bool(&q, 3, true);
+		error = see_request(SEE_SUID_LOOKUP, SEE_SUID_LOOKUP, SEE_MSG_SUID_REQUEST, lookup, q.at);
+		if (error != 0 || !see_wait_answer()) {
+			printf("slpi: %u: the lookup for \"%s\" NOT TAKEN (%d, result %u, error %u)\n", step, types[t], error, see.result,
+			    see.error);
+			continue;
+		}
+		for (unsigned ms = 0; ms < 10000 && !see.rotv_named; ms++) {
+			sleep_ms(1);
+		}
+		tell("slpi: %u: \"%s\": %s\n", step, types[t], see.rotv_named ? "named: the compass for applications "
+		    "(kern.hakios.rotv, on while kern.hakios.rotv_lease is written)" : "NONE NAMED in 10 s");
+	}
+}
+
+/*
+ * After the steps, while the DSP stays on (this thread, which made the requests of the steps: the link's thread
+ * takes the answers): the rotation vector switched on while it is leased, off when it is not, checked five
+ * times a second.
+ */
+static void
+see_control(void)
+{
+	while (dsp_started && !leaving) {
+		bool want = now_us() < rotv_lease_until;
+
+		if (see.rotv_named && want != (see_rotv.on != 0)) {
+			uint8_t rate[5] = { 0x0d };     /* sns_std_sensor_config { float sample_rate = 1 } */
+			uint32_t bits = float_bits(ROTV_HZ);
+			int error;
+
+			memcpy(rate + 1, &bits, 4);
+			error = want ? see_request(see.rotv_suid[0], see.rotv_suid[1], SEE_MSG_STREAM, rate, sizeof(rate)) :
+			    see_request(see.rotv_suid[0], see.rotv_suid[1], SEE_MSG_DISABLE, NULL, 0);
+			if (error == 0 && see_wait_answer()) {
+				see_rotv.on = want;
+				see.rotv_shown = 0;
+				tell("slpi: the rotation vector %s\n", want ? "on, " ROTV_TEXT " readings a second" : "off");
+			} else {
+				tell("slpi: the rotation vector NOT SWITCHED %s (%d, result %u, error %u)\n", want ? "ON" : "OFF", error,
+				    see.result, see.error);
+				sleep_ms(2000);
+			}
+		}
+		sleep_ms(200);
+	}
+}
+
 static bool
 step_see(void)
 {
@@ -4755,6 +4936,7 @@ step_see(void)
 	printf("slpi: %u: the light sensor is on: %d readings in the first 3 s%s\n", step, see_events, see_events ? "" :
 	    " (an on-change sensor says nothing while the light stays the same)");
 	see_orient_on();
+	see_rotv_lookup();
 	return true;
 }
 
@@ -4865,6 +5047,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	if (step == STEPS && dsp_started) {
 		tell("slpi: THE SENSOR DSP IS UP AND LINKED, %llu ms after the kernel began on it (the "
 		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
+		see_control();
 	} else {
 		tell("slpi: THE SENSOR DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);

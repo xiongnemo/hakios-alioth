@@ -88,6 +88,9 @@ SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra
                HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
+# ... but these are wanted all the same: locationd (31 MB) is CoreLocation and CoreMotion -- the compass, the
+# motion sensors for applications, and every application's location (OSS Weather found none)
+BIG_WANTED = ('usr/libexec/locationd',)
 # sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
 # system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
@@ -150,7 +153,7 @@ def wanted_file(path, size):
     if path.startswith(ALL_PICTURES) and path.lower().endswith('.png'):
         return True
     if path.startswith(('usr/libexec/', 'usr/sbin/')):
-        return size <= BIG_PROGRAM
+        return size <= BIG_PROGRAM or path in BIG_WANTED
     if path.startswith(('Applications/', HEALTH)):
         return not path.lower().endswith(SKIP_APP_EXT) and '.mlmodelc/' not in path
     if path.startswith(FRAMEWORKS):
