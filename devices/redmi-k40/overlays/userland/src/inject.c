@@ -25,6 +25,7 @@
  * Addresses of things inside the dyld shared cache are those of iOS 16.5 (20F66) for iPhone10,3;
  * every one is checked against what is expected to be there before it is touched.
  */
+#include <Block.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
@@ -34,6 +35,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <notify.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -59,7 +61,7 @@ static uintptr_t slide;
 static void
 say(const char *format, ...)
 {
-	char line[256];
+	char line[2048];
 	va_list ap;
 	int n;
 
@@ -555,6 +557,509 @@ window_server_fixes(void)
  */
 static dispatch_semaphore_t input_services_made;
 
+/*
+ * A light sensor that arrives after CoreBrightness has started (ours: the sensor DSP is up some 20 s after the
+ * boot) went -[CBDisplayContaineriOS addHIDServiceClient:] -> setColorMitigations -> -[CBABModuleiOS
+ * shouldMitigateHarmony:] -> AABC::getALSSensorTypeFromService() on the module's AABC, which is still NULL then:
+ * backboardd died at 0x1c8, every 10 s, and the home screen never came (2026-10-30, slpi=1). On an iPhone the sensor
+ * is there before the module. With no AABC there is nothing to mitigate True Tone ("Harmony") for: NO.
+ */
+#define CB_SHOULD_MITIGATE_HARMONY      0x1af03a028UL   /* -[CBABModuleiOS shouldMitigateHarmony:] (20F66) */
+#define CB_ABMODULE_AABC_OFFSET         0x1ddda5140UL   /* the ivar offset it reads the AABC with */
+
+static BOOL (*orig_should_mitigate_harmony)(id, SEL, id);
+
+static BOOL
+should_mitigate_harmony(id self, SEL selector, id service)
+{
+	int32_t offset = *(const int32_t *)(CB_ABMODULE_AABC_OFFSET + slide);
+
+	if (self == NULL || *(void *const *)((const uint8_t *)(const void *)self + offset) == NULL) {
+		return NO;
+	}
+	return orig_should_mitigate_harmony(self, selector, service);
+}
+
+/*
+ * -[CBABModuleiOS addHIDServiceClient:] makes the module's AABC -- what turns the light into a brightness -- only
+ * for a light sensor it finds in the IORegistry by the service's RegistryID: IOServiceGetMatchingService(
+ * IORegistryEntryIDMatching(id)) != 0 (0x1af039708 .. 0x1af039754), and AABC::open() then reads the sensor's tuning
+ * from that entry (ALSBrightenPdeltaSlow, alsCalibration, crgb, ...; every one of them may be missing). Ours is a
+ * virtual HID service: its RegistryID is one the event server made up, no entry has it, and no AABC was made --
+ * Auto-Brightness was on and the screen stayed as bright under a torch as in the dark (2026-10-30). For that one
+ * call the service gives the kernel's nub HakiosALS instead (iokit/Kernel/hakios.sensors.cpp), an entry with no
+ * tuning: CoreBrightness's defaults. The ID goes back right after; the event server knows the service by its own.
+ */
+#define CB_ADD_HID_SERVICE_CLIENT       0x1af0395d8UL   /* -[CBABModuleiOS addHIDServiceClient:] (20F66) */
+#define CB_AB_HANDLE_EVENT              0x1aefa3fb4UL   /* -[CBABModuleiOS handleHIDEvent:from:] */
+#define SERVICE_CLIENT_REGISTRY_ID      0x10            /* IOHIDServiceClientGetRegistryID(): ldr x0, [x0, #0x10]; ret */
+
+typedef struct __IOHIDServiceClient *IOHIDServiceClientRef;
+extern CFTypeRef IOHIDServiceClientGetRegistryID(IOHIDServiceClientRef service);
+extern Boolean IOHIDServiceClientConformsTo(IOHIDServiceClientRef service, uint32_t page, uint32_t usage);
+
+static void (*orig_add_hid_service_client)(id, SEL, IOHIDServiceClientRef);
+
+static bool
+in_registry(CFTypeRef number)
+{
+	uint64_t entry_id;
+	io_service_t entry;
+
+	if (number == NULL || CFGetTypeID(number) != CFNumberGetTypeID() ||
+	    !CFNumberGetValue((CFNumberRef)number, kCFNumberSInt64Type, &entry_id)) {
+		return false;
+	}
+	entry = IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(entry_id));
+	if (entry == IO_OBJECT_NULL) {
+		return false;
+	}
+	IOObjectRelease(entry);
+	return true;
+}
+
+/* (what CoreBrightness did with the light: light_thread() says it every 30 s, where the log's tail keeps it) */
+static volatile unsigned cb_offered, cb_lights;
+static id cb_module;                    /* the CBABModuleiOS the light went to */
+
+/* "KEY=value" of the AB module's own properties (-copyPropertyForKey:, AABC::getPropertyForClient()), into `text` */
+static void
+cb_properties(char *text, size_t size)
+{
+	static const char *const keys[] = { "TrustedLux", "nits", "BrightnessCurveLevel", "CBAutoBrightnessAvailable",
+		"ALSSAvailable", "ALSUserPreference", "SemanticAmbientLightLevel", "ALSCurveInfo", "ALSInternalSettings" };
+	size_t at = 0;
+
+	text[0] = 0;
+	for (unsigned i = 0; cb_module != NULL && i < sizeof(keys) / sizeof(keys[0]) && at < size - 1; i++) {
+		CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+		CFTypeRef value = ((CFTypeRef (*)(id, SEL, CFStringRef))objc_msgSend)(cb_module,
+		    sel_registerName("copyPropertyForKey:"), key);
+		char shown[700] = "-";
+
+		if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+			double number = 0;
+
+			CFNumberGetValue((CFNumberRef)value, kCFNumberDoubleType, &number);
+			snprintf(shown, sizeof(shown), "%g", number);
+		} else if (value != NULL && CFGetTypeID(value) == CFBooleanGetTypeID()) {
+			strlcpy(shown, CFBooleanGetValue((CFBooleanRef)value) ? "yes" : "no", sizeof(shown));
+		} else if (value != NULL) {
+			CFStringRef description = CFCopyDescription(value);
+
+			if (description != NULL) {
+				CFStringGetCString(description, shown, sizeof(shown), kCFStringEncodingUTF8);
+				CFRelease(description);
+			}
+		}
+		if (value != NULL) {
+			CFRelease(value);
+		}
+		/* (squeezed: the log's lines end at some 500 characters; a long one goes out in pieces of its own) */
+		size_t out = 0;
+
+		for (size_t in = 0; shown[in] != 0; in++) {
+			char c = shown[in] == '\n' || shown[in] == '\t' ? ' ' : shown[in];
+
+			if (c != ' ' || (out > 0 && shown[out - 1] != ' ')) {
+				shown[out++] = c;
+			}
+		}
+		shown[out] = 0;
+		if (out > 300) {
+			for (size_t piece = 0; piece < out; piece += 300) {
+				say("hakios: light: %s [%zu]: %.300s\n", keys[i], piece / 300, shown + piece);
+			}
+		} else {
+			at += (size_t)snprintf(text + at, size - at, " %s=%s", keys[i], shown);
+		}
+		CFRelease(key);
+	}
+}
+
+static void *
+cb_aabc(void)
+{
+	int32_t offset = *(const int32_t *)(CB_ABMODULE_AABC_OFFSET + slide);
+
+	return cb_module == NULL ? NULL : *(void *const *)((const uint8_t *)(const void *)cb_module + offset);
+}
+
+static void
+add_hid_service_client(id self, SEL selector, IOHIDServiceClientRef service)
+{
+	CFTypeRef *slot = service ? (CFTypeRef *)(void *)((uint8_t *)service + SERVICE_CLIENT_REGISTRY_ID) : NULL;
+	CFTypeRef own_id;
+	CFNumberRef nub_id = NULL;
+	io_service_t nub;
+	uint64_t entry_id = 0;
+	bool light = service != NULL && IOHIDServiceClientConformsTo(service, 0xff00, 4);
+
+	cb_offered++;
+	if (!light || in_registry(*slot)) {
+		orig_add_hid_service_client(self, selector, service);
+		if (light) {
+			cb_lights++;
+			cb_module = self;
+			say("hakios: CoreBrightness: a light sensor of the registry's taken; its AABC %p\n", cb_aabc());
+		}
+		return;
+	}
+	cb_lights++;
+	cb_module = self;
+	nub = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceNameMatching("HakiosALS"));
+	if (nub != IO_OBJECT_NULL) {
+		if (IORegistryEntryGetRegistryEntryID(nub, &entry_id) == KERN_SUCCESS) {
+			nub_id = CFNumberCreate(NULL, kCFNumberSInt64Type, &entry_id);
+		}
+		IOObjectRelease(nub);
+	}
+	if (nub_id == NULL) {
+		say("hakios: CoreBrightness: no HakiosALS in the registry: the light sensor gets no AABC\n");
+		orig_add_hid_service_client(self, selector, service);
+		return;
+	}
+	own_id = *slot;
+	*slot = nub_id;
+	orig_add_hid_service_client(self, selector, service);
+	*slot = own_id;
+	CFRelease(nub_id);
+	say("hakios: CoreBrightness: the light sensor taken with the registry's HakiosALS (entry %#llx); its AABC %p\n",
+	    (unsigned long long)entry_id, cb_aabc());
+}
+
+/*
+ * (and what reaches the module: -[CBABModuleiOS handleHIDEvent:from:], counted, the light's events apart -- the light
+ * went in and the screen's brightness did not move, 2026-10-30, with nothing in the log to say where it stopped)
+ */
+extern uint32_t IOHIDEventGetType(void *event);
+static uintptr_t (*orig_ab_handle_event)(id, SEL, void *, IOHIDServiceClientRef);
+static volatile unsigned cb_events, cb_light_events;
+static volatile uintptr_t cb_light_answer = 0xdead;
+
+static uintptr_t
+ab_handle_event(id self, SEL selector, void *event, IOHIDServiceClientRef service)
+{
+	uintptr_t answer = orig_ab_handle_event(self, selector, event, service);
+
+	cb_events++;
+	if (event != NULL && IOHIDEventGetType(event) == 12 /* ambient light */) {
+		cb_light_answer = answer & 0xff;
+		if (cb_light_events++ < 3) {
+			say("hakios: CoreBrightness: the AB module was given a light event (from a light: %d); it answered %lu, its AABC %p\n",
+			    service != NULL && IOHIDServiceClientConformsTo(service, 0xff00, 4), (unsigned long)(answer & 0xff),
+			    *(void *const *)((const uint8_t *)(const void *)self + *(const int32_t *)(CB_ABMODULE_AABC_OFFSET + slide)));
+		}
+	}
+	return answer;
+}
+
+/*
+ * Boot-arg cblog=1: CoreBrightness's own words on the console. They are os_log messages of the debug level, which
+ * neither the subsystem's level in /private/var/preferences/Logging nor OS_ACTIVITY_MODE=debug brought out
+ * (2026-10-30); libsystem_trace's in-process hook does (os_log_set_hook, which also turns those levels on in the
+ * process: os_log_type_enabled() consults it). Only the messages whose format string is CoreBrightness's own --
+ * its __TEXT, where its __oslogstring is -- are written out, formatted by os_log_copy_message_string().
+ */
+typedef void (^os_log_hook_block_t)(uint8_t type, void *message);
+extern os_log_hook_block_t os_log_set_hook(uint8_t level, os_log_hook_block_t hook);
+extern char *os_log_copy_message_string(void *message);
+#define CB_TEXT_START                   0x1aef00000UL
+#define CB_TEXT_END                     0x1af120000UL
+#define OS_LOG_MESSAGE_FORMAT           0x58            /* (os_log_copy_message_string() reads it there) */
+
+/*
+ * Auto-brightness's last step. CoreBrightness works out the light the screen should give (AABC: the lux, its
+ * curve, what the user's slider taught it) and ramps to it in nits -- "[BRT update: ALS]: Begin ramp: L_target=N
+ * ... timeConstant=T". On this panel's legacy backlight path the ramp ends in CoreBrightness's own model: what it
+ * writes to the backlight is the slider's level alone, so the screen never moved (2026-10-30); the path in nits
+ * ("new-backlight-architecture") waits for display hardware this phone has not, and the screen stopped drawing.
+ * So that message, which CoreBrightness says at the default level whenever an ALS ramp begins, is taken at its
+ * word: the target goes to the backlight in nits ("brightness-nits", 16.16, which the kernel's AppleARMBacklight
+ * maps on its calibration), faded over the ramp's time (the kernel caps a fade at 5 s).
+ */
+static io_service_t cb_backlight;
+/* (the SDK marks it unavailable on iOS; IOKit has it, and CoreBrightness sets the backlight with it) */
+extern kern_return_t registry_set_properties(io_registry_entry_t entry, CFTypeRef properties)
+    __asm__("_IORegistryEntrySetCFProperties");
+
+static void
+ramp_to(double nits, double seconds)
+{
+	static unsigned said;
+	int32_t value = (int32_t)(nits * 65536.0), fade = (int32_t)((seconds > 5.0 ? 5.0 : seconds < 0.0 ? 0.0 : seconds) * 65536.0);
+	CFNumberRef value_number, fade_number;
+	CFMutableDictionaryRef properties;
+	kern_return_t kr;
+
+	if (nits <= 0.0 || nits > 2000.0) {
+		return;
+	}
+	if (cb_backlight == IO_OBJECT_NULL) {
+		cb_backlight = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleARMBacklight"));
+		if (cb_backlight == IO_OBJECT_NULL) {
+			say("hakios: auto-brightness: no AppleARMBacklight\n");
+			return;
+		}
+	}
+	properties = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	value_number = CFNumberCreate(NULL, kCFNumberSInt32Type, &value);
+	fade_number = CFNumberCreate(NULL, kCFNumberSInt32Type, &fade);
+	CFDictionarySetValue(properties, CFSTR("brightness-nits"), value_number);
+	CFDictionarySetValue(properties, CFSTR("FadePeriod"), fade_number);
+	kr = registry_set_properties(cb_backlight, properties);
+	CFRelease(value_number);
+	CFRelease(fade_number);
+	CFRelease(properties);
+	if (said++ < 40) {
+		say("hakios: auto-brightness: %.1f nits over %.1f s (%#x)\n", nits, seconds, kr);
+	}
+}
+
+static void
+ramp_message(const char *text)
+{
+	const char *at = strstr(text, "[BRT update: ALS]: Begin ramp: L_target=");
+	const char *tc;
+
+	if (at == NULL || (tc = strstr(at, "timeConstant=")) == NULL) {
+		return;
+	}
+	ramp_to(strtod(at + strlen("[BRT update: ALS]: Begin ramp: L_target="), NULL), strtod(tc + strlen("timeConstant="), NULL));
+}
+
+/* slpi=1: the ramps followed; cblog=1: and every message of CoreBrightness's written out, at all levels */
+static void
+cb_log_on(bool everything)
+{
+	os_log_set_hook(everything ? 2 /* OS_LOG_TYPE_DEBUG */ : 0 /* OS_LOG_TYPE_DEFAULT */, ^(uint8_t type, void *message) {
+		uintptr_t format = message ? *(const uintptr_t *)((const uint8_t *)message + OS_LOG_MESSAGE_FORMAT) : 0;
+		char *text;
+
+		if (format < CB_TEXT_START + slide || format >= CB_TEXT_END + slide) {
+			return;
+		}
+		if ((text = os_log_copy_message_string(message)) != NULL) {
+			if (everything) {
+				say("cb[%u]: %.400s\n", type, text);
+			}
+			ramp_message(text);
+			free(text);
+		}
+	});
+	say("hakios: CoreBrightness's ramps followed%s\n", everything ? ", and its own messages to the console (cblog=1)" : "");
+}
+
+static void
+light_sensor_fixes(void)
+{
+	Class cls = objc_getClass("CBABModuleiOS");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("shouldMitigateHarmony:")) : NULL;
+	IMP original = method ? method_getImplementation(method) : NULL;
+	const uint32_t *get_id = (const uint32_t *)(const void *)IOHIDServiceClientGetRegistryID;
+
+	if (original == NULL || (uintptr_t)original != CB_SHOULD_MITIGATE_HARMONY + slide) {
+		say("hakios: -[CBABModuleiOS shouldMitigateHarmony:]: found %#lx, not what was expected; left alone\n",
+		    original ? (uintptr_t)original - slide : 0);
+		return;
+	}
+	orig_should_mitigate_harmony = (BOOL (*)(id, SEL, id))original;
+	method_setImplementation(method, (IMP)should_mitigate_harmony);
+	say("hakios: CoreBrightness: a light sensor that comes late no longer finds a NULL AABC\n");
+
+	method = class_getInstanceMethod(cls, sel_registerName("addHIDServiceClient:"));
+	original = method ? method_getImplementation(method) : NULL;
+	if (original == NULL || (uintptr_t)original != CB_ADD_HID_SERVICE_CLIENT + slide ||
+	    get_id[0] != 0xf9400800 /* ldr x0, [x0, #0x10] */ || get_id[1] != 0xd65f03c0 /* ret */) {
+		say("hakios: -[CBABModuleiOS addHIDServiceClient:]: found %#lx (RegistryID %08x %08x), not what was "
+		    "expected; left alone\n", original ? (uintptr_t)original - slide : 0, get_id[0], get_id[1]);
+		return;
+	}
+	orig_add_hid_service_client = (void (*)(id, SEL, IOHIDServiceClientRef))original;
+	method_setImplementation(method, (IMP)add_hid_service_client);
+	say("hakios: CoreBrightness: the light sensor will be found in the registry\n");
+
+	method = class_getInstanceMethod(cls, sel_registerName("handleHIDEvent:from:"));
+	original = method ? method_getImplementation(method) : NULL;
+	if (original == NULL || (uintptr_t)original != CB_AB_HANDLE_EVENT + slide) {
+		say("hakios: -[CBABModuleiOS handleHIDEvent:from:]: found %#lx, not what was expected; not watched\n",
+		    original ? (uintptr_t)original - slide : 0);
+		return;
+	}
+	orig_ab_handle_event = (uintptr_t (*)(id, SEL, void *, IOHIDServiceClientRef))original;
+	method_setImplementation(method, (IMP)ab_handle_event);
+	say("hakios: CoreBrightness: -[CBABModuleiOS handleHIDEvent:from:] (%s) watched\n", method_getTypeEncoding(method));
+}
+
+/* ---- backboardd: the device's orientation ------------------------------------------------------------- */
+
+/*
+ * backboardd's BKOrientationManager has the device's orientation from CoreMotion's CMDeviceOrientationManager --
+ * -startDeviceOrientationUpdatesToQueue:withHandler: while SpringBoard wants orientation events, and
+ * -deviceOrientationBlocking when it asks -- which reads the AOP's orientation service, or an accelerometer and a
+ * gyro of the iPhone's own. None of them is here ("[Orientation] fHidDeviceInterface NULL", "missing accel HID
+ * service plugin"): the screen never turned. The sensor DSP knows the orientation (sysctl kern.hakios.orientation,
+ * bsd/dev/hakios.slpi.c, Qualcomm's device_orient: portrait, upside down and the two landscapes, never face up or
+ * down); with slpi=1 those methods give that instead, looked at ten times a second (work/research/sensors-ios.md).
+ */
+#define CM_START_ORIENTATION    0x19199d3f0UL   /* -[CMDeviceOrientationManager startDeviceOrientationUpdatesToQueue:withHandler:] */
+#define CM_STOP_ORIENTATION     0x191c5288cUL   /* -[CMDeviceOrientationManager stopDeviceOrientationUpdates] */
+#define CM_ORIENTATION_BLOCKING 0x1919a32ccUL   /* -[CMDeviceOrientationManager deviceOrientationBlocking] (20F66) */
+
+static pthread_mutex_t orientation_lock = PTHREAD_MUTEX_INITIALIZER;
+static id orientation_queue;                    /* (an NSOperationQueue, retained) */
+static void (^orientation_handler)(id, id);     /* (a copy: void (^)(CMDeviceOrientation *, NSError *)) */
+static int orientation_now;                     /* a UIDeviceOrientation, 0 while not known */
+
+static int
+orientation_read(void)
+{
+	int value = 0;
+	size_t size = sizeof(value);
+
+	return sysctlbyname("kern.hakios.orientation", &value, &size, NULL, 0) == 0 ? value : -1;
+}
+
+/* a CMDeviceOrientation, +1 (-initWithOrientation:andTimestamp: 0x191c51d80: an int, and seconds of mach time) */
+static id
+orientation_object(int orientation)
+{
+	Class cls = objc_getClass("CMDeviceOrientation");
+	id object = cls ? ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_registerName("alloc")) : nil;
+	mach_timebase_info_data_t base;
+
+	mach_timebase_info(&base);
+	return object == nil ? nil : ((id (*)(id, SEL, int, double))objc_msgSend)(object,
+	           sel_registerName("initWithOrientation:andTimestamp:"), orientation,
+	           (double)mach_absolute_time() * base.numer / base.denom / 1e9);
+}
+
+/* The handler, on its queue, told the orientation (with orientation_lock held). */
+static void
+orientation_deliver(int orientation)
+{
+	void (^handler)(id, id) = orientation_handler;
+	id object;
+
+	if (orientation_queue == nil || handler == NULL || (object = orientation_object(orientation)) == nil) {
+		return;
+	}
+	/* (the block keeps the handler; the object it releases itself: plain C does not retain an id it takes along) */
+	((void (*)(id, SEL, void (^)(void)))objc_msgSend)(orientation_queue, sel_registerName("addOperationWithBlock:"), ^{
+		handler(object, nil);
+		((void (*)(id, SEL))objc_msgSend)(object, sel_registerName("release"));
+	});
+}
+
+static void
+orientation_start(__unused id self, __unused SEL selector, id queue, void (^handler)(id, id))
+{
+	static unsigned said;
+
+	pthread_mutex_lock(&orientation_lock);
+	if (orientation_queue != nil) {
+		((void (*)(id, SEL))objc_msgSend)(orientation_queue, sel_registerName("release"));
+	}
+	if (orientation_handler != NULL) {
+		Block_release(orientation_handler);
+	}
+	orientation_queue = queue != nil ? ((id (*)(id, SEL))objc_msgSend)(queue, sel_registerName("retain")) : nil;
+	orientation_handler = handler != NULL ? Block_copy(handler) : NULL;
+	if (orientation_now > 0) {
+		orientation_deliver(orientation_now);
+	}
+	pthread_mutex_unlock(&orientation_lock);
+	if (said++ < 8) {
+		say("hakios: orientation: updates wanted (now %d)\n", orientation_now);
+	}
+}
+
+static void
+orientation_stop(__unused id self, __unused SEL selector)
+{
+	pthread_mutex_lock(&orientation_lock);
+	if (orientation_queue != nil) {
+		((void (*)(id, SEL))objc_msgSend)(orientation_queue, sel_registerName("release"));
+		orientation_queue = nil;
+	}
+	if (orientation_handler != NULL) {
+		Block_release(orientation_handler);
+		orientation_handler = NULL;
+	}
+	pthread_mutex_unlock(&orientation_lock);
+}
+
+static id
+orientation_blocking(__unused id self, __unused SEL selector)
+{
+	int now = orientation_read();
+	id object = orientation_object(now > 0 ? now : 0);
+
+	return object == nil ? nil : ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName("autorelease"));
+}
+
+static void *
+orientation_thread(__unused void *arg)
+{
+	unsigned changes = 0;
+
+	pthread_setname_np("redwood orientation");
+	for (;;) {
+		int value = orientation_read();
+
+		if (value < 0) {
+			say("hakios: orientation: no kern.hakios.orientation: not looked at\n");
+			return NULL;
+		}
+		if (value > 0 && value != orientation_now) {
+			pthread_mutex_lock(&orientation_lock);
+			orientation_now = value;
+			orientation_deliver(value);
+			pthread_mutex_unlock(&orientation_lock);
+			if (changes++ < 40) {
+				say("hakios: orientation: %d (UIDeviceOrientation)\n", value);
+			}
+		}
+		usleep(100000);
+	}
+}
+
+static void
+orientation_fixes(void)
+{
+	static const struct {
+		const char *name;
+		uintptr_t expected;
+		IMP ours;
+	} methods[] = {
+		{ "startDeviceOrientationUpdatesToQueue:withHandler:", CM_START_ORIENTATION, (IMP)orientation_start },
+		{ "stopDeviceOrientationUpdates", CM_STOP_ORIENTATION, (IMP)orientation_stop },
+		{ "deviceOrientationBlocking", CM_ORIENTATION_BLOCKING, (IMP)orientation_blocking },
+	};
+	Class cls = objc_getClass("CMDeviceOrientationManager");
+	Method found[3];
+	pthread_t thread;
+
+	for (unsigned i = 0; i < 3; i++) {
+		IMP original;
+
+		found[i] = cls ? class_getInstanceMethod(cls, sel_registerName(methods[i].name)) : NULL;
+		original = found[i] ? method_getImplementation(found[i]) : NULL;
+		if (original == NULL || (uintptr_t)original != methods[i].expected + slide) {
+			say("hakios: -[CMDeviceOrientationManager %s]: found %#lx, not what was expected; the orientation left alone\n",
+			    methods[i].name, original ? (uintptr_t)original - slide : 0);
+			return;
+		}
+	}
+	for (unsigned i = 0; i < 3; i++) {
+		method_setImplementation(found[i], methods[i].ours);
+	}
+	if (pthread_create(&thread, NULL, orientation_thread, NULL) == 0) {
+		pthread_detach(thread);
+	}
+	say("hakios: orientation: CoreMotion's in backboardd is the sensor DSP's (kern.hakios.orientation)\n");
+}
+
 static void
 wait_for_als_arrival(__unused id self, __unused SEL selector)
 {
@@ -757,9 +1262,10 @@ extern void IOHIDEventSetFloatValue(IOHIDEventRef event, uint32_t field, double 
 #define HID_PAGE_APPLE_VENDOR           0xff00
 #define HID_USAGE_AMBIENT_LIGHT         0x04
 #define HID_EVENT_AMBIENT_LIGHT         12
-#define FIELD_ALS_ILLUMINANCE           0xc000a
+#define FIELD_ALS_ILLUMINANCE           0xc000b /* (0xc000a is the colour temperature: work/research/sensors-ios.md) */
 
 static volatile int als_millilux = -1;
+static volatile unsigned als_asked;             /* (copyEvent calls) */
 
 static IOHIDEventRef
 als_event(void)
@@ -778,9 +1284,7 @@ static IOHIDEventRef
 als_copy_event(__unused void *target, __unused void *refcon, __unused IOHIDServiceClientRef service, uint32_t type,
     __unused IOHIDEventRef matching, __unused uint32_t options)
 {
-	static unsigned asked;
-
-	if (asked++ < 4) {
+	if (als_asked++ < 4) {
 		say("hakios: input: the light asked for (event type %u): %d mlx\n", type, als_millilux);
 	}
 	return type == HID_EVENT_AMBIENT_LIGHT ? als_event() : NULL;
@@ -967,9 +1471,20 @@ light_thread(void *arg)
 	unsigned quiet = 0;
 
 	pthread_setname_np("redwood light");
-	for (;;) {
+	for (unsigned turn = 1;; turn++) {
 		int milli = -1, count = 0;
 		size_t size = sizeof(milli);
+
+		if (turn % 120 == 0) {
+			char properties[1800];
+
+			say("hakios: light: %d mlx, %d events sent, asked for %u times; CoreBrightness: offered %u services, %u a "
+			    "light, AABC %p; its AB module given %u events, %u of the light (the last answered %lu)\n", als_millilux,
+			    sent, als_asked, cb_offered, cb_lights, cb_aabc(), cb_events, cb_light_events,
+			    (unsigned long)cb_light_answer);
+			cb_properties(properties, sizeof(properties));
+			say("hakios: light: the AB module says%s\n", properties);
+		}
 
 		if (sysctlbyname("kern.hakios.als_millilux", &milli, &size, NULL, 0) != 0) {
 			say("hakios: input: no kern.hakios.als_millilux: the light is not looked at\n");
@@ -1235,6 +1750,13 @@ hakios_init(void)
 		}
 		opengl_es();
 		window_server_fixes();
+		if (strstr(arguments, "slpi=1") != NULL || strstr(arguments, "cblog=1") != NULL) {
+			cb_log_on(strstr(arguments, "cblog=1") != NULL);
+		}
+		light_sensor_fixes();
+		if (strstr(arguments, "slpi=1") != NULL) {
+			orientation_fixes();
+		}
 		/*
 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
 		 * screen service for its own ("still waiting for a main screen digitizer"), whether the

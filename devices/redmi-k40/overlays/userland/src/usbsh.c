@@ -367,6 +367,23 @@ execute(char *line)
 		const char *value = getenv(argv[1]);
 
 		out("%s=%s\n", argv[1], value ? value : "(not set)");
+	} else if (!strcmp(argv[0], "sysctl") && argc > 1) {
+		/* sysctl NAME [COUNT [MS]]: an integer sysctl, COUNT times MS apart (default once) */
+		int times = argc > 2 ? atoi(argv[2]) : 1, gap = argc > 3 ? atoi(argv[3]) : 500;
+
+		for (int i = 0; i < times && i < 1000; i++) {
+			int value = 0;
+			size_t size = sizeof(value);
+
+			if (sysctlbyname(argv[1], &value, &size, NULL, 0) != 0) {
+				out("%s: %s\n", argv[1], strerror(errno));
+				break;
+			}
+			out("%s = %d\n", argv[1], value);
+			if (i + 1 < times) {
+				usleep((useconds_t)gap * 1000);
+			}
+		}
 	} else if (!strcmp(argv[0], "cs") && argc > 1) {
 		/* cs PID [NAME]: the process's code-signing flags and both entitlement blobs, as programs get them */
 		pid_t pid = (pid_t)atoi(argv[1]);
