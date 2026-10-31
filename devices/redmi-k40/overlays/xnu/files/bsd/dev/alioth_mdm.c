@@ -555,6 +555,10 @@ static vm_offset_t smmu, smmu_second, smmu_context, smmu_contexts[128], tables;
 static uint32_t smmu_match = ~0u, smmu_context_n, smmu_old_smr, smmu_old_s2cr;
 static bool smmu_on, dma_on, dma_cached;
 static uint64_t window_next;
+/* what mdm_allocate() handed out: where the modem sees it and where it is (for smmu_translation_check()) */
+struct mdm_allocation { uint64_t iova, physical, size; };
+static struct mdm_allocation allocations[16];
+static unsigned allocation_count;
 
 /* A free match register (none may already cover the stream) and a context no match register sends anything to,
  * switched off and without a fault. With hakios_smmu_lock held. */
@@ -785,8 +789,73 @@ mdm_allocate(__unused void *context, size_t size, struct alioth_mhi_dma *dma)
 	dma->bytes = (void *)uncached;
 	dma->address = MDM_WINDOW + window_next;
 	dma->size = size;
+	if (allocation_count < sizeof(allocations) / sizeof(allocations[0])) {
+		allocations[allocation_count++] = (struct mdm_allocation){ dma->address, physical, size };
+	}
 	window_next += size;
 	return 0;
+}
+
+/*
+ * boot-arg mdm_ats=1 (diagnosis): the SMMU's own address translation (MMU-500's ATS1PR in the context bank, the
+ * answer in its PAR) of every page of the first piece of the window -- the BHI image -- set beside the physical
+ * pages behind it. Our hash of the image reads it through the CPU; a table entry that sent some page of it
+ * elsewhere would hand the modem other bytes without a fault.
+ */
+#define SMMU_IDR0_ATOSNS        (1u << 26)
+#define SMMU_CB_PAR             0x50
+#define SMMU_CB_ATS1PR          0x800
+#define SMMU_CB_ATSR            0x8f0
+
+static void
+smmu_translation_check(void)
+{
+	const struct mdm_allocation *a = &allocations[0];
+	unsigned right = 0, elsewhere = 0, faults = 0, busy = 0;
+	uint64_t first_par = 0;
+
+	if (allocation_count == 0 || !smmu_on) {
+		return;
+	}
+	if (rd(smmu + SMMU_IDR0) & SMMU_IDR0_ATOSNS) {
+		say("mdm: 4: the SMMU has no address translation operations (idr0 %#x)\n", rd(smmu + SMMU_IDR0));
+		return;
+	}
+	lck_mtx_lock(&hakios_smmu_lock);
+	for (uint64_t offset = 0; offset < a->size; offset += 4096) {
+		uint64_t va = a->iova + offset, par;
+		unsigned spin = 0;
+
+		/* (one 64-bit write: the write is what starts the operation) */
+		*(volatile uint64_t *)(smmu_context + SMMU_CB_ATS1PR) = va;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		while ((rd(smmu_context + SMMU_CB_ATSR) & 1) && spin < 100000) {
+			spin++;
+		}
+		if (spin == 100000) {
+			busy++;
+			break;
+		}
+		par = rd(smmu_context + SMMU_CB_PAR) | (uint64_t)rd(smmu_context + SMMU_CB_PAR + 4) << 32;
+		if (offset == 0) {
+			first_par = par;
+		}
+		if (par & 1) {
+			if (faults++ < 3) {
+				say("mdm: 4: translation of %#llx FAULTS: PAR %#llx\n", va, par);
+			}
+		} else if ((par & 0xfffffffff000ull) != a->physical + offset) {
+			if (elsewhere++ < 4) {
+				say("mdm: 4: %#llx TRANSLATES TO %#llx, its page is at %#llx\n", va, par & 0xfffffffff000ull, a->physical + offset);
+			}
+		} else {
+			right++;
+		}
+	}
+	lck_mtx_unlock(&hakios_smmu_lock);
+	say("mdm: 4: the SMMU's own translation of the image's %llu pages (%#llx -> %#llx): %u right, %u elsewhere, "
+	    "%u faults%s; PAR of the first %#llx\n", a->size >> 12, a->iova, a->physical, right, elsewhere, faults,
+	    busy ? ", THE OPERATION NEVER FINISHED" : "", first_par);
 }
 
 /* PCIe2's requests from the endpoint (bus 1, devfn 0) through the SMMU as stream 0x1d01: umi_pcie_enable_dma()'s
@@ -1107,10 +1176,40 @@ step_mhi(void)
 		error = EBUSY;
 	}
 	if (error == 0) {
+		const uint8_t *image = sbl;
+		uint32_t corrupt = 0, ats = 0;
+
+		/*
+		 * boot-arg mdm_bhi_corrupt=N (diagnosis: which of the PBL's checks gives 0xef0e0003?): the image given with
+		 * 1 the ELF magic's first byte flipped, 2 one byte flipped inside the first loaded segment (file offset
+		 * 0x10000), 3 one byte flipped in the signature at the end, 4 only its first 64 KB
+		 */
+		if (PE_parse_boot_argn("mdm_bhi_corrupt", &corrupt, sizeof(corrupt)) && corrupt >= 1 && corrupt <= 4) {
+			vm_offset_t copy = 0;
+
+			if (kmem_alloc(kernel_map, &copy, round_page(size), KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+				uint8_t *c = (uint8_t *)copy;
+				uint64_t at = corrupt == 1 ? 0 : corrupt == 2 ? 0x10000 : size - 16;
+
+				memcpy(c, sbl, (size_t)size);
+				if (corrupt == 4) {
+					size = 0x10000;
+				} else if (at < size) {
+					c[at] ^= 0xff;
+				}
+				image = c;
+				say("mdm: 4: THE IMAGE GIVEN IS MADE WRONG ON PURPOSE (mdm_bhi_corrupt=%u: %s)\n", corrupt,
+				    corrupt == 1 ? "the ELF magic" : corrupt == 2 ? "a byte of the first segment" :
+				    corrupt == 3 ? "a byte of the signature" : "only its first 64 KB");
+			}
+		}
 		pcie_errors("4: before BHI");
 		say("mdm: 4: BHI %llu ms after the reset (Android: some 300)\n", since_reset_ms());
-		error = alioth_mhi_bhi(&mhi, sbl, (size_t)size, 2000);
+		error = alioth_mhi_bhi(&mhi, image, (size_t)size, 2000);
 		pcie_errors("4: after BHI");
+		if (PE_parse_boot_argn("mdm_ats", &ats, sizeof(ats)) && ats != 0) {
+			smmu_translation_check();
+		}
 	}
 	if (error == 0) {
 		error = alioth_mhi_ready(&mhi, known, sizeof(known) / sizeof(known[0]), 5000);
