@@ -52,6 +52,7 @@ extern void hakios_tl(const char *, ...) __printflike(1, 2);
 extern void hakios_spmi_lock(void);
 extern void hakios_spmi_unlock(void);
 extern int umi_rpmh_wifi_power(void);
+extern int umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y);
 extern kern_return_t thread_terminate(thread_t thread);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern lck_mtx_t hakios_smmu_lock;      /* (bsd/dev/hakios.wifi.c: the SMMU's global registers are shared) */
@@ -109,6 +110,19 @@ extern lck_mtx_t hakios_smmu_lock;      /* (bsd/dev/hakios.wifi.c: the SMMU's gl
 
 static vm_offset_t gcc, tlmm, parf, phy, dbi, atu, conf, bar, arb_core, arb_cnfg, arb_obs;
 static uint32_t mdm_step, mdm_keep = 1, bar_size;
+static uint64_t reset_at;                       /* mach_absolute_time() of the modem's warm reset */
+
+static uint64_t
+since_reset_ms(void)
+{
+	uint64_t ns = 0;
+
+	if (reset_at == 0) {
+		return 0;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - reset_at, &ns);
+	return ns / 1000000;
+}
 
 static uint32_t
 rd(vm_offset_t a)
@@ -268,17 +282,30 @@ step_power(void)
 	if (!pon_put(PON_SW_RST_GO, PON_GO)) {
 		return false;
 	}
+	reset_at = mach_absolute_time();
 	delay(150 * 1000);
 	/* (inputs: function 0, no pull -- the modem drives them) */
 	update(tlmm + GPIO_MDM2AP_STATUS * 0x1000, 0x3ff, 0);
 	update(tlmm + GPIO_MDM2AP_ERRFATAL * 0x1000, 0x3ff, 0);
 	gpio_out(GPIO_AP2MDM_ERRFATAL, false, 0);
 	gpio_out(GPIO_AP2MDM_STATUS, true, 0);
-	for (unsigned ms = 0; ms <= 2000; ms += 250) {
-		say("mdm: 2: %u ms: MDM2AP_STATUS %d, MDM2AP_ERRFATAL %d\n", ms, gpio_in(GPIO_MDM2AP_STATUS),
-		    gpio_in(GPIO_MDM2AP_ERRFATAL));
-		delay(250 * 1000);
+	if (mdm_step == 2) {
+		/* (step 2 alone: the modem's two pins watched for 2 s) */
+		for (unsigned ms = 0; ms <= 2000; ms += 250) {
+			say("mdm: 2: %u ms: MDM2AP_STATUS %d, MDM2AP_ERRFATAL %d\n", ms, gpio_in(GPIO_MDM2AP_STATUS),
+			    gpio_in(GPIO_MDM2AP_ERRFATAL));
+			delay(250 * 1000);
+		}
+	} else {
+		/*
+		 * Then straight on, as esoc-mdm-pon.c does without a PBLRDY pin (msleep(200)): Android's BHI comes some
+		 * 0.3 s after the reset (its dmesg, 16.45 -> 16.75 s); ours came 3.5 s after it, and the PBL refused the
+		 * image it read (2026-10-31).
+		 */
+		delay(200 * 1000);
 	}
+	say("mdm: 2: %llu ms after the reset: MDM2AP_STATUS %d, MDM2AP_ERRFATAL %d\n", since_reset_ms(),
+	    gpio_in(GPIO_MDM2AP_STATUS), gpio_in(GPIO_MDM2AP_ERRFATAL));
 	return true;
 }
 
@@ -402,8 +429,8 @@ step_pcie2(void)
 		say("mdm: 3: link status %#x, LTSSM %#x\n", rd(dbi + 0x80), rd(parf + 0x24));
 		return false;
 	}
-	say("mdm: 3: THE LINK IS UP: status %#x (Gen%u x%u)\n", rd(dbi + 0x80), (rd(dbi + 0x80) >> 16) & 0xf,
-	    (rd(dbi + 0x80) >> 20) & 0x3f);
+	say("mdm: 3: THE LINK IS UP %llu ms after the reset: status %#x (Gen%u x%u)\n", since_reset_ms(), rd(dbi + 0x80),
+	    (rd(dbi + 0x80) >> 16) & 0xf, (rd(dbi + 0x80) >> 20) & 0x3f);
 	wr(dbi + 0x18, 0x00010100);                             /* buses 0, 1, 1 */
 	wr(dbi + 0x20, 0x64306430);                             /* a 1 MiB bridge window at 0x64300000 */
 	wr(dbi + 0xb40, 0x14);
@@ -443,6 +470,22 @@ step_pcie2(void)
 	wr(conf + 0x10, (uint32_t)BAR_PHYS | (bar0 & 15));
 	if ((bar0 & 6) == 4) {
 		wr(conf + 0x14, 0);
+	}
+	/* the SDX55's second BAR (BAR2, config 0x18, 64-bit, 4 KB) where Android puts it, right after BAR0 */
+	if ((bar0 & 6) == 4) {
+		uint32_t bar2 = rd(conf + 0x18), mask;
+
+		wr(conf + 0x18, 0xffffffffu);
+		mask = rd(conf + 0x18) & ~15u;
+		say("mdm: 3: BAR2 %#x, %u KB\n", bar2, mask == 0 ? 0 : (~mask + 1) >> 10);
+		if (mask != 0 && ~mask + 1 <= 0x1000) {
+			wr(conf + 0x18, ((uint32_t)BAR_PHYS + 0x1000) | (bar2 & 15));
+			if ((bar2 & 6) == 4) {
+				wr(conf + 0x1c, 0);
+			}
+		} else {
+			wr(conf + 0x18, bar2);
+		}
 	}
 	if (!outbound(1, 0, BAR_PHYS, BAR_PHYS + 0xfffff, BAR_PHYS)) {
 		return false;
@@ -768,6 +811,15 @@ dma_route(void)
 		    rd(parf + 0x2c00), command);
 		return false;
 	}
+	/*
+	 * PCIe2's way to the memory (Linux's sm8250 interconnect: xm_pcie3_modem -> qns_pcie_modem_mem_noc, BCM SN12, which
+	 * nothing keeps alive) voted for, as Android's MHI does before its BHI (msm-bus 108 -> 512, by link speed)
+	 */
+	{
+		int vote = umi_rpmh_bcm_vote("SN12", 0x3fff, 0x3fff);
+
+		say("mdm: 4: the bus vote for PCIe2's way to the memory (BCM SN12): %s (%d)\n", vote == 0 ? "taken" : "NOT TAKEN", vote);
+	}
 	wr(dbi + 4, 6);                                         /* the root bridge: memory, bus mastering */
 	wr(conf + 4, (command & 0xffff) | 4);                   /* the endpoint: bus mastering */
 	dma_on = true;
@@ -914,6 +966,33 @@ mdm_image(__unused void *context, uint64_t id, uint64_t *size)
 	return NULL;
 }
 
+static const uint8_t *sbl;
+static uint64_t sbl_size;
+
+/* sahara.txt and the SBL read before the modem is reset (step 2): from the reset to BHI only the hardware's work */
+static bool
+images_ready(void)
+{
+	if (!config_load()) {
+		return false;
+	}
+	if ((sbl = image_named(bhi_name, &sbl_size)) == NULL) {
+		say("mdm: 4: no fw/sdx55m/%s\n", bhi_name);
+		return false;
+	}
+	{
+		/* (the file as the kernel has it, FNV-1a: sbl1.mbn of ~/hk/fw-modem is 548056 bytes, 0xa4dfb904) */
+		uint32_t hash = 2166136261u;
+
+		for (uint64_t i = 0; i < sbl_size; i++) {
+			hash = (hash ^ sbl[i]) * 16777619u;
+		}
+		say("mdm: 4: %s: %llu bytes, FNV-1a %#x, first bytes %02x %02x %02x %02x\n", bhi_name, sbl_size, hash, sbl[0],
+		    sbl[1], sbl[2], sbl[3]);
+	}
+	return true;
+}
+
 static bool
 step_mhi(void)
 {
@@ -922,28 +1001,13 @@ step_mhi(void)
 		{ 10, ALIOTH_MHI_TO_DEVICE, 1 }, { 11, ALIOTH_MHI_FROM_DEVICE, 1 },
 		{ 20, ALIOTH_MHI_TO_DEVICE, 2 }, { 21, ALIOTH_MHI_FROM_DEVICE, 2 },
 	};
-	const uint8_t *sbl;
-	uint64_t size = 0;
+	uint64_t size = sbl_size;
 	uint32_t ee = ~0u;
 	int error;
 
 	say("mdm: 4: the SMMU, bus mastering, MHI: the SBL through BHI, READY, M0\n");
-	if (!config_load()) {
+	if (sbl == NULL) {
 		return false;
-	}
-	if ((sbl = image_named(bhi_name, &size)) == NULL) {
-		say("mdm: 4: no fw/sdx55m/%s\n", bhi_name);
-		return false;
-	}
-	{
-		/* (the file as the kernel has it, FNV-1a: sbl1.mbn of ~/hk/fw-modem is 548056 bytes, 0xa4dfb904) */
-		uint32_t hash = 2166136261u;
-
-		for (uint64_t i = 0; i < size; i++) {
-			hash = (hash ^ sbl[i]) * 16777619u;
-		}
-		say("mdm: 4: %s: %llu bytes, FNV-1a %#x, first bytes %02x %02x %02x %02x\n", bhi_name, size, hash, sbl[0], sbl[1],
-		    sbl[2], sbl[3]);
 	}
 	{
 		uint32_t cached_dma = 0;
@@ -977,6 +1041,7 @@ step_mhi(void)
 		error = EBUSY;
 	}
 	if (error == 0) {
+		say("mdm: 4: BHI %llu ms after the reset (Android: some 300)\n", since_reset_ms());
 		error = alioth_mhi_bhi(&mhi, sbl, (size_t)size, 2000);
 	}
 	if (error == 0) {
@@ -1185,6 +1250,9 @@ mdm_thread(__unused void *arg, __unused wait_result_t wr_result)
 		return;
 	}
 	ok = step_pon_find();
+	if (ok && mdm_step >= 4) {
+		ok = images_ready();
+	}
 	if (ok && mdm_step >= 2) {
 		ok = step_power();
 	}
