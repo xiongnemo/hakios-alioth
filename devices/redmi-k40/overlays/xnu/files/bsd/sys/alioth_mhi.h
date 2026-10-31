@@ -47,6 +47,8 @@ struct alioth_mhi_io {
 	int (*allocate)(void *, size_t, struct alioth_mhi_dma *);
 	void (*delay_us)(void *, unsigned);
 	void (*say)(void *, const char *, uint64_t, uint64_t, uint64_t);
+	/* optional: what the host wrote into an allocation made visible to the device (cached memory) */
+	void (*sync)(void *, const struct alioth_mhi_dma *);
 };
 
 /* bytes from the device on a channel; `end` when they end what it sent (MHI's EOT), not when the buffer filled */
@@ -82,6 +84,7 @@ struct alioth_mhi {
 	uint64_t command_pending;
 	int command_code;
 	uint32_t events, bandwidth_requests, sequence;
+	uint64_t bhi_probe;                     /* (diagnosis: BHI is pointed here instead of at the image, if not 0) */
 	struct alioth_mhi_dma image, channel_contexts, event_contexts, command_context;
 	struct alioth_mhi_ring commands, event[ALIOTH_MHI_EVENT_RINGS];
 	struct alioth_mhi_channel open[ALIOTH_MHI_OPEN];

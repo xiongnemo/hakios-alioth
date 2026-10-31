@@ -198,6 +198,14 @@ ring_given(const struct alioth_mhi_ring *ring, uint64_t pointer)
 	return in_ring(ring, pointer) && (pointer + length - ring->rp) % length < (ring->wp + length - ring->rp) % length;
 }
 
+static void
+sync(struct alioth_mhi *host, const struct alioth_mhi_dma *dma)
+{
+	if (host->io->sync != NULL && dma->bytes != NULL) {
+		host->io->sync(host->io->context, dma);
+	}
+}
+
 static int
 allocate(struct alioth_mhi *host, size_t size, struct alioth_mhi_dma *dma)
 {
@@ -303,11 +311,26 @@ alioth_mhi_bhi(struct alioth_mhi *host, const void *image, size_t size, unsigned
 		return error;
 	}
 	memcpy(host->image.bytes, image, size);
+	{
+		/* what the device will read, as it lies in the memory given it (FNV-1a, to set beside the file's) */
+		const volatile uint8_t *b = host->image.bytes;
+		uint32_t hash = 2166136261u;
+
+		for (size_t i = 0; i < size; i++) {
+			hash = (hash ^ b[i]) * 16777619u;
+		}
+		say(host, "MHI: BHI image as given: bytes, FNV-1a, first word", size, hash,
+		    (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
+	}
+	sync(host, &host->image);
 	sequence = host->sequence++ & 0x3fffffff;
 	write_barrier();
 	wr(host, host->bhi + BHI_STATUS, 0);
 	wr(host, host->bhi + BHI_INTVEC, 0);
-	wr64(host, host->bhi + BHI_IMGADDR, host->image.address);
+	if (host->bhi_probe != 0) {
+		say(host, "MHI: BHI POINTED AT AN ADDRESS WITH NOTHING BEHIND IT (diagnosis): address", host->bhi_probe, 0, 0);
+	}
+	wr64(host, host->bhi + BHI_IMGADDR, host->bhi_probe != 0 ? host->bhi_probe : host->image.address);
 	wr(host, host->bhi + BHI_IMGSIZE, (uint32_t)size);
 	write_barrier();
 	wr(host, host->bhi + BHI_IMGTXDB, sequence);
@@ -422,6 +445,9 @@ alioth_mhi_ready(struct alioth_mhi *host, const struct alioth_mhi_known *known, 
 		set64(c, 7, host->commands.dma.address);
 		set64(c, 9, host->commands.dma.address);
 	}
+	sync(host, &host->channel_contexts);
+	sync(host, &host->event_contexts);
+	sync(host, &host->command_context);
 	write_barrier();
 	config = rd(host, MHICFG);
 	wr(host, MHICFG, (config & 0xffff) | (uint32_t)ALIOTH_MHI_EVENT_RINGS << 16);
@@ -469,6 +495,8 @@ static void
 channel_doorbell(struct alioth_mhi *host, struct alioth_mhi_channel *c)
 {
 	set64(context_of(&host->channel_contexts, c->number), 9, c->ring.wp);
+	sync(host, &c->ring.dma);
+	sync(host, &host->channel_contexts);
 	write_barrier();
 	wr64(host, host->channel_db + c->number * 8, c->ring.wp);
 }
@@ -604,6 +632,7 @@ service(struct alioth_mhi *host, unsigned r)
 	if (handled != 0) {
 		host->events += handled;
 		set64(c, 9, ring->wp);
+		sync(host, &host->event_contexts);
 		write_barrier();
 		wr64(host, host->event_db + r * 8, ring->wp);
 	}
@@ -657,6 +686,9 @@ command(struct alioth_mhi *host, unsigned type, unsigned number)
 	host->command_pending = at;
 	host->command_code = -1;
 	set64(host->command_context.bytes, 9, after);
+	sync(host, &host->commands.dma);
+	sync(host, &host->command_context);
+	sync(host, &host->channel_contexts);    /* (START/RESET read the channel's context) */
 	write_barrier();
 	wr64(host, CRDB, after);
 	for (unsigned ms = 0; ms < COMMAND_MS; ms++) {
@@ -807,6 +839,12 @@ alioth_mhi_send(struct alioth_mhi *host, unsigned number, const void *bytes, uin
 		}
 		index = ring_index(&c->ring, c->ring.wp);
 		memcpy((uint8_t *)c->buffers.bytes + (size_t)index * c->slot, p, n);
+		{
+			const struct alioth_mhi_dma piece = { (uint8_t *)c->buffers.bytes + (size_t)index * c->slot,
+				                              c->buffers.address + (uint64_t)index * c->slot, n };
+
+			sync(host, &piece);
+		}
 		/*
 		 * A transfer goes on (CHAIN) until its last bytes (EOT); when the ring is about to be full it ends early
 		 * (EOT), as Android's mhi_uci does, so that the device gives elements back and the rest can follow.

@@ -492,6 +492,9 @@ step_pcie2(void)
 #define SMMU_MAIR0              0xf404ff44
 #define SMMU_FSR_ALL            0xc00001fe
 #define MDM_PTE                 (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)       /* hakios.wifi.c's RADIO_PTE */
+/* boot-arg mdm_dma_cached=1: write-back cacheable (MAIR entry 1), inner shareable -- what Linux's io-pgtable makes
+ * for a dma-coherent device (pcie2 is, and kona-mhi.dtsi asks for coherent page tables) */
+#define MDM_PTE_CACHED          (3ull | 1ull << 2 | 1ull << 6 | 3ull << 8 | 1ull << 10 | 1ull << 11)
 #define MDM_STREAM              0x1d01u         /* kona-pcie.dtsi pcie2: iommu-map <0x100 &apps_smmu 0x1d01 1> */
 #define MDM_WINDOW              0x20000000ull   /* kona-mhi.dtsi: qcom,iommu-dma-addr-pool <0x20000000 ...> */
 #define MDM_WINDOW_SIZE         (64ull << 20)
@@ -499,7 +502,7 @@ step_pcie2(void)
 
 static vm_offset_t smmu, smmu_second, smmu_context, smmu_contexts[128], tables;
 static uint32_t smmu_match = ~0u, smmu_context_n, smmu_old_smr, smmu_old_s2cr;
-static bool smmu_on, dma_on;
+static bool smmu_on, dma_on, dma_cached;
 static uint64_t window_next;
 
 /* A free match register (none may already cover the stream) and a context no match register sends anything to,
@@ -523,10 +526,18 @@ smmu_find(void)
 		return false;
 	}
 	smmu_match = ~0u;
+	say("mdm: 4: SMMU scr0 %#x (a stream nobody matches %s)\n", rd(smmu + SMMU_SCR0),
+	    rd(smmu + SMMU_SCR0) & BIT(10) ? "faults" : "PASSES UNTRANSLATED");
 	for (uint32_t n = 0; n < (idr0 & 0xff) && SMMU_SMR(n) < 0xc00; n++) {
 		uint32_t smr = rd(smmu + SMMU_SMR(n)), s2cr = rd(smmu + SMMU_S2CR(n));
 
 		if (smr >> 31) {
+			/* (any match of PCIe2's streams 0x1d00-0x1d01 said: one that passes them untranslated would let the
+			 * modem read physical memory at its "address" -- 2026-10-31, the PBL refused what it read) */
+			if ((((smr & 0x7fff) ^ 0x1d00) & ~((smr >> 16 & 0x7fff) | 1)) == 0) {
+				say("mdm: 4: SMMU match register %u covers PCIe2's streams: smr %#x, s2cr %#x (%s, context %u)\n", n, smr,
+				    s2cr, (s2cr >> 16 & 3) == 0 ? "translated" : (s2cr >> 16 & 3) == 1 ? "BYPASS" : "fault", s2cr & 0xff);
+			}
 			used[s2cr & 0xff] = true;
 			if ((((smr & 0x7fff) ^ MDM_STREAM) & ~(smr >> 16 & 0x7fff)) == 0) {
 				say("mdm: 4: SMMU match register %u (%#x) is somebody's for the modem's stream: left alone\n", n, smr);
@@ -706,14 +717,16 @@ mdm_allocate(__unused void *context, size_t size, struct alioth_mhi_dma *dma)
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
-	if ((uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB)) == 0) {
+	if (dma_cached) {
+		uncached = cached;                      /* (the cached view is the one used: mdm_sync() cleans it) */
+	} else if ((uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB)) == 0) {
 		return ENOMEM;
 	}
 	for (uint64_t offset = 0; offset < size; offset += 4096) {
 		uint64_t at = window_next + offset;
 		uint64_t *third = (uint64_t *)(tables + (2 + (at >> 21)) * 4096);
 
-		third[at >> 12 & 0x1ff] = (physical + offset) | MDM_PTE;
+		third[at >> 12 & 0x1ff] = (physical + offset) | (dma_cached ? MDM_PTE_CACHED : MDM_PTE);
 		__asm__ volatile ("dc civac, %0" : : "r" (&third[at >> 12 & 0x1ff]));
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -804,6 +817,19 @@ static void
 mhi_delay(__unused void *context, unsigned us)
 {
 	delay(us);
+}
+
+/* (mdm_dma_cached=1: what we wrote cleaned to the point of coherency, for a device that does not snoop after all) */
+static void
+mdm_sync(__unused void *context, const struct alioth_mhi_dma *dma)
+{
+	if (!dma_cached) {
+		return;
+	}
+	for (vm_offset_t line = (vm_offset_t)dma->bytes & ~(vm_offset_t)63; line < (vm_offset_t)dma->bytes + dma->size; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
 static void
@@ -909,14 +935,40 @@ step_mhi(void)
 		say("mdm: 4: no fw/sdx55m/%s\n", bhi_name);
 		return false;
 	}
+	{
+		/* (the file as the kernel has it, FNV-1a: sbl1.mbn of ~/hk/fw-modem is 548056 bytes, 0xa4dfb904) */
+		uint32_t hash = 2166136261u;
+
+		for (uint64_t i = 0; i < size; i++) {
+			hash = (hash ^ sbl[i]) * 16777619u;
+		}
+		say("mdm: 4: %s: %llu bytes, FNV-1a %#x, first bytes %02x %02x %02x %02x\n", bhi_name, size, hash, sbl[0], sbl[1],
+		    sbl[2], sbl[3]);
+	}
+	{
+		uint32_t cached_dma = 0;
+
+		dma_cached = PE_parse_boot_argn("mdm_dma_cached", &cached_dma, sizeof(cached_dma)) && cached_dma != 0;
+		say("mdm: 4: the modem's memory: %s\n", dma_cached ? "CACHED, write-back cacheable and inner shareable to the SMMU "
+		    "(mdm_dma_cached=1, Android's way for a dma-coherent device)" : "uncached, non-cacheable to the SMMU (the Wi-Fi's way)");
+	}
 	if (!smmu_up() || !dma_route()) {
 		return false;
 	}
 	/* (in the structure's order: "say" is this file's macro for hakios_tl, so no designators) */
 	mhi_io = (struct alioth_mhi_io){ NULL, bar_size, MDM_WINDOW, MDM_WINDOW + MDM_WINDOW_SIZE - 1, mhi_read, mhi_write,
-		                         mdm_allocate, mhi_delay, mhi_say };
+		                         mdm_allocate, mhi_delay, mhi_say, mdm_sync };
 	memset(&mhi, 0, sizeof(mhi));
 	error = alioth_mhi_probe(&mhi, &mhi_io);
+	{
+		/* boot-arg mdm_bhi_probe=1 (diagnosis): BHI given an address of the window with nothing mapped behind it --
+		 * if the modem's reads go through our context, it records a fault there */
+		uint32_t probe = 0;
+
+		if (PE_parse_boot_argn("mdm_bhi_probe", &probe, sizeof(probe)) && probe != 0) {
+			mhi.bhi_probe = MDM_WINDOW + MDM_WINDOW_SIZE - 0x100000;
+		}
+	}
 	if (error == 0) {
 		error = alioth_mhi_execution_environment(&mhi, &ee);
 	}

@@ -725,7 +725,7 @@ static const struct alioth_mhi_known known[] = {
 int
 main(void)
 {
-	const struct alioth_mhi_io io = { NULL, BAR, WINDOW, WINDOW_LAST, read32, write32, allocate, delay_us, say };
+	const struct alioth_mhi_io io = { NULL, BAR, WINDOW, WINDOW_LAST, read32, write32, allocate, delay_us, say, NULL };
 	static uint8_t sbl_bytes[700000];
 	struct alioth_mhi host;
 	int error;
