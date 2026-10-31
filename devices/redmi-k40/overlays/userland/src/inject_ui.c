@@ -18,8 +18,9 @@
  * +headingAvailable is YES, -startUpdatingHeading leases the rotation vector (kern.hakios.rotv_lease) and
  * gives the delegate -locationManager:didUpdateHeading: twenty times a second, the heading of the top of the
  * device -- of its back when it is held upright -- with the DSP's own accuracy; -heading is the last one.
- * locationd is not asked for it. Not yet: the true north (no declination without a location: trueHeading is
- * the magnetic one) and the raw field (x, y, z are 0).
+ * locationd is not asked for it. trueHeading: the magnetic heading turned by the declination where the phone is
+ * (NOAA's World Magnetic Model 2025, wmm2025.h), from the location manager's own last location; without one, the
+ * magnetic heading, as before. Not yet: the raw field (x, y, z are 0).
  */
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -37,6 +38,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "wmm2025.h"
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
@@ -237,6 +240,55 @@ watcher_of(id manager)
 	return NULL;
 }
 
+/*
+ * The declination for trueHeading: from the manager's last location (-[CLLocationManager location]: what it was
+ * given, or the system's last fix for an application that may have it), worked out again when the phone has moved
+ * some 10 km or every 10 minutes, and looked for once a second at most. NAN: no location (trueHeading = magnetic).
+ */
+struct coordinate { double latitude, longitude; };      /* (CLLocationCoordinate2D) */
+
+static double
+declination_for(id manager)
+{
+	static double latitude = 1000, longitude, height, declination = NAN;
+	static uint64_t asked, worked;
+	static int shown;
+	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	id location;
+	struct coordinate c;
+	double accuracy, year;
+
+	if (asked != 0 && now - asked < 1000000000ull) {
+		return declination;
+	}
+	asked = now;
+	location = ((id (*)(id, SEL))objc_msgSend)(manager, sel_registerName("location"));
+	if (location == nil) {
+		return declination;
+	}
+	accuracy = ((double (*)(id, SEL))objc_msgSend)(location, sel_registerName("horizontalAccuracy"));
+	c = ((struct coordinate (*)(id, SEL))objc_msgSend)(location, sel_registerName("coordinate"));
+	if (accuracy < 0 || !isfinite(c.latitude) || !isfinite(c.longitude)) {
+		return declination;
+	}
+	if (!isnan(declination) && fabs(c.latitude - latitude) < 0.1 && fabs(c.longitude - longitude) < 0.1 &&
+	    now - worked < 600000000000ull) {
+		return declination;
+	}
+	latitude = c.latitude;
+	longitude = c.longitude;
+	height = ((double (*)(id, SEL))objc_msgSend)(location, sel_registerName("altitude")) / 1000;
+	year = 2001 + ((double (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSDate"),
+	    sel_registerName("timeIntervalSinceReferenceDate")) / (365.2425 * 86400);
+	declination = wmm_declination(latitude, longitude, isfinite(height) ? height : 0, year);
+	worked = now;
+	if (shown++ < 4) {
+		say("compass: declination %.2f degrees at %.2f, %.2f (WMM 2025, %.2f): true north is the magnetic heading + that\n",
+		    declination, latitude, longitude, year);
+	}
+	return declination;
+}
+
 static void
 tick(struct watcher *w)
 {
@@ -244,7 +296,7 @@ tick(struct watcher *w)
 	struct hakios_rotv r;
 	size_t length = sizeof(r);
 	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);         /* (dispatch_time() is in ticks, not ns) */
-	double accuracy = -1, heading, filter;
+	double accuracy = -1, heading, filter, declination;
 	id delegate, h;
 	SEL did = sel_registerName("locationManager:didUpdateHeading:");
 
@@ -277,7 +329,8 @@ tick(struct watcher *w)
 	w->last = heading;
 	h = class_createInstance(heading_class, 0);
 	values_of(h)[H_MAGNETIC] = heading;
-	values_of(h)[H_TRUE] = heading;         /* (no declination without a location) */
+	declination = declination_for(w->manager);
+	values_of(h)[H_TRUE] = isnan(declination) ? heading : fmod(heading + declination + 360, 360);
 	values_of(h)[H_ACCURACY] = accuracy;
 	values_of(h)[H_TIME] = ((double (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSDate"),
 	    sel_registerName("timeIntervalSinceReferenceDate"));
