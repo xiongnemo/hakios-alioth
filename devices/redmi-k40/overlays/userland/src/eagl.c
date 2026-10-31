@@ -4590,20 +4590,22 @@ my_sharegroup(id self, SEL selector)
 /*
  * EAGLSharegroup in an application: every one there is ours (my_sharegroup()), its private part empty, and Apple's
  * methods read that -- -[EAGLSharegroup APIs] + 4 faulted on address 0 for GLKTextureLoader's -initWithSharegroup:
- * (GPU Check, 2026-11-01). These answer from the group's contexts instead: APIs is a mask of 1 << API.
+ * (GPU Check, 2026-11-01). These answer from the group's contexts instead. APIs is the group's API itself, not a
+ * mask: GLKTextureLoader hands it as it is to -initWithAPI:sharegroup: (GLKit 20F66 0x1e94d56c8..d8); as 1 << API
+ * its loader asked for API 4, got no context, and its asynchronous loads never called back.
  */
 static unsigned long
 app_sharegroup_APIs(id self, SEL selector)
 {
-	unsigned long mask = 0;
+	unsigned long api = 0;
 
 	(void)selector;
 	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
-		if (contexts[i] != NULL && contexts[i]->sharegroup == self) {
-			mask |= 1ul << contexts[i]->api;
+		if (contexts[i] != NULL && contexts[i]->sharegroup == self && contexts[i]->api > api) {
+			api = contexts[i]->api;
 		}
 	}
-	return mask != 0 ? mask : 1ul << 2 | 1ul << 3;
+	return api != 0 ? api : 2;
 }
 
 static id app_sharegroup_label;         /* (one for all of them: nobody reads it back but a debugger) */
