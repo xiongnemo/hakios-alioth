@@ -270,12 +270,24 @@ gpio_in(unsigned pin)
 static bool
 step_power(void)
 {
-	say("mdm: 2: the PMX55's warm reset, then AP2MDM_STATUS high (Xiaomi's sdx55m first power-on)\n");
+	/*
+	 * boot-arg mdm_pon_type=7 (or 8): the PMX55's HARD reset (PON_POWER_OFF_TYPE_HARD_RESET; 8 = DVDD_HARD_RESET)
+	 * instead of the warm one -- its rails off and on again, the modem's PBL from cold as at the phone's power-on.
+	 * (2026-10-31: after a warm reset the PBL takes the SBL's signature and every segment's hash and still refuses
+	 * the image ~8 ms later, 0xef0e0003; Android's PBL, which takes it, starts from cold.)
+	 */
+	uint32_t type = PON_WARM_RESET;
+
+	if (PE_parse_boot_argn("mdm_pon_type", &type, sizeof(type)) && type != 7 && type != 8) {
+		type = PON_WARM_RESET;
+	}
+	say("mdm: 2: the PMX55's %s reset (type %u), then AP2MDM_STATUS high (Xiaomi's sdx55m first power-on)\n",
+	    type == PON_WARM_RESET ? "warm" : "HARD", type);
 	if (!pon_put(PON_SW_RST_S2_CTL2, 0)) {
 		return false;
 	}
 	delay(500);
-	if (!pon_put(PON_SW_RST_S2_CTL, PON_WARM_RESET) || !pon_put(PON_SW_RST_S2_CTL2, PON_RESET_EN)) {
+	if (!pon_put(PON_SW_RST_S2_CTL, (uint8_t)type) || !pon_put(PON_SW_RST_S2_CTL2, PON_RESET_EN)) {
 		return false;
 	}
 	delay(500);
@@ -283,7 +295,8 @@ step_power(void)
 		return false;
 	}
 	reset_at = mach_absolute_time();
-	delay(150 * 1000);
+	/* (a hard reset takes the PMIC through its whole power-on sequence again: the pins wait longer for it) */
+	delay((type == PON_WARM_RESET ? 150 : 600) * 1000);
 	/* (inputs: function 0, no pull -- the modem drives them) */
 	update(tlmm + GPIO_MDM2AP_STATUS * 0x1000, 0x3ff, 0);
 	update(tlmm + GPIO_MDM2AP_ERRFATAL * 0x1000, 0x3ff, 0);
@@ -1182,14 +1195,19 @@ step_mhi(void)
 		/*
 		 * boot-arg mdm_bhi_corrupt=N (diagnosis: which of the PBL's checks gives 0xef0e0003?): the image given with
 		 * 1 the ELF magic's first byte flipped, 2 one byte flipped inside the first loaded segment (file offset
-		 * 0x10000), 3 one byte flipped in the signature at the end, 4 only its first 64 KB
+		 * 0x10000), 3 one byte flipped in the signature at the end, 4 only its first 64 KB, 5 one byte flipped at
+		 * the file offset mdm_bhi_corrupt_at= says. (2026-10-31: 2 answers 0xef0a0105 after 26 ms -- a segment's hash
+		 * -- where the image as it is gets 0xef0e0003 after 38 ms: the signature passes, the segments' hashes are
+		 * checked one by one, and something after segment 5 stops the true image; 5 finds where.)
 		 */
-		if (PE_parse_boot_argn("mdm_bhi_corrupt", &corrupt, sizeof(corrupt)) && corrupt >= 1 && corrupt <= 4) {
+		if (PE_parse_boot_argn("mdm_bhi_corrupt", &corrupt, sizeof(corrupt)) && corrupt >= 1 && corrupt <= 5) {
 			vm_offset_t copy = 0;
+			uint64_t corrupt_at = 0;
 
+			(void)PE_parse_boot_argn("mdm_bhi_corrupt_at", &corrupt_at, sizeof(corrupt_at));
 			if (kmem_alloc(kernel_map, &copy, round_page(size), KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
 				uint8_t *c = (uint8_t *)copy;
-				uint64_t at = corrupt == 1 ? 0 : corrupt == 2 ? 0x10000 : size - 16;
+				uint64_t at = corrupt == 1 ? 0 : corrupt == 2 ? 0x10000 : corrupt == 5 ? corrupt_at : size - 16;
 
 				memcpy(c, sbl, (size_t)size);
 				if (corrupt == 4) {
@@ -1198,9 +1216,10 @@ step_mhi(void)
 					c[at] ^= 0xff;
 				}
 				image = c;
-				say("mdm: 4: THE IMAGE GIVEN IS MADE WRONG ON PURPOSE (mdm_bhi_corrupt=%u: %s)\n", corrupt,
+				say("mdm: 4: THE IMAGE GIVEN IS MADE WRONG ON PURPOSE (mdm_bhi_corrupt=%u: %s, file offset %#llx)\n", corrupt,
 				    corrupt == 1 ? "the ELF magic" : corrupt == 2 ? "a byte of the first segment" :
-				    corrupt == 3 ? "a byte of the signature" : "only its first 64 KB");
+				    corrupt == 3 ? "a byte of the signature" : corrupt == 5 ? "a byte where mdm_bhi_corrupt_at says" :
+				    "only its first 64 KB", corrupt == 4 ? 0x10000ull : at);
 			}
 		}
 		pcie_errors("4: before BHI");
