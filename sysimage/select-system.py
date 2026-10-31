@@ -42,10 +42,28 @@ WHOLE = ('usr/libexec/', 'usr/sbin/', 'usr/bin/', 'usr/lib/', 'usr/share/', 'sbi
 # application and its daemon are made of: both stop with a fatal error when the directory is not there.
 # Of Health only the pictures and films of the activity awards are left out, see SKIP_PREFIX and HEALTH)
 SKIP_SYSTEM_LIBRARY = ('LinguisticData', 'PreinstalledAssetsV2', 'NanoTimeKit', 'Audio',
-                       'Assistant', 'AccessibilityBundles',
+                       'Assistant',
                        'VideoProcessors', 'ScreenReader', 'Photos', 'Carrier Bundles', 'NanoPreferenceBundles',
                        'ImagingNetworks', 'ProductDocuments', 'AppPlaceholders', 'UserNotifications',
                        'Caches')
+# the accessibility bundles (62 MB, 415 of them): what iOS loads into a process once an accessibility feature is on.
+# Their servers are in them -- backboardd's job names com.apple.accessibility.AXBackBoardServer, which only
+# BackBoard.axbundle answers -- so without them Smart Invert, Classic Invert and AssistiveTouch did nothing.
+# The ones of the system as a whole (12 MB): UIKit's, SpringBoard's, backboardd's, Control Center's, Settings',
+# Safari's and WebKit's, every UI service (AssistiveTouch, Zoom, the display filters) and the plain bundles
+# (InvertColorsManager, Guided Access); not those of single applications, nor the maps of which to load where
+# beyond the two there are.
+ACCESSIBILITY = 'System/Library/AccessibilityBundles/'
+ACCESSIBILITY_WANTED = re.compile(
+    r'[^/]+\.(axuiservice|bundle|axbundlemap)$|(UIKit|SpringBoard\w*|BackBoard\w*|ControlCenter\w*|UserNotificationsUIKit|'
+    r'Preferences\w*|AccessibilitySettings\w*|QuartzCore|FrontBoard\w*|WebKit\w*|MobileSafari\w*)\.axbundle$')
+
+
+def accessibility_unwanted(path):
+    """a path in an accessibility bundle left out (see ACCESSIBILITY_WANTED)"""
+    if not path.startswith(ACCESSIBILITY) or path == ACCESSIBILITY.rstrip('/'):
+        return False
+    return not ACCESSIBILITY_WANTED.match(path[len(ACCESSIBILITY):].split('/')[0])
 FRAMEWORKS = ('System/Library/Frameworks/', 'System/Library/PrivateFrameworks/')
 SMALL = 4 << 20
 # never from frameworks: machine-learning models, shader libraries, sound and video, big tables.
@@ -146,7 +164,7 @@ def wanted_file(path, size):
         return False
     if path.startswith(AUDIO):
         return not path.startswith(SKIP_AUDIO) and '.espresso.' not in path
-    if path.startswith(SKIP_PREFIX):
+    if path.startswith(SKIP_PREFIX) or accessibility_unwanted(path):
         return False
     if path.startswith('System/Library/Fonts/'):
         return size <= MAX_FONT or path in TRIMMED_FONTS
@@ -199,14 +217,15 @@ def main():
             keep = wanted_file(path, size)
         elif stat.S_ISLNK(mode):
             # a symlink costs nothing: keep every one that lives where we take anything at all
-            keep = '/' not in path or path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX)
+            keep = '/' not in path or path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX) and \
+                not accessibility_unwanted(path)
         else:
             # (the sound plug-ins' too: Library/Audio is skipped but for AUDIO, and without its en.lproj the
             # virtual audio device's port names came out NULL -- mediaserverd died naming the microphone)
             lproj = re.search(r'/([^/]+)\.lproj$', path)
             keep = '/' not in path or path in ('private/var', 'private/tmp', 'private/etc', 'private/preboot',
                                                'private/xarts', 'private') or \
-                bool(lproj) and lproj.group(1) in KEEP_LANG and \
+                bool(lproj) and lproj.group(1) in KEEP_LANG and not accessibility_unwanted(path) and \
                 (path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX) or
                  path.startswith(AUDIO) and not path.startswith(SKIP_AUDIO))
         if keep:
