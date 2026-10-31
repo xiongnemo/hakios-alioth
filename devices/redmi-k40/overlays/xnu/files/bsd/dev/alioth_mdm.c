@@ -933,6 +933,12 @@ step_mhi(void)
 	say("mdm: 4: %s (%d): execution environment %u, MHI state %u; MDM2AP_STATUS %d, MDM2AP_ERRFATAL %d\n",
 	    error ? "MHI STOPPED" : "THE SBL RUNS, MHI IN M0", error, mhi.ee, mhi.state, gpio_in(GPIO_MDM2AP_STATUS),
 	    gpio_in(GPIO_MDM2AP_ERRFATAL));
+	if (error != 0) {
+		/* the link and both ends' PCI status (bits 28/29: a target/master abort received, 27 signalled, 30 SERR):
+		 * did a request of the modem's, or of ours, fail on the way? */
+		say("mdm: 4: link status %#x, LTSSM %#x; endpoint command/status %#x, root command/status %#x\n", rd(dbi + 0x80),
+		    rd(parf + 0x24), rd(conf + 4), rd(dbi + 4));
+	}
 	smmu_faults();
 	return error == 0;
 }

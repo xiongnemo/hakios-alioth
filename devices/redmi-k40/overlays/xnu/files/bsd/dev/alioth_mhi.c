@@ -311,26 +311,35 @@ alioth_mhi_bhi(struct alioth_mhi *host, const void *image, size_t size, unsigned
 	wr(host, host->bhi + BHI_IMGSIZE, (uint32_t)size);
 	write_barrier();
 	wr(host, host->bhi + BHI_IMGTXDB, sequence);
-	for (unsigned ms = 0; ms < timeout_ms; ms++) {
-		status = rd(host, host->bhi + BHI_STATUS);
-		if (status == UINT32_MAX) {
-			break;
+	{
+		uint32_t last = rd(host, host->bhi + BHI_STATUS), changes = 0;
+
+		say(host, "MHI: BHI rung: image at, bytes, status right after", host->image.address, size, last);
+		for (unsigned ms = 0; ms < timeout_ms; ms++) {
+			status = rd(host, host->bhi + BHI_STATUS);
+			if (status != last && changes++ < 16) {
+				/* (every change said: all ones from a register is not always the link -- 2026-10-31 the SDX55's BHI
+				 * status read 0xffffffff while MHISTATUS read 0) */
+				say(host, "MHI: BHI status now: status, ms, MHI status", status, ms, rd(host, MHISTATUS));
+				last = status;
+			}
+			if (status >> 30 == 2 && status != UINT32_MAX) {
+				say(host, "MHI: BHI took the image: bytes, status, ms", size, status, ms);
+				return 0;
+			}
+			if (status >> 30 == 3 && status != UINT32_MAX) {
+				break;
+			}
+			host->io->delay_us(host->io->context, 1000);
 		}
-		if (status >> 30 == 2) {
-			say(host, "MHI: BHI took the image: bytes, status, ms", size, status, ms);
-			return 0;
-		}
-		if (status >> 30 == 3) {
-			say(host, "MHI: BHI REFUSED THE IMAGE: status, error code, debug 1", status, rd(host, host->bhi + BHI_ERRCODE),
-			    rd(host, host->bhi + BHI_ERRDBG1));
-			host->poisoned = true;
-			return EIO;
-		}
-		host->io->delay_us(host->io->context, 1000);
 	}
-	say(host, "MHI: BHI did not finish: status, MHI status", status, rd(host, MHISTATUS), 0);
+	say(host, "MHI: BHI DID NOT TAKE THE IMAGE: status, error code, execution environment", status,
+	    rd(host, host->bhi + BHI_ERRCODE), rd(host, host->bhi + BHI_EXECENV));
+	say(host, "MHI: BHI's debug registers 1, 2, 3", rd(host, host->bhi + BHI_ERRDBG1), rd(host, host->bhi + BHI_ERRDBG1 + 4),
+	    rd(host, host->bhi + BHI_ERRDBG1 + 8));
+	say(host, "MHI: MHI status, control, version", rd(host, MHISTATUS), rd(host, MHICTRL), rd(host, MHIVER));
 	host->poisoned = true;
-	return status == UINT32_MAX ? EIO : ETIMEDOUT;
+	return status >> 30 == 3 && status != UINT32_MAX ? EIO : ETIMEDOUT;
 }
 
 int
