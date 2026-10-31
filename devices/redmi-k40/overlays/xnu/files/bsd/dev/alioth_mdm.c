@@ -1,7 +1,7 @@
 /*
  * The Redmi K40's modem: an SDX55 outside the SoC, on PCIe2, whose GNSS receiver is the phone's GPS
  * (work/research/gps-sdx55.md, from Xiaomi's device tree and kernel for alioth). The first steps towards it,
- * a diagnostic: only with boot-arg mdm_step=N, N = 1 .. 5; nothing here runs otherwise.
+ * a diagnostic: only with boot-arg mdm_step=N, N = 1 .. 6; nothing here runs otherwise.
  *
  *   1  reads   the SPMI arbiter's table: the channel of the modem's own PMIC's power-on block (PMX55,
  *              "pmxprairie", slave 8, peripheral 0x08 -- kona-pmic-overlay.dtsi's qcom,modem-reset), who may write
@@ -22,6 +22,8 @@
  *              fw/sdx55m/sahara.txt names ("bhi FILE" for the SBL, then "ID FILE" a line, from mdm_helper's
  *              arguments to Android's ks; work/research/gps-sdx55.md); never in a shared image (the modem's EFS
  *              copies hold the phone's IMEI and calibration)
+ *   6  talks   QRTR (sys/alioth_qrtr.h) on the IPCR channels 20/21: our HELLO, then for 10 s what the modem tells of
+ *              its services -- QMI LOC (0x10) is the GPS's; lookups of the modem's are answered "none"
  * After step 3 alone, or when a step fails, PERST (GPIO 85) is held asserted and the SMMU put back as it was; a
  * modem in mission mode is left running (boot-arg mdm_keep=0: stopped too). On the way back to the loader
  * (loader_return.c) alioth_mdm_quiesce() stops it either way.
@@ -36,6 +38,7 @@
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <sys/alioth_mhi.h>
+#include <sys/alioth_qrtr.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
@@ -948,6 +951,146 @@ step_sahara(void)
 	return error == 0;
 }
 
+/* ---- step 6: QRTR on the IPCR channels (20 to the modem, 21 from it, event ring 2): the modem's services ---- */
+
+#define IPCR_TO_DEVICE          20
+#define IPCR_FROM_DEVICE        21
+#define IPCR_EVENT_RING         2
+#define IPCR_ELEMENTS           32
+#define IPCR_SLOT               0x2000
+#define IPCR_QUEUE              8
+#define IPCR_PACKET_MAX         0x4000
+#define QRTR_OUR_NODE           1               /* the application processor's, as Linux numbers it */
+#define IPCR_LISTEN_MS          10000
+#define MDM_SERVERS             64
+
+static struct {
+	unsigned head, tail;
+	uint32_t partial, dropped;
+	bool skipping;
+	uint32_t length[IPCR_QUEUE];
+	uint8_t packet[IPCR_QUEUE][IPCR_PACKET_MAX];
+} ipcr;
+static struct qrtr_server servers[MDM_SERVERS];
+static unsigned server_count;
+
+/* (from the poll: only queued, answered by step_qrtr()'s loop; alioth_sahara's way) */
+static void
+ipcr_received(__unused void *context, __unused unsigned channel, const uint8_t *bytes, uint32_t length, bool end)
+{
+	unsigned slot = ipcr.tail % IPCR_QUEUE;
+
+	if (ipcr.partial == 0 && !ipcr.skipping && ipcr.tail - ipcr.head == IPCR_QUEUE) {
+		ipcr.skipping = true;
+	}
+	if (!ipcr.skipping) {
+		if (ipcr.partial + length <= IPCR_PACKET_MAX) {
+			memcpy(ipcr.packet[slot] + ipcr.partial, bytes, length);
+		}
+		ipcr.partial += length;
+	}
+	if (!end) {
+		return;
+	}
+	if (ipcr.skipping) {
+		ipcr.dropped++;
+		ipcr.skipping = false;
+		return;
+	}
+	ipcr.length[slot] = ipcr.partial <= IPCR_PACKET_MAX ? ipcr.partial : 0;
+	ipcr.partial = 0;
+	ipcr.tail++;
+}
+
+static int
+ipcr_send(const uint8_t *packet, size_t length)
+{
+	return length == 0 ? EMSGSIZE : alioth_mhi_send(&mhi, IPCR_TO_DEVICE, packet, (uint32_t)length, true, 2000);
+}
+
+static int
+ipcr_handle(const uint8_t *bytes, uint32_t length)
+{
+	struct qrtr_packet p;
+	struct qrtr_server s;
+	uint8_t out[64];
+
+	if (!qrtr_parse(bytes, length, &p)) {
+		say("mdm: 6: %u bytes that are no QRTR packet (%02x %02x %02x %02x)\n", length, length > 0 ? bytes[0] : 0,
+		    length > 1 ? bytes[1] : 0, length > 2 ? bytes[2] : 0, length > 3 ? bytes[3] : 0);
+		return 0;
+	}
+	switch (p.type) {
+	case QRTR_TYPE_HELLO:
+		say("mdm: 6: HELLO from node %u (QRTR version %u)\n", p.src_node, p.version);
+		return 0;
+	case QRTR_TYPE_NEW_SERVER:
+	case QRTR_TYPE_DEL_SERVER:
+		if (!qrtr_server_of(&p, &s)) {
+			return 0;
+		}
+		if (s.service == 0 && s.node == 0 && s.port == 0) {
+			say("mdm: 6: (the end of a list of servers)\n");
+			return 0;
+		}
+		say("mdm: 6: %s service %u (%#x) version %u instance %u at node %u port %u%s\n",
+		    p.type == QRTR_TYPE_NEW_SERVER ? "NEW" : "GONE:", s.service, s.service, s.version, s.instance, s.node, s.port,
+		    s.service == QRTR_SERVICE_LOC ? ": LOCATION (QMI LOC)" : "");
+		if (p.type == QRTR_TYPE_NEW_SERVER && server_count < MDM_SERVERS) {
+			servers[server_count++] = s;
+		}
+		return 0;
+	case QRTR_TYPE_NEW_LOOKUP:
+		/* we serve nothing yet: the list's end straight away, to the client that asked (Linux qrtr-ns's answer) */
+		say("mdm: 6: node %u port %u looks for service %u instance %#x: we have none\n", p.src_node, p.src_port,
+		    p.size >= QRTR_CONTROL_SIZE ? qrtr_le32(p.payload + 4) : 0, p.size >= QRTR_CONTROL_SIZE ? qrtr_le32(p.payload + 8) : 0);
+		return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_NEW_SERVER, QRTR_OUR_NODE, QRTR_PORT_CTRL, p.src_node,
+		    p.src_port, (const uint8_t[QRTR_CONTROL_SIZE]){ QRTR_TYPE_NEW_SERVER }, QRTR_CONTROL_SIZE, false));
+	case QRTR_TYPE_DATA:
+		say("mdm: 6: data from %u:%u to port %#x, %u bytes (nobody listens there yet)\n", p.src_node, p.src_port, p.dst_port,
+		    p.size);
+		return 0;
+	default:
+		say("mdm: 6: control %u from %u:%u (%u bytes)\n", p.type, p.src_node, p.src_port, p.size);
+		return 0;
+	}
+}
+
+static bool
+step_qrtr(void)
+{
+	uint8_t hello[64];
+	unsigned locations = 0;
+	int error;
+
+	say("mdm: 6: QRTR on the IPCR channels: our HELLO, then what the modem tells of its services\n");
+	memset(&ipcr, 0, sizeof(ipcr));
+	server_count = 0;
+	error = alioth_mhi_open(&mhi, IPCR_TO_DEVICE, ALIOTH_MHI_TO_DEVICE, IPCR_EVENT_RING, IPCR_ELEMENTS, IPCR_SLOT, NULL, NULL);
+	if (error == 0) {
+		error = alioth_mhi_open(&mhi, IPCR_FROM_DEVICE, ALIOTH_MHI_FROM_DEVICE, IPCR_EVENT_RING, IPCR_ELEMENTS, IPCR_SLOT,
+		    ipcr_received, NULL);
+	}
+	if (error == 0) {
+		error = ipcr_send(hello, qrtr_make_control(hello, sizeof(hello), QRTR_TYPE_HELLO, QRTR_OUR_NODE, QRTR_NODE_BCAST, NULL));
+	}
+	for (unsigned ms = 0; error == 0 && ms < IPCR_LISTEN_MS; ms++) {
+		error = alioth_mhi_poll(&mhi);
+		while (error == 0 && ipcr.head != ipcr.tail) {
+			unsigned slot = ipcr.head++ % IPCR_QUEUE;
+
+			error = ipcr_handle(ipcr.packet[slot], ipcr.length[slot]);
+		}
+		delay(1000);
+	}
+	for (unsigned i = 0; i < server_count; i++) {
+		locations += servers[i].service == QRTR_SERVICE_LOC;
+	}
+	say("mdm: 6: %s (%d): %u services of the modem's; location (QMI LOC, 0x10) %s; %u packets dropped\n",
+	    error ? "QRTR STOPPED" : "listened", error, server_count, locations ? "IS THERE" : "not seen", ipcr.dropped);
+	return error == 0 && server_count > 0;
+}
+
 /* On the way back to the loader (osfmk/arm64/loader_return.c), the other cores stopped: the modem held in reset,
  * the SMMU as it was found. */
 void alioth_mdm_quiesce(void);
@@ -996,6 +1139,9 @@ mdm_thread(__unused void *arg, __unused wait_result_t wr_result)
 	if (ok && mdm_step >= 5) {
 		ok = step_sahara();
 	}
+	if (ok && mdm_step >= 6) {
+		ok = step_qrtr();
+	}
 	if (mdm_step >= 3 && (!ok || mdm_step < 5 || !mdm_keep)) {
 		mdm_stop(false);                                /* (held in reset again; a modem in mission mode stays) */
 	}
@@ -1014,8 +1160,8 @@ alioth_mdm_init(void)
 	if (!PE_parse_boot_argn("mdm_step", &mdm_step, sizeof(mdm_step)) || mdm_step == 0) {
 		return;
 	}
-	if (mdm_step > 5) {
-		mdm_step = 5;
+	if (mdm_step > 6) {
+		mdm_step = 6;
 	}
 	PE_parse_boot_argn("mdm_keep", &mdm_keep, sizeof(mdm_keep));
 	if (kernel_thread_start(mdm_thread, NULL, &thread) == KERN_SUCCESS) {

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/alioth_mhi.h>
+#include <sys/alioth_qrtr.h>
 #include <sys/alioth_sahara.h>
 
 static int failures;
@@ -85,14 +86,22 @@ static struct {
 	bool event_doorbell[3];
 	struct ring ch[NCH];
 	unsigned events, resets;
-	/* the transfer being received on channel 2 */
+	/* the transfer being received on channel 2 (or 20) */
 	uint8_t *transfer;
 	size_t transfer_length;
-	/* packets for channel 3 */
-	uint8_t out[16][64];
-	uint32_t out_length[16];
-	unsigned out_head, out_tail;
+	/* packets for channel 3 (dl[0], Sahara) and 21 (dl[1], QRTR) */
+	struct {
+		uint8_t bytes[16][128];
+		uint32_t length[16];
+		unsigned head, tail;
+	} dl[2];
+	/* its QRTR side, in mission mode */
+	bool qrtr_hello, lookup_answered;
+	unsigned qrtr_packets;
 } dev;
+
+#define MODEM_NODE      3
+#define LOOKUP_PORT     0x30
 
 /* its SBL's Sahara side: a script */
 enum step_kind { HELLO, READ, READ64, EOI, DONE_PENDING, DONE_COMPLETE };
@@ -162,21 +171,68 @@ ring_next(const struct ring *r, uint64_t p)
 	return p == r->base + r->length ? r->base : p;
 }
 
-static void dl_flush(void);
+static void dl_flush(unsigned which);
+
+static void
+dl_send(unsigned which, const void *bytes, uint32_t length)
+{
+	unsigned slot = dev.dl[which].tail % 16;
+
+	if (dev.dl[which].tail - dev.dl[which].head == 16 || length > sizeof(dev.dl[which].bytes[0])) {
+		DEVICE_FAIL("the chip's own queue %u is full, or a packet too long", which);
+		return;
+	}
+	memcpy(dev.dl[which].bytes[slot], bytes, length);
+	dev.dl[which].length[slot] = length;
+	dev.dl[which].tail++;
+	dl_flush(which);
+}
 
 static void
 chip_send(const uint32_t *words, unsigned count)
 {
-	unsigned slot = dev.out_tail % 16;
+	dl_send(0, words, count * 4);
+}
 
-	if (dev.out_tail - dev.out_head == 16) {
-		DEVICE_FAIL("the chip's own queue is full");
+/* the modem's QRTR in mission mode: our HELLO gets its own, two servers (one of them LOC) and a lookup of its own */
+static void
+modem_qrtr(const uint8_t *bytes, size_t length)
+{
+	struct qrtr_packet p;
+	struct qrtr_server s;
+	uint8_t out[64];
+	size_t n;
+
+	dev.qrtr_packets++;
+	if (!qrtr_parse(bytes, length, &p) || p.version != 1) {
+		DEVICE_FAIL("not a QRTR version 1 packet (%zu bytes)", length);
 		return;
 	}
-	memcpy(dev.out[slot], words, count * 4);
-	dev.out_length[slot] = count * 4;
-	dev.out_tail++;
-	dl_flush();
+	if (p.type == QRTR_TYPE_HELLO && p.src_node == 1 && p.src_port == QRTR_PORT_CTRL && p.dst_port == QRTR_PORT_CTRL &&
+	    p.size == QRTR_CONTROL_SIZE && qrtr_le32(p.payload) == QRTR_TYPE_HELLO) {
+		uint32_t loc[4] = { QRTR_SERVICE_LOC, 0 << 8 | 2, MODEM_NODE, 0x20 }, dms[4] = { 2, 0 << 8 | 1, MODEM_NODE, 0x21 };
+		uint8_t lookup[QRTR_CONTROL_SIZE] = { 0 };
+
+		qrtr_put32(lookup, QRTR_TYPE_NEW_LOOKUP);
+		qrtr_put32(lookup + 4, 4096);           /* (TFTP: what the SDX55 asks the phone for) */
+		dev.qrtr_hello = true;
+		n = qrtr_make_control(out, sizeof(out), QRTR_TYPE_HELLO, MODEM_NODE, 1, NULL);
+		dl_send(1, out, (uint32_t)n);
+		n = qrtr_make_control(out, sizeof(out), QRTR_TYPE_NEW_SERVER, MODEM_NODE, 1, dms);
+		dl_send(1, out, (uint32_t)n);
+		n = qrtr_make_control(out, sizeof(out), QRTR_TYPE_NEW_SERVER, MODEM_NODE, 1, loc);
+		dl_send(1, out, (uint32_t)n);
+		n = qrtr_make(out, sizeof(out), QRTR_TYPE_NEW_LOOKUP, MODEM_NODE, LOOKUP_PORT, 1, QRTR_PORT_CTRL, lookup,
+		    QRTR_CONTROL_SIZE, false);
+		dl_send(1, out, (uint32_t)n);
+		return;
+	}
+	if (p.type == QRTR_TYPE_NEW_SERVER && p.dst_node == MODEM_NODE && p.dst_port == LOOKUP_PORT && qrtr_server_of(&p, &s) &&
+	    s.service == 0 && s.node == 0 && s.port == 0) {
+		dev.lookup_answered = true;
+		return;
+	}
+	DEVICE_FAIL("a QRTR packet of type %u to %u:%#x that the modem did not expect", p.type, p.dst_node, p.dst_port);
 }
 
 static void
@@ -300,10 +356,12 @@ maybe_hello(void)
 	}
 }
 
+/* what the host sent on channel 2 (Sahara, event ring 1) or 20 (QRTR, event ring 2) */
 static void
-ul_process(void)
+ul_process(unsigned ch)
 {
-	struct ring *r = &dev.ch[2];
+	struct ring *r = &dev.ch[ch];
+	unsigned event_ring = ch == 2 ? 1 : 2;
 
 	while (r->rp != r->wp) {
 		uint32_t *t = (uint32_t *)device_memory(r->rp, 16);
@@ -321,7 +379,7 @@ ul_process(void)
 		memcpy(dev.transfer + dev.transfer_length, device_memory(pointer, length), length);
 		dev.transfer_length += length;
 		if (flags & (1u << 9)) {
-			post_event(1, r->rp, 2u << 24 | length, 2u << 24 | 0x22u << 16);
+			post_event(event_ring, r->rp, 2u << 24 | length, ch << 24 | 0x22u << 16);
 		}
 		r->rp = ring_next(r, r->rp);
 		if (!(flags & 1)) {
@@ -331,47 +389,55 @@ ul_process(void)
 				DEVICE_FAIL("a transfer ended without asking for its completion");
 			}
 			dev.transfer_length = 0;
-			chip_transfer(dev.transfer, n);
+			if (ch == 2) {
+				chip_transfer(dev.transfer, n);
+			} else {
+				modem_qrtr(dev.transfer, n);
+			}
 		}
 	}
 }
 
+/* what the modem has to send on channel 3 (dl[0], event ring 1) or 21 (dl[1], event ring 2) */
 static void
-dl_flush(void)
+dl_flush(unsigned which)
 {
-	struct ring *r = &dev.ch[3];
+	unsigned ch = which ? 21 : 3, event_ring = which ? 2 : 1;
+	struct ring *r = &dev.ch[ch];
 
-	while (dev.out_head != dev.out_tail && r->running && r->rp != r->wp) {
+	while (dev.dl[which].head != dev.dl[which].tail && r->running && r->rp != r->wp) {
 		uint32_t *t = (uint32_t *)device_memory(r->rp, 16);
-		unsigned slot = dev.out_head % 16;
-		uint32_t n = dev.out_length[slot];
+		unsigned slot = dev.dl[which].head % 16;
+		uint32_t n = dev.dl[which].length[slot];
 
 		if (t[2] < n || ((t[3] >> 16) & 0xff) != 2 || !(t[3] & (1u << 9))) {
 			/* (without IEOT a real modem would fill it and say nothing) */
 			DEVICE_FAIL("a receive buffer too small, not a transfer element or asking for no completion");
 			return;
 		}
-		memcpy(device_memory(words64(t, 0), n), dev.out[slot], n);
-		post_event(1, r->rp, 2u << 24 | n, 3u << 24 | 0x22u << 16);
+		memcpy(device_memory(words64(t, 0), n), dev.dl[which].bytes[slot], n);
+		post_event(event_ring, r->rp, 2u << 24 | n, ch << 24 | 0x22u << 16);
 		r->rp = ring_next(r, r->rp);
-		dev.out_head++;
+		dev.dl[which].head++;
 	}
 }
 
+/* SBL's channels 2/3 on event ring 1, mission mode's IPCR 20/21 on event ring 2 (kona-mhi.dtsi) */
 static uint32_t
 start_channel(unsigned ch)
 {
 	uint32_t *c = channel_context(ch);
-	unsigned want = ch == 2 ? 1 : ch == 3 ? 2 : 0;
+	uint32_t ee = regs[(BHI + 0x28) / 4];
+	unsigned want = ch == 2 || ch == 20 ? 1 : ch == 3 || ch == 21 ? 2 : 0, ring = ch < 20 ? 1 : 2;
 	struct ring *r = &dev.ch[ch];
 
-	if (want == 0 || regs[(BHI + 0x28) / 4] != ALIOTH_MHI_EE_SBL) {
-		DEVICE_FAIL("START of channel %u, not one of SBL's", ch);
+	if (want == 0 || ee != (ch < 20 ? ALIOTH_MHI_EE_SBL : ALIOTH_MHI_EE_AMSS)) {
+		DEVICE_FAIL("START of channel %u in execution environment %u", ch, ee);
 		return 0x10;
 	}
 	r->base = words64(c, 3);
 	r->length = words64(c, 5);
-	if ((c[0] & 0xff) != 1 || c[1] != want || c[2] != 1 || (r->base & 15) || r->length == 0 || (r->length & 15) ||
+	if ((c[0] & 0xff) != 1 || c[1] != want || c[2] != ring || (r->base & 15) || r->length == 0 || (r->length & 15) ||
 	    words64(c, 7) != r->base || words64(c, 9) != r->base) {
 		DEVICE_FAIL("channel %u's context is not what START wants: %#x %u %u", ch, c[0], c[1], c[2]);
 		return 0x10;
@@ -517,10 +583,10 @@ write32(void *context, uint32_t offset, uint32_t value)
 			return;
 		}
 		r->wp = wp;
-		if (ch == 2) {
-			ul_process();
-		} else if (ch == 3) {
-			dl_flush();
+		if (ch == 2 || ch == 20) {
+			ul_process(ch);
+		} else if (ch == 3 || ch == 21) {
+			dl_flush(ch == 21);
 		}
 		maybe_hello();
 	} else if (offset >= ERDB && offset < ERDB + 3 * 8 && !(offset & 4)) {
@@ -582,7 +648,9 @@ modem_reset(void)
 	dev.m0 = false;
 	dev.events = dev.resets = 0;
 	dev.transfer_length = 0;
-	dev.out_head = dev.out_tail = 0;
+	memset(dev.dl, 0, sizeof(dev.dl));
+	dev.qrtr_hello = dev.lookup_answered = false;
+	dev.qrtr_packets = 0;
 	memset(dev.event_doorbell, 0, sizeof(dev.event_doorbell));
 	regs[0x00 / 4] = 0x100;                 /* MHIREGLEN */
 	regs[0x08 / 4] = 0x01000000;            /* MHIVER */
@@ -593,6 +661,60 @@ modem_reset(void)
 	regs[(BHI + 4) / 4] = 1;                /* BHI major version */
 	regs[(BHI + 0x28) / 4] = ALIOTH_MHI_EE_PBL;
 	arena_used = 0;
+}
+
+/* the host's QRTR packets from channel 21, as alioth_mdm.c's step 6 takes them (queued, handled outside the poll) */
+static uint8_t host_packets[16][256];
+static uint32_t host_lengths[16];
+static unsigned host_head, host_tail;
+
+static void
+host_received(void *context, unsigned channel, const uint8_t *bytes, uint32_t length, bool end)
+{
+	(void)context;
+	CHECK(channel == 21 && end && length <= sizeof(host_packets[0]) && host_tail - host_head < 16, "a QRTR packet to queue");
+	memcpy(host_packets[host_tail % 16], bytes, length);
+	host_lengths[host_tail++ % 16] = length;
+}
+
+static void
+host_qrtr(struct alioth_mhi *host)
+{
+	uint8_t out[64];
+	unsigned servers = 0, locations = 0, hellos = 0, lookups = 0;
+	int error;
+
+	host_head = host_tail = 0;
+	CHECK(alioth_mhi_open(host, 20, ALIOTH_MHI_TO_DEVICE, 2, 32, 0x2000, NULL, NULL) == 0, "open 20");
+	CHECK(alioth_mhi_open(host, 21, ALIOTH_MHI_FROM_DEVICE, 2, 32, 0x2000, host_received, NULL) == 0, "open 21");
+	CHECK(alioth_mhi_send(host, 20, out, (uint32_t)qrtr_make_control(out, sizeof(out), QRTR_TYPE_HELLO, 1, QRTR_NODE_BCAST, NULL),
+	    true, 100) == 0, "send HELLO");
+	for (unsigned ms = 0; ms < 50; ms++) {
+		CHECK((error = alioth_mhi_poll(host)) == 0, "poll: %d", error);
+		while (host_head != host_tail) {
+			unsigned slot = host_head++ % 16;
+			struct qrtr_packet p;
+			struct qrtr_server s;
+
+			CHECK(qrtr_parse(host_packets[slot], host_lengths[slot], &p), "a QRTR packet from the modem");
+			if (p.type == QRTR_TYPE_HELLO) {
+				hellos++;
+			} else if (qrtr_server_of(&p, &s)) {
+				servers++;
+				locations += s.service == QRTR_SERVICE_LOC && s.version == 2 && s.node == MODEM_NODE && s.port == 0x20;
+			} else if (p.type == QRTR_TYPE_NEW_LOOKUP) {
+				lookups++;
+				CHECK(p.src_port == LOOKUP_PORT && qrtr_le32(p.payload + 4) == 4096, "the lookup's port and service");
+				CHECK(alioth_mhi_send(host, 20, out, (uint32_t)qrtr_make(out, sizeof(out), QRTR_TYPE_NEW_SERVER, 1,
+				    QRTR_PORT_CTRL, p.src_node, p.src_port, (const uint8_t[QRTR_CONTROL_SIZE]){ QRTR_TYPE_NEW_SERVER },
+				    QRTR_CONTROL_SIZE, false), true, 100) == 0, "answer the lookup");
+			}
+		}
+		delay_us(NULL, 1000);
+	}
+	CHECK(dev.qrtr_hello && hellos == 1 && servers == 2 && locations == 1 && lookups == 1 && dev.lookup_answered,
+	    "QRTR: hello %d/%u, %u servers, LOC %u, %u lookups, answered %d", dev.qrtr_hello, hellos, servers, locations, lookups,
+	    dev.lookup_answered);
 }
 
 static const struct alioth_mhi_known known[] = {
@@ -635,9 +757,23 @@ main(void)
 	CHECK(host.ee == ALIOTH_MHI_EE_AMSS, "mission mode");
 	CHECK(dev.resets == 2 && !dev.ch[2].running && !dev.ch[3].running, "SBL's channels reset (%u)", dev.resets);
 	CHECK(host.bandwidth_requests == 1, "the link speed request seen (%u)", host.bandwidth_requests);
+	/* mission mode: QRTR on IPCR, as alioth_mdm.c's step 6 */
+	host_qrtr(&host);
 	CHECK(!host.poisoned, "not poisoned");
-	printf("run 1: %u events, %zu KB of host memory, %llu ms pretend\n", dev.events, arena_used >> 10,
-	    (unsigned long long)(dev.us / 1000));
+	printf("run 1: %u events, %zu KB of host memory, %llu ms pretend, %u QRTR packets to the modem\n", dev.events,
+	    arena_used >> 10, (unsigned long long)(dev.us / 1000), dev.qrtr_packets);
+
+	/* a version 2 header, as Linux's router also sends: HELLO from node 3's control port, broadcast */
+	{
+		uint8_t v2[16 + QRTR_CONTROL_SIZE] = { 3, QRTR_TYPE_HELLO, 0, 0, QRTR_CONTROL_SIZE, 0, 3, 0, 0xfe, 0xff, 0xff, 0xff,
+			                               0xfe, 0xff, 0, 0, QRTR_TYPE_HELLO };
+		struct qrtr_packet p;
+
+		CHECK(qrtr_parse(v2, sizeof(v2), &p) && p.version == 2 && p.type == QRTR_TYPE_HELLO && p.src_node == 3 &&
+		    p.src_port == QRTR_PORT_CTRL && p.dst_node == QRTR_NODE_BCAST && p.dst_port == QRTR_PORT_CTRL &&
+		    p.size == QRTR_CONTROL_SIZE && qrtr_le32(p.payload) == QRTR_TYPE_HELLO, "a version 2 HELLO");
+		CHECK(!qrtr_parse(v2, 20, &p), "a version 2 packet shorter than it says");
+	}
 
 	printf("run 2: the modem fails after its HELLO\n");
 	quiet_say = 0;
