@@ -68,6 +68,8 @@ extern "C" uint32_t alioth_panel_rate(void);
 extern "C" uint64_t alioth_panel_frame_ns(void);
 extern "C" void alioth_scan_source(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride);
 extern "C" uint32_t alioth_panel_line(void);
+extern "C" void alioth_pcc_set(const int32_t m[3][3], const int32_t c[3], int on);
+extern "C" void alioth_pcc_test(unsigned mode);
 extern "C" void hakios_gpu_to_memory(void * start, uint64_t size);
 extern "C" uint64_t gPhysBase, gPhysSize;       /* (osfmk/arm: the physical memory XNU has) */
 
@@ -84,8 +86,12 @@ enum {
 	kFBMethodGetDigitalOutState     = 25,
 	kFBMethodGetDotPitch            = 28,
 	kFBMethodGetDisplayArea         = 29,
+	kFBMethodSetColorRemapMode      = 51,       /* (work/research/color-matrix.md: these from the dyld cache) */
 	kFBMethodSwapCancel             = 52,
+	kFBMethodGetMatrix              = 54,
+	kFBMethodSetMatrix              = 55,
 	kFBMethodGetColorRemapMode      = 57,
+	kFBMethodSwapSetColorMatrix     = 69,
 	kFBMethodNotifications          = 72,
 	kFBMethodChangeFrameInfo        = 73,
 	kFBMethodSupportedFrameInfo     = 74,
@@ -530,6 +536,57 @@ IOMobileFramebuffer::aliothFlipStart(void)
 	    a, b, a == b ? "same" : "DIFFERENT", c, c != a ? "different" : "SAME", d, t1 && t2 ? "taken" : "NOT TAKEN",
 	    pass ? "the display engine reads our buffers: frames are flipped" : "no flips");
 	alioth_flip_misr_off();
+	if (pass) {
+		uint32_t pcc_test = 0;
+
+		/* (boot-arg pcc_test=1/2: is DSPP_0's colour correction in this path, and in which numbers -- alioth_dsi.c) */
+		if (PE_parse_boot_argn("pcc_test", &pcc_test, sizeof(pcc_test)) && pcc_test != 0 && pcc_test != 3) {
+			alioth_pcc_test(pcc_test);
+		}
+		/*
+		 * pcc_test=3: what the PCC's constant term counts in. The coefficients' 1.0 is 0x8000 (pcc_test=1), but an
+		 * invert made with constant 0x8000 showed a black screen (2026-10-31 19:53). So: the signature of a white
+		 * frame, then a black frame with all coefficients 0 and only a constant, for constants doubling from 0x40:
+		 * the smallest that gives white's signature is the constant's full scale (or more, clamped). Under 1 s.
+		 */
+		if (pcc_test == 3) {
+			static const int32_t zero[3][3] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
+			uint32_t * p = (uint32_t *) fFlipBase[1], white, black, seen;
+			size_t n = bytes / 4;
+
+			for (size_t i = 0; i < n; i++) {
+				p[i] = 0xffffffffu;
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			(void) alioth_flip_to(phys1, 100000);
+			white = alioth_flip_misr(2);
+			for (size_t i = 0; i < n; i++) {
+				p[i] = 0xff000000u;
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			black = alioth_flip_misr(2);
+			hakios_tl("alioth pcc: constant probe: white %#x, black %#x\n", white, black);
+			for (int32_t c = 0x40; c <= 0x20000; c <<= 1) {
+				int32_t k = c > 0x1ffff ? 0x1ffff : c, cs[3] = { k, k, k };
+
+				alioth_pcc_set(zero, cs, 1);
+				seen = alioth_flip_misr(2);
+				hakios_tl("alioth pcc: constant %#x alone: %#x (%s)\n", k, seen, seen == white ? "WHITE" : seen == black ?
+				    "black" : "between, or something else");
+				k = k - 1;      /* (and one under: full scale may be 2^n - 1) */
+				cs[0] = cs[1] = cs[2] = k;
+				alioth_pcc_set(zero, cs, 1);
+				seen = alioth_flip_misr(2);
+				hakios_tl("alioth pcc: constant %#x alone: %#x (%s)\n", k, seen, seen == white ? "WHITE" : seen == black ?
+				    "black" : "between, or something else");
+			}
+			alioth_pcc_set(zero, zero[0], 0);
+			alioth_flip_misr_off();
+			memcpy(fFlipBase[1], fFlipBase[0], bytes);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			(void) alioth_flip_to(phys0, 100000);
+		}
+	}
 	if (!pass) {
 		alioth_flip_to(phys0, 100000);
 		fFlipMap->release();
@@ -2028,6 +2085,214 @@ IOMobileFramebufferUserClient::vsync(void)
 	}
 }
 
+/*
+ * The whole picture's colour, as a real iPhone's display hardware applies it (iOS 16.5's calls, read from the dyld
+ * cache: work/research/color-matrix.md): the colour remap mode (51; backboardd for Classic and Smart Invert: 1
+ * inverted, 3 grayscale, 4 both, 0 neither), Night Shift's matrix (55, CoreBrightness, index 9) and the colour
+ * filters' / Reduce White Point's (69, Accessibility: 0x88 bytes, byte 0 "disabled", the 3x3 at 0x20 row by row, the
+ * offsets after it at 0x68). iOS's numbers are s31.32; an all-zero matrix is no matrix. Put together, Night Shift
+ * first, then the filter, then grayscale (Rec. 709) and invert (1 - x), into one matrix for DSPP_0's PCC
+ * (alioth_dsi.c alioth_pcc_set, 1.0 = 0x8000); none of them: the PCC off.
+ */
+static IOSimpleLock * gColorLock;
+static uint32_t gRemapMode;
+static bool gNightShiftSet, gColorFilterSet;
+static int64_t gNightShift[9], gColorFilter[9], gColorFilterPost[3];       /* s31.32, as iOS gave them */
+
+static void
+colorMultiply(int64_t r[3][3], const int64_t a[3][3], const int64_t b[3][3])   /* r = a b, in s15.16 */
+{
+	int64_t t[3][3];
+
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			t[i][j] = (a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j]) >> 16;
+		}
+	}
+	memcpy(r, t, sizeof(t));
+}
+
+static int32_t
+colorToPCC(int64_t v)                                   /* s15.16 -> the PCC's 1.0 = 0x8000, within its 18 bits */
+{
+	v >>= 1;
+	return (int32_t) (v < -0x20000 ? -0x20000 : v > 0x1ffff ? 0x1ffff : v);
+}
+
+static int32_t
+colorConstantToPCC(int64_t v)                           /* the constant: the same units in 16 bits, white 0x7fff */
+{
+	v >>= 1;
+	return (int32_t) (v < -0x8000 ? -0x8000 : v > 0x7fff ? 0x7fff : v);
+}
+
+static void
+colorApply(void)
+{
+	const int64_t one = 1 << 16;
+	int64_t m[3][3] = { { one, 0, 0 }, { 0, one, 0 }, { 0, 0, one } }, s[3][3], c[3] = { 0, 0, 0 };
+	uint32_t mode;
+	bool night, filter, gray, invert, identity = true;
+	int32_t pm[3][3], pc[3];
+
+	IOSimpleLockLock(gColorLock);
+	mode = gRemapMode;
+	night = gNightShiftSet;
+	filter = gColorFilterSet;
+	if (night) {
+		for (int i = 0; i < 9; i++) {
+			s[i / 3][i % 3] = gNightShift[i] >> 16;
+		}
+		colorMultiply(m, s, m);
+	}
+	if (filter) {
+		for (int i = 0; i < 9; i++) {
+			s[i / 3][i % 3] = gColorFilter[i] >> 16;
+		}
+		colorMultiply(m, s, m);
+		for (int i = 0; i < 3; i++) {
+			c[i] = gColorFilterPost[i] >> 16;
+		}
+	}
+	IOSimpleLockUnlock(gColorLock);
+	gray = mode == 3 || mode == 4;
+	invert = mode == 1 || mode == 4;
+	if (gray) {
+		static const int64_t w[3] = { 13933, 46871, 4732 };     /* 0.2126, 0.7152, 0.0722 in 1/65536 */
+		int64_t y[3][3], cy = (w[0] * c[0] + w[1] * c[1] + w[2] * c[2]) >> 16;
+
+		for (int i = 0; i < 3; i++) {
+			for (int j = 0; j < 3; j++) {
+				y[i][j] = w[j];
+			}
+			c[i] = cy;
+		}
+		colorMultiply(m, y, m);
+	}
+	if (invert) {
+		for (int i = 0; i < 3; i++) {
+			for (int j = 0; j < 3; j++) {
+				m[i][j] = -m[i][j];
+			}
+			c[i] = one - c[i];
+		}
+	}
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			pm[i][j] = colorToPCC(m[i][j]);
+			identity = identity && pm[i][j] == (i == j ? 0x8000 : 0);
+		}
+		pc[i] = colorConstantToPCC(c[i]);
+		identity = identity && pc[i] == 0;
+	}
+	alioth_pcc_set(pm, pc, !identity);
+	{
+		/* (said when what is on changes: Night Shift's ramps send a matrix every frame, 250 of them in 2 s) */
+		static uint32_t said = ~0u;
+		uint32_t now = mode << 3 | (night ? 4 : 0) | (filter ? 2 : 0) | (identity ? 1 : 0);
+
+		if (now != said) {
+			said = now;
+			hakios_tl("alioth colour: remap mode %u, night shift %s, filter %s -> %s (R from R G B %#x %#x %#x, constant %#x)\n",
+			    mode, night ? "on" : "off", filter ? "on" : "off", identity ? "the PCC off" : "the PCC on",
+			    (uint32_t) pm[0][0] & 0x3ffff, (uint32_t) pm[0][1] & 0x3ffff, (uint32_t) pm[0][2] & 0x3ffff,
+			    (uint32_t) pc[0] & 0xffff);
+		}
+	}
+}
+
+/* One of the colour calls; true when it was one (its answer in `result`). */
+static bool
+colorCall(uint32_t selector, IOExternalMethodArguments * args, IOReturn * result)
+{
+	const uint64_t * in = args->scalarInput;
+	bool any;
+
+	if (gColorLock == NULL) {
+		IOSimpleLock * lock = IOSimpleLockAlloc();
+
+		if (!OSCompareAndSwapPtr(NULL, lock, (void * volatile *) &gColorLock)) {
+			IOSimpleLockFree(lock);
+		}
+	}
+	*result = kIOReturnSuccess;
+	switch (selector) {
+	case kFBMethodSetColorRemapMode:                /* in: the mode */
+		if (args->scalarInputCount < 1) {
+			*result = kIOReturnBadArgument;
+			return true;
+		}
+		IOSimpleLockLock(gColorLock);
+		gRemapMode = (uint32_t) in[0];
+		IOSimpleLockUnlock(gColorLock);
+		colorApply();
+		return true;
+
+	case kFBMethodGetColorRemapMode:                /* out: the mode */
+		if (args->scalarOutputCount < 1) {
+			*result = kIOReturnBadArgument;
+			return true;
+		}
+		args->scalarOutput[0] = gRemapMode;
+		args->scalarOutputCount = 1;
+		return true;
+
+	case kFBMethodSetMatrix:                        /* in: which (9: Night Shift's), 3x3 s31.32 */
+		if (args->scalarInputCount < 1 || args->structureInput == NULL || args->structureInputSize < 72) {
+			*result = kIOReturnBadArgument;
+			return true;
+		}
+		if (in[0] != 9) {
+			return true;                    /* (another stage: nothing iOS 16.5 was seen to use) */
+		}
+		IOSimpleLockLock(gColorLock);
+		memcpy(gNightShift, args->structureInput, sizeof(gNightShift));
+		any = false;
+		for (int i = 0; i < 9; i++) {
+			any = any || gNightShift[i] != 0;
+		}
+		gNightShiftSet = any;
+		IOSimpleLockUnlock(gColorLock);
+		colorApply();
+		return true;
+
+	case kFBMethodGetMatrix:                        /* in: which; out: its 3x3 */
+		if (args->structureOutput != NULL && args->structureOutputSize != 0) {
+			bzero(args->structureOutput, args->structureOutputSize);
+			if (args->scalarInputCount >= 1 && in[0] == 9 && args->structureOutputSize >= 72) {
+				IOSimpleLockLock(gColorLock);
+				memcpy(args->structureOutput, gNightShift, sizeof(gNightShift));
+				IOSimpleLockUnlock(gColorLock);
+			}
+		}
+		return true;
+
+	case kFBMethodSwapSetColorMatrix:               /* in: 0x88 bytes (above) */
+		if (args->structureInput == NULL || args->structureInputSize < 0x80) {
+			*result = kIOReturnBadArgument;
+			return true;
+		}
+		{
+			const uint8_t * b = (const uint8_t *) args->structureInput;
+
+			IOSimpleLockLock(gColorLock);
+			memcpy(gColorFilter, b + 0x20, sizeof(gColorFilter));
+			memcpy(gColorFilterPost, b + 0x68, sizeof(gColorFilterPost));
+			any = false;
+			for (int i = 0; i < 9; i++) {
+				any = any || gColorFilter[i] != 0;
+			}
+			gColorFilterSet = b[0] == 0 && any;
+			IOSimpleLockUnlock(gColorLock);
+		}
+		colorApply();
+		return true;
+
+	default:
+		return false;
+	}
+}
+
 IOReturn
 IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
@@ -2195,6 +2460,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		return kIOReturnSuccess;
 
 	default:
+		{
+			IOReturn result;
+
+			if (colorCall(selector, args, &result)) {
+				return result;
+			}
+		}
 		break;
 	}
 

@@ -914,6 +914,79 @@ alioth_flip_misr_off(void)
 	misr_on = false;
 }
 
+/*
+ * Colour correction for the whole picture (iOS's invert / grayscale / Night Shift / colour filters, which a real
+ * iPhone's display hardware applies; MiniIOMobileFramebuffer.cpp works out the matrix): DSPP_0's PCC, which layer
+ * mixer 0 -- VIG0's -- feeds (kona catalog: LM_0 -> DSPP_0, no mux; the live DT's qcom,sde-dspp-pcc 0x1700 in
+ * DSPP_0 at 0x55000). Downstream sde_hw_color_proc_v4.c sde_setup_dspp_pccv4: per output channel o (R, G, B)
+ * the constant at +0x04 + 4o, the coefficients of input R / G / B at +0x10 / +0x1c / +0x28 + 4o, the second-order
+ * terms RG RB GB RGB RR GG BB at +0x34 .. +0x84 (written 0), PCC_EN bit 0 of +0x00. The coefficients: 18-bit
+ * two's complement, 1.0 = 0x8000 (pcc_test=1). The constant: 16-bit two's complement in the same units -- full
+ * white is 0x7fff, and 0x8000 is -1.0, a black screen (pcc_test=3, 2026-10-31 19:58: a constant alone on a
+ * black frame, 0x7fff gave white's signature, 0x8000 and 0x10000 black's). Double-buffered: taken with
+ * CTL_FLUSH's DSPP_0 bit at the next frame. (work/research/color-matrix.md)
+ */
+#define DSPP0_PCC               0x56700
+#define CTL_FLUSH_DSPP0         (1u << 13)
+#define PCC_ONE                 0x8000
+#define PCC_CONSTANT_ONE        0x7fff
+
+void alioth_pcc_set(const int32_t m[3][3], const int32_t c[3], int on);
+void alioth_pcc_test(unsigned mode);
+
+void
+alioth_pcc_set(const int32_t m[3][3], const int32_t c[3], int on)
+{
+	if (mdss == 0) return;
+	if (on) {
+		for (unsigned o = 0; o < 3; o++) {
+			md_wr(DSPP0_PCC + 0x04 + 4 * o, (uint32_t)c[o] & 0xffff);
+			for (unsigned i = 0; i < 3; i++) md_wr(DSPP0_PCC + 0x10 + 0xc * i + 4 * o, (uint32_t)m[o][i] & 0x3ffff);
+		}
+		for (uint32_t r = 0x34; r <= 0x84; r += 4) md_wr(DSPP0_PCC + r, 0);
+	}
+	md_wr(DSPP0_PCC, on ? 1 : 0);
+	/* (VIG0's bit too: a flip's flush written over ours must not leave it out -- the same address taken again is nothing) */
+	md_wr(CTL0_OFF + CTL_FLUSH, CTL_FLUSH_DSPP0 | CTL_FLUSH_VIG0);
+}
+
+/*
+ * boot-arg pcc_test=1 (2: the inverted picture held 10 s, to be seen): is DSPP_0's PCC in VIG0's path, and is
+ * 1.0 = 0x8000? INTF_1's signature of the frame as found, with the PCC at identity (must be the same), inverted
+ * (must differ), off again (the same). 2026-10-31 19:36: same / different / same -- it is, and it is.
+ * (2 holds the framebuffer's start, which backboardd waits on: its displays were not up in time and SpringBoard
+ * asserted in -[FBSDisplayMonitor _init...] over and over. For the eyes only, never with a system to use.)
+ */
+void
+alioth_pcc_test(unsigned mode)
+{
+	static const int32_t id[3][3] = { { PCC_ONE, 0, 0 }, { 0, PCC_ONE, 0 }, { 0, 0, PCC_ONE } };
+	static const int32_t inv[3][3] = { { -PCC_ONE, 0, 0 }, { 0, -PCC_ONE, 0 }, { 0, 0, -PCC_ONE } };
+	static const int32_t zero[3] = { 0, 0, 0 }, one[3] = { PCC_CONSTANT_ONE, PCC_CONSTANT_ONE, PCC_CONSTANT_ONE };
+	uint32_t a, b, c, d;
+
+	if (mdss == 0 || intf == 0) return;
+	printf("alioth pcc: DSPP_0's PCC as found: enable %#x, constants %#x %#x %#x, R %#x %#x %#x\n", md_rd(DSPP0_PCC),
+	    md_rd(DSPP0_PCC + 4), md_rd(DSPP0_PCC + 8), md_rd(DSPP0_PCC + 0xc), md_rd(DSPP0_PCC + 0x10), md_rd(DSPP0_PCC + 0x14),
+	    md_rd(DSPP0_PCC + 0x18));
+	a = alioth_flip_misr(2);
+	alioth_pcc_set(id, zero, 1);
+	b = alioth_flip_misr(3);
+	alioth_pcc_set(inv, one, 1);
+	c = alioth_flip_misr(3);
+	if (mode >= 2) {
+		printf("alioth pcc: the picture inverted for 10 s\n");
+		delay_for_interval(10, NSEC_PER_SEC);
+	}
+	alioth_pcc_set(id, zero, 0);
+	d = alioth_flip_misr(3);
+	alioth_flip_misr_off();
+	printf("alioth pcc: test: signature %#x, identity %#x (%s), inverted %#x (%s), off %#x (%s); flush %#x: %s\n", a, b,
+	    b == a ? "same" : "DIFFERENT", c, c != a ? "different" : "SAME", d, d == a ? "same" : "DIFFERENT",
+	    md_rd(CTL0_OFF + CTL_FLUSH), a != 0 && b == a && c != a && d == a ? "THE PCC IS IN THE PATH, 1.0 = 0x8000" :
+	    c == a ? "the PCC changes nothing: not in the path (or not flushed)" : "the PCC is in the path, 1.0 is NOT 0x8000");
+}
+
 /* The TE period now, from the tear check's line counter wrapping (ns), 0 if it does not move. */
 uint64_t
 alioth_panel_frame_ns(void)
