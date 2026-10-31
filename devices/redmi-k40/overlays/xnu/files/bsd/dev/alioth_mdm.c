@@ -421,7 +421,15 @@ step_pcie2(void)
 	update(dbi + 0x8bc, 0, BIT(0));
 	wr(dbi + 0x154, 0x55555555);
 	update(dbi + 0x8bc, BIT(0), 0);
-	update(dbi + 0xa0, 0xf, 2);                             /* Gen2 to begin with (the SDX55 can do Gen3 x2) */
+	{
+		/* Gen2 to begin with (the SDX55 can do Gen3 x2; Android trains it at 8 GT/s): boot-arg mdm_gen=1..3 */
+		uint32_t gen = 2;
+
+		PE_parse_boot_argn("mdm_gen", &gen, sizeof(gen));
+		gen = gen < 1 ? 1 : gen > 3 ? 3 : gen;
+		update(dbi + 0xa0, 0xf, gen);
+		say("mdm: 3: the link's target speed: Gen%u\n", gen);
+	}
 	wr(dbi + 0x78, (rd(dbi + 0x78) & 0xffff) & ~0x7000u);   /* (the control half only; the upper half is W1C) */
 	update(parf + 0x1b0, 0, BIT(8));                        /* LTSSM on */
 	if (!wait_bits(dbi + 0xf28, BIT(10), BIT(10), 100000, "the link") ||
@@ -966,6 +974,64 @@ mdm_image(__unused void *context, uint64_t id, uint64_t *size)
 	return NULL;
 }
 
+/*
+ * Both ends' PCIe error state (did the modem's reads come back whole?): the endpoint's PCI Express capability (found
+ * through its list: device control/status -- the correctable, non-fatal, fatal and unsupported-request flags, MPS,
+ * MRRS -- and the link status) and its AER (extended capability 1: uncorrectable/correctable status, the header log
+ * of the first error); the root port's the same (DWC: capability at 0x70, AER at 0x100).
+ */
+static void
+pcie_errors(const char *when)
+{
+	uint32_t at = rd(conf + 0x34) & 0xfc, pcie = 0, aer = 0, msi = 0;
+
+	for (unsigned n = 0; at >= 0x40 && at < 0x100 && n < 32; n++) {
+		uint32_t head = rd(conf + at);
+
+		if ((head & 0xff) == 0x10) {
+			pcie = at;
+		} else if ((head & 0xff) == 0x05) {
+			msi = at;
+		}
+		at = (head >> 8) & 0xfc;
+	}
+	for (unsigned n = 0, x = 0x100; x >= 0x100 && x < 0x1000 && n < 32; n++) {
+		uint32_t head = rd(conf + x);
+
+		if (head == 0 || head == UINT32_MAX) {
+			break;
+		}
+		if ((head & 0xffff) == 1) {
+			aer = x;
+			break;
+		}
+		x = head >> 20;
+	}
+	if (pcie != 0) {
+		uint32_t dev = rd(conf + pcie + 8), link = rd(conf + pcie + 0x10);
+
+		say("mdm: %s: endpoint device control/status %#x (status: correctable %u, non-fatal %u, fatal %u, UR %u; MPS %u, "
+		    "MRRS %u), link status Gen%u x%u\n", when, dev, dev >> 16 & 1, dev >> 17 & 1, dev >> 18 & 1, dev >> 19 & 1,
+		    128u << (dev >> 5 & 7), 128u << (dev >> 12 & 7), link >> 16 & 0xf, link >> 20 & 0x3f);
+	}
+	if (msi != 0) {
+		say("mdm: %s: endpoint MSI control %#x (%s)\n", when, rd(conf + msi) >> 16, rd(conf + msi) & (1u << 16) ? "on" : "off");
+	}
+	if (aer != 0) {
+		say("mdm: %s: endpoint AER: uncorrectable %#x (mask %#x), correctable %#x, header log %#x %#x %#x %#x\n", when,
+		    rd(conf + aer + 4), rd(conf + aer + 8), rd(conf + aer + 0x10), rd(conf + aer + 0x1c), rd(conf + aer + 0x20),
+		    rd(conf + aer + 0x24), rd(conf + aer + 0x28));
+	}
+	{
+		uint32_t dev = rd(dbi + 0x78);
+
+		say("mdm: %s: root device control/status %#x (status: correctable %u, non-fatal %u, fatal %u, UR %u; MPS %u, "
+		    "MRRS %u); root AER (if at 0x100: %#x): uncorrectable %#x, correctable %#x, root status %#x\n", when, dev,
+		    dev >> 16 & 1, dev >> 17 & 1, dev >> 18 & 1, dev >> 19 & 1, 128u << (dev >> 5 & 7), 128u << (dev >> 12 & 7),
+		    rd(dbi + 0x100), rd(dbi + 0x104), rd(dbi + 0x110), rd(dbi + 0x130));
+	}
+}
+
 static const uint8_t *sbl;
 static uint64_t sbl_size;
 
@@ -1041,8 +1107,10 @@ step_mhi(void)
 		error = EBUSY;
 	}
 	if (error == 0) {
+		pcie_errors("4: before BHI");
 		say("mdm: 4: BHI %llu ms after the reset (Android: some 300)\n", since_reset_ms());
 		error = alioth_mhi_bhi(&mhi, sbl, (size_t)size, 2000);
+		pcie_errors("4: after BHI");
 	}
 	if (error == 0) {
 		error = alioth_mhi_ready(&mhi, known, sizeof(known) / sizeof(known[0]), 5000);
