@@ -282,7 +282,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libhakios.app.dylib src/inject_app.c
 		# ... and inside every application and app extension, to keep CoreImage off an OpenGL ES that does
 		# not work there (src/inject_ui.c)
-		$DYN -dynamiclib -install_name /redwood/lib/libhakios.ui.dylib -lobjc \
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.ui.dylib -lobjc -weak_framework CoreVideo \
 			-o obj/libhakios.ui.dylib src/inject_ui.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \

@@ -60,12 +60,16 @@
  * every frame (see frame_end()).
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <libkern/OSCacheControl.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -138,6 +142,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define VBLUR_CHAINS    6               /* ... such blurs kept track of at a time */
 
 struct eagl;
+static bool app_role;                   /* an application's OpenGL ES, not the window server's (see below, by contexts[]) */
 static int eagl_tracing;                /* this frame's calls are written down (boot-arg gltrace=FIRST-LAST) */
 static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()) */
 static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
@@ -169,6 +174,16 @@ say(const char *format, ...)
 	va_end(ap);
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
+	}
+	/* (an application's standard error goes nowhere: the console, as libhakios.ui.dylib's lines) */
+	if (app_role) {
+		static int console = -1;
+
+		if (console < 0) {
+			console = open("/dev/console", O_WRONLY);
+		}
+		write(console >= 0 ? console : 2, line, (size_t)n);
+		return;
 	}
 	write(2, line, (size_t)n);
 }
@@ -243,9 +258,42 @@ struct image {
 	GLsizei width, height;
 };
 
+/* an application's CAEAGLLayer, drawn into a renderbuffer of ours and handed over as IOSurfaces (app_present()) */
+#define APP_SURFACES    3
+struct app_drawable {
+	GLuint renderbuffer;            /* the application's, its storage made by -renderbufferStorage:fromDrawable: (0: unused) */
+	id layer;                       /* retained */
+	GLsizei width, height;
+	IOSurfaceRef surface[APP_SURFACES];
+	GLuint texture[APP_SURFACES];   /* each surface's memory as a texture (shared), or a texture read back into it */
+	bool shared[APP_SURFACES];
+	GLuint between, between_fb;     /* appgl_way=4: a texture of the library's the frame goes through, and its framebuffer */
+	uint64_t due_us;                /* the earliest the next present may return (app_period_us) */
+	IOSurfaceRef waiting;           /* the newest frame not yet on the layer (retained), the main thread asked for it */
+	unsigned replaced;              /* frames that never got there, a newer one in their place */
+	unsigned next, presents;
+	uint64_t first_us;
+	unsigned window_frames;         /* the 2 s the next line about it is of: frames, when they began, time spent */
+	uint64_t window_us, wait_us, present_us;
+	_Atomic unsigned shown;         /* frames the main thread has put on the layer (of `presents`) */
+	_Atomic uint64_t shown_late_us; /* ... and how long after their present, summed */
+};
+
 struct eagl {
+	/*
+	 * What OpenGLES's exported gl* functions find in thread-local storage slot 30 (tpidrro_el0 + 0xf0) for an
+	 * application's current context: [0] the EAGLContext (+currentContext), the table 0x20 bytes on -- glClear is
+	 * `ldr x8, [tsd, #0xf0]; ldr x2, [x8, #0x78]; ldr x0, [x8, #0x20]; br x2` (iOS 16.5, OpenGLES 0x1d3154f9c),
+	 * i.e. entry 0x58 of the table called with table[0]. CoreAnimation never needs it: it calls the table itself.
+	 */
+	void *tls_head[4];
 	void *table[SLOTS];             /* [0] is the context itself: what every entry gets as its first argument */
 	id object;                      /* the EAGLContext */
+	struct app_drawable drawables[4];       /* (an application's contexts only) */
+	GLuint app_read, app_draw;      /* ... and the two framebuffers app_present() copies a frame with */
+	uint64_t app_presented;         /* `calls` at the last present (app_glInvalidateFramebuffer()'s log) */
+	id sharegroup;                  /* an application's: its EAGLSharegroup (retained), made when asked for */
+	char *extensions;               /* ... its extensions' string, with Apple's names added (app_glGetString()) */
 	struct hakios_gl *gl;
 	unsigned long api;
 	struct image images[256];
@@ -318,6 +366,9 @@ struct eagl {
 	unsigned plain_said;
 };
 
+_Static_assert(__builtin_offsetof(struct eagl, table) - __builtin_offsetof(struct eagl, tls_head) == 0x20,
+    "OpenGLES finds the table 0x20 bytes after what thread-local slot 30 holds");
+
 static unsigned trace_first, trace_last;        /* the frames whose calls are written down */
 static uint64_t trace_at;                       /* ... or the first frame from this time on (now_us()) */
 static unsigned trace_draws;                    /* ... or the first frame after one of so many draws */
@@ -337,6 +388,41 @@ static int all_shaders;                         /* boot-arg glshaders=1: the tex
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
 static struct eagl *contexts[8];
+/*
+ * Which program this library is in: backboardd, whose CoreAnimation render server it was written for (the
+ * functions by hand, the frame's end at glFlush, the display's surfaces), or an application drawing OpenGL ES of
+ * its own (a game): plain OpenGL ES for it, its CAEAGLLayer handed over as IOSurfaces (app_present()). (app_role,
+ * declared at the top.)
+ */
+static int app_finish;                  /* boot-arg appgl_finish=1: a present waits for the GPU (glFinish), not a flush */
+static int app_seed = 1;                /* boot-arg appgl_seed=0: a present leaves the surface's seed as it is */
+static int app_sum;                     /* boot-arg appgl_sum=1: a line about what a frame holds, once a second */
+static int app_mark;                    /* boot-arg appgl_mark=1: a square of ours that moves, put into every frame copied */
+static int app_discard;                 /* boot-arg appgl_discard=1: an application's discards of a layer's colour passed on */
+static id app_last;                     /* the context +setCurrentContext: was given last (hakios_gl_app_context()) */
+static pthread_key_t app_held;          /* a thread's current context, retained (app_setCurrentContext()) */
+
+static void
+app_held_end(void *context)
+{
+	if (context != NULL) {
+		((void (*)(id, SEL))objc_msgSend)((id)context, sel_registerName("release"));
+	}
+}
+/*
+ * The least time between two presents' returns, boot-arg appgl_fps=N (0: none): an iPhone's present waits while
+ * frames are queued for the display, a loop that draws as fast as it can is held to the display's pace by that;
+ * here a present comes back at once, and The Sims 3 Ambitions presented 1600 frames a second. 62 by default:
+ * nothing for a game on a 60 Hz CADisplayLink (Minecraft's frames come 16.5 ms apart), 62 a second for the rest.
+ */
+static uint64_t app_period_us = 1000000 / 62;
+static unsigned app_way;                /* boot-arg appgl_way=N: how a frame is copied into its surface (app_present()) */
+static int app_ways;                    /* boot-arg appgl_ways=1: each way in turn, 600 frames each */
+static const char *const app_way_names[] = {
+	"one blit, turned over", "glFlush, then the blit", "glFinish, then the blit", "one blit, not turned over",
+	"a blit into a texture of the library's, then one from there, turned over", "read back by the processor",
+};
+#define APP_WAYS        (sizeof(app_way_names) / sizeof(app_way_names[0]))
 static uint32_t slot_calls[SLOTS];
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
@@ -381,6 +467,8 @@ static int fetch_offered = 1;
 #define GL_SCISSOR_TEST                 0x0c11
 #define GL_SCISSOR_BOX                  0x0c10
 #define GL_COLOR_CLEAR_VALUE            0x0c22
+#define GL_COLOR_WRITEMASK              0x0c23
+#define GL_RASTERIZER_DISCARD           0x8c89
 
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
@@ -409,7 +497,7 @@ eagl_leave(struct eagl *e, unsigned offset)
 
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
 		if (e->errors++ < 60) {
-			say("hakios-gl: %s: error %#x\n", eagl_slot_name(offset), error);
+			say("hakios-gl: %s: %s: error %#x\n", getprogname(), eagl_slot_name(offset), error);
 		}
 	}
 	if (slow_calls_us != 0) {
@@ -3845,6 +3933,502 @@ my_glDeleteProgram(void *context, GLuint name)
 	EAGL_LEAVE(e, 0x1280);
 }
 
+/*
+ * An application's glInvalidateFramebuffer / glDiscardFramebufferEXT. The colour of a framebuffer whose colour is a
+ * layer's renderbuffer is not let go of: Mesa's freedreno, told so while the frame's drawing is still to be sent to the
+ * GPU, leaves the frame out of the renderbuffer's memory (emit_resolve_blit() on an invalid resource), and the layer
+ * showed one early frame for good (Minecraft, 2026-11-01). Its depth and the rest are let go of as asked.
+ * Boot-arg appgl_discard=1: all of it passed on.
+ */
+static void
+app_glInvalidateFramebuffer(void *context, GLenum target, GLsizei count, const GLenum *attachments)
+{
+	struct eagl *e = context;
+	GLint type = 0, name = 0;
+	GLenum kept[16];
+	GLsizei left = 0;
+	bool layer = false;
+	static unsigned seen;
+
+	EAGL_ENTER(context, 0x2000);
+	glGetFramebufferAttachmentParameteriv(target, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+	if (type == 0x8d41 /* GL_RENDERBUFFER */) {
+		glGetFramebufferAttachmentParameteriv(target, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+		for (unsigned i = 0; i < sizeof(e->drawables) / sizeof(e->drawables[0]); i++) {
+			layer |= name != 0 && e->drawables[i].renderbuffer == (GLuint)name && e->drawables[i].layer != nil;
+		}
+	}
+	for (GLsizei i = 0; i < count && left < (GLsizei)(sizeof(kept) / sizeof(kept[0])); i++) {
+		if (!layer || app_discard || (attachments[i] != GL_COLOR_ATTACHMENT0 && attachments[i] != 0x1800 /* GL_COLOR_EXT */)) {
+			kept[left++] = attachments[i];
+		}
+	}
+	if (seen++ < 6 || seen % 600 == 0) {
+		char list[128] = "";
+
+		for (GLsizei i = 0; i < count && i < 8; i++) {
+			snprintf(list + strlen(list), sizeof(list) - strlen(list), "%s%#x", i ? " " : "", attachments[i]);
+		}
+		say("hakios-gl: %s: glInvalidateFramebuffer #%u (%#x, %d: %s) %llu calls after the last present; colour %s %d%s; "
+		    "%d passed on\n", getprogname(), seen, target, count, list, (unsigned long long)(e->calls - e->app_presented),
+		    type == 0x8d41 ? "renderbuffer" : type ? "texture" : "none", name, layer ? ", a layer's" : "", left);
+	}
+	if (left != 0) {
+		glInvalidateFramebuffer(target, left, kept);
+	}
+	EAGL_LEAVE(context, 0x2000);
+}
+
+/*
+ * appgl_sum=1: an application's viewports and scissor boxes, each one the first time it is set (12 of each), with
+ * the framebuffer drawn into -- where its pictures go in its layer (Minecraft's top row of controls was half off it).
+ */
+static void
+app_seen_box(const char *what, GLint x, GLint y, GLsizei width, GLsizei height, GLint boxes[][4], unsigned *count)
+{
+	GLint framebuffer = 0;
+
+	for (unsigned i = 0; i < *count; i++) {
+		if (boxes[i][0] == x && boxes[i][1] == y && boxes[i][2] == width && boxes[i][3] == height) {
+			return;
+		}
+	}
+	if (*count >= 12) {
+		return;
+	}
+	boxes[*count][0] = x;
+	boxes[*count][1] = y;
+	boxes[*count][2] = width;
+	boxes[*count][3] = height;
+	(*count)++;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+	say("hakios-gl: %s: %s %d,%d %dx%d (framebuffer %d)\n", getprogname(), what, x, y, width, height, framebuffer);
+}
+
+static void
+app_glViewport(void *context, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	static GLint boxes[12][4];
+	static unsigned count;
+
+	EAGL_ENTER(context, 0x0a80);
+	if (app_sum) {
+		app_seen_box("glViewport", x, y, width, height, boxes, &count);
+	}
+	glViewport(x, y, width, height);
+	EAGL_LEAVE(context, 0x0a80);
+}
+
+static void
+app_glScissor(void *context, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	static GLint boxes[12][4];
+	static unsigned count;
+
+	EAGL_ENTER(context, 0x07e0);
+	if (app_sum) {
+		app_seen_box("glScissor", x, y, width, height, boxes, &count);
+	}
+	glScissor(x, y, width, height);
+	EAGL_LEAVE(context, 0x07e0);
+}
+
+/*
+ * An application's glDeleteProgram and glDeleteShader: iOS's OpenGLES has one entry for the two (0x1280), the name
+ * says which kind it is. Passed on as glDeleteProgram, every glDeleteShader was GL_INVALID_OPERATION and left the
+ * shader there (Terraria, 24 of them at its start; GPU Check's tests found the error waiting, 2026-11-01).
+ */
+static void
+app_glDeleteProgram(void *context, GLuint name)
+{
+	EAGL_ENTER(context, 0x1280);
+	if (name != 0 && glIsShader(name)) {
+		glDeleteShader(name);
+	} else {
+		glDeleteProgram(name);
+	}
+	EAGL_LEAVE(context, 0x1280);
+}
+
+/* ---- PVRTC (PowerVR's compressed textures, which every iPhone's GPU samples and an Adreno does not) ---------- */
+
+/*
+ * PVRTC1, 4 and 2 bits a texel, decoded by the processor into RGBA8 for an application's glCompressedTexImage2D.
+ * A 64-bit word a block (4x4 texels, 8x4 at 2 bits): 32 bits of modulation, then two endpoint colours A (low half)
+ * and B (high half), each opaque (RGB 554/555) or translucent (ARGB 3443/3444) by its top bit; bit 0 of the colour
+ * word chooses the modulation mode. The blocks are in Morton order (Y in the even bits, X in the odd, the larger
+ * dimension's extra bits above). A texel's colour: A and B each upscaled bilinearly between the centres of the four
+ * blocks around it, mixed by its modulation weight /8. (Imagination's published format, as its PowerVR SDK's
+ * PVRTDecompress and Basis Universal's PVRTC1 code read it.)
+ */
+struct pvr_colour {
+	int r, g, b, a;                 /* 5-bit colour, 4-bit alpha */
+};
+
+static uint32_t
+pvr_morton(uint32_t xblocks, uint32_t yblocks, uint32_t x, uint32_t y)
+{
+	uint32_t smaller = xblocks < yblocks ? xblocks : yblocks, rest = xblocks < yblocks ? y : x, out = 0, shift = 0;
+
+	for (uint32_t bit = 1, to = 1; bit < smaller; bit <<= 1, to <<= 2, shift++) {
+		out |= (y & bit) ? to : 0;
+		out |= (x & bit) ? to << 1 : 0;
+	}
+	return out | (rest >> shift) << (2 * shift);
+}
+
+static struct pvr_colour
+pvr_colour_a(uint32_t c)
+{
+	if (c & 0x8000) {
+		return (struct pvr_colour){ (int)(c >> 10 & 31), (int)(c >> 5 & 31), (int)((c & 0x1e) | (c & 0x1e) >> 4), 15 };
+	}
+	return (struct pvr_colour){ (int)((c >> 7 & 0x1e) | (c >> 11 & 1)), (int)((c >> 3 & 0x1e) | (c >> 7 & 1)),
+	    (int)((c & 0xe) << 1 | (c & 0xe) >> 2), (int)(c >> 11 & 0xe) };
+}
+
+static struct pvr_colour
+pvr_colour_b(uint32_t c)
+{
+	if (c & 0x80000000u) {
+		return (struct pvr_colour){ (int)(c >> 26 & 31), (int)(c >> 21 & 31), (int)(c >> 16 & 31), 15 };
+	}
+	return (struct pvr_colour){ (int)((c >> 23 & 0x1e) | (c >> 27 & 1)), (int)((c >> 19 & 0x1e) | (c >> 23 & 1)),
+	    (int)((c >> 15 & 0x1e) | (c >> 19 & 1)), (int)(c >> 27 & 0xe) };
+}
+
+/* the four blocks' colours upscaled over the w x 4 texels between their centres, 8 bits a channel */
+static void
+pvr_upscale(struct pvr_colour p, struct pvr_colour q, struct pvr_colour r, struct pvr_colour s, int w, int out[32][4])
+{
+	int hp[4] = { p.r * w, p.g * w, p.b * w, p.a * w }, hr[4] = { r.r * w, r.g * w, r.b * w, r.a * w };
+	int qp[4] = { q.r - p.r, q.g - p.g, q.b - p.b, q.a - p.a }, sr[4] = { s.r - r.r, s.g - r.g, s.b - r.b, s.a - r.a };
+
+	for (int x = 0; x < w; x++) {
+		int v[4], dy[4];
+
+		for (int c = 0; c < 4; c++) {
+			v[c] = 4 * hp[c];
+			dy[c] = hr[c] - hp[c];
+		}
+		for (int y = 0; y < 4; y++) {
+			for (int c = 0; c < 4; c++) {
+				/* (v is the 5-bit colour, 4-bit alpha times 16 at 4 bpp, 32 at 2: widened to 8 bits) */
+				out[y * w + x][c] = w == 4 ? (c < 3 ? (v[c] >> 6) + (v[c] >> 1) : (v[c] >> 4) + v[c]) :
+				    (c < 3 ? (v[c] >> 7) + (v[c] >> 2) : (v[c] >> 5) + (v[c] >> 1));
+				v[c] += dy[c];
+			}
+		}
+		for (int c = 0; c < 4; c++) {
+			hp[c] += qp[c];
+			hr[c] += sr[c];
+		}
+	}
+}
+
+/* a block's modulation into mod[][] at (ox, oy): weights /8 (4 bpp; +10: punch-through alpha), or 2-bit codes (2 bpp) */
+static void
+pvr_modulation(uint32_t bits, uint32_t colour, int two, int ox, int oy, int mod[8][16], int mode[8][16])
+{
+	int m = (int)(colour & 1);
+
+	if (!two) {
+		for (int y = 0; y < 4; y++) {
+			for (int x = 0; x < 4; x++, bits >>= 2) {
+				static const int standard[4] = { 0, 3, 5, 8 }, punch[4] = { 0, 4, 14, 8 };
+
+				mod[oy + y][ox + x] = m ? punch[bits & 3] : standard[bits & 3];
+			}
+		}
+		return;
+	}
+	if (m == 0) {
+		for (int y = 0; y < 4; y++) {
+			for (int x = 0; x < 8; x++, bits >>= 1) {
+				mode[oy + y][ox + x] = 0;
+				mod[oy + y][ox + x] = bits & 1 ? 3 : 0;
+			}
+		}
+		return;
+	}
+	if (bits & 1) {
+		m = bits & 1u << 20 ? 3 : 2;            /* vertical only : horizontal only */
+		bits = bits & 1u << 21 ? bits | 1u << 20 : bits & ~(1u << 20);
+	}
+	bits = bits & 2 ? bits | 1 : bits & ~1u;
+	for (int y = 0; y < 4; y++) {
+		for (int x = 0; x < 8; x++) {
+			mode[oy + y][ox + x] = m;
+			if (((x ^ y) & 1) == 0) {
+				mod[oy + y][ox + x] = (int)(bits & 3);
+				bits >>= 2;
+			}
+		}
+	}
+}
+
+static int
+pvr_weight(int mod[8][16], int mode[8][16], int x, int y, int two)
+{
+	static const int code[4] = { 0, 3, 5, 8 };
+
+	if (!two) {
+		return mod[y][x];
+	}
+	if (mode[y][x] == 0 || ((x ^ y) & 1) == 0) {
+		return code[mod[y][x]];
+	}
+	if (mode[y][x] == 1) {
+		return (code[mod[y - 1][x]] + code[mod[y + 1][x]] + code[mod[y][x - 1]] + code[mod[y][x + 1]] + 2) / 4;
+	}
+	if (mode[y][x] == 2) {
+		return (code[mod[y][x - 1]] + code[mod[y][x + 1]] + 1) / 2;
+	}
+	return (code[mod[y - 1][x]] + code[mod[y + 1][x]] + 1) / 2;
+}
+
+/* the whole image (the block grid at least 2 x 2 blocks), RGBA8 into out (width x height of the padded size) */
+static void
+pvr_decode(const uint8_t *data, int two, int width, int height, uint8_t *out)
+{
+	int bw = two ? 8 : 4, xblocks = width / bw, yblocks = height / 4;
+
+	for (int by = 0; by < yblocks; by++) {
+		for (int bx = 0; bx < xblocks; bx++) {
+			int at[4][2] = { { bx, by }, { (bx + 1) % xblocks, by }, { bx, (by + 1) % yblocks },
+			    { (bx + 1) % xblocks, (by + 1) % yblocks } };
+			uint32_t words[4][2];
+			int mod[8][16] = { { 0 } }, mode[8][16] = { { 0 } }, a[32][4], b[32][4];
+
+			for (int i = 0; i < 4; i++) {
+				const uint8_t *word = data + 8 * (size_t)pvr_morton((uint32_t)xblocks, (uint32_t)yblocks,
+				    (uint32_t)at[i][0], (uint32_t)at[i][1]);
+
+				words[i][0] = (uint32_t)word[0] | (uint32_t)word[1] << 8 | (uint32_t)word[2] << 16 | (uint32_t)word[3] << 24;
+				words[i][1] = (uint32_t)word[4] | (uint32_t)word[5] << 8 | (uint32_t)word[6] << 16 | (uint32_t)word[7] << 24;
+				pvr_modulation(words[i][0], words[i][1], two, (i & 1) * bw, (i >> 1) * 4, mod, mode);
+			}
+			pvr_upscale(pvr_colour_a(words[0][1]), pvr_colour_a(words[1][1]), pvr_colour_a(words[2][1]),
+			    pvr_colour_a(words[3][1]), bw, a);
+			pvr_upscale(pvr_colour_b(words[0][1]), pvr_colour_b(words[1][1]), pvr_colour_b(words[2][1]),
+			    pvr_colour_b(words[3][1]), bw, b);
+			/* the texels from this block's centre to the next ones' (wrapping at the edges) */
+			for (int y = 0; y < 4; y++) {
+				for (int x = 0; x < bw; x++) {
+					int w = pvr_weight(mod, mode, x + bw / 2, y + 2, two), punch = w > 10;
+					uint8_t *px = out + 4 * ((size_t)((by * 4 + 2 + y) % height) * (size_t)width +
+					    (size_t)((bx * bw + bw / 2 + x) % width));
+
+					w -= punch ? 10 : 0;
+					for (int c = 0; c < 4; c++) {
+						px[c] = (uint8_t)((a[y * bw + x][c] * (8 - w) + b[y * bw + x][c] * w) / 8);
+					}
+					px[3] = punch ? 0 : px[3];
+				}
+			}
+		}
+	}
+}
+
+/*
+ * An application's glCompressedTexImage2D: PVRTC decoded here and given to the library as RGBA8 (the other formats
+ * as they are: ETC1/2, ASTC and S3TC the library takes itself). The application's unpacking state is put aside.
+ */
+static void
+app_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum internal, GLsizei width, GLsizei height,
+    GLint border, GLsizei size, const void *data)
+{
+	struct eagl *e = context;
+	int two = internal == 0x8c01 || internal == 0x8c03, alpha = internal == 0x8c02 || internal == 0x8c03;
+	GLsizei padded_w = width < (two ? 16 : 8) ? (two ? 16 : 8) : width, padded_h = height < 8 ? 8 : height;
+	/* (OpenGL ES 1 has the alignment only) */
+	static const GLenum unpacking[] = { GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, 0x0cf3 /* SKIP_ROWS */,
+	    0x0cf4 /* SKIP_PIXELS */ };
+	unsigned states = e->api >= 2 ? 4 : 1;
+	GLint kept[4], buffer = 0;
+	uint8_t *pixels;
+
+	EAGL_ENTER(context, 0x0be8);
+	if (internal < 0x8c00 || internal > 0x8c03 || data == NULL || width <= 0 || height <= 0 || border != 0 ||
+	    (width & (width - 1)) != 0 || (height & (height - 1)) != 0 ||
+	    (size_t)size < (size_t)padded_w * (size_t)padded_h * (two ? 2 : 4) / 8 ||
+	    (pixels = malloc((size_t)padded_w * (size_t)padded_h * 4)) == NULL) {
+		glCompressedTexImage2D(target, level, internal, width, height, border, size, data);
+		EAGL_LEAVE(context, 0x0be8);
+		return;
+	}
+	pvr_decode(data, two, padded_w, padded_h, pixels);
+	if (!alpha) {
+		for (size_t i = 3; i < (size_t)padded_w * (size_t)padded_h * 4; i += 4) {
+			pixels[i] = 255;
+		}
+	}
+	/* (a picture smaller than a block grid: its top-left width x height, rows made tight) */
+	for (GLsizei y = 1; padded_w != width && y < height; y++) {
+		memmove(pixels + (size_t)y * (size_t)width * 4, pixels + (size_t)y * (size_t)padded_w * 4, (size_t)width * 4);
+	}
+	for (unsigned i = 0; i < states; i++) {
+		glGetIntegerv(unpacking[i], &kept[i]);
+		glPixelStorei(unpacking[i], i == 0 ? 4 : 0);
+	}
+	if (e->api >= 2) {
+		glGetIntegerv(0x88ef /* GL_PIXEL_UNPACK_BUFFER_BINDING */, &buffer);
+		glBindBuffer(0x88ec /* GL_PIXEL_UNPACK_BUFFER */, 0);
+	}
+	glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+	for (unsigned i = 0; i < states; i++) {
+		glPixelStorei(unpacking[i], kept[i]);
+	}
+	if (e->api >= 2) {
+		glBindBuffer(0x88ec, (GLuint)buffer);
+	}
+	free(pixels);
+	EAGL_LEAVE(context, 0x0be8);
+}
+
+/*
+ * What an iPhone's OpenGL ES says it has that this one does too, by Apple's names: PVRTC (decoded above), the
+ * APPLE multisample resolve (below; not for OpenGL ES 1) and BGRA textures. Added to the extensions' string, and the
+ * PVRTC formats to GL_COMPRESSED_TEXTURE_FORMATS.
+ */
+static const GLubyte *
+app_glGetString(void *context, GLenum name)
+{
+	struct eagl *e = context;
+	const GLubyte *answer;
+
+	EAGL_ENTER(context, 0x03b0);
+	answer = glGetString(name);
+	if (name == GL_EXTENSIONS && answer != NULL) {
+		if (e->extensions == NULL) {
+			const char *ours = e->api == 1 ? " GL_IMG_texture_compression_pvrtc GL_APPLE_texture_format_BGRA8888" :
+			    " GL_IMG_texture_compression_pvrtc GL_APPLE_framebuffer_multisample GL_APPLE_texture_format_BGRA8888";
+			size_t length = strlen((const char *)answer) + strlen(ours) + 1;
+
+			if ((e->extensions = malloc(length)) != NULL) {
+				snprintf(e->extensions, length, "%s%s", (const char *)answer, ours);
+			}
+		}
+		answer = e->extensions != NULL ? (const GLubyte *)e->extensions : answer;
+	}
+	EAGL_LEAVE(context, 0x03b0);
+	return answer;
+}
+
+static void
+app_glGetIntegerv(void *context, GLenum name, GLint *values)
+{
+	static const GLint pvrtc[4] = { 0x8c00, 0x8c01, 0x8c02, 0x8c03 };
+
+	EAGL_ENTER(context, 0x0348);
+	if (name == 0x86a3 /* GL_COMPRESSED_TEXTURE_FORMATS */ && values != NULL) {
+		GLint count = 0;
+
+		glGetIntegerv(0x86a2 /* GL_NUM_COMPRESSED_TEXTURE_FORMATS */, &count);
+		glGetIntegerv(name, values);
+		memcpy(values + (count > 0 ? count : 0), pvrtc, sizeof(pvrtc));
+	} else {
+		glGetIntegerv(name, values);
+		if (name == 0x86a2 && values != NULL) {
+			values[0] += 4;
+		}
+	}
+	EAGL_LEAVE(context, 0x0348);
+}
+
+/*
+ * APPLE_framebuffer_multisample's resolve: the read framebuffer's samples into the draw framebuffer, all of it (the
+ * scissor box applies, as Apple's does), as one glBlitFramebuffer. Mesa has no function of that name; games call it
+ * without asking whether the extension is there (GPU Check's es2.screen.msaa read black, 2026-11-01).
+ */
+static GLsizei
+app_attachment_size(GLenum target, GLsizei *height)
+{
+	GLint type = 0, name = 0, width = 0, bound = 0;
+
+	glGetFramebufferAttachmentParameteriv(target, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+	glGetFramebufferAttachmentParameteriv(target, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+	*height = 0;
+	if (type == 0x8d41 /* GL_RENDERBUFFER */) {
+		glGetIntegerv(0x8ca7 /* GL_RENDERBUFFER_BINDING */, &bound);
+		glBindRenderbuffer(0x8d41, (GLuint)name);
+		glGetRenderbufferParameteriv(0x8d41, 0x8d42 /* WIDTH */, &width);
+		glGetRenderbufferParameteriv(0x8d41, 0x8d43 /* HEIGHT */, height);
+		glBindRenderbuffer(0x8d41, (GLuint)bound);
+	} else if (type == GL_TEXTURE) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+		glBindTexture(GL_TEXTURE_2D, (GLuint)name);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000 /* GL_TEXTURE_WIDTH */, &width);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001 /* GL_TEXTURE_HEIGHT */, height);
+		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	}
+	return width;
+}
+
+static void
+app_glResolveMultisampleFramebufferAPPLE(void *context)
+{
+	GLsizei width, height, read_height;
+
+	EAGL_ENTER(context, 0x2018);
+	width = app_attachment_size(GL_DRAW_FRAMEBUFFER, &height);
+	if (app_attachment_size(GL_READ_FRAMEBUFFER, &read_height) < width) {
+		width = app_attachment_size(GL_READ_FRAMEBUFFER, &read_height);
+	}
+	height = read_height < height ? read_height : height;
+	if (width > 0 && height > 0) {
+		glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	}
+	EAGL_LEAVE(context, 0x2018);
+}
+
+/*
+ * An application's glCheckFramebufferStatus: an answer other than complete is logged with what is attached (the
+ * first 8 times) -- Terraria said "Failed to make complete framebuffer object 812, 375" and stopped.
+ */
+static GLenum
+app_glCheckFramebufferStatus(void *context, GLenum target)
+{
+	static const GLenum points[] = { GL_COLOR_ATTACHMENT0, 0x8d00 /* depth */, 0x8d20 /* stencil */ };
+	static unsigned told;
+	GLenum status;
+
+	EAGL_ENTER(context, 0x1520);
+	status = glCheckFramebufferStatus(target);
+	if (status != GL_FRAMEBUFFER_COMPLETE && told++ < 8) {
+		GLint framebuffer = 0, bound = 0;
+		char line[400];
+
+		glGetIntegerv(target == GL_READ_FRAMEBUFFER ? GL_READ_FRAMEBUFFER_BINDING : GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+		glGetIntegerv(0x8ca7 /* GL_RENDERBUFFER_BINDING */, &bound);
+		snprintf(line, sizeof(line), "framebuffer %d (target %#x): status %#x;", framebuffer, target, status);
+		for (unsigned i = 0; i < sizeof(points) / sizeof(points[0]); i++) {
+			GLint type = 0, name = 0, width = 0, height = 0, format = 0, samples = 0;
+
+			glGetFramebufferAttachmentParameteriv(target, points[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+			if (type != 0) {
+				glGetFramebufferAttachmentParameteriv(target, points[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+			}
+			if (type == 0x8d41 /* GL_RENDERBUFFER */) {
+				glBindRenderbuffer(0x8d41, (GLuint)name);
+				glGetRenderbufferParameteriv(0x8d41, 0x8d42 /* WIDTH */, &width);
+				glGetRenderbufferParameteriv(0x8d41, 0x8d43 /* HEIGHT */, &height);
+				glGetRenderbufferParameteriv(0x8d41, 0x8d44 /* INTERNAL_FORMAT */, &format);
+				glGetRenderbufferParameteriv(0x8d41, 0x8cab /* SAMPLES */, &samples);
+			}
+			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s: %s %d %dx%d format %#x samples %d;",
+			    i == 0 ? "colour" : i == 1 ? "depth" : "stencil", type == 0x8d41 ? "renderbuffer" : type ? "texture" : "none",
+			    name, width, height, format, samples);
+		}
+		glBindRenderbuffer(0x8d41, (GLuint)bound);
+		while (glGetError() != 0) {
+		}
+		say("hakios-gl: %s: glCheckFramebufferStatus: %s\n", getprogname(), line);
+	}
+	EAGL_LEAVE(context, 0x1520);
+	return status;
+}
+
 #define EAGL_GEN_TABLE
 #include "eagl_gen.h"
 #undef EAGL_GEN_TABLE
@@ -3853,21 +4437,78 @@ _Static_assert(EAGL_TABLE_SIZE <= SLOTS * 8, "the table has grown");
 
 /* ---- EAGLContext ---------------------------------------------------------------------------------- */
 
+static id eagl_init(id self, unsigned long api, struct eagl *share);
+
 static id
 my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
+{
+	(void)selector;
+	(void)properties;
+	return eagl_init(self, api, NULL);
+}
+
+/*
+ * An application's -initWithAPI: and -initWithAPI:sharegroup:, which iOS 16's EAGLContext does not route through
+ * -initWithAPI:properties: (Everyplay in Terraria made its context of Terraria's sharegroup, got nil from Apple's
+ * init, handed that to CVOpenGLESTextureCacheCreate and asserted). A context of a sharegroup shares the objects of
+ * the group's other contexts (OSMesa's shared context); one made without is a group of its own.
+ */
+static id
+app_initWithAPI(id self, SEL selector, unsigned long api)
+{
+	(void)selector;
+	return eagl_init(self, api, NULL);
+}
+
+static id
+app_initWithAPI_sharegroup(id self, SEL selector, unsigned long api, id sharegroup)
+{
+	struct eagl *share = NULL;
+
+	(void)selector;
+	for (unsigned i = 0; sharegroup != nil && i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+		if (contexts[i] != NULL && contexts[i]->sharegroup == sharegroup) {
+			share = contexts[i];
+		}
+	}
+	if (sharegroup != nil && share == NULL) {
+		say("hakios-gl: %s: -initWithAPI:sharegroup: of a group none of ours is in: a group of its own\n", getprogname());
+	}
+	self = eagl_init(self, api, share);
+	if (self != nil && share != NULL) {
+		struct eagl *e = context_of(self);
+
+		e->sharegroup = ((id (*)(id, SEL))objc_msgSend)(share->sharegroup, sel_registerName("retain"));
+		say("hakios-gl: %s: a context of API %lu in the sharegroup of another (%p)\n", getprogname(), api,
+		    (void *)share->object);
+	}
+	return self;
+}
+
+static id
+eagl_init(id self, unsigned long api, struct eagl *share)
 {
 	struct eagl *e;
 	unsigned place;
 
-	(void)selector;
-	(void)properties;
 	for (place = 0; place < sizeof(contexts) / sizeof(contexts[0]) && contexts[place] != NULL; place++) {
 	}
-	if (api < 2 || api > 3 || place == sizeof(contexts) / sizeof(contexts[0]) || (e = calloc(1, sizeof(*e))) == NULL) {
+	if (api < (app_role ? 1u : 2u) || api > 3 || place == sizeof(contexts) / sizeof(contexts[0]) ||
+	    (e = calloc(1, sizeof(*e))) == NULL) {
 		say("hakios-gl: no context of API %lu\n", api);
 		return nil;
 	}
-	if ((e->gl = hakios_gl_create((int)api)) == NULL || !hakios_gl_make_current(e->gl)) {
+	/*
+	 * An application's OpenGL ES 2 or 3 context is OpenGL ES 3 underneath: an OpenGL ES 2 program runs on it (its
+	 * "#version 100" shaders too), and app_present() uses glBlitFramebuffer. OpenGL ES 1 (fixed function: The Sims 3
+	 * Ambitions) is a context of its own kind, its frames copied by hakios_gl_copy().
+	 */
+	if (share != NULL) {
+		e->gl = hakios_gl_create_shared(app_role && api >= 2 ? 3 : (int)api, share->gl);
+	} else {
+		e->gl = app_role && api >= 2 ? hakios_gl_create(3) : NULL;
+	}
+	if ((e->gl == NULL && (e->gl = hakios_gl_create((int)api)) == NULL) || !hakios_gl_make_current(e->gl)) {
 		say("hakios-gl: %s gives no OpenGL ES %lu context\n", hakios_gl_library(), api);
 		free(e);
 		return nil;
@@ -3876,11 +4517,21 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	e->object = self;
 	e->api = api;
 	e->table[0] = e;
-	eagl_fill_table(e->table);
+	e->tls_head[0] = (void *)self;
+	if (app_role) {
+		eagl_fill_table_app(e->table);
+		/*
+		 * EAGLContext's own ivar (its private part, at 8, which the methods we leave read): ours instead of
+		 * nothing, so that one of them asked for (-isMultiThreaded, -debugLabel ...) reads zeros, not address 8.
+		 */
+		*(void **)((char *)self + 8) = e->tls_head;
+	} else {
+		eagl_fill_table(e->table);
+	}
 	contexts[place] = e;
-	say("hakios-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, hakios_gl_library(),
-	    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
-	    (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
+	say("hakios-gl: an OpenGL ES %lu context for %s, by %s: %s; %s; shaders %s\n", api,
+	    app_role ? getprogname() : "CoreAnimation", hakios_gl_library(), (const char *)glGetString(GL_VERSION),
+	    (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
 	{
 		/* where the libraries are in this process: for a profile's addresses (kernel boot-arg prof=1) */
 		Dl_info gl, own;
@@ -3914,14 +4565,72 @@ static id
 my_sharegroup(id self, SEL selector)
 {
 	static int said;
+	struct eagl *e = context_of(self);
 
-	(void)self;
 	(void)selector;
+	/*
+	 * An application's context is in a sharegroup: an EAGLSharegroup of its own, made the first time it is asked
+	 * for (its ivars zeros; nothing of Apple's reads them here), the one its later contexts are made with.
+	 */
+	if (app_role && e != NULL) {
+		if (e->sharegroup == nil) {
+			Class group = objc_getClass("EAGLSharegroup");
+
+			e->sharegroup = group != Nil ? class_createInstance(group, 0) : nil;
+		}
+		return e->sharegroup;
+	}
 	if (!said) {
 		said = 1;
 		say("hakios-gl: -sharegroup asked for: none (nothing here shares a context)\n");
 	}
 	return nil;
+}
+
+/*
+ * EAGLSharegroup in an application: every one there is ours (my_sharegroup()), its private part empty, and Apple's
+ * methods read that -- -[EAGLSharegroup APIs] + 4 faulted on address 0 for GLKTextureLoader's -initWithSharegroup:
+ * (GPU Check, 2026-11-01). These answer from the group's contexts instead: APIs is a mask of 1 << API.
+ */
+static unsigned long
+app_sharegroup_APIs(id self, SEL selector)
+{
+	unsigned long mask = 0;
+
+	(void)selector;
+	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+		if (contexts[i] != NULL && contexts[i]->sharegroup == self) {
+			mask |= 1ul << contexts[i]->api;
+		}
+	}
+	return mask != 0 ? mask : 1ul << 2 | 1ul << 3;
+}
+
+static id app_sharegroup_label;         /* (one for all of them: nobody reads it back but a debugger) */
+
+static id
+app_sharegroup_debugLabel(id self, SEL selector)
+{
+	(void)self;
+	(void)selector;
+	return app_sharegroup_label;
+}
+
+static void
+app_sharegroup_setDebugLabel(id self, SEL selector, id label)
+{
+	(void)self;
+	(void)selector;
+	app_sharegroup_label = label != nil ? ((id (*)(id, SEL))objc_msgSend)(label, sel_registerName("copy")) : nil;
+}
+
+static void
+app_sharegroup_dealloc(id self, SEL selector)
+{
+	struct objc_super super = { self, objc_getClass("NSObject") };
+
+	(void)selector;
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, sel_registerName("dealloc"));
 }
 
 static unsigned long
@@ -4057,6 +4766,679 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	return YES;
 }
 
+/* ---- an application's OpenGL ES: its current context, its CAEAGLLayer ---------------------------- */
+
+#define GL_SCISSOR_TEST                 0x0c11
+#define GL_RGBA8                        0x8058
+#define GL_RENDERBUFFER_BINDING         0x8ca7
+#define GL_RENDERBUFFER                 0x8d41
+#define GL_PIXEL_PACK_BUFFER            0x88eb
+#define GL_PIXEL_PACK_BUFFER_BINDING    0x88ed
+
+/* this thread's thread-local storage, slot 30: what OpenGLES's gl* functions and +currentContext read */
+static void **
+app_tsd(void)
+{
+	void **tsd;
+
+	__asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (tsd));
+	return tsd;
+}
+
+/*
+ * +[EAGLContext setCurrentContext:] for an application: Mesa's context made the thread's, and slot 30 pointed at
+ * the context's tls_head, so that the application's own gl* calls (OpenGLES's exports) come through our table.
+ */
+static BOOL
+app_setCurrentContext(id self, SEL selector, id context)
+{
+	struct eagl *e = context != nil ? context_of(context) : NULL;
+
+	(void)self;
+	(void)selector;
+	if (context != nil && e == NULL) {
+		return NO;
+	}
+	/*
+	 * A thread's current context is retained while it is current, as Apple's +setCurrentContext: does (and released
+	 * when the thread ends): SceneKit's mesh clean-up made a context current that nobody else held any more, and Mesa
+	 * faulted in _mesa_make_current (GPU Check, 2026-11-01). The one let go of first -- its -dealloc makes contexts
+	 * current itself -- then the new one made this thread's.
+	 */
+	{
+		id before = pthread_getspecific(app_held);
+
+		if (context != nil) {
+			((id (*)(id, SEL))objc_msgSend)(context, sel_registerName("retain"));
+		}
+		pthread_setspecific(app_held, context);
+		if (before != nil) {
+			((void (*)(id, SEL))objc_msgSend)(before, sel_registerName("release"));
+		}
+	}
+	if (e != NULL) {
+		static _Atomic unsigned told;
+
+		if (told < 12) {
+			told++;
+			say("hakios-gl: %s: +setCurrentContext: on %s thread %p\n", getprogname(), pthread_main_np() ? "the main" : "another",
+			    (void *)pthread_self());
+		}
+		if (current != e && !hakios_gl_make_current(e->gl)) {
+			say("hakios-gl: %s: the context cannot be made this thread's\n", getprogname());
+			return NO;
+		}
+		current = e;
+		app_tsd()[30] = e->tls_head;
+		app_last = context;
+	} else {
+		hakios_gl_make_current(NULL);
+		current = NULL;
+		app_tsd()[30] = NULL;
+	}
+	return YES;
+}
+
+/*
+ * For libhakios.ui.dylib (dlsym): the application's context made current last, whether it still is or not, nil if
+ * none. A CVOpenGLESTextureCache asked for without a context gets this one (Everyplay in Terraria asked when none
+ * was current, src/inject_ui.c cv_cache_create()).
+ */
+__attribute__((visibility("default"))) id
+hakios_gl_app_context(void)
+{
+	for (unsigned i = 0; app_last != nil && i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+		if (contexts[i] != NULL && contexts[i]->object == app_last) {
+			return app_last;
+		}
+	}
+	return nil;
+}
+
+static id
+app_currentContext(id self, SEL selector)
+{
+	void **head = app_tsd()[30];
+
+	(void)self;
+	(void)selector;
+	return head != NULL ? (id)head[0] : nil;
+}
+
+static struct app_drawable *
+app_drawable_of(struct eagl *e, GLuint renderbuffer, bool make)
+{
+	struct app_drawable *unused = NULL;
+
+	for (unsigned i = 0; i < sizeof(e->drawables) / sizeof(e->drawables[0]); i++) {
+		if (renderbuffer != 0 && e->drawables[i].renderbuffer == renderbuffer) {
+			return &e->drawables[i];
+		}
+		if (e->drawables[i].renderbuffer == 0 && unused == NULL) {
+			unused = &e->drawables[i];
+		}
+	}
+	if (make && unused != NULL) {
+		memset(unused, 0, sizeof(*unused));
+		unused->renderbuffer = renderbuffer;
+		return unused;
+	}
+	return NULL;
+}
+
+static void
+app_drawable_drop(struct app_drawable *d)
+{
+	for (unsigned i = 0; i < APP_SURFACES; i++) {
+		if (d->texture[i] != 0) {
+			glDeleteTextures(1, &d->texture[i]);
+		}
+		if (d->surface[i] != NULL) {
+			CFRelease(d->surface[i]);
+		}
+	}
+	if (d->between != 0) {
+		glDeleteTextures(1, &d->between);
+		glDeleteFramebuffers(1, &d->between_fb);
+	}
+	{
+		IOSurfaceRef waiting = __atomic_exchange_n(&d->waiting, NULL, __ATOMIC_ACQ_REL);
+
+		if (waiting != NULL) {
+			CFRelease(waiting);
+		}
+	}
+	if (d->layer != nil) {
+		((void (*)(id, SEL))objc_msgSend)(d->layer, sel_registerName("release"));
+	}
+	memset(d, 0, sizeof(*d));
+}
+
+static void
+app_set_number(CFMutableDictionaryRef properties, CFStringRef key, int32_t value)
+{
+	CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt32Type, &value);
+
+	CFDictionarySetValue(properties, key, number);
+	CFRelease(number);
+}
+
+/* a BGRA IOSurface of this size, rows 64-byte aligned: what CoreAnimation shows as a layer's contents */
+static IOSurfaceRef
+app_surface(GLsizei width, GLsizei height)
+{
+	CFMutableDictionaryRef properties = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef surface;
+
+	app_set_number(properties, kIOSurfaceWidth, width);
+	app_set_number(properties, kIOSurfaceHeight, height);
+	app_set_number(properties, kIOSurfaceBytesPerElement, 4);
+	app_set_number(properties, kIOSurfaceBytesPerRow, (width * 4 + 63) & ~63);
+	app_set_number(properties, kIOSurfacePixelFormat, 'BGRA');
+	surface = IOSurfaceCreate(properties);
+	CFRelease(properties);
+	return surface;
+}
+
+struct app_rect {
+	double x, y, width, height;     /* (CGRect) */
+};
+
+struct app_insets {
+	double top, left, bottom, right;        /* (UIEdgeInsets) */
+};
+
+static bool
+app_answers(id object, const char *selector)
+{
+	return object != nil && class_respondsToSelector(object_getClass(object), sel_registerName(selector));
+}
+
+/*
+ * appgl_sum=1: the geometry UIKit gives an application around a layer -- the screen, its window, the layer's view and
+ * their safe areas, the interface's orientation -- on the main thread, now and 5 s on (layouts settle later)
+ */
+static void
+app_say_geometry(id layer, const char *when)
+{
+	id view = app_answers(layer, "delegate") ? ((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("delegate")) : nil;
+	id window = app_answers(view, "window") ? ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("window")) : nil;
+	id screen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+	id application = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+	struct app_rect screen_bounds = {0}, native = {0}, window_bounds = {0}, frame = {0}, layer_frame = {0};
+	struct app_insets window_safe = {0}, view_safe = {0};
+	double scale = 0, native_scale = 0;
+	long orientation = 0;
+
+	if (app_answers(screen, "bounds")) {
+		screen_bounds = ((struct app_rect (*)(id, SEL))objc_msgSend)(screen, sel_registerName("bounds"));
+		native = ((struct app_rect (*)(id, SEL))objc_msgSend)(screen, sel_registerName("nativeBounds"));
+		scale = ((double (*)(id, SEL))objc_msgSend)(screen, sel_registerName("scale"));
+		native_scale = ((double (*)(id, SEL))objc_msgSend)(screen, sel_registerName("nativeScale"));
+	}
+	if (app_answers(application, "statusBarOrientation")) {
+		orientation = ((long (*)(id, SEL))objc_msgSend)(application, sel_registerName("statusBarOrientation"));
+	}
+	if (app_answers(window, "safeAreaInsets")) {
+		window_bounds = ((struct app_rect (*)(id, SEL))objc_msgSend)(window, sel_registerName("bounds"));
+		window_safe = ((struct app_insets (*)(id, SEL))objc_msgSend)(window, sel_registerName("safeAreaInsets"));
+	}
+	if (app_answers(view, "safeAreaInsets")) {
+		frame = ((struct app_rect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+		view_safe = ((struct app_insets (*)(id, SEL))objc_msgSend)(view, sel_registerName("safeAreaInsets"));
+	}
+	layer_frame = ((struct app_rect (*)(id, SEL))objc_msgSend)(layer, sel_registerName("frame"));
+	say("hakios-gl: %s: %s: screen %.0fx%.0f pt (native %.0fx%.0f, scale %.1f/%.2f), interface orientation %ld; window "
+	    "%.0fx%.0f, safe area t%.0f l%.0f b%.0f r%.0f; the layer's view %s at %.0f,%.0f %.0fx%.0f, safe area t%.0f l%.0f "
+	    "b%.0f r%.0f; the layer at %.0f,%.0f %.0fx%.0f\n", getprogname(), when, screen_bounds.width, screen_bounds.height,
+	    native.width, native.height, scale, native_scale, orientation, window_bounds.width, window_bounds.height,
+	    window_safe.top, window_safe.left, window_safe.bottom, window_safe.right,
+	    view != nil ? object_getClassName(view) : "(none)", frame.x, frame.y, frame.width, frame.height, view_safe.top,
+	    view_safe.left, view_safe.bottom, view_safe.right, layer_frame.x, layer_frame.y, layer_frame.width, layer_frame.height);
+}
+
+/*
+ * -renderbufferStorage:fromDrawable: -- the renderbuffer bound to GL_RENDERBUFFER gets storage of the layer's size
+ * in pixels, an ordinary one of the library's; and three IOSurfaces of that size are made for the frames to be
+ * shown in, each the memory of a texture where the GPU can draw into a surface (else a texture read back).
+ */
+static BOOL
+app_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable)
+{
+	struct eagl *e = context_of(self);
+	struct app_drawable *d;
+	struct app_rect bounds;
+	double scale;
+	GLint renderbuffer = 0, texture = 0;
+	GLsizei width, height;
+
+	(void)selector;
+	if (e == NULL || target != GL_RENDERBUFFER) {
+		return NO;
+	}
+	if (current != e && !hakios_gl_make_current(e->gl)) {
+		return NO;
+	}
+	current = e;
+	glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
+	if (renderbuffer == 0) {
+		say("hakios-gl: %s: -renderbufferStorage:fromDrawable: with no renderbuffer bound\n", getprogname());
+		return NO;
+	}
+	if ((d = app_drawable_of(e, (GLuint)renderbuffer, false)) != NULL) {
+		app_drawable_drop(d);
+	}
+	if (drawable == nil) {
+		return YES;
+	}
+	if ((d = app_drawable_of(e, (GLuint)renderbuffer, true)) == NULL) {
+		say("hakios-gl: %s: more than %zu layers for one context\n", getprogname(), sizeof(e->drawables) / sizeof(e->drawables[0]));
+		return NO;
+	}
+	bounds = ((struct app_rect (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("bounds"));
+	scale = ((double (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("contentsScale"));
+	width = (GLsizei)(bounds.width * (scale > 0 ? scale : 1) + 0.5);
+	height = (GLsizei)(bounds.height * (scale > 0 ? scale : 1) + 0.5);
+	width = width < 1 ? 1 : width > 4096 ? 4096 : width;
+	height = height < 1 ? 1 : height > 4096 ? 4096 : height;
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+	d->layer = ((id (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("retain"));
+	d->width = width;
+	d->height = height;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+	for (unsigned i = 0; i < APP_SURFACES; i++) {
+		d->surface[i] = app_surface(width, height);
+		glGenTextures(1, &d->texture[i]);
+		glBindTexture(GL_TEXTURE_2D, d->texture[i]);
+		d->shared[i] = d->surface[i] != NULL && hakios_gl_surface_texture(e->gl, IOSurfaceGetID(d->surface[i]));
+		if (!d->shared[i]) {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		}
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
+	say("hakios-gl: %s: a layer of %dx%d pixels (%.0fx%.0f points at %.1f), its frames in %d IOSurfaces %s\n",
+	    getprogname(), width, height, bounds.width, bounds.height, scale, APP_SURFACES,
+	    d->shared[0] ? "the GPU draws into" : "read back into (the GPU cannot address them)");
+	if (app_sum) {
+		id layer = ((id (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("retain"));
+
+		dispatch_async(dispatch_get_main_queue(), ^{
+			app_say_geometry(layer, "at its storage");
+		});
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			app_say_geometry(layer, "5 s on");
+			((void (*)(id, SEL))objc_msgSend)(layer, sel_registerName("release"));
+		});
+	}
+	return YES;
+}
+
+/*
+ * -presentRenderbuffer: -- the frame copied by the GPU from the renderbuffer into the next of the layer's surfaces,
+ * turned over on the way (OpenGL's rows go up, an IOSurface's down), waited for, and the surface made the layer's
+ * contents. The render server (backboardd) then draws the layer with that surface, as any other.
+ */
+static BOOL
+app_present(id self, SEL selector, unsigned long target)
+{
+	struct eagl *e = context_of(self);
+	struct app_drawable *d;
+	GLint renderbuffer = 0, read = 0, draw = 0;
+	GLboolean scissor;
+	Class transaction = objc_getClass("CATransaction");
+	unsigned i, way;
+	uint64_t entered = now_us(), began, waited;
+	static unsigned refused;
+
+	(void)selector;
+	if (e == NULL || target != GL_RENDERBUFFER) {
+		return NO;
+	}
+	if (current != e && !hakios_gl_make_current(e->gl)) {
+		return NO;
+	}
+	current = e;
+	glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
+	if ((d = app_drawable_of(e, (GLuint)renderbuffer, false)) == NULL || d->layer == nil) {
+		if (refused++ < 4) {
+			say("hakios-gl: %s: -presentRenderbuffer: of renderbuffer %d, which no layer has\n", getprogname(), renderbuffer);
+		}
+		return NO;
+	}
+	if (e->api == 1) {
+		/*
+		 * OpenGL ES 1: no read and draw framebuffers to bind (nor glBlitFramebuffer); the library copies the frame
+		 * itself, turned over, and nothing of the application's state is touched
+		 */
+		static unsigned failed;
+
+		i = d->next;
+		way = 0;
+		if (d->presents == 0) {
+			say("hakios-gl: %s: OpenGL ES 1 frames copied by the library (hakios_gl_copy)\n", getprogname());
+		}
+		if ((!d->shared[i] || !hakios_gl_copy(e->gl, (GLuint)renderbuffer, d->texture[i], 1)) && failed++ < 4) {
+			say("hakios-gl: %s: frame %u not copied (%s)\n", getprogname(), d->presents,
+			    d->shared[i] ? "the library cannot" : "the surface is not the GPU's");
+		}
+		began = now_us();
+		glFlush();
+		if (app_seed) {
+			IOSurfaceLock(d->surface[i], 0, NULL);
+			IOSurfaceUnlock(d->surface[i], 0, NULL);
+		}
+		waited = now_us();
+		goto handed;
+	}
+	if (e->app_read == 0) {
+		glGenFramebuffers(1, &e->app_read);
+		glGenFramebuffers(1, &e->app_draw);
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	scissor = glIsEnabled(GL_SCISSOR_TEST);
+	i = d->next;
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->app_read);
+	glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, (GLuint)renderbuffer);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->app_draw);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->texture[i], 0);
+	if (scissor) {
+		glDisable(GL_SCISSOR_TEST);
+	}
+	way = app_ways ? (d->presents / 600) % APP_WAYS : app_way;
+	if (d->presents == 0 || (app_ways && d->presents % 600 == 0)) {
+		say("hakios-gl: %s: from frame %u: %s\n", getprogname(), d->presents, app_way_names[way]);
+	}
+	if (way == 1) {
+		glFlush();
+	} else if (way == 2) {
+		glFinish();
+	}
+	if (way == 3) {
+		glBlitFramebuffer(0, 0, d->width, d->height, 0, 0, d->width, d->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	} else if (way == 4) {
+		GLint bound = 0;
+
+		if (d->between == 0) {
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+			glGenTextures(1, &d->between);
+			glBindTexture(GL_TEXTURE_2D, d->between);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, d->width, d->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+			glGenFramebuffers(1, &d->between_fb);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, d->between_fb);
+			glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->between, 0);
+		}
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, d->between_fb);
+		glBlitFramebuffer(0, 0, d->width, d->height, 0, 0, d->width, d->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, d->between_fb);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->app_draw);
+		glBlitFramebuffer(0, 0, d->width, d->height, 0, d->height, d->width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, e->app_read);
+	} else if (way == 5 && d->surface[i] != NULL) {
+		/* the processor's copy: the frame read back into the surface as it is, its rows then turned over */
+		GLint pack = 0;
+		uint8_t *base;
+		size_t stride, bytes = (size_t)d->width * 4;
+		static uint8_t swap[4096 * 4];
+
+		glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		IOSurfaceLock(d->surface[i], 0, NULL);
+		base = IOSurfaceGetBaseAddress(d->surface[i]);
+		stride = IOSurfaceGetBytesPerRow(d->surface[i]);
+		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(stride / 4));
+		glReadPixels(0, 0, d->width, d->height, GL_BGRA, GL_UNSIGNED_BYTE, base);
+		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+		for (GLsizei y = 0; y < d->height / 2; y++) {
+			uint8_t *top = base + stride * (size_t)y, *bottom = base + stride * (size_t)(d->height - 1 - y);
+
+			memcpy(swap, top, bytes);
+			memcpy(top, bottom, bytes);
+			memcpy(bottom, swap, bytes);
+		}
+		IOSurfaceUnlock(d->surface[i], 0, NULL);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
+	} else {
+		glBlitFramebuffer(0, 0, d->width, d->height, 0, d->height, d->width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	}
+	/*
+	 * appgl_mark=1: a square 8 pixels further on in every frame, cleared into the copy -- a picture that stands still
+	 * on the screen while the square moves is the application's; one where the square stands still too is ours
+	 */
+	if (app_mark) {
+		GLfloat colour[4];
+		GLint box[4];
+		GLboolean mask[4], discard = glIsEnabled(GL_RASTERIZER_DISCARD);
+		GLint x = d->width > 96 ? (GLint)((d->presents * 8u) % (unsigned)(d->width - 96)) : 0;
+
+		glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
+		glGetIntegerv(GL_SCISSOR_BOX, box);
+		glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+		if (discard) {
+			glDisable(GL_RASTERIZER_DISCARD);
+		}
+		glEnable(GL_SCISSOR_TEST);
+		glScissor(x, 32, 96, 96);
+		glColorMask(1, 1, 1, 1);
+		glClearColor(1, (d->presents / 30) % 2 ? 1 : 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glColorMask(mask[0], mask[1], mask[2], mask[3]);
+		glClearColor(colour[0], colour[1], colour[2], colour[3]);
+		glScissor(box[0], box[1], box[2], box[3]);
+		glDisable(GL_SCISSOR_TEST);             /* (as the blit had it: put back below) */
+		if (discard) {
+			glEnable(GL_RASTERIZER_DISCARD);
+		}
+	}
+	began = now_us();
+	if (!d->shared[i] && d->surface[i] != NULL) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, e->app_draw);
+		IOSurfaceLock(d->surface[i], 0, NULL);
+		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(IOSurfaceGetBytesPerRow(d->surface[i]) / 4));
+		glReadPixels(0, 0, d->width, d->height, GL_BGRA, GL_UNSIGNED_BYTE, IOSurfaceGetBaseAddress(d->surface[i]));
+		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+		IOSurfaceUnlock(d->surface[i], 0, NULL);
+	} else {
+		/*
+		 * The render server draws with the surface after us through the same ring of the GPU's: a flush is enough.
+		 * appgl_finish=1: the frame waited for here as well; appgl_seed=0: the surface's seed left as it is.
+		 */
+		if (app_finish) {
+			glFinish();
+		} else {
+			glFlush();
+		}
+		if (app_seed) {
+			uint32_t seed = IOSurfaceGetSeed(d->surface[i]);
+
+			IOSurfaceLock(d->surface[i], 0, NULL);
+			IOSurfaceUnlock(d->surface[i], 0, NULL);
+			if (d->presents == 1) {
+				say("hakios-gl: %s: a surface's seed %u -> %u over a lock and unlock\n", getprogname(), seed,
+				    IOSurfaceGetSeed(d->surface[i]));
+			}
+		}
+	}
+	waited = now_us();
+	/* boot-arg appgl_sum=1: once a second what the frame holds (a sum over a sparse sample), to tell a frame that does
+	 * not change from a layer the render server does not draw again */
+	if (app_sum && d->presents % 60 == 0 && d->surface[i] != NULL) {
+		const uint8_t *base;
+		const uint32_t *pixels;
+		size_t count, size, stride;
+		uint64_t sum = 0, flushed = 0, own = 0, drawn = 0, memory = 0;
+		GLint pack = 0;
+		GLsizei wide = d->width < 4096 ? d->width : 4096;
+		GLenum error = glGetError();            /* (since the last of these: the application's, or the copy's) */
+		static uint32_t row[4096];
+
+		glFinish();
+		IOSurfaceLock(d->surface[i], kIOSurfaceLockReadOnly, NULL);
+		base = IOSurfaceGetBaseAddress(d->surface[i]);
+		pixels = (const uint32_t *)base;
+		size = IOSurfaceGetAllocSize(d->surface[i]);
+		stride = IOSurfaceGetBytesPerRow(d->surface[i]);
+		count = size / 4;
+		for (size_t k = 0; k < count; k += 4093) {
+			sum = sum * 31 + pixels[k];
+		}
+		/* the same again after the processor's cache has let go of the surface (it may hold what was there before) */
+		sys_dcache_flush((void *)base, size);
+		for (size_t k = 0; k < count; k += 4093) {
+			flushed = flushed * 31 + pixels[k];
+		}
+		/*
+		 * Sixteen rows of the middle half three ways: the application's renderbuffer and the texture it was copied into,
+		 * as the library reads them, and the surface's memory as the processor does (the copy turned over; blue-first
+		 * words made red-first) -- all three alike when the copy is in the memory the window server shows
+		 */
+		glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		for (GLint r = 0; r < 16; r++) {
+			GLint y = d->height / 4 + d->height / 2 * r / 16, t = way == 3 ? y : d->height - 1 - y;
+			const uint32_t *line = (const uint32_t *)(base + stride * (size_t)t);
+
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, e->app_read);
+			glReadPixels(0, y, wide, 1, GL_RGBA, GL_UNSIGNED_BYTE, row);
+			for (GLsizei k = 0; k < wide; k += 7) {
+				own = own * 31 + row[k];
+			}
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, e->app_draw);
+			glReadPixels(0, t, wide, 1, GL_RGBA, GL_UNSIGNED_BYTE, row);
+			for (GLsizei k = 0; k < wide; k += 7) {
+				drawn = drawn * 31 + row[k];
+				memory = memory * 31 + ((line[k] & 0xff00ff00u) | ((line[k] >> 16) & 0xffu) | ((line[k] & 0xffu) << 16));
+			}
+		}
+		IOSurfaceUnlock(d->surface[i], kIOSurfaceLockReadOnly, NULL);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
+		say("hakios-gl: %s: frame %u in surface %u: sum %#llx (%#llx after a cache flush); 16 rows: renderbuffer %d %#llx, "
+		    "texture %#llx, memory %#llx%s; GL error %#x; %llu GL calls so far, this thread %s\n", getprogname(), d->presents,
+		    IOSurfaceGetID(d->surface[i]), (unsigned long long)sum, (unsigned long long)flushed, renderbuffer,
+		    (unsigned long long)own, (unsigned long long)drawn, (unsigned long long)memory,
+		    own == drawn && drawn == memory ? " (alike)" : "", error, (unsigned long long)e->calls,
+		    pthread_main_np() ? "the main one" : "another");
+	}
+	/* appgl_sum=1: what the application calls in a frame, frames 300 to 600, the 40 called most */
+	if (app_sum && (d->presents == 300 || d->presents == 600)) {
+		static uint32_t before[SLOTS];
+
+		if (d->presents == 300) {
+			memcpy(before, slot_calls, sizeof(before));
+		} else {
+			uint32_t calls[SLOTS];
+
+			for (unsigned s = 0; s < SLOTS; s++) {
+				calls[s] = slot_calls[s] - before[s];
+			}
+			say("hakios-gl: %s: GL calls a frame over 300 frames, the most called first:\n", getprogname());
+			for (unsigned n = 0; n < 40; n++) {
+				unsigned most = 0;
+
+				for (unsigned s = 1; s < SLOTS; s++) {
+					most = calls[s] > calls[most] ? s : most;
+				}
+				if (calls[most] == 0) {
+					break;
+				}
+				say("hakios-gl: %s:   %-36s %8.2f\n", getprogname(), eagl_slot_name(most * 8), calls[most] / 300.0);
+				calls[most] = 0;
+			}
+		}
+	}
+	if (scissor) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+handed:
+	/*
+	 * The layer's contents set on the main thread, later, not here: a game's render thread that took CoreAnimation's
+	 * transaction lock while its main thread held it and waited for the render thread hung both (2026-10-31: the
+	 * first frame on the screen, then nothing). A real CAEAGLLayer hands frames over without a transaction either.
+	 */
+	/*
+	 * One frame at a time waits for the main thread: a newer one takes the place of one not yet put on the layer
+	 * (`waiting`), and only the first of them asks the main thread. The Sims 3 Ambitions, presenting 1600 frames a
+	 * second from a thread of its own, had the main thread commit a transaction for each, and its buttons did not
+	 * answer taps (2026-11-01).
+	 */
+	{
+		id layer = d->layer;
+		struct app_drawable *counted = d;
+		uint64_t sent = now_us();
+		IOSurfaceRef older;
+
+		CFRetain(d->surface[i]);
+		older = __atomic_exchange_n(&d->waiting, d->surface[i], __ATOMIC_ACQ_REL);
+		if (older != NULL) {
+			CFRelease(older);       /* (a request is on its way: it takes this one instead) */
+			d->replaced++;
+		} else {
+			((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("retain"));
+			dispatch_async(dispatch_get_main_queue(), ^{
+				IOSurfaceRef surface = __atomic_exchange_n(&counted->waiting, NULL, __ATOMIC_ACQ_REL);
+
+				if (surface != NULL) {
+					((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("begin"));
+					((void (*)(id, SEL, BOOL))objc_msgSend)((id)transaction, sel_registerName("setDisableActions:"), YES);
+					((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setContents:"), (id)surface);
+					((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("commit"));
+					CFRelease(surface);
+					counted->shown++;
+					counted->shown_late_us += now_us() - sent;
+				}
+				((void (*)(id, SEL))objc_msgSend)(layer, sel_registerName("release"));
+			});
+		}
+	}
+	if (d->presents == 0) {
+		say("hakios-gl: %s: frames presented on %s\n", getprogname(), pthread_main_np() ? "the main thread" : "a thread of its own");
+	}
+	d->next = (i + 1) % APP_SURFACES;
+	e->app_presented = e->calls;
+	/* every 2 s: frames a second, and where a present's time goes (the copy and its wait, the rest) */
+	d->window_frames++;
+	d->wait_us += waited - began;
+	d->present_us += now_us() - entered;
+	if (d->presents++ == 0) {
+		d->first_us = d->window_us = now_us();
+		say("hakios-gl: %s: its first frame is on its layer\n", getprogname());
+	} else if (now_us() - d->window_us >= 2000000) {
+		uint64_t span = now_us() - d->window_us;
+
+		unsigned shown = d->shown;
+
+		say("hakios-gl: %s: %.1f frames a second (%u so far); a present %.2f ms, of it the GPU's copy + %s %.2f ms; "
+		    "%u put on the layer by the main thread, %.1f ms after\n", getprogname(), (double)d->window_frames * 1e6 / (double)span,
+		    d->presents, (double)d->present_us / 1000.0 / d->window_frames, app_finish ? "glFinish" : "glFlush",
+		    (double)d->wait_us / 1000.0 / d->window_frames, shown, shown ? (double)d->shown_late_us / 1000.0 / shown : 0.0);
+		d->window_us = now_us();
+		d->window_frames = 0;
+		d->wait_us = d->present_us = 0;
+	}
+	/* held to a display's pace (app_period_us): back no sooner than that after the last present came back */
+	if (app_period_us != 0) {
+		uint64_t now = now_us();
+
+		if (now < d->due_us) {
+			usleep((useconds_t)(d->due_us - now));
+			now = d->due_us;
+		}
+		d->due_us = now + app_period_us;
+	}
+	return YES;
+}
+
+static BOOL
+app_present_at(id self, SEL selector, unsigned long target, double when)
+{
+	(void)when;
+	return app_present(self, selector, target);
+}
+
 static void
 my_dealloc(id self, SEL selector)
 {
@@ -4071,14 +5453,39 @@ my_dealloc(id self, SEL selector)
 				contexts[i] = NULL;
 			}
 		}
+		if (app_role && hakios_gl_make_current(e->gl)) {
+			current = e;
+			for (unsigned i = 0; i < sizeof(e->drawables) / sizeof(e->drawables[0]); i++) {
+				if (e->drawables[i].renderbuffer != 0) {
+					app_drawable_drop(&e->drawables[i]);
+				}
+			}
+			if (e->app_read != 0) {
+				glDeleteFramebuffers(1, &e->app_read);
+				glDeleteFramebuffers(1, &e->app_draw);
+			}
+			if (app_tsd()[30] == (void *)e->tls_head) {
+				app_tsd()[30] = NULL;
+			}
+		}
 		if (current == e) {
 			hakios_gl_make_current(NULL);
 			current = NULL;
 		}
 		hakios_gl_destroy(e->gl);
+		if (e->sharegroup != nil) {
+			((void (*)(id, SEL))objc_msgSend)(e->sharegroup, sel_registerName("release"));
+		}
+		free(e->extensions);
 		free(e);
 	}
-	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
+	/*
+	 * NSObject's -dealloc by its own name, not by the one this was called by: a library that swaps implementations
+	 * (Everyplay in Terraria: -dealloc <-> -deallocEveryplay) calls this as -deallocEveryplay, which NSObject does
+	 * not have -- an exception, and Terraria exited (2026-11-01).
+	 */
+	(void)selector;
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, sel_registerName("dealloc"));
 }
 
 /* Does the display's driver wait for the GPU before it shows a surface (iokit/Kernel/MiniIOMobileFramebuffer.cpp)? */
@@ -4117,12 +5524,51 @@ install(void)
 		{ "attachImage:toCoreSurface:invertedRender:", (IMP)my_attachImage },
 		{ "dealloc", (IMP)my_dealloc },
 	};
+	/* an application's: its layer handed over as IOSurfaces, its current context in OpenGLES's own slot */
+	static const struct {
+		const char *name;
+		IMP ours;
+		bool class_method;
+	} app_methods[] = {
+		{ "renderbufferStorage:fromDrawable:", (IMP)app_renderbufferStorage, false },
+		{ "presentRenderbuffer:", (IMP)app_present, false },
+		{ "presentRenderbuffer:atTime:", (IMP)app_present_at, false },
+		{ "presentRenderbuffer:afterMinimumDuration:", (IMP)app_present_at, false },
+		{ "setCurrentContext:", (IMP)app_setCurrentContext, true },
+		{ "currentContext", (IMP)app_currentContext, true },
+		{ "initWithAPI:", (IMP)app_initWithAPI, false },
+		{ "initWithAPI:sharegroup:", (IMP)app_initWithAPI_sharegroup, false },
+	};
 	Class class = objc_getClass("EAGLContext");
 	unsigned replaced = 0;
 	char arguments[1024] = "";
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 
+	app_role = getprogname() == NULL || strcmp(getprogname(), "backboardd") != 0;
+	if (app_role) {
+		check_errors = 0;               /* (glGetError after every call would take the application's errors from it) */
+		pthread_key_create(&app_held, app_held_end);
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+			app_finish = strstr(arguments, "appgl_finish=1") != NULL;
+			app_seed = strstr(arguments, "appgl_seed=0") == NULL;
+			app_sum = strstr(arguments, "appgl_sum=1") != NULL;
+			app_mark = strstr(arguments, "appgl_mark=1") != NULL;
+			app_ways = strstr(arguments, "appgl_ways=1") != NULL;
+			app_discard = strstr(arguments, "appgl_discard=1") != NULL;
+			if ((argument = strstr(arguments, "appgl_fps=")) != NULL) {
+				unsigned long fps = strtoul(argument + 10, NULL, 10);
+
+				app_period_us = fps != 0 ? 1000000 / fps : 0;
+			}
+			/* appgl_errors=1: the first 60 errors logged, with the call (the application no longer gets them) */
+			check_errors = strstr(arguments, "appgl_errors=1") != NULL;
+			if ((argument = strstr(arguments, "appgl_way=")) != NULL) {
+				app_way = (unsigned)strtoul(argument + 10, NULL, 10) % APP_WAYS;
+			}
+		}
+		size = sizeof(arguments) - 1;
+	}
 	/* the kernel's boot-args are where a run is told things */
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
@@ -4259,4 +5705,52 @@ install(void)
 	}
 	say("hakios-gl: %u of %zu methods of EAGLContext are ours; OpenGL ES by %s\n", replaced,
 	    sizeof(methods) / sizeof(methods[0]), hakios_gl_library());
+	if (!app_role) {
+		return;
+	}
+	replaced = 0;
+	for (unsigned i = 0; i < sizeof(app_methods) / sizeof(app_methods[0]); i++) {
+		SEL selector = sel_registerName(app_methods[i].name);
+		Class where = app_methods[i].class_method ? object_getClass((id)class) : class;
+		Method method = class_getInstanceMethod(where, selector);
+
+		if (method == NULL) {
+			say("hakios-gl: EAGLContext has no %c%s\n", app_methods[i].class_method ? '+' : '-', app_methods[i].name);
+			continue;
+		}
+		if (method == class_getInstanceMethod(class_getSuperclass(where), selector)) {
+			class_addMethod(where, selector, app_methods[i].ours, method_getTypeEncoding(method));
+		} else {
+			method_setImplementation(method, app_methods[i].ours);
+		}
+		replaced++;
+	}
+	say("hakios-gl: %s: OpenGL ES of its own (%u of %zu application methods ours)\n", getprogname(), replaced,
+	    sizeof(app_methods) / sizeof(app_methods[0]));
+	{
+		static const struct {
+			const char *name;
+			IMP ours;
+		} group_methods[] = {
+			{ "APIs", (IMP)app_sharegroup_APIs },
+			{ "debugLabel", (IMP)app_sharegroup_debugLabel },
+			{ "setDebugLabel:", (IMP)app_sharegroup_setDebugLabel },
+			{ "dealloc", (IMP)app_sharegroup_dealloc },
+		};
+		Class group = objc_getClass("EAGLSharegroup");
+
+		for (unsigned i = 0; group != Nil && i < sizeof(group_methods) / sizeof(group_methods[0]); i++) {
+			SEL selector = sel_registerName(group_methods[i].name);
+			Method method = class_getInstanceMethod(group, selector);
+
+			if (method == NULL) {
+				continue;
+			}
+			if (method == class_getInstanceMethod(class_getSuperclass(group), selector)) {
+				class_addMethod(group, selector, group_methods[i].ours, method_getTypeEncoding(method));
+			} else {
+				method_setImplementation(method, group_methods[i].ours);
+			}
+		}
+	}
 }

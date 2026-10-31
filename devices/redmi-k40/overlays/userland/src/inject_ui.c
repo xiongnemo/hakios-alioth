@@ -26,11 +26,15 @@
 #include <objc/runtime.h>
 #include <Block.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <math.h>
 #include <stdarg.h>
 #include <sys/sysctl.h>
+#include <sys/utsname.h>
+#include <errno.h>
 #include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -104,13 +108,253 @@ gl_works(void)
 	return works;
 }
 
+static bool app_gl;                     /* this application draws OpenGL ES of ours (app_opengl_es()) */
+static bool app_ci_off;                 /* boot-arg appci=0: CoreImage kept off an application's OpenGL ES of ours */
+
 static id
 context_with_eagl(id self, SEL selector, id eagl, id options)
 {
-	if (eagl != nil ? !has_table(eagl) : !gl_works()) {
+	/*
+	 * An application with OpenGL ES of ours: its contexts have a table of functions and a sharegroup, CoreImage
+	 * may draw with them (GPU Check's coreimage.* tests; 2026-11-01, before that it was kept off them, untried).
+	 */
+	if ((app_gl && app_ci_off) || (eagl != nil ? !has_table(eagl) : !gl_works())) {
 		return nil;
 	}
 	return orig_context_with_eagl(self, selector, eagl, options);
+}
+
+/* ---- OpenGL ES for an application of its own (a game) ------------------------------------------------------ */
+
+#define HAKIOS_GL               "/redwood/lib/libhakios.gl.dylib"
+
+/*
+ * The main program's image: the one of type MH_EXECUTE. Not image 0 -- with libraries inserted that is the first of
+ * them, this one ("/redwood/lib/libhakios.ui.dylib", seen 2026-10-31 in every application).
+ */
+static uint32_t
+main_image(void)
+{
+	for (uint32_t i = 0, n = _dyld_image_count(); i < n; i++) {
+		const struct mach_header *header = _dyld_get_image_header(i);
+
+		if (header != NULL && header->filetype == MH_EXECUTE) {
+			return i;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Programs told another model in hw.machine (sysctlbyname, sysctl, uname) -- the program's own calls only, the
+ * system's libraries in it still see the iPhone X. Minecraft 1.2 lays its controls out for the iPhone X's notch
+ * when it sees iPhone10,3 or 10,6, and cuts its top row off doing so on a real iPhone X too (Mojang's MCPE-30223,
+ * MCPE-31058): as an iPhone 8 Plus (the same A11) it lays them out on the whole screen. Boot-arg appmodel=0: none.
+ */
+static const struct {
+	const char *program, *model;
+} models[] = {
+	{ "minecraftpe", "iPhone10,2" },
+};
+
+static const char *model_given;         /* this program's, or NULL */
+static uintptr_t model_text, model_text_size;   /* where the program's own code is */
+
+static void
+model_decide(void)
+{
+	const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(main_image());
+	const struct load_command *command;
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *model = NULL;
+
+	for (size_t i = 0; i < sizeof(models) / sizeof(models[0]); i++) {
+		if (getprogname() != NULL && strcmp(getprogname(), models[i].program) == 0) {
+			model = models[i].model;
+		}
+	}
+	if (model == NULL || header == NULL || header->magic != MH_MAGIC_64) {
+		return;
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "appmodel=0") != NULL) {
+		say("hw.machine: as it is, with appmodel=0\n");
+		return;
+	}
+	command = (const struct load_command *)(header + 1);
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
+
+		if (command->cmd == LC_SEGMENT_64 && strcmp(segment->segname, "__TEXT") == 0) {
+			model_text = (uintptr_t)header;
+			model_text_size = segment->vmsize;
+		}
+		command = (const struct load_command *)((const char *)command + command->cmdsize);
+	}
+	if (model_text_size != 0) {
+		model_given = model;
+		say("hw.machine: %s for the program's own code (its iPhone X layout does not fit)\n", model);
+	}
+}
+
+static bool
+model_for(const void *caller)
+{
+	return model_given != NULL && (uintptr_t)caller - model_text < model_text_size;
+}
+
+static int
+model_answer(void *old, size_t *oldlen)
+{
+	size_t need = strlen(model_given) + 1;
+
+	if (oldlen == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (old != NULL && *oldlen < need) {
+		*oldlen = need;
+		errno = ENOMEM;
+		return -1;
+	}
+	if (old != NULL) {
+		memcpy(old, model_given, need);
+	}
+	*oldlen = need;
+	return 0;
+}
+
+static int
+model_sysctlbyname(const char *name, void *old, size_t *oldlen, void *new, size_t newlen)
+{
+	if (new == NULL && name != NULL && strcmp(name, "hw.machine") == 0 && model_for(__builtin_return_address(0))) {
+		return model_answer(old, oldlen);
+	}
+	return sysctlbyname(name, old, oldlen, new, newlen);
+}
+
+static int
+model_sysctl(int *mib, u_int count, void *old, size_t *oldlen, void *new, size_t newlen)
+{
+	if (new == NULL && count == 2 && mib[0] == CTL_HW && mib[1] == HW_MACHINE && model_for(__builtin_return_address(0))) {
+		return model_answer(old, oldlen);
+	}
+	return sysctl(mib, count, old, oldlen, new, newlen);
+}
+
+static int
+model_uname(struct utsname *name)
+{
+	int result = uname(name);
+
+	if (result == 0 && model_for(__builtin_return_address(0))) {
+		strlcpy(name->machine, model_given, sizeof(name->machine));
+	}
+	return result;
+}
+
+/*
+ * CoreVideo's OpenGL ES texture cache, for a program with OpenGL ES of its own (app_gl): what it is asked and says,
+ * the first times, and a cache asked for without a context made for the current one. Terraria's Everyplay asserted
+ * on "CVOpenGLESTextureCacheCreate failed: -6661" (kCVReturnInvalidArgument: CoreVideo 20F66 0x1a1e83998 checks the
+ * context, the place for the answer, and that both attribute arguments are dictionaries).
+ */
+extern int CVOpenGLESTextureCacheCreate(const void *allocator, const void *cache_attributes, void *context,
+    const void *texture_attributes, void **cache) __attribute__((weak_import));
+static bool app_gl;
+
+static int
+cv_cache_create(const void *allocator, const void *cache_attributes, void *context, const void *texture_attributes,
+    void **cache)
+{
+	static unsigned told;
+	void *given = context;
+	int result;
+
+	if (app_gl && context == NULL) {
+		Class class = objc_getClass("EAGLContext");
+		void *(*last)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "hakios_gl_app_context");
+
+		context = class ? ((void *(*)(Class, SEL))objc_msgSend)(class, sel_registerName("currentContext")) : NULL;
+		if (context == NULL && last != NULL) {
+			context = last();       /* (the one made current last: libhakios.gl.dylib's) */
+		}
+	}
+	result = CVOpenGLESTextureCacheCreate(allocator, cache_attributes, context, texture_attributes, cache);
+	if (app_gl && told++ < 6) {
+		say("CVOpenGLESTextureCacheCreate(attributes %p, context %p%s, texture attributes %p): %d\n", cache_attributes,
+		    given, given != context ? context ? ", made the current one" : ", and none is current" : "", texture_attributes,
+		    result);
+	}
+	return result;
+}
+
+/* (dyld's interposing: this library is inserted, DYLD_INSERT_LIBRARIES) */
+__attribute__((used, section("__DATA,__interpose"))) static const struct {
+	const void *replacement, *original;
+} interposed[] = {
+	{ (const void *)model_sysctlbyname, (const void *)sysctlbyname },
+	{ (const void *)model_sysctl, (const void *)sysctl },
+	{ (const void *)model_uname, (const void *)uname },
+	{ (const void *)cv_cache_create, (const void *)CVOpenGLESTextureCacheCreate },
+};
+
+/* Whether the main program itself names OpenGLES among its libraries -- a game does; a framework might as well */
+static bool
+main_links_opengles(void)
+{
+	const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(main_image());
+	const struct load_command *command;
+
+	if (header == NULL || header->magic != MH_MAGIC_64) {
+		return false;
+	}
+	command = (const struct load_command *)(header + 1);
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		if (command->cmd == LC_LOAD_DYLIB || command->cmd == LC_LOAD_WEAK_DYLIB) {
+			const struct dylib_command *library = (const struct dylib_command *)command;
+
+			if (strstr((const char *)library + library->dylib.name.offset, "/OpenGLES.framework/OpenGLES") != NULL) {
+				return true;
+			}
+		}
+		command = (const struct load_command *)((const char *)command + command->cmdsize);
+	}
+	return false;
+}
+
+/*
+ * The window server's OpenGL ES library (libhakios.gl.dylib: eagl.c over Mesa's freedreno, the GPU) loaded into an
+ * application of the user's that links OpenGLES, where it gives EAGLContexts of their own and hands a CAEAGLLayer's
+ * frames over as IOSurfaces. Not into the system's own (/Applications, /System): there CoreImage and the like would
+ * start drawing with it. Boot-arg appgl=0: none. (Until the GPU driver keeps processes apart, an application could
+ * reach the others' GPU memory: the plan's B4.)
+ */
+static void
+app_opengl_es(void)
+{
+	const char *path = _dyld_get_image_name(main_image());
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	if (path == NULL || strncmp(path, "/Applications/", 14) == 0 || strncmp(path, "/System/", 8) == 0 ||
+	    strncmp(path, "/private/var/staged_system_apps/", 32) == 0 || !main_links_opengles()) {
+		return;
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "appgl=0") != NULL) {
+		say("OpenGL ES of its own: not with appgl=0\n");
+		return;
+	}
+	if (access(HAKIOS_GL, R_OK) != 0) {
+		return;                 /* (an image without the library) */
+	}
+	if (dlopen(HAKIOS_GL, RTLD_NOW) == NULL) {
+		say("%s: %s\n", HAKIOS_GL, dlerror());
+		return;
+	}
+	app_gl = true;
+	app_ci_off = strstr(arguments, "appci=0") != NULL;
+	say("OpenGL ES of its own for %s: %s (the GPU, as the window server's)\n", path, HAKIOS_GL);
 }
 
 /* ---- the compass ------------------------------------------------------------------------------------------- */
@@ -1036,10 +1280,15 @@ hakios_ui_init(void)
 {
 	size_t length = 0;
 	const void *cache = _dyld_get_shared_cache_range(&length);
-	Class cls = objc_getClass("CIContext");
-	Method method = cls ? class_getClassMethod(cls, sel_registerName("internalContextWithEAGLContext:options:")) : NULL;
-	IMP original = method ? method_getImplementation(method) : NULL;
+	Class cls;
+	Method method;
+	IMP original;
 
+	model_decide();
+	app_opengl_es();
+	cls = objc_getClass("CIContext");
+	method = cls ? class_getClassMethod(cls, sel_registerName("internalContextWithEAGLContext:options:")) : NULL;
+	original = method ? method_getImplementation(method) : NULL;
 	if (cache == NULL || original == NULL) {
 		return;         /* (no CoreImage in this program: nothing of it to keep off OpenGL ES) */
 	}
