@@ -885,17 +885,36 @@ hook(Class cls, bool class_method, const char *name, IMP imp)
 	}
 }
 
+/*
+ * Settings' Privacy & Security has Location Services only while -[PUIPrivacyController
+ * _cachedLocationServicesAvailableValue] is YES, which -refreshLocationServicesAvailable asks the carrier bundle
+ * for (CoreTelephony: each subscription's "LocationServicesAvailable"). There is no CommCenter here, the question
+ * fails and the row was gone though Location Services worked (2026-10-31): the answer a phone without a SIM gets.
+ */
+static id
+location_services_available(id self, SEL c)
+{
+	(void)self;
+	(void)c;
+	return ((id (*)(Class, SEL, BOOL))objc_msgSend)(objc_getClass("NSNumber"), sel_registerName("numberWithBool:"), true);
+}
+
 /* CLLocationManager's heading and CMMotionManager's device motion answered here (once each, in the first image
- * that has the class: CoreLocation's, CoreMotion's) */
+ * that has the class: CoreLocation's, CoreMotion's); Settings' privacy pane's question about location too */
 static void
 compass_hooks(const struct mach_header *header, intptr_t image_slide)
 {
-	static bool done, motion_done;
-	Class manager, motion;
+	static bool done, motion_done, privacy_done;
+	Class manager, motion, privacy;
 	Method m;
 
 	(void)header;
 	(void)image_slide;
+	if (!privacy_done && (privacy = objc_getClass("PUIPrivacyController")) != Nil) {
+		privacy_done = true;
+		hook(privacy, false, "_cachedLocationServicesAvailableValue", (IMP)location_services_available);
+		say("privacy: Location Services shown in Privacy & Security (no carrier bundle to ask)\n");
+	}
 	if (!motion_done) {
 		/* boot-arg motion_hook=0: CoreMotion left as it is (to tell what is ours from what is not) */
 		char args[1024] = "";
