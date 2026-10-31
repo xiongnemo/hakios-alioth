@@ -1,0 +1,59 @@
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -62,6 +62,8 @@
+ #include <c11/threads.h>
+ 
+ #include "state_tracker/st_context.h"
++#include "main/fbobject.h"
++#include "main/texobj.h"
+ 
+ #include "glapi/glapi.h"  /* for OSMesaGetProcAddress below */
+ 
+@@ -1054,3 +1056,47 @@
+       debug_warning("Calling OSMesaPostprocess() after OSMesaMakeCurrent()\n");
+    }
+ }
++
++
++/*
++ * Darwin on redwood: the picture of a renderbuffer of the current context copied by the GPU into a
++ * texture of it, the same way up or turned over, whatever OpenGL ES the context is -- OpenGL ES 1 has
++ * no glBlitFramebuffer, and an application's CAEAGLLayer is shown by such a copy (userland/src/eagl.c).
++ * Nothing of the context's state is touched. GL_FALSE: no such renderbuffer or texture, or no storage.
++ */
++GLAPI GLboolean GLAPIENTRY
++OSMesaHakiosCopy(GLuint renderbuffer, GLuint texture, GLboolean flip)
++{
++   GET_CURRENT_CONTEXT(ctx);
++   struct gl_renderbuffer *rb;
++   struct gl_texture_object *tex;
++   struct pipe_blit_info blit;
++   unsigned width, height;
++
++   if (!ctx || !ctx->pipe)
++      return GL_FALSE;
++   rb = _mesa_lookup_renderbuffer(ctx, renderbuffer);
++   tex = _mesa_lookup_texture(ctx, texture);
++   if (!rb || !rb->texture || !tex || !tex->pt)
++      return GL_FALSE;
++   width = MIN2(rb->texture->width0, tex->pt->width0);
++   height = MIN2(rb->texture->height0, tex->pt->height0);
++
++   memset(&blit, 0, sizeof(blit));
++   blit.src.resource = rb->texture;
++   blit.src.format = rb->texture->format;
++   blit.src.box.x = 0;
++   blit.src.box.y = flip ? (int)height : 0;
++   blit.src.box.width = width;
++   blit.src.box.height = flip ? -(int)height : (int)height;
++   blit.src.box.depth = 1;
++   blit.dst.resource = tex->pt;
++   blit.dst.format = tex->pt->format;
++   blit.dst.box.width = width;
++   blit.dst.box.height = height;
++   blit.dst.box.depth = 1;
++   blit.mask = PIPE_MASK_RGBA;
++   blit.filter = PIPE_TEX_FILTER_NEAREST;
++   ctx->pipe->blit(ctx->pipe, &blit);
++   return GL_TRUE;
++}

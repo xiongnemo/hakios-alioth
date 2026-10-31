@@ -4,7 +4,7 @@
  #define OSMESA_COMPAT_PROFILE        0x35
  #define OSMESA_CONTEXT_MAJOR_VERSION 0x36
  #define OSMESA_CONTEXT_MINOR_VERSION 0x37
-+#define OSMESA_ES_PROFILE            0x38  /* an OpenGL ES 2 or 3 context, by the version asked for */
++#define OSMESA_ES_PROFILE            0x38  /* an OpenGL ES 1, 2 or 3 context, by the version asked for */
  
  
  typedef struct osmesa_context *OSMesaContext;
@@ -26,7 +26,7 @@
     memset(&attribs, 0, sizeof(attribs));
 -   attribs.profile = (profile == OSMESA_CORE_PROFILE)
 -      ? API_OPENGL_CORE : API_OPENGL_COMPAT;
-+   attribs.profile = (profile == OSMESA_ES_PROFILE) ? API_OPENGLES2 :
++   attribs.profile = (profile == OSMESA_ES_PROFILE) ? (version_major == 1 ? API_OPENGLES : API_OPENGLES2) :
 +      (profile == OSMESA_CORE_PROFILE) ? API_OPENGL_CORE : API_OPENGL_COMPAT;
     attribs.major = version_major;
     attribs.minor = version_minor;
