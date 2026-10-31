@@ -3891,10 +3891,17 @@ usb_wait(uint8_t endpoint)
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
+			print("usb: %s (waiting on endpoint %x)\n", usb_connected ? "connected" : "disconnected", (uint64_t)endpoint);
 			return -1;
 		}
-		/* with a kernel running, a host that went away must not keep this core from watching it */
+		/*
+		 * With a kernel running, a host that went away must not keep this core from watching it -- and the
+		 * transfer goes too: one left with the controller went out later with a later reply's bytes in the
+		 * buffer and its own length (replies empty or a command behind, after the cable moved, 2026-10-31).
+		 */
 		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
+			(void)USB->abort_xfer(endpoint);
+			print("usb: endpoint %x: nothing for 3 s, the transfer given up\n", (uint64_t)endpoint);
 			return -1;
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
@@ -4067,7 +4074,10 @@ fb_command(char *cmd)
 				}
 				sent += chunk;
 			}
-			fb_reply("OKAY", "");
+			/* (not after a chunk that did not go: the host still waits for data, and an OKAY would be taken for it) */
+			if (sent == staged_len) {
+				fb_reply("OKAY", "");
+			}
 		} else if (starts_with(cmd, "oem screenshot")) {
 			/* stage the raw framebuffer; "getvar screen" gives its geometry */
 			if (SCREEN.base == 0) {
@@ -4188,6 +4198,7 @@ usb_poll_command(void)
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		usb_connected = (data.device_state == UsbDeviceStateConnected);
 		usb_rx_queued = 0;
+		print("usb: %s while the kernel runs\n", usb_connected ? "connected" : "disconnected");
 		return;
 	}
 	if (msg != UsbDeviceEventTransferNotification || data.transfer.endpoint_index != USB_EP_OUT) {
