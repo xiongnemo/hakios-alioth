@@ -62,6 +62,7 @@ extern void hakios_camera_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void alioth_display_quiesce(void);      /* bsd/dev/alioth_dsi.c (Redmi K40 overlay) */
+extern void alioth_mdm_quiesce(void);          /* bsd/dev/alioth_mdm.c (Redmi K40 overlay) */
 extern void hakios_usb_quiesce(void);          /* bsd/dev/hakios.usb.c (Redmi K40 overlay) */
 extern void hakios_var_save_on_return(void);   /* bsd/dev/hakios.ufs.c: the data volume into the flash */
 void loader_checkpoint(uint64_t n);
@@ -391,6 +392,7 @@ loader_return(void)
 	hakios_adsp_quiesce();         /* nor the audio DSP */
 	hakios_slpi_quiesce();         /* nor the sensor DSP */
 	hakios_mpss_quiesce();         /* nor the modem */
+	alioth_mdm_quiesce();          /* nor the K40's own (an SDX55 on PCIe2): held in reset, the SMMU as found */
 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */

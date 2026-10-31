@@ -55,6 +55,8 @@
 #                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
 #                      MODEM=1      stage checked local MPSS firmware from ../fw-modem in system.apfs /fw.
 #                                   This does not start the modem; the XNU MPSS driver is still required.
+#                                   With ../fw-modem/sdx55m (the Redmi K40's external SDX55): its images and
+#                                   partition copies in /fw/sdx55m (bsd/dev/alioth_mdm.c). Never with SHARE=1.
 #   system.apfs      the system image, the root filesystem (the resident RAM disk, /dev/md0), an
 #                    APFS container: the part of iOS 16.5 chosen by ../sysimage/select-system.py at
 #                    its real paths, the dyld shared cache, and src/stage0.c as /sbin/launchd (the
@@ -592,7 +594,20 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# MPSS firmware is much too large for the small boot image. Keep it in the system APFS,
 	# only when explicitly requested, after checking every loadable segment against this DTB.
 	# This stages the files; a separate XNU MPSS driver is still required to start the modem.
-	if [ -n "$MODEM" ]; then
+	if [ -n "$MODEM" ] && [ -f ../fw-modem/sdx55m/sbl1.mbn ]; then
+		# the Redmi K40's modem is an SDX55 outside the SoC (bsd/dev/alioth_mdm.c, mdm_step=4..5): its images, pulled
+		# from the phone's /vendor/firmware_mnt/image/sdx55m, copies of the partitions its SBL asks for (file systems,
+		# DDR training, debug policy: work/tools/pull-modem.ps1), and which Sahara id is which file
+		# (devices/redmi-k40/sdx55m-sahara.txt). The file systems hold this phone's IMEI: never in a shared image.
+		[ -z "$SHARE" ] || { echo "build.sh: MODEM=1 puts this phone's IMEI into the image: not with SHARE=1" >&2; exit 1; }
+		mkdir -p sysroot/fw/sdx55m
+		cp ../fw-modem/sdx55m/*.mbn ../fw-modem/sdx55m/*.elf sysroot/fw/sdx55m/
+		for p in mdm1m9kefs1 mdm1m9kefs2 mdm1m9kefs3 mdmddr msadp; do
+			cp ../fw-modem/parts/$p.img sysroot/fw/sdx55m/
+		done
+		cp ../devices/redmi-k40/sdx55m-sahara.txt sysroot/fw/sdx55m/sahara.txt
+		echo "  the SDX55's images and partition copies: $(du -sh sysroot/fw/sdx55m | cut -f1) in /fw/sdx55m"
+	elif [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
 		../devices/poco-x5-pro/tools/modem_firmware.py --dtb ../devices/poco-x5-pro/prebuilt/device-tree.dtb --firmware-dir ../fw-modem \
 			--node /soc/qcom,mss@4080000 >/dev/null
@@ -649,7 +664,9 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
-	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	# (fw/ stored as it is, in one piece: the kernel uses firmware where it lies -- bsd/dev/hakios.image.c --
+	# instead of reading an 84 MB modem image out into memory of its own first)
+	python3 ../tools/apfs/mkapfs.py -z --plain fw -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$IOS/system.manifest
 	rm -rf sysroot
 fi

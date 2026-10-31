@@ -1,7 +1,7 @@
 /*
  * The Redmi K40's modem: an SDX55 outside the SoC, on PCIe2, whose GNSS receiver is the phone's GPS
  * (work/research/gps-sdx55.md, from Xiaomi's device tree and kernel for alioth). The first steps towards it,
- * a diagnostic: only with boot-arg mdm_step=N, N = 1 .. 3; nothing here runs otherwise.
+ * a diagnostic: only with boot-arg mdm_step=N, N = 1 .. 5; nothing here runs otherwise.
  *
  *   1  reads   the SPMI arbiter's table: the channel of the modem's own PMIC's power-on block (PMX55,
  *              "pmxprairie", slave 8, peripheral 0x08 -- kona-pmic-overlay.dtsi's qcom,modem-reset), who may write
@@ -12,27 +12,46 @@
  *              does; then watches MDM2AP_STATUS (GPIO 3) and MDM2AP_ERRFATAL (GPIO 1) for 2 s
  *   3  writes  PCIe2 up the way umi_pcie.c brings PCIe0 up for the Wi-Fi, with PCIe2's numbers (Linux
  *              gcc-sm8250.c, Xiaomi's kona-pcie.dtsi; its PHY's sequence in alioth_pcie2_phy.h); looks for the
- *              SDX55 (17cb:0306) and reads its MHI registers -- the version, BHI, the execution environment.
- *              Bus mastering stays off: nothing of the modem's reaches memory.
- * At the end PERST (GPIO 85) is held asserted; the modem stays powered (the next warm reset restarts it).
+ *              SDX55 (17cb:0306), sizes its BAR and reads its MHI registers -- the version, BHI, the execution
+ *              environment. Bus mastering stays off: nothing of the modem's reaches memory.
+ *   4  writes  the SMMU: a free match register sends the modem's stream (0x1d01: kona-pcie.dtsi's iommu-map for
+ *              requester 0x100) through a free context with page tables of ours for 64 MB at 0x20000000
+ *              (kona-mhi.dtsi's qcom,iommu-dma-addr-pool), PCIe2's BDF-to-SID route as umi_pcie.c makes PCIe0's,
+ *              then bus mastering on; MHI (alioth_mhi.c): the SBL through BHI, READY, contexts, M0
+ *   5  talks   Sahara: the SBL's images, up to mission mode. The images: fw/sdx55m/ of the system image, which
+ *              fw/sdx55m/sahara.txt names ("bhi FILE" for the SBL, then "ID FILE" a line, from mdm_helper's
+ *              arguments to Android's ks; work/research/gps-sdx55.md); never in a shared image (the modem's EFS
+ *              copies hold the phone's IMEI and calibration)
+ * After step 3 alone, or when a step fails, PERST (GPIO 85) is held asserted and the SMMU put back as it was; a
+ * modem in mission mode is left running (boot-arg mdm_keep=0: stopped too). On the way back to the loader
+ * (loader_return.c) alioth_mdm_quiesce() stops it either way.
  *
  * The SDX55's pins are all in the TLMM's SOUTH tile (Linux pinctrl-sm8250.c), the Wi-Fi's in the NORTH one.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
+#include <sys/alioth_mhi.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
+#include <vm/memory_types.h>
+#include <vm/vm_kern.h>
 #include "alioth_pcie2_phy.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+extern uint64_t kvtophys(vm_offset_t va);
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
 extern void hakios_spmi_lock(void);
 extern void hakios_spmi_unlock(void);
 extern int umi_rpmh_wifi_power(void);
 extern kern_return_t thread_terminate(thread_t thread);
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern lck_mtx_t hakios_smmu_lock;      /* (bsd/dev/hakios.wifi.c: the SMMU's global registers are shared) */
 #define say hakios_tl
 
 /* ---- registers --------------------------------------------------------------------------------------- */
@@ -86,7 +105,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define BIT(n)          (1u << (n))
 
 static vm_offset_t gcc, tlmm, parf, phy, dbi, atu, conf, bar, arb_core, arb_cnfg, arb_obs;
-static uint32_t mdm_step;
+static uint32_t mdm_step, mdm_keep = 1, bar_size;
 
 static uint32_t
 rd(vm_offset_t a)
@@ -399,6 +418,25 @@ step_pcie2(void)
 	bar0 = rd(conf + 0x10);
 	say("mdm: 3: command %#x, BAR0 %#x\n", command, bar0);
 	wr(conf + 4, ((command & 0xffff) & ~7u) | BIT(10));    /* no decode, no bus mastering, no INTx */
+	/* the BAR's size, the usual way (all ones, read back), with decoding off */
+	wr(conf + 0x10, 0xffffffffu);
+	{
+		uint32_t mask = rd(conf + 0x10) & ~15u;
+
+		bar_size = mask == 0 ? 0 : ~mask + 1;
+	}
+	say("mdm: 3: BAR0 is %u KB%s\n", bar_size >> 10, bar_size > 0x100000 ? " (only its first megabyte is mapped)" : "");
+	if (bar_size == 0 || bar_size > 0x100000) {
+		bar_size = bar_size == 0 ? 0 : 0x100000;
+	}
+	if (bar_size < 0x1000) {
+		say("mdm: 3: a BAR of less than 4 KB is not the SDX55's\n");
+		return false;
+	}
+	/* the BDF-to-SID table may hold anything after a reset: zero, with bus mastering off (as umi_pcie.c for PCIe0) */
+	for (unsigned i = 0; i < 256; i++) {
+		wr(parf + 0x2000 + 4 * i, 0);
+	}
 	wr(conf + 0x10, (uint32_t)BAR_PHYS | (bar0 & 15));
 	if ((bar0 & 6) == 4) {
 		wr(conf + 0x14, 0);
@@ -417,6 +455,509 @@ step_pcie2(void)
 		    rd(bar + bhi + 0x28), rd(bar + bhi + 0x2c));
 	}
 	return true;
+}
+
+/* ---- the modem's view of memory: a context of the SMMU (hakios.camera.c's way; hakios.wifi.c's PTEs for PCIe) ---- */
+
+#define SMMU_PHYS               0x15000000UL
+#define SMMU_SCR0               0x000
+#define SMMU_IDR0               0x020
+#define SMMU_IDR1               0x024
+#define SMMU_SGFSR              0x048
+#define SMMU_SGFSYNR1           0x054
+#define SMMU_SMR(n)             (0x800 + 4 * (n))
+#define SMMU_S2CR(n)            (0xc00 + 4 * (n))
+#define SMMU_CBAR(n)            (4 * (n))
+#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
+#define SMMU_CBA2R(n)           (0x800 + 4 * (n))
+#define SMMU_CB_SCTLR           0x00
+#define SMMU_CB_TCR2            0x10
+#define SMMU_CB_TTBR0           0x20
+#define SMMU_CB_TTBR1           0x28
+#define SMMU_CB_TCR             0x30
+#define SMMU_CB_MAIR0           0x38
+#define SMMU_CB_MAIR1           0x3c
+#define SMMU_CB_FSR             0x58
+#define SMMU_CB_FAR             0x60
+#define SMMU_CB_FSYNR0          0x68
+#define SMMU_CB_TLBIASID        0x610
+#define SMMU_CB_TLBSYNC         0x7f0
+#define SMMU_CB_TLBSTATUS       0x7f4
+#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 8 | 1u << 12)
+#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
+#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)
+#define SMMU_MAIR0              0xf404ff44
+#define SMMU_FSR_ALL            0xc00001fe
+#define MDM_PTE                 (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)       /* hakios.wifi.c's RADIO_PTE */
+#define MDM_STREAM              0x1d01u         /* kona-pcie.dtsi pcie2: iommu-map <0x100 &apps_smmu 0x1d01 1> */
+#define MDM_WINDOW              0x20000000ull   /* kona-mhi.dtsi: qcom,iommu-dma-addr-pool <0x20000000 ...> */
+#define MDM_WINDOW_SIZE         (64ull << 20)
+#define MDM_THIRDS              ((uint32_t)(MDM_WINDOW_SIZE >> 21))
+
+static vm_offset_t smmu, smmu_second, smmu_context, smmu_contexts[128], tables;
+static uint32_t smmu_match = ~0u, smmu_context_n, smmu_old_smr, smmu_old_s2cr;
+static bool smmu_on, dma_on;
+static uint64_t window_next;
+
+/* A free match register (none may already cover the stream) and a context no match register sends anything to,
+ * switched off and without a fault. With hakios_smmu_lock held. */
+static bool
+smmu_find(void)
+{
+	bool used[256] = { false };
+	uint32_t idr0, idr1, contexts, page, pages;
+
+	if (smmu == 0 && (smmu = ml_io_map(SMMU_PHYS, 0x1000)) == 0) {
+		return false;
+	}
+	idr0 = rd(smmu + SMMU_IDR0);
+	idr1 = rd(smmu + SMMU_IDR1);
+	contexts = idr1 & 0xff;
+	page = idr1 >> 31 ? 0x10000 : 0x1000;
+	pages = 2u << (idr1 >> 28 & 7);
+	if (2 * pages * page != 0x100000 || contexts > 128 || (rd(smmu + SMMU_SCR0) & BIT(3))) {
+		say("mdm: 4: the SMMU's layout is not the one known here (idr1 %#x, scr0 %#x)\n", idr1, rd(smmu + SMMU_SCR0));
+		return false;
+	}
+	smmu_match = ~0u;
+	for (uint32_t n = 0; n < (idr0 & 0xff) && SMMU_SMR(n) < 0xc00; n++) {
+		uint32_t smr = rd(smmu + SMMU_SMR(n)), s2cr = rd(smmu + SMMU_S2CR(n));
+
+		if (smr >> 31) {
+			used[s2cr & 0xff] = true;
+			if ((((smr & 0x7fff) ^ MDM_STREAM) & ~(smr >> 16 & 0x7fff)) == 0) {
+				say("mdm: 4: SMMU match register %u (%#x) is somebody's for the modem's stream: left alone\n", n, smr);
+				return false;
+			}
+		} else if (smmu_match == ~0u) {
+			smmu_match = n;
+			smmu_old_smr = smr;
+			smmu_old_s2cr = s2cr;
+		}
+	}
+	if (smmu_match == ~0u) {
+		say("mdm: 4: the SMMU has no match register left\n");
+		return false;
+	}
+	if (smmu_second == 0 && (smmu_second = ml_io_map(SMMU_PHYS + page, 0x1000)) == 0) {
+		return false;
+	}
+	for (smmu_context_n = 0; smmu_context_n < contexts; smmu_context_n++) {
+		if (used[smmu_context_n]) {
+			continue;
+		}
+		if (smmu_contexts[smmu_context_n] == 0) {
+			smmu_contexts[smmu_context_n] = ml_io_map(SMMU_PHYS + (uint64_t)(pages + smmu_context_n) * page, 0x1000);
+		}
+		smmu_context = smmu_contexts[smmu_context_n];
+		if (smmu_context != 0 && !(rd(smmu_context + SMMU_CB_SCTLR) & 1) && !(rd(smmu_context + SMMU_CB_FSR) & SMMU_FSR_ALL)) {
+			return true;
+		}
+	}
+	smmu_match = ~0u;
+	say("mdm: 4: the SMMU has no context left\n");
+	return false;
+}
+
+static bool
+smmu_put(vm_offset_t base, uint32_t offset, uint32_t value, uint32_t check)
+{
+	wr(base + offset, value);
+	if ((rd(base + offset) & check) != (value & check)) {
+		say("mdm: 4: SMMU %#x <- %#x, but it reads %#x\n", offset, value, rd(base + offset));
+		return false;
+	}
+	return true;
+}
+
+static void
+smmu_forget(void)
+{
+	wr(smmu_context + SMMU_CB_TLBIASID, smmu_context_n);
+	wr(smmu_context + SMMU_CB_TLBSYNC, 1);
+	for (unsigned i = 0; i < 100000 && (rd(smmu_context + SMMU_CB_TLBSTATUS) & 1); i++) {
+	}
+}
+
+/* Tables of ours for the window (its pages filled in by mdm_allocate()), the context on, the stream through it. */
+static bool
+smmu_up(void)
+{
+	uint64_t *root, *second, table_root;
+	bool ok;
+
+	lck_mtx_lock(&hakios_smmu_lock);
+	ok = smmu_find();
+	if (ok && tables == 0) {
+		ok = kmem_alloc(kernel_map, &tables, (2 + MDM_THIRDS) * 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) ==
+		    KERN_SUCCESS;
+	}
+	if (ok) {
+		root = (uint64_t *)tables;
+		second = (uint64_t *)(tables + 4096);
+		root[MDM_WINDOW >> 30 & 0x1ff] = kvtophys((vm_offset_t)second) | 3;
+		for (uint32_t t = 0; t < MDM_THIRDS; t++) {
+			second[(MDM_WINDOW >> 21 & 0x1ff) + t] = kvtophys(tables + (2 + t) * 4096) | 3;
+		}
+		for (vm_offset_t line = tables; line < tables + (2 + MDM_THIRDS) * 4096; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (line));
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		table_root = kvtophys(tables) | (uint64_t)smmu_context_n << 48;
+		say("mdm: 4: SMMU: context %u gets our tables for %llu MB at %#llx; match register %u sends stream %#x through it\n",
+		    smmu_context_n, MDM_WINDOW_SIZE >> 20, MDM_WINDOW, smmu_match, MDM_STREAM);
+		ok = smmu_put(smmu_context, SMMU_CB_SCTLR, 0, ~0u) && smmu_put(smmu_second, SMMU_CBA2R(smmu_context_n), 1, 1) &&
+		    smmu_put(smmu_second, SMMU_CBAR(smmu_context_n), SMMU_CBAR_STAGE_1, 0x30000) &&
+		    smmu_put(smmu_context, SMMU_CB_TCR2, SMMU_TCR2, 0) && smmu_put(smmu_context, SMMU_CB_TCR, SMMU_TCR_39_BITS, ~0u) &&
+		    smmu_put(smmu_context, SMMU_CB_TTBR0, (uint32_t)table_root, ~0u) &&
+		    smmu_put(smmu_context, SMMU_CB_TTBR0 + 4, (uint32_t)(table_root >> 32), ~0u) &&
+		    smmu_put(smmu_context, SMMU_CB_TTBR1, 0, ~0u) && smmu_put(smmu_context, SMMU_CB_TTBR1 + 4, 0, ~0u) &&
+		    smmu_put(smmu_context, SMMU_CB_MAIR0, SMMU_MAIR0, ~0u) && smmu_put(smmu_context, SMMU_CB_MAIR1, 0, ~0u);
+	}
+	if (ok) {
+		wr(smmu_context + SMMU_CB_FSR, SMMU_FSR_ALL);
+		smmu_forget();
+		ok = smmu_put(smmu_context, SMMU_CB_SCTLR, SMMU_SCTLR_ON, 1);
+		smmu_on = ok;
+	}
+	if (ok) {
+		ok = smmu_put(smmu, SMMU_S2CR(smmu_match), smmu_context_n, 0x300ff) &&
+		    smmu_put(smmu, SMMU_SMR(smmu_match), 1u << 31 | MDM_STREAM, ~0u);
+	}
+	lck_mtx_unlock(&hakios_smmu_lock);
+	return ok;
+}
+
+static void
+smmu_faults(void)
+{
+	uint32_t status, global;
+
+	if (!smmu_on) {
+		return;
+	}
+	status = rd(smmu_context + SMMU_CB_FSR);
+	global = rd(smmu + SMMU_SGFSR);
+	if ((status & SMMU_FSR_ALL) == 0 && global == 0) {
+		say("mdm: the SMMU has refused the modem nothing (context %u)\n", smmu_context_n);
+		return;
+	}
+	say("mdm: THE SMMU HAS REFUSED A REQUEST OF THE MODEM'S: context %u status %#x, address %#llx, syndrome %#x; global "
+	    "status %#x, stream %#x\n", smmu_context_n, status,
+	    (uint64_t)rd(smmu_context + SMMU_CB_FAR + 4) << 32 | rd(smmu_context + SMMU_CB_FAR), rd(smmu_context + SMMU_CB_FSYNR0),
+	    global, rd(smmu + SMMU_SGFSYNR1));
+}
+
+/* As found: the match register, then the context. `leaving`: on the way back to the loader, no lock, no saying. */
+static void
+smmu_down(bool leaving)
+{
+	if (smmu_match == ~0u) {
+		return;
+	}
+	if (!leaving) {
+		smmu_faults();
+		lck_mtx_lock(&hakios_smmu_lock);
+	}
+	wr(smmu + SMMU_SMR(smmu_match), smmu_old_smr);
+	wr(smmu + SMMU_S2CR(smmu_match), smmu_old_s2cr);
+	if (smmu_on) {
+		uint32_t fsr = rd(smmu_context + SMMU_CB_FSR) & SMMU_FSR_ALL;
+
+		wr(smmu_context + SMMU_CB_SCTLR, 0);
+		smmu_forget();
+		if (fsr != 0) {
+			wr(smmu_context + SMMU_CB_FSR, fsr);
+		}
+	}
+	smmu_on = false;
+	smmu_match = ~0u;
+	if (!leaving) {
+		lck_mtx_unlock(&hakios_smmu_lock);
+		say("mdm: the SMMU's match register and context put back as they were found\n");
+	}
+}
+
+/*
+ * MHI's memory (alioth_mhi.h): in one physical piece, seen by the modem at the next addresses of the window and by
+ * us through an uncached mapping (lx_os_radio_memory()'s way), so that neither side's caches stand between.
+ * Handed out upwards, never taken back: the modem may still use what it was given.
+ */
+static int
+mdm_allocate(__unused void *context, size_t size, struct alioth_mhi_dma *dma)
+{
+	vm_offset_t cached = 0, uncached;
+	uint64_t physical;
+
+	size = round_page(size);
+	if (!smmu_on || window_next + size > MDM_WINDOW_SIZE) {
+		return ENOMEM;
+	}
+	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {
+		say("mdm: no %lu KB of memory in one piece\n", (unsigned long)(size >> 10));
+		return ENOMEM;
+	}
+	physical = kvtophys(cached);
+	for (vm_offset_t line = cached; line < cached + size; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if ((uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB)) == 0) {
+		return ENOMEM;
+	}
+	for (uint64_t offset = 0; offset < size; offset += 4096) {
+		uint64_t at = window_next + offset;
+		uint64_t *third = (uint64_t *)(tables + (2 + (at >> 21)) * 4096);
+
+		third[at >> 12 & 0x1ff] = (physical + offset) | MDM_PTE;
+		__asm__ volatile ("dc civac, %0" : : "r" (&third[at >> 12 & 0x1ff]));
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	smmu_forget();
+	dma->bytes = (void *)uncached;
+	dma->address = MDM_WINDOW + window_next;
+	dma->size = size;
+	window_next += size;
+	return 0;
+}
+
+/* PCIe2's requests from the endpoint (bus 1, devfn 0) through the SMMU as stream 0x1d01: umi_pcie_enable_dma()'s
+ * route (CRC-8 of the BDF picks the table's entry; BDF, SID offset 1), translation instead of the bypass, then bus
+ * mastering on. */
+static bool
+dma_route(void)
+{
+	static const uint8_t bdf[] = { 1, 0 };
+	uint8_t hash = 0;
+	uint32_t route, old, command;
+
+	for (unsigned i = 0; i < sizeof(bdf); i++) {
+		hash ^= bdf[i];
+		for (unsigned b = 0; b < 8; b++) {
+			hash = (uint8_t)((hash << 1) ^ ((hash & 0x80) ? 7 : 0));
+		}
+	}
+	route = 0x2000 + 4u * hash;
+	old = rd(parf + route);
+	if (old != 0 && old != 0x01000100) {
+		say("mdm: 4: PCIe2's BDF-to-SID entry %#x holds %#x already\n", route, old);
+		return false;
+	}
+	wr(parf + route, 0x01000100);
+	update(parf + 0x2c00, 1, 0);
+	command = rd(conf + 4);
+	if (rd(parf + route) != 0x01000100 || (rd(parf + 0x2c00) & 1) || command == UINT32_MAX || (command & 7) != 2) {
+		say("mdm: 4: PCIe2's route did not take (entry %#x, configuration %#x, command %#x)\n", rd(parf + route),
+		    rd(parf + 0x2c00), command);
+		return false;
+	}
+	wr(dbi + 4, 6);                                         /* the root bridge: memory, bus mastering */
+	wr(conf + 4, (command & 0xffff) | 4);                   /* the endpoint: bus mastering */
+	dma_on = true;
+	say("mdm: 4: bus mastering on: the modem reaches our memory as stream %#x (command %#x)\n", MDM_STREAM, rd(conf + 4));
+	return (rd(conf + 4) & 7) == 6;
+}
+
+/* The modem stopped (PERST), what it was given put back. `leaving`: alioth_mdm_quiesce(), the other cores stopped. */
+static void
+mdm_stop(bool leaving)
+{
+	if (dma_on) {
+		wr(dbi + 4, 2);                                 /* nothing upstream through the root bridge */
+	}
+	gpio_out(GPIO_PERST, false, 1);
+	for (unsigned i = 0; i < 4000; i++) {           /* (a millisecond or so, no timer needed) */
+		(void)rd(tlmm + GPIO_PERST * 0x1000);
+	}
+	dma_on = false;
+	smmu_down(leaving);
+}
+
+/* ---- MHI and Sahara over it (bsd/dev/alioth_mhi.c) --------------------------------------------------------- */
+
+#define MDM_IMAGES      32
+static struct { uint32_t id; char name[40]; } images[MDM_IMAGES];
+static unsigned image_count;
+static char bhi_name[40];
+static struct alioth_mhi mhi;
+static struct alioth_mhi_io mhi_io;
+
+static uint32_t
+mhi_read(__unused void *context, uint32_t offset)
+{
+	return offset < bar_size && !(offset & 3) ? rd(bar + offset) : UINT32_MAX;
+}
+
+static void
+mhi_write(__unused void *context, uint32_t offset, uint32_t value)
+{
+	if (offset < bar_size && !(offset & 3)) {
+		wr(bar + offset, value);
+	}
+}
+
+static void
+mhi_delay(__unused void *context, unsigned us)
+{
+	delay(us);
+}
+
+static void
+mhi_say(__unused void *context, const char *what, uint64_t a, uint64_t b, uint64_t c)
+{
+	say("mdm: %s %#llx %#llx %#llx\n", what, a, b, c);
+}
+
+/* fw/sdx55m/sahara.txt (devices/redmi-k40/sdx55m-sahara.txt): "bhi FILE", "ID FILE", '#' to the end of a line. */
+static bool
+config_load(void)
+{
+	uint64_t size = 0;
+	const char *text = (const char *)hakios_image_file("fw", "sdx55m/sahara.txt", &size, NULL), *end;
+
+	if (text == NULL) {
+		say("mdm: 4: no fw/sdx55m/sahara.txt in the system image (MODEM=1 with ~/hk/fw-modem)\n");
+		return false;
+	}
+	end = text + size;
+	image_count = 0;
+	bhi_name[0] = 0;
+	for (const char *p = text; p < end;) {
+		const char *line_end = p, *q, *name;
+		char word[8];
+		unsigned n = 0, length;
+
+		while (line_end < end && *line_end != '\n') {
+			line_end++;
+		}
+		for (q = p; q < line_end && (*q == ' ' || *q == '\t'); q++) {
+		}
+		while (q < line_end && *q != ' ' && *q != '\t' && *q != '#' && n < sizeof(word) - 1) {
+			word[n++] = *q++;
+		}
+		word[n] = 0;
+		while (q < line_end && (*q == ' ' || *q == '\t')) {
+			q++;
+		}
+		for (name = q, length = 0; q < line_end && *q != ' ' && *q != '\t' && *q != '#' && *q != '\r'; q++) {
+			length++;
+		}
+		if (n != 0 && word[0] != '#' && length > 0 && length < sizeof(bhi_name)) {
+			if (strcmp(word, "bhi") == 0) {
+				memcpy(bhi_name, name, length);
+				bhi_name[length] = 0;
+			} else if (word[0] >= '0' && word[0] <= '9' && image_count < MDM_IMAGES) {
+				images[image_count].id = (uint32_t)strtoul(word, NULL, 10);
+				memcpy(images[image_count].name, name, length);
+				images[image_count].name[length] = 0;
+				image_count++;
+			}
+		}
+		p = line_end + 1;
+	}
+	say("mdm: 4: sahara.txt: the SBL is %s, %u images by id\n", bhi_name[0] ? bhi_name : "NOT NAMED", image_count);
+	return bhi_name[0] != 0;
+}
+
+static const uint8_t *
+image_named(const char *name, uint64_t *size)
+{
+	char path[64];
+
+	snprintf(path, sizeof(path), "sdx55m/%s", name);
+	return hakios_image_file("fw", path, size, NULL);
+}
+
+static const uint8_t *
+mdm_image(__unused void *context, uint64_t id, uint64_t *size)
+{
+	for (unsigned i = 0; i < image_count; i++) {
+		if (images[i].id == id) {
+			const uint8_t *data = image_named(images[i].name, size);
+
+			say("mdm: 5: the SBL asks for image %llu: %s, %s%llu bytes\n", id, images[i].name, data ? "" : "NOT IN fw/sdx55m, ",
+			    data ? *size : 0);
+			return data;
+		}
+	}
+	say("mdm: 5: the SBL asks for image %llu, which sahara.txt does not name\n", id);
+	return NULL;
+}
+
+static bool
+step_mhi(void)
+{
+	static const struct alioth_mhi_known known[] = {
+		{ 2, ALIOTH_MHI_TO_DEVICE, 1 }, { 3, ALIOTH_MHI_FROM_DEVICE, 1 }, { 25, ALIOTH_MHI_FROM_DEVICE, 1 },
+		{ 10, ALIOTH_MHI_TO_DEVICE, 1 }, { 11, ALIOTH_MHI_FROM_DEVICE, 1 },
+		{ 20, ALIOTH_MHI_TO_DEVICE, 2 }, { 21, ALIOTH_MHI_FROM_DEVICE, 2 },
+	};
+	const uint8_t *sbl;
+	uint64_t size = 0;
+	uint32_t ee = ~0u;
+	int error;
+
+	say("mdm: 4: the SMMU, bus mastering, MHI: the SBL through BHI, READY, M0\n");
+	if (!config_load()) {
+		return false;
+	}
+	if ((sbl = image_named(bhi_name, &size)) == NULL) {
+		say("mdm: 4: no fw/sdx55m/%s\n", bhi_name);
+		return false;
+	}
+	if (!smmu_up() || !dma_route()) {
+		return false;
+	}
+	/* (in the structure's order: "say" is this file's macro for hakios_tl, so no designators) */
+	mhi_io = (struct alioth_mhi_io){ NULL, bar_size, MDM_WINDOW, MDM_WINDOW + MDM_WINDOW_SIZE - 1, mhi_read, mhi_write,
+		                         mdm_allocate, mhi_delay, mhi_say };
+	memset(&mhi, 0, sizeof(mhi));
+	error = alioth_mhi_probe(&mhi, &mhi_io);
+	if (error == 0) {
+		error = alioth_mhi_execution_environment(&mhi, &ee);
+	}
+	if (error == 0 && ee != ALIOTH_MHI_EE_PBL) {
+		say("mdm: 4: the modem is in execution environment %u, not its boot ROM: no BHI\n", ee);
+		error = EBUSY;
+	}
+	if (error == 0) {
+		error = alioth_mhi_bhi(&mhi, sbl, (size_t)size, 2000);
+	}
+	if (error == 0) {
+		error = alioth_mhi_ready(&mhi, known, sizeof(known) / sizeof(known[0]), 5000);
+	}
+	say("mdm: 4: %s (%d): execution environment %u, MHI state %u; MDM2AP_STATUS %d, MDM2AP_ERRFATAL %d\n",
+	    error ? "MHI STOPPED" : "THE SBL RUNS, MHI IN M0", error, mhi.ee, mhi.state, gpio_in(GPIO_MDM2AP_STATUS),
+	    gpio_in(GPIO_MDM2AP_ERRFATAL));
+	smmu_faults();
+	return error == 0;
+}
+
+static bool
+step_sahara(void)
+{
+	int error;
+
+	say("mdm: 5: Sahara: the SBL's images, up to mission mode\n");
+	error = alioth_mhi_sahara(&mhi, mdm_image, NULL, 5000);
+	say("mdm: 5: %s (%d): execution environment %u; MDM2AP_STATUS %d, MDM2AP_ERRFATAL %d; %u events, %u link requests\n",
+	    error ? "SAHARA STOPPED" : "THE MODEM IS IN MISSION MODE", error, mhi.ee, gpio_in(GPIO_MDM2AP_STATUS),
+	    gpio_in(GPIO_MDM2AP_ERRFATAL), mhi.events, mhi.bandwidth_requests);
+	smmu_faults();
+	return error == 0;
+}
+
+/* On the way back to the loader (osfmk/arm64/loader_return.c), the other cores stopped: the modem held in reset,
+ * the SMMU as it was found. */
+void alioth_mdm_quiesce(void);
+
+void
+alioth_mdm_quiesce(void)
+{
+	if (dma_on || smmu_match != ~0u) {
+		mdm_stop(true);
+	}
 }
 
 /* ---- the steps ------------------------------------------------------------------------------------------ */
@@ -448,7 +989,15 @@ mdm_thread(__unused void *arg, __unused wait_result_t wr_result)
 	}
 	if (ok && mdm_step >= 3) {
 		ok = step_pcie2();
-		gpio_out(GPIO_PERST, false, 1);                 /* (held in reset again: no MHI here yet) */
+	}
+	if (ok && mdm_step >= 4) {
+		ok = step_mhi();
+	}
+	if (ok && mdm_step >= 5) {
+		ok = step_sahara();
+	}
+	if (mdm_step >= 3 && (!ok || mdm_step < 5 || !mdm_keep)) {
+		mdm_stop(false);                                /* (held in reset again; a modem in mission mode stays) */
 	}
 	say("mdm: steps 1..%u %s\n", mdm_step, ok ? "done" : "STOPPED (see above)");
 	thread_terminate(current_thread());
@@ -465,9 +1014,10 @@ alioth_mdm_init(void)
 	if (!PE_parse_boot_argn("mdm_step", &mdm_step, sizeof(mdm_step)) || mdm_step == 0) {
 		return;
 	}
-	if (mdm_step > 3) {
-		mdm_step = 3;
+	if (mdm_step > 5) {
+		mdm_step = 5;
 	}
+	PE_parse_boot_argn("mdm_keep", &mdm_keep, sizeof(mdm_keep));
 	if (kernel_thread_start(mdm_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

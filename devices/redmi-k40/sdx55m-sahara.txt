@@ -1,0 +1,25 @@
+# The SDX55's images for bsd/dev/alioth_mdm.c (steps 4 and 5), as fw/sdx55m/sahara.txt of the system image; the
+# files beside it in fw/sdx55m/ (from ~/hk/fw-modem: sdx55m/ and parts/, which stay out of every shared image).
+# "bhi FILE": what the modem's boot ROM is given through BHI. "ID FILE": what its SBL may ask for over Sahara,
+# from Android's /vendor/lib64/libmdmimgload.so, table for SDX55M (work/research/gps-sdx55.md).
+bhi sbl1.mbn
+21 sbl1.mbn
+37 multi_image.mbn
+# (Android's table says xbl_config.elf; the phone has the file as xbl_cfg.elf)
+38 xbl_cfg.elf
+36 multi_image_qti.mbn
+41 devcfg.mbn
+25 tz.mbn
+23 aop.mbn
+8 qdsp6sw.mbn
+6 apps.mbn
+# the modem's file systems and its DDR training: copies of the partitions, never written back
+16 mdm1m9kefs1.img
+17 mdm1m9kefs2.img
+20 mdm1m9kefs3.img
+29 acdb.mbn
+34 mdmddr.img
+# (the other SDX55 table has the partition msadp here: msadp.img)
+40 apdp.mbn
+33 hyp.mbn
+42 sec.elf

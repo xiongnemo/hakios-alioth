@@ -58,7 +58,7 @@ def userland():
     copy_overlay(DEVICE / 'overlays/userland', sandbox / 'userland')
     for name in ('xnu-env.sh', 'xnu-deps', 'tools', 'prebuilt', 'sysimage', 'devices', 'wifi',
                  'fw-gpu', 'fw-audio', 'fw-haptic', 'fw-wifi', 'fw-bluetooth', 'fw-camera', 'fw-sensors',
-                 'apps'):
+                 'fw-modem', 'apps'):
         path = sandbox / name
         if not path.exists() and not path.is_symlink():
             path.symlink_to(ROOT / name, target_is_directory=(ROOT / name).is_dir())
