@@ -4075,15 +4075,23 @@ fb_command(char *cmd)
 				return;
 			}
 			staged_data = (const char *)(uintptr_t)SCREEN.base;
+			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
 #ifdef LOADER_ALIOTH
 			{
-				/* the kernel flips VIG0 (0xae05014) between buffers in the display's reserved memory */
-				uint64_t scanned = *(volatile uint32_t *)(uintptr_t)0x0ae05014ULL;
-				if (scanned >= 0x9C000000ULL && scanned + (uint64_t)SCREEN.stride * SCREEN.height <= 0x9E300000ULL)
+				/*
+				 * The kernel flips VIG0 (0xae05014) between buffers in the display's reserved memory. iOS's
+				 * surfaces there are 1125 x 2436 with rows of up to 1152 pixels: 11.2 MB, more than the panel's
+				 * 1080 x 2400, so the panel-sized copy lost their last 186 rows (2026-10-31). All of it, then,
+				 * where it fits; tools/k40.py keeps the rows beyond the panel's, tools/fixshot.py cuts them again.
+				 */
+				uint64_t scanned = *(volatile uint32_t *)(uintptr_t)0x0ae05014ULL, surface = 4608ULL * 2436;
+				if (scanned >= 0x9C000000ULL && scanned + staged_len <= 0x9E300000ULL) {
 					staged_data = (const char *)(uintptr_t)scanned;
+					if (scanned != SCREEN.base && surface > staged_len && scanned + surface <= 0x9E300000ULL)
+						staged_len = surface;
+				}
 			}
 #endif
-			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem recording")) {
 			/* stage what the kernel's display driver recorded (boot-arg rec_secs) */
