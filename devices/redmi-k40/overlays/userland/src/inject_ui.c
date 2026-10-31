@@ -802,7 +802,10 @@ start_feed(id self, int kind, id queue, id handler)
 	struct mover *v = mover_of(self, kind);
 	double interval;
 
-	if (!make_motion_classes() || !make_heading_class()) {
+	/* (not make_heading_class(): that needs CoreLocation, which an application with CoreMotion alone never loads --
+	 * Motion Test got no feed at all because of it, 2026-10-31) */
+	if (!make_motion_classes()) {
+		say("motion: %s for %p NOT ANSWERED: CoreMotion's data classes could not be made\n", feed_name[kind], (void *)self);
 		return;
 	}
 	if (v == NULL && (v = mover_of(nil, kind)) == NULL) {
