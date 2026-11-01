@@ -365,12 +365,21 @@ io_trace(__unused void *cookie, enum dwc3_trace event, uint32_t a, uint32_t b)
 		                              "suspend", "start of frame", "?", "erratic error", "command complete", "event overflow",
 		                              "?", "?", "?", "?" };
 
+	static unsigned session_said, said_all;
+
 	switch (event) {
 	case DWC3_TRACE_DEVICE_EVENT:
 		say("usb: event: %s (DSTS %#x)\n", devt[a & 15], b);
+		if ((a & 15) == 1) {
+			session_said = 0;       /* (a bus reset: the next session's first requests are said too) */
+		}
+		break;
+	case DWC3_TRACE_STUCK:
+		say("usb: the computer reset the port %u times %s: the device side from scratch\n", a,
+		    (b & 0x100) ? "without ever configuring it" : "and got no request through");
 		break;
 	case DWC3_TRACE_SETUP:
-		if (setups_said++ < 24) {
+		if (setups_said++ < 24 || (session_said++ < 6 && said_all++ < 300)) {
 			say("usb: request %02x %02x value %#x index %#x length %u\n", a >> 24, (a >> 16) & 0xff, a & 0xffff, b >> 16, b & 0xffff);
 		}
 		break;
@@ -499,17 +508,35 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 		    USB_VID, USB_PID, usb_name, usb_dma_pa);
 	}
 	log_at = loader_log_tee_total > LOG_BACKLOG ? loader_log_tee_total - LOG_BACKLOG : 0;
+	/*
+	 * Boot-arg usb_bounce=SECS (a test, usb_bounce_every=SECS, three times): the port leaves and comes back at that
+	 * many seconds of uptime, as the computer sees a cable pulled and put back -- for what happens above the port
+	 * then (the usbmux's new session) to be tried with nobody at the cable.
+	 */
+	uint32_t bounce_at = 0, bounce_every = 60, bounces = 0;
+	PE_parse_boot_argn("usb_bounce", &bounce_at, sizeof(bounce_at));
+	PE_parse_boot_argn("usb_bounce_every", &bounce_every, sizeof(bounce_every));
 	while (!usb_stopping) {
-		bool readable = false, writable, restarted = false;
+		bool readable = false, writable, restarted = false, bounce = false;
 		uint8_t buf[2048];
 		size_t n;
 
+		if (bounce_at != 0 && bounces < 3) {
+			uint64_t ns;
+
+			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+			if (ns / NSEC_PER_SEC >= bounce_at + (uint64_t)bounces * bounce_every) {
+				bounces++;
+				bounce = true;
+				say("usb: test (usb_bounce): the port leaves and comes back (%u of 3)\n", bounces);
+			}
+		}
 		lck_mtx_lock(&usb_lock);
 		if (usb_stopping) {
 			lck_mtx_unlock(&usb_lock);
 			break;
 		}
-		r = dwc3_poll(usb_dev, 64);
+		r = bounce ? -10 : dwc3_poll(usb_dev, 64);
 		if (r < 0) {
 			restarted = true;
 			/*
@@ -560,7 +587,12 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 			log_at = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
 		}
 		writable = level == 3 ? dwc3_packet_room(usb_dev, DWC3_PACKET_MAX) : dwc3_queued(usb_dev) < DWC3_TX_BYTES / 2;
-		lck_mtx_unlock(&usb_lock);
+		/*
+		 * Under the lock that usbdev_select() records the waiters under: selwakeup() of this XNU also tears the
+		 * select queue down (waitq_deinit), and one that ran while the usbmux was in selrecord() met a link half
+		 * made -- "waitq.c:1771 Assertion failed: waitq_sellinks.next == NULL", a panic the moment the cable was
+		 * pulled, when the usbmux selects most often (2026-11-01 16:12).
+		 */
 		if (readable) {
 			wakeup(rx_ring);
 			selwakeup(&usb_rsel);
@@ -569,6 +601,7 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 			wakeup(&usb_wchan);
 			selwakeup(&usb_wsel);
 		}
+		lck_mtx_unlock(&usb_lock);
 		delay(POLL_US);
 	}
 	thread_terminate(current_thread());
@@ -649,10 +682,15 @@ usbdev_write_packet(struct uio *uio, int ioflag)
 	user_ssize_t n = uio_resid(uio);
 	int error;
 
+	uint32_t session;
+
 	if (n <= 0 || n > (user_ssize_t)DWC3_PACKET_MAX) {
 		return EMSGSIZE;
 	}
 	lck_mtx_lock(&usb_write_lock);
+	lck_mtx_lock(&usb_lock);
+	session = usb_generation;
+	lck_mtx_unlock(&usb_lock);
 	error = uiomove((caddr_t)packet, (int)n, uio);
 	while (error == 0) {
 		bool sent;
@@ -661,6 +699,16 @@ usbdev_write_packet(struct uio *uio, int ioflag)
 		if (!usb_owned || usb_stopping) {
 			lck_mtx_unlock(&usb_lock);
 			error = EIO;
+			break;
+		}
+		/*
+		 * A packet of a session that ended while it waited for room (the cable pulled with the queue full) is not
+		 * sent into the next: it went out first there, half a TCP segment of the old session where the computer's
+		 * usbmuxd waited for the answer to its version packet. The program learns of the new session from this.
+		 */
+		if (usb_generation != session) {
+			lck_mtx_unlock(&usb_lock);
+			error = ENETRESET;
 			break;
 		}
 		sent = dwc3_send_packet(usb_dev, packet, (size_t)n) == 0;
@@ -766,7 +814,7 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 		if (level != 3 || mux_pid != proc_selfpid()) {
 			return level != 3 ? ENOTSUP : EPERM;
 		}
-		if (said++ < 8) {
+		if (said++ < 40) {
 			say("usb: the mux says the computer's usbmux has %s\n", *(const int *)(const void *)data ? "come" : "gone");
 		}
 		hakios_usbmux_host(*(const int *)(const void *)data != 0);

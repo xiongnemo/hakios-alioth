@@ -40,7 +40,8 @@ enum dwc3_trace {
     DWC3_TRACE_SETUP,
     DWC3_TRACE_UNSUPPORTED,
     DWC3_TRACE_BAD_EVENT,
-    DWC3_TRACE_READY
+    DWC3_TRACE_READY,
+    DWC3_TRACE_STUCK       /* hakios: bus resets with no request between them: the device side from scratch */
 };
 
 struct dwc3_platform {

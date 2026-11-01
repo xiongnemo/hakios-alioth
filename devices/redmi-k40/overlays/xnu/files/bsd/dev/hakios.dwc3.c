@@ -44,6 +44,9 @@ struct dwc3 {
     uint64_t dropped;
     uint8_t device_descriptor[18], manufacturer[130], product[130], serial[130];
     uint8_t mux;                /* hakios: the iPhone's usbmux interface, packets (see dwc3_identity) */
+    /* hakios: requests since the last CONNECTDONE, and bus resets in a row that came with none (device_event()) */
+    uint32_t setups_since_conn, empty_sessions, unconfigured_resets;
+    uint8_t conn_seen;
     uint8_t qualifier[10];
 };
 
@@ -311,6 +314,7 @@ static int setup_request(struct dwc3 *d)
     uint16_t value = le16(s + 2), index = le16(s + 4), length = le16(s + 6);
     size_t n = 0;
     int ok = 0;
+    d->setups_since_conn++;
     trace(d, DWC3_TRACE_SETUP, ((uint32_t)s[0] << 24) | ((uint32_t)s[1] << 16) | value,
           ((uint32_t)index << 16) | length);
     d->control_three_stage = length != 0;
@@ -452,6 +456,34 @@ static int device_event(struct dwc3 *d, unsigned event)
 {
     unsigned i, speed;
     trace(d, DWC3_TRACE_DEVICE_EVENT, event, rd(d, DWC3_DSTS));
+    /*
+     * hakios: the cable pulled and put back. With VBUS overridden to valid (the phone has no OTG block telling the
+     * controller), the device side never sees the cable go, and after it comes back EP0 answered nothing: the computer
+     * reset the port eight times without a single request getting through, then called it an unknown device
+     * ("Device Descriptor Request Failed", 2026-11-01). A bus reset after a connection that saw no request, three
+     * times in a row -- which a computer enumerating never does -- has the device side started again from scratch
+     * (-9: hakios.usb.c stops and brings it up, the computer sees it leave and come back), as Linux does when VBUS
+     * goes and comes.
+     */
+    if (event == DWC3_DEVT_USBRST && d->conn_seen) {
+        if (d->setups_since_conn != 0) {
+            d->empty_sessions = 0;
+        } else if (++d->empty_sessions >= 3) {
+            trace(d, DWC3_TRACE_STUCK, d->empty_sessions, d->control_state);
+            d->empty_sessions = 0;
+            return -9;
+        }
+        /* ... and four in a row that never got as far as a configuration: after a restart the computer once read a
+         * device descriptor that said no configuration (it asked for configuration 255) and reset the port over and
+         * over; the next restart from scratch enumerated at once. A computer enumerating resets twice at most. */
+        if (d->configured) {
+            d->unconfigured_resets = 0;
+        } else if (++d->unconfigured_resets >= 4) {
+            trace(d, DWC3_TRACE_STUCK, d->unconfigured_resets, 0x100u | d->control_state);
+            d->unconfigured_resets = 0;
+            return -9;
+        }
+    }
     if (event == DWC3_DEVT_USBRST || event == DWC3_DEVT_DISCONN) {
         d->configured = d->dtr = d->zlp_pending = 0;
         rx_reset(d);
@@ -482,6 +514,8 @@ static int device_event(struct dwc3 *d, unsigned event)
             speed != DWC3_DSTS_FULLSPEED2) return -6;
         d->full_speed = speed != DWC3_DSTS_HIGHSPEED;
         d->packet_size = d->full_speed ? 64 : 512;
+        d->conn_seen = 1;
+        d->setups_since_conn = 0;
         if (configure_ep(d, 0, DWC3_DEPCMD_TYPE_CONTROL, 64, 1) ||
             configure_ep(d, 1, DWC3_DEPCMD_TYPE_CONTROL, 64, 1) ||
             configure_ep(d, EP_IN, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 1) ||
