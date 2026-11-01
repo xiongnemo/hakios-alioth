@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Siri off, as Settings > Siri & Search leaves it when it is turned off (the phone's owner, 2026-11-01): Siri wants
+     Apple's servers and an activated phone, and its interface is SpringBoard's own (SiriUI), so leaving Siri.app out of
+     the system image did not stop a long press of the side button from bringing it up. With this the long press does
+     nothing, as on an iPhone with Siri off. -->
+<plist version="1.0">
+<dict>
+	<key>Assistant Enabled</key>
+	<false/>
+</dict>
+</plist>
