@@ -23,3 +23,4 @@ MobileStore.app     iTunes Store: not wanted
 Passbook.app        Wallet: no NFC, no Apple Pay
 MobilePhone.app     Phone: no cellular network (InCallService, the call screen, stays)
 Siri.app            Siri: Apple's servers and an activated phone; the side button's long press is to be checked without it
+Contacts.app        Contacts: not wanted (its data stays reachable to apps through the address book framework)
