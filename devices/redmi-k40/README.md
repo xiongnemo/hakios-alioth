@@ -1,94 +1,63 @@
-# Xiaomi Mi 10 (UMI, Snapdragon 865)
+# Redmi K40 / POCO F3 (alioth, Snapdragon 870)
 
-This device port follows unified upstream `88513176b1e96ecf0b764cd62c6f4e6ac71345e3`.
-The previous UMI kernel and userland history is retained by the integration merge.
+The device package for the Redmi K40 / POCO F3. What runs, with screenshots: the [top README](../../README.md). How
+each part works and what was measured: [docs/alioth/status.md](../../docs/alioth/status.md).
 
-## Source isolation
+## Layout
 
-All UMI implementations live here. Shared upstream sources in `xnu/files/`,
-`userland/src/`, `wifi/lx/`, the shared loader, and `xnu/hakios.patch` remain
-unchanged. `upstream-templates.sha256` records their contents;
-`python3 devices/redmi-k40/prepare.py verify` checks that invariant.
+| Path | What |
+|---|---|
+| `overlays/xnu/files/` | This phone's kernel drivers: display (`bsd/dev/alioth_dsi.c`), GPU (`bsd/dev/hakios.adreno.c`, `iokit/Kernel/hakios.gpu.cpp`), USB (`hakios.dwc3.c`, `hakios.usb.c`), cameras, sensors, audio, modem and the rest. `xnu-device.patch` adds them to the build and to the kernel's start, after upstream's patch. |
+| `overlays/userland/` | This phone's user space: `build.sh` (the root disk and the system image), `src/` (OpenGL ES on Mesa in `eagl.c`, the libraries injected into SpringBoard, backboardd and apps, `usbmux.c`, `usbsh.c`, `ipainstall.m`, ...), launchd jobs. |
+| `overlays/wifi/` | The Wi-Fi driver's layer for this phone. |
+| `loader/` | The boot loader (an EFI application): fastboot over USB, the system image and the payload into RAM, the kernel started on the other cores. |
+| `prebuilt/` | The UEFI stage (Project Silicium), its boot shim, the device tree. |
+| `boot.args` | The kernel arguments verified together on the phone. |
+| `system-apps-removed.txt` | Stock apps left out of the system image, with why. |
+| `prepare.py`, `upstream-templates.sha256` | Keep upstream's shared sources unchanged: everything of this phone is an overlay (`prepare.py verify`). |
 
-`overlays/xnu/files/` contains the UMI-specific driver variants and helpers.
-`xnu-device.patch` adds their build entries and startup calls to the generated
-Apple source tree; it is applied after upstream's patch. It also retains the
-32 MiB peripheral mapping window required by the working UMI port.
+## Building (Linux or WSL)
 
-`overlays/wifi/` selects QCA6390 PCIe/MHI and retains UMI authentication fixes.
-`overlays/userland/` holds UMI firmware packaging, Bluetooth startup, and its
-controller compatibility library. The build scripts stage these into private
-copies under `out/redmi-k40/`; they do not replace upstream templates.
-
-The loader and UEFI source port are likewise device-local (`loader/`, `uefi/`).
-The supplied device tree is `prebuilt/device-tree.dtb`. Firmware, generated Apple
-identity headers, build output, captures, and credentials remain outside git.
-
-## Building
-
-Set `THEOS` to a toolchain directory containing `sdks/iPhoneOS16.5.sdk`; prepare
-XNU's dependencies with upstream `xnu-deps/setup.sh` when needed. Keep your own
-extracted iOS files in `sysimage/`, and the phone's firmware in the ignored
-`fw-gpu/`, `fw-audio/`, `fw-haptic/`, `fw-wifi/`, and `fw-bluetooth/` directories.
-UMI Bluetooth needs `htbtfw20.tlv` and `htnv20.bin`; its firmware is embedded only
-in the generated kernel tree. No vendor firmware is committed here.
+You need theos with `sdks/iPhoneOS16.5.sdk` (`THEOS`), XNU's dependencies (`xnu-deps/setup.sh`), clang and lld,
+Python 3; your own iOS 16.5 files in `sysimage/` (`sysimage/fetch.sh` downloads the IPSW from Apple's servers); and
+this phone's firmware, pulled from its own Android, in the ignored `fw-*/` directories (GPU, audio, Wi-Fi, Bluetooth,
+cameras, sensors). `fw-wifi/network` names the network iOS joins (its name on the first line, the passphrase on the
+second); `fw-usb/serial` may give your phone's serial, which the loader then shows over USB.
 
 ```sh
 devices/redmi-k40/build-wifi.sh
 devices/redmi-k40/build-kernel.sh -j8 -k
 devices/redmi-k40/build-loader.sh
 devices/redmi-k40/build-userland.sh
+# the boot image: shim + UEFI + loader + device tree
+python3 xnuloader/mkpayload.py -o out/redmi-k40/usb-payload.bin loader.efi=out/redmi-k40/loader.efi --usb
+UEFI_TARGET=alioth FD_BASE=0x9FC00000 FD_SIZE=0x300000 PAYLOAD_BASE=0xF0000000 \
+  UEFI_FD=devices/redmi-k40/prebuilt/SILICIUM_UEFI.fd DTB=devices/redmi-k40/prebuilt/device-tree.dtb \
+  SHIM=devices/redmi-k40/prebuilt/BootShim.bin \
+  python3 devices/redmi-k40/tools/mkimage.py -p out/redmi-k40/usb-payload.bin -o out/redmi-k40/alioth-xnu.img
+# the run payload: kernel, root disk, arguments
+python3 xnuloader/mkpayload.py -o out/redmi-k40/run-payload.bin \
+  kernel=out/redmi-k40/xnu/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837 \
+  ramdisk=out/redmi-k40/userland-build/userland/root.apfs --cmdline "$(cat devices/redmi-k40/boot.args)"
 ```
 
-The kernel is `out/redmi-k40/xnu/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837`.
-The images and loader are `out/redmi-k40/{root.apfs,system.apfs,loader.efi}`.
-Build or supply a UMI UEFI image implementing the existing XNUP hook:
-`UEFI_FD=/path/to/SILICIUM_UEFI.fd`, with the device-local UEFI source in `uefi/`.
-The UMI FD is 3 MiB at `0x9fc00000`; packaging rejects another model's DTB.
+The system image is `out/redmi-k40/userland-build/userland/system.apfs` (2.4 GB).
 
-## RAM boot
+## Running (RAM only)
+
+With the phone in its bootloader (`adb reboot bootloader`):
 
 ```sh
-devices/redmi-k40/run.sh reload
-devices/redmi-k40/run.sh ramdisk
-XL_SECS=1800 devices/redmi-k40/run.sh run
+fastboot boot out/redmi-k40/alioth-xnu.img     # our loader, into RAM
+fastboot oem ramdisk
+fastboot stage out/redmi-k40/userland-build/userland/system.apfs    # about 97 s
+fastboot stage out/redmi-k40/run-payload.bin
+fastboot oem run
 ```
 
-`run.sh` uses a generated, device-selected copy of upstream `xl`. It shares the
-phone lock with the earlier UMI workspace and refuses to fall back to a POCO
-kernel or loader. Nothing is flashed. The default arguments are in `boot.args`;
-they keep touch, keys, haptics, audio, GPU, scan synchronization, Wi-Fi, Bluetooth,
-and all eight cores. Stock maximum GPU frequency remains 587 MHz.
-
-For live USB logs, use `bootcpu=7 cpus=7` instead of the eight-core pair in
-`boot.args`. `XL_FOLLOW=5 XL_FOLLOW_KEEP=1` retains timing snapshots. `thermal=2`
-is an optional comparison mode: CPU caps are not applied, while sensors,
-pressure reporting and the emergency shutdown stay active. It is not a default.
-
-The upstream compositor currently uses OpenGL ES through Mesa. This update
-follows upstream's unfinished Metal status; it does not claim a Metal compositor.
-The UMI display variant retains the validated staging/cache fixes and releases
-source ownership after staging so rendering can overlap panel presentation.
-
-The physical panel buffer and the CPU staging buffer each hold a complete
-1080 x 2340 frame (10,108,800 bytes with the bootloader's stride). Increasing
-their dimensions adds memory traffic. Command-mode copies instead use the full
-measured DMA idle interval, subject to the copy duration plus a safety margin,
-rather than accepting frames only in its first 128 lines (about 0.9 ms).
-The DMA completion is checked between two phase reads to reject refresh wraps.
-The wait sleeps through the known active scan interval and polls only near the
-idle boundary, rather than spinning a CPU core throughout the wait.
-
-## Validation
-
-The kernel, Wi-Fi object, Mesa, userland images and UMI loader build. The actual
-scan-reader register-model test passes (`python3 devices/redmi-k40/tools/test-display.py`).
-The template checksum test passes. The Android RAM-boot package builds with the
-supplied UMI device tree and UMI UEFI layout. The updated kernel and matching
-iOS images booted on UMI; touch initialized, the GPU rendered apps at its
-587 MHz setting, and the audio DSP and Wi-Fi interface initialized. The user
-confirmed that the build works, while scrolling skips/freezes remain. This
-source migration does not claim to resolve that remaining performance issue.
+While a run lasts, the loader still answers on its own core: `fastboot getvar result` (has it ended), `fastboot oem log`
+then `fastboot get_staged FILE` (the kernel's log), `fastboot oem screenshot` then `get_staged` (the screen),
+`fastboot oem stop` (end it). `fastboot reboot` goes back to Android. Nothing is ever written to the phone's storage.
 
 ## Microphone
 
@@ -136,8 +105,7 @@ own tuning.
 Brightness: `AppleARMBacklight` in `MiniIOMobileFramebuffer.cpp` takes CoreBrightness's level (0..2047) to
 the panel's DBV by DCS 0x51 (`alioth_dsi.c`), squared (`panel_bl_curve=1`: linear), starting at half of
 iOS's scale (a quarter of the panel's light; `panel_bl_init=N`) since the data volume is new at every boot.
-Verified: Control Center's slider changes the panel's brightness. There is no automatic brightness: the
-ambient light sensor is the sensor DSP's (SLPI), which is not running.
+Verified: Control Center's slider changes the panel's brightness. Automatic brightness: the ambient light sensor on the sensor DSP (`slpi=1`) feeds CoreBrightness.
 
 ## Default arguments (Redmi K40)
 

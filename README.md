@@ -5,7 +5,9 @@ English · [中文](README.zh.md)
 The stock iOS 16.5 (20F66) user space on the Redmi K40 / POCO F3 (`alioth`, Snapdragon 870), running on the
 open-source XNU kernel with our own boot loader and drivers. It is a port of [HakiOS](https://github.com/oosexgang/hakios-os)
 to this phone, built on the Mi 10 port of the same SoC family
-([hackios-xnu-kernel-umi](https://github.com/JopangJovan/hackios-xnu-kernel-umi)).
+([hackios-xnu-kernel-umi](https://github.com/JopangJovan/hackios-xnu-kernel-umi)). HakiOS's own README, for the
+project as a whole and its other phones, is [README.hakios.md](README.hakios.md); this phone's code is in
+[devices/redmi-k40/](devices/redmi-k40/).
 
 **Nothing is flashed.** The loader goes into RAM through `fastboot boot`, iOS runs from RAM for one session, and a
 reboot brings the phone back to its own Android with its data untouched. iOS sees the phone as an iPhone X

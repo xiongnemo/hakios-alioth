@@ -5,6 +5,8 @@
 在 Redmi K40 / POCO F3（`alioth`，骁龙 870）上运行原版 iOS 16.5（20F66）用户空间，底层是开源的 XNU 内核，
 配上我们自己的引导程序和驱动。这是 [HakiOS](https://github.com/oosexgang/hakios-os) 在这台手机上的移植，
 以同一 SoC 家族的小米 10 移植（[hackios-xnu-kernel-umi](https://github.com/JopangJovan/hackios-xnu-kernel-umi)）为基础。
+HakiOS 自己的 README（整个项目和它支持的其他手机）在 [README.hakios.zh.md](README.hakios.zh.md)；这台手机的代码在
+[devices/redmi-k40/](devices/redmi-k40/)。
 
 **不刷写任何东西。** 引导程序通过 `fastboot boot` 进入内存，iOS 在内存里运行一个会话，重启后手机回到它自己的
 Android，数据原封不动。iOS 把这台手机当作 iPhone X（`iPhone10,3`）。
