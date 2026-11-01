@@ -1,0 +1,85 @@
+# The Redmi K40 / POCO F3 kit (devices/redmi-k40/kit/build-kit.sh): the kernel with this phone's drivers and our
+# programs for iOS, built from this repository alone, with the scripts that assemble the bootable package on the
+# user's own computer (assemble.bat / assemble.sh). A tag kit-v<version> publishes it on the Releases page; started
+# by hand (Actions > kit > Run workflow) it is kept as the run's artifact.
+#
+# The IPSW is fetched from Apple's public servers only to link our programs against; nothing of it, and no firmware,
+# goes into the kit.
+name: kit
+on:
+  workflow_dispatch:
+  push:
+    tags: ['kit-v*']
+permissions:
+  contents: write
+jobs:
+  kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Room on the disk (the IPSW's files, the kernel's tree)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force > /dev/null || true
+          df -h /
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential clang lld llvm flex bison m4 perl python3 python3-venv autoconf \
+            automake libtool gawk git curl xz-utils lz4 meson ninja-build zip unzip cpio bc pkg-config > /dev/null
+          # (XNU's build wants GNU awk: mawk breaks its system call table)
+          sudo update-alternatives --set awk /usr/bin/gawk
+          # 7-Zip 23 or newer reads APFS
+          curl -fsSL https://www.7-zip.org/a/7z2409-linux-x64.tar.xz | sudo tar -xJ -C /usr/local/bin 7zz
+          sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
+          7z | head -2
+      - name: theos (its Linux toolchain and the iOS 16.5 SDK)
+        run: |
+          T=$HOME/theos
+          mkdir -p $T/toolchain/linux/iphone $T/sdks /tmp/tc
+          curl -fsSL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain.tar.xz | tar -xJ -C /tmp/tc
+          bin=$(dirname "$(find /tmp/tc -type f -name clang -path '*/bin/*' | head -1)")
+          cp -a "$bin/.."/. $T/toolchain/linux/iphone/
+          git clone -q --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks $T/sdks-git
+          git -C $T/sdks-git sparse-checkout set iPhoneOS16.5.sdk
+          ln -s ../sdks-git/iPhoneOS16.5.sdk $T/sdks/iPhoneOS16.5.sdk
+          echo "THEOS=$T" >> "$GITHUB_ENV"
+          $T/toolchain/linux/iphone/bin/clang --version | head -1
+      - name: The IPSW's files, to link against
+        run: |
+          # (the kernel tree's dependencies first: fetch.sh builds its LZBITMAP helper with them)
+          cd sysimage && bash fetch.sh
+          df -h /
+      - name: The kit
+        run: |
+          v=${GITHUB_REF_NAME#kit-v}
+          [ "$GITHUB_REF_TYPE" = tag ] || v=$(git describe --tags --always)
+          bash devices/redmi-k40/kit/build-kit.sh "$RUNNER_TEMP/kit" "$v"
+          echo "KIT_ZIP=$(ls $RUNNER_TEMP/kit/alioth-kit-*.zip)" >> "$GITHUB_ENV"
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: ${{ runner.temp }}/kit*.log
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alioth-kit
+          path: ${{ env.KIT_ZIP }}
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/kit-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=${GITHUB_REF_NAME#kit-v}
+          cat > notes.md <<'EOF'
+          The kernel with the Redmi K40 / POCO F3's drivers and our programs for iOS 16.5, built from this repository
+          alone: half of a bootable package. Unpack it and run `assemble.bat` (Windows, with WSL) or `assemble.sh`
+          (Linux) with the phone connected in Android: it downloads the IPSW from Apple's servers, copies the firmware
+          from your phone (root needed), asks for your Wi-Fi and writes the package, `ios-alioth-k40/` with
+          `start.bat`. See the README's "Getting a package you can boot" and the kit's README.md.
+          EOF
+          gh release create "$GITHUB_REF_NAME" "$KIT_ZIP" --title "alioth kit $v" --notes-file notes.md

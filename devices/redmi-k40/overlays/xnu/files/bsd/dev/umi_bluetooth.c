@@ -15,6 +15,36 @@
 #include <sys/errno.h>
 #include <sys/hakios.bluetooth.h>
 #include "umi_bt_firmware.inc"
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+/*
+ * The controller's patch and NVM: in the kernel when its build had them (fw-bluetooth/, tools/embed-firmware.py),
+ * else read from the system image's /fw/qca6390-bt, where build.sh puts the phone's own (hakios.image.c), as the GPU's
+ * firmware is. A kernel built from the repository alone -- the published kit -- carries none of the vendor's files.
+ */
+static const uint8_t *bt_patch, *bt_nvm;
+static size_t bt_patch_size, bt_nvm_size;
+
+static void
+bt_firmware(void)
+{
+    uint64_t size = 0;
+    const char *from = "in the kernel";
+
+    bt_patch = umi_bt_patch;
+    bt_patch_size = umi_bt_patch_size;
+    bt_nvm = umi_bt_nvm;
+    bt_nvm_size = umi_bt_nvm_size;
+    if (bt_patch_size == 0 || bt_nvm_size == 0) {
+        from = "from the system image's /fw/qca6390-bt";
+        bt_patch = hakios_image_file("fw", "qca6390-bt/htbtfw20.tlv", &size, NULL);
+        bt_patch_size = bt_patch != NULL ? (size_t)size : 0;
+        size = 0;
+        bt_nvm = hakios_image_file("fw", "qca6390-bt/htnv20.bin", &size, NULL);
+        bt_nvm_size = bt_nvm != NULL ? (size_t)size : 0;
+    }
+    hakios_tl("UMI BT: firmware %s: patch %lu bytes, NVM %lu bytes\n", from, (unsigned long)bt_patch_size,
+        (unsigned long)bt_nvm_size);
+}
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern bool umi_wifi_is_board(void);
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
@@ -276,12 +306,13 @@ static int bt_qca_firmware(vm_offset_t uart)
     hakios_tl("UMI BT: QCA product=%#x ROM=%#x SoC=%#x patch=%#x\n",
         product, rom, soc, bt_le16(event + 13));
     if (product != 0x10 || rom != 0x200 || soc != 0x400a0200) return ENODEV;
-    if (umi_bt_patch_size < 28 || umi_bt_nvm_size < 4) return ENOENT;
-    if (bt_le16(umi_bt_patch + 16) != product || bt_le16(umi_bt_patch + 18) != rom)
+    bt_firmware();
+    if (bt_patch == NULL || bt_nvm == NULL || bt_patch_size < 28 || bt_nvm_size < 4) return ENOENT;
+    if (bt_le16(bt_patch + 16) != product || bt_le16(bt_patch + 18) != rom)
         return EINVAL;
-    unsigned mode = umi_bt_patch[14];
+    unsigned mode = bt_patch[14];
     if (mode != 0 && mode != 3) return EINVAL;
-    if (umi_bt_nvm_size > sizeof(bt_nvm_work)) return E2BIG;
+    if (bt_nvm_size > sizeof(bt_nvm_work)) return E2BIG;
     uint8_t baud_index = 0;
     if (bt_baud == 921600) {
         const uint8_t index = 10;       /* QCA_BAUDRATE_921600 */
@@ -309,13 +340,13 @@ static int bt_qca_firmware(vm_offset_t uart)
         hakios_tl("UMI BT: the UART at 921600 baud: the controller answers at it\n");
         baud_index = 10;
     }
-    memcpy(bt_nvm_work, umi_bt_nvm, umi_bt_nvm_size);
-    if (hakios_bt_qca6390_nvm_prepare(bt_nvm_work, umi_bt_nvm_size, baud_index)) return EINVAL;
+    memcpy(bt_nvm_work, bt_nvm, bt_nvm_size);
+    if (hakios_bt_qca6390_nvm_prepare(bt_nvm_work, bt_nvm_size, baud_index)) return EINVAL;
     hakios_tl("UMI BT: loading htbtfw20/htnv20 at %u baud (Hastings tag17 byte1 %u)\n", bt_baud, baud_index);
-    error = bt_qca_download(uart, umi_bt_patch, umi_bt_patch_size, mode == 3);
+    error = bt_qca_download(uart, bt_patch, bt_patch_size, mode == 3);
     if (error) return error;
     delay(10000);
-    error = bt_qca_download(uart, bt_nvm_work, umi_bt_nvm_size, false);
+    error = bt_qca_download(uart, bt_nvm_work, bt_nvm_size, false);
     if (error) return error;
     /* QCA6390's normal Linux sequence disables diagnostic logging before reset. */
     const uint8_t logging[] = {0x14, 0};

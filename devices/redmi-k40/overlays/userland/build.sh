@@ -75,6 +75,10 @@
 #   PREBUILT=1       do not compile anything: take our programs from ../prebuilt/userland (this is also
 #                    what happens when the cross toolchain is not set up, see ../xnu-deps/setup.sh);
 #                    the images are then made of them and of the iOS files alone (python3)
+#                      PREBUILT_DIR=<dir>  take them from there instead (the published kit's userland/:
+#                                          devices/redmi-k40/kit/assemble.sh)
+#   COMPILE_ONLY=1   compile the programs into obj/ and stop: no image, no firmware (the kit's build in GitHub
+#                    Actions, devices/redmi-k40/kit/build-kit.sh)
 #   CHECK=1          check every image (every container) as it is made: apfsck has to find it clean and
 #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
 #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
@@ -160,8 +164,8 @@ mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
 if [ -n "$PREBUILT" ]; then
-	echo "build.sh: not compiling, using the programs in prebuilt/userland"
-	for f in ../prebuilt/userland/*; do
+	echo "build.sh: not compiling, using the programs in ${PREBUILT_DIR:-prebuilt/userland}"
+	for f in ${PREBUILT_DIR:-../prebuilt/userland}/*; do
 		# keep a file that did not change (and its time stamp): system.apfs depends on stage0
 		cmp -s "$f" "obj/$(basename "$f")" || cp "$f" obj/
 	done
@@ -321,6 +325,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# it, and it is copied in when it is there.
 			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		fi
+	fi
+	if [ -n "$COMPILE_ONLY" ]; then
+		cp hello obj/hello
+		echo "build.sh: COMPILE_ONLY: the programs are in obj/ ($(ls obj | wc -l) files); no image made"
+		exit 0
 	fi
 	# The GPU diagnostic is absent from some prebuilt program sets.
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
