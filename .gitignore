@@ -99,3 +99,5 @@ __pycache__/
 !/README.hakios.zh.md
 !/README.hakios.uk.md
 !/.github/
+# this phone's own device tree, dumped from its Android: its serial is in it
+/devices/redmi-k40/prebuilt/android-live.dtb
