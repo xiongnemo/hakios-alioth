@@ -28,7 +28,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential clang lld llvm flex bison m4 perl python3 python3-venv autoconf \
-            automake libtool gawk git curl xz-utils lz4 meson ninja-build zip unzip cpio bc pkg-config > /dev/null
+            automake libtool gawk git curl xz-utils lz4 meson ninja-build zip unzip cpio bc pkg-config python3-dev \
+            uuid-dev libbsd-dev libbz2-dev libcrypt-dev libexpat1-dev libffi-dev libfl-dev liblz4-dev libmd-dev \
+            libncurses-dev libplist-dev libssl-dev libxml2-dev libxxhash-dev zlib1g-dev > /dev/null
           # (XNU's build wants GNU awk: mawk breaks its system call table)
           sudo update-alternatives --set awk /usr/bin/gawk
           # 7-Zip 23 or newer reads APFS
