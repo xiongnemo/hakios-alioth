@@ -65,6 +65,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | GPU Check | 81 of 83 (the two left need Metal) |
 | GPU address spaces | 6 clients, 33 012 switches in 25 minutes, none refused, no SMMU fault; a present costs the same 0.2–0.5 ms as without |
 | System image | 2.4 GB, in RAM for the whole session |
+| Memory for iOS | 11 GB of a 12 GB phone (the whole free block from 0xc0000000; the rest is firmware's and the loader's); with the bundled apps installed iOS still has about 5.5 GB available, and the data volume (sized by memory) can grow to about 8 GB. 6 and 8 GB phones get their own largest block (not tried on one). |
 | Boot from the PC | about 3 minutes, most of it the system image over USB |
 
 ## Known problems
@@ -76,7 +77,6 @@ The one-click release does all of this from a PC script; development runs do it 
 | A GPU hang stops the screen | There is no hang detection or GPU reset yet. |
 | Warm with the screen off | The CPU slows down, but the display link and the GPU stay on; no GPU power management yet (fixed clock). |
 | USB after re-plugging | Fixed: a race in select() panicked the kernel at the unplug; the controller's EP0 stayed dead or answered wrongly after a replug (the controller is now restarted when the computer resets it in vain); the old session's data and a waiting write leaked into the new one. Tested with the port leaving and coming back by itself, three times a run (boot-arg usb_bounce); a hand-pulled cable is to be tried with this version. |
-| Safari cannot pick photos | The photo picker does not reach the library here; not investigated yet. |
 | A game asks for notifications at every boot | The answer is kept in the data volume, which is in RAM. |
 | AssistiveTouch's Home does nothing | Its button, menu and Control Center work; the Home action is not wired to anything here yet. |
 
