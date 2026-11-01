@@ -26,10 +26,17 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define KERNEL_VIRT_BASE    0xFFFFFFF004000000ULL /* boot_args.virtBase */
 #define KERNEL_LINK_OFFSET  0x03000000ULL         /* kernel text sits 48 MB above the base */
 #define BASE_ALIGN          0x02000000ULL         /* 32 MB: L2 block size with 16K pages */
-/* 8 GB: what the kernel's bootstrap page tables cover (more and it says "BOOTSTRAP_TABLE_SIZE too small for memory
- * config"). The K40 has 12 GB, one free block of 11 GB from 0xc0000000; upstream gave 6. A phone with less gets its
- * largest free block, as before. */
+/*
+ * The most the kernel is given: its largest free block of RAM in the firmware's map, up to this. The alioth comes
+ * with 6, 8 or 12 GB, and the firmware's map follows what the phone has (the RAM partitions XBL leaves in SMEM:
+ * Silicium's own table stops at 0x9fffffff). 8 GB verified on a 12 GB phone (2026-11-01 19:22, the window from
+ * 0xf4000000). 11 GB from 0xc0000000 (the payload moved away first, "oem stage away" + "oem memmax 11264") reset
+ * the phone about 90 s into the run (20:10, PS_HOLD, no log): to be told apart -- the low part or the size past 8 GB
+ * -- with someone at the phone. (Upstream's 6 GB was for 4 KB pages' bootstrap tables; with 16 KB pages one L2
+ * table maps 64 GB.)
+ */
 #define MAX_MEM_SIZE        0x200000000ULL
+static uint64_t mem_max = MAX_MEM_SIZE;     /* "oem memmax MB" lowers it for a session (before "oem ramdisk") */
 /*
  * A root image too big for the payload area is placed here, at a fixed
  * offset inside the kernel's memory window, once; it then survives any
@@ -43,8 +50,15 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define CHECKPOINT_SELFTEST 999
 #define PANIC_LOG_SIZE      0x80000u
 #define NVRAM_BANK_SIZE     0x2000u
-#define PANIC_LOG_BASE      (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x100000ULL)
+#define PANIC_LOG_BASE      (payload_at + PAYLOAD_MAX_SIZE - 0x100000ULL)
 #define PAYLOAD_MAX_SIZE    0x04000000ULL         /* RAM reserved for the payload in the UEFI memory map */
+/*
+ * Where payloads are read from and the host's downloads go: at first where the boot image put the loader's own
+ * payload (PAYLOAD_BASE), then -- taking commands over USB -- 64 MB the firmware gives below 0xc0000000
+ * (stage_away). On the K40 0xf0000000 lies in the one free block of 11 GB from 0xc0000000, which the kernel could
+ * only have from 0xf4000000 on while the payload stayed there.
+ */
+static uint64_t payload_at = PAYLOAD_BASE;
 
 /* ------------------------------------------------------------------------ */
 /* XNU structures (pexpert/pexpert/arm64/boot.h, mach-o/loader.h)           */
@@ -2670,15 +2684,33 @@ parse_number(const char *c, unsigned base)
 	return v;
 }
 
+/*
+ * "oem stage away" (not by default: see MAX_MEM_SIZE): the host's downloads go to 64 MB of the firmware's below
+ * 0xc0000000 (the highest it has there), with the panic log in its last MB, and PAYLOAD_BASE's place is free for the
+ * kernel's window. If the firmware has no such 64 MB, all stays at PAYLOAD_BASE.
+ */
+static void
+stage_away(void)
+{
+	uint64_t at = 0xc0000000ULL - 1;
+
+	if (EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, PAYLOAD_MAX_SIZE >> 12, &at))) {
+		SAY("stage: no %d MB below c0000000: downloads stay at %x\n", PAYLOAD_MAX_SIZE >> 20, payload_at);
+		return;
+	}
+	payload_at = at;
+	SAY("stage: downloads at %x (%d MB); %x is free for the kernel\n", payload_at, PAYLOAD_MAX_SIZE >> 20, PAYLOAD_BASE);
+}
+
 static int
 parse_payload(struct payload_info *pi, int verbose)
 {
-	struct payload_header *ph = (struct payload_header *)PAYLOAD_BASE;
+	struct payload_header *ph = (struct payload_header *)(uintptr_t)payload_at;
 
 	memset(pi, 0, sizeof(*pi));
 	pi->cmdline = "";
 	if (ph->magic != PAYLOAD_MAGIC) {
-		print("no payload at %x (magic %x)\n", PAYLOAD_BASE, (uint64_t)ph->magic);
+		print("no payload at %x (magic %x)\n", payload_at, (uint64_t)ph->magic);
 		return 0;
 	}
 	const uint8_t *p = (const uint8_t *)(ph + 1), *pend = p + ph->size;
@@ -3015,7 +3047,7 @@ choose_window(const struct payload_info *pi)
 	uint64_t map_size = sizeof(map_buf), map_key, desc_size;
 	uint32_t desc_ver;
 	uint64_t best_base = 0, best_size = 0;
-	uint64_t pay_lo = PAYLOAD_BASE, pay_hi = PAYLOAD_BASE + PAYLOAD_MAX_SIZE;
+	uint64_t pay_lo = payload_at, pay_hi = payload_at + PAYLOAD_MAX_SIZE;
 
 	if (win_size != 0) {
 		return 1;
@@ -3048,10 +3080,10 @@ choose_window(const struct payload_info *pi)
 	print("largest free block %x size %x\n", best_base, best_size);
 	if (pi->forced_base != 0) {
 		best_base = pi->forced_base;
-		best_size = MAX_MEM_SIZE;
+		best_size = mem_max;
 	}
-	if (best_size > MAX_MEM_SIZE) {
-		best_size = MAX_MEM_SIZE;
+	if (best_size > mem_max) {
+		best_size = mem_max;
 	}
 	/* UEFI stays alive while the kernel runs, so the kernel must own all of its window. */
 	uint64_t claim = best_base;
@@ -3141,7 +3173,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET, n = pi.resident_size;
 
 		/* the payload holding it must not lie where it goes (in QEMU both are ordinary RAM) */
-		if (res_pa < PAYLOAD_BASE + PAYLOAD_MAX_SIZE && PAYLOAD_BASE < res_pa + n) {
+		if (res_pa < payload_at + PAYLOAD_MAX_SIZE && payload_at < res_pa + n) {
 			print("the resident image's place overlaps the payload: not booted\n");
 			return 0;
 		}
@@ -4155,6 +4187,7 @@ fb_command(char *cmd)
 	}
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
+		    starts_with(cmd, "oem memmax") || starts_with(cmd, "oem stage") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
 		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
@@ -4184,6 +4217,37 @@ fb_command(char *cmd)
 			} else {
 				fb_reply("OKAY", "");
 			}
+		} else if (starts_with(cmd, "oem memmax")) {
+			/* "oem memmax MB": the most the kernel's window may be, for this session (tests; before "oem ramdisk") */
+			const char *a = cmd + 10;
+
+			while (*a == ' ') {
+				a++;
+			}
+			if (win_size != 0 || parse_number(a, 10) < 4096) {
+				fb_reply("FAIL", win_size != 0 ? "the window is chosen already" : "4096 MB at least");
+				return;
+			}
+			mem_max = parse_number(a, 10) << 20;
+			SAY("memory: the kernel's window %d MB at most\n", mem_max >> 20);
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem stage away")) {
+			/* downloads into 64 MB of the firmware's below 0xc0000000 (tests; before "oem ramdisk") */
+			if (win_size != 0) {
+				fb_reply("FAIL", "the window is chosen already");
+				return;
+			}
+			stage_away();
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem stage back")) {
+			/* downloads at PAYLOAD_BASE again, as before stage_away (tests; before "oem ramdisk") */
+			if (win_size != 0) {
+				fb_reply("FAIL", "the window is chosen already");
+				return;
+			}
+			payload_at = PAYLOAD_BASE;
+			SAY("stage: downloads at %x again\n", payload_at);
+			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem ramdisk")) {
 			/* "oem ramdisk": the next download is a root image for the resident area; "oem ramdisk none" drops it */
 			struct payload_info pi;
@@ -4207,7 +4271,7 @@ fb_command(char *cmd)
 		} else if (starts_with(cmd, "download:")) {
 			uint64_t total = parse_number(cmd + 9, 16), got = 0;
 			uint64_t limit = PAYLOAD_MAX_SIZE - 0x100000;
-			uint8_t *dest = (uint8_t *)PAYLOAD_BASE;
+			uint8_t *dest = (uint8_t *)(uintptr_t)payload_at;
 			int to_ramdisk = download_to_ramdisk;
 
 			download_to_ramdisk = 0;
