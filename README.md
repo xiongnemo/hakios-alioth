@@ -144,8 +144,8 @@ How each part works, what was measured and what comes next: [docs/alioth/status.
 
 ## Getting a package you can boot
 
-> The workflow and the assembly script described here are being set up. Until the first kit is on the Releases page,
-> the only way is to build everything from source.
+> The kits: [Releases](https://github.com/xiongnemo/hakios-alioth/releases) (`alioth-kit-<version>.zip`). Built by
+> [the kit workflow](.github/workflows/kit.yml) from a tag `kit-v<version>`.
 
 A bootable package has two halves, and only one of them can be published.
 

@@ -139,7 +139,7 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 
 ## 怎样得到能启动的包
 
-> 这里说的自动构建和组装脚本正在搭建。在 Releases 页面出现第一个套件之前，只能从源码自己构建全部内容。
+> 套件在 [Releases](https://github.com/xiongnemo/hakios-alioth/releases) 页面（`alioth-kit-<版本>.zip`），由 [kit 工作流](.github/workflows/kit.yml) 在打上 `kit-v<版本>` 标签时构建。
 
 能启动的包由两半组成，其中只有一半可以公开发布。
 
