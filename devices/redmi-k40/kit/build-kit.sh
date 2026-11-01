@@ -23,7 +23,8 @@ git diff --quiet HEAD -- . 2>/dev/null || log "WARNING: the tree has changes tha
 
 log "the kernel tree and its dependencies"
 python3 devices/redmi-k40/prepare.py kernel > /dev/null
-bash xnu-deps/setup.sh
+# (stage 2 exports this tree's headers and builds two libraries against them)
+XNU_SRC="$ROOT/out/redmi-k40/xnu" bash xnu-deps/setup.sh
 log "Wi-Fi (ath11k)"
 bash devices/redmi-k40/build-wifi.sh > "$OUT.wifi.log" 2>&1 || { tail -20 "$OUT.wifi.log"; die "Wi-Fi did not build"; }
 log "the kernel (-j$JOBS), without any firmware in it"

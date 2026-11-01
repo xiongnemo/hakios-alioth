@@ -16,6 +16,7 @@
 #include <sys/hakios.bluetooth.h>
 #include "umi_bt_firmware.inc"
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern void hakios_tl(const char *, ...) __printflike(1, 2);
 /*
  * The controller's patch and NVM: in the kernel when its build had them (fw-bluetooth/, tools/embed-firmware.py),
  * else read from the system image's /fw/qca6390-bt, where build.sh puts the phone's own (hakios.image.c), as the GPU's
@@ -47,7 +48,6 @@ bt_firmware(void)
 }
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern bool umi_wifi_is_board(void);
-extern void hakios_tl(const char *, ...) __printflike(1, 2);
 extern void loader_return(void);
 extern int umi_rpmh_bluetooth_power(void);
 extern int umi_bluetooth_publish(const uint8_t address[6],const uint8_t commands[64]);
