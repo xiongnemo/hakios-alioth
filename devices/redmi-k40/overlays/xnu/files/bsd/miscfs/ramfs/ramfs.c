@@ -139,22 +139,26 @@ static LCK_GRP_DECLARE(ramfs_lck_grp, "ramfs");
  * stayed a quarter whatever the apps were doing. What memory allows instead:
  *
  *  - a write may take a new page while the kernel's count of memory that can still be had (free pages, and file
- *    pages that can be dropped; a ramfs page is wired and not among them) stays above jetsam's pressure line by
- *    ramfs_keep_mb (boot-arg, default 64). The volume never pushes the phone into memory pressure by itself; when
- *    apps have, a write waits up to two seconds for jetsam to make room before it finds the volume full -- a
- *    moment's want of memory is not a want of room;
+ *    pages that can be dropped; a ramfs page is wired and not among them) stays above jetsam's CRITICAL line by
+ *    ramfs_keep_mb (boot-arg, default 64). Below the pressure line jetsam ends idle processes to make memory, as on
+ *    any iPhone, and a write about to take a new page waits up to two seconds for it before it finds the volume full
+ *    -- a moment's want of memory is not a want of room. (First the floor was the pressure line itself: then
+ *    nothing ever asked jetsam for memory, and eight apps installed during a boot found the volume full half-way
+ *    through The Sims, 2026-11-01 20:29 -- "inflate -1, 6291456 of 16777276 bytes".);
  *  - a volume's size (statfs's blocks) is what that allowed when it was mounted, or boot-arg ramfs_mb=; its free
  *    blocks are what memory allows now, so Settings shows less room while apps hold more memory.
  *
  * kern.ramfs tells the numbers of the first volume mounted (/private/var).
  */
 #if CONFIG_JETSAM
-extern unsigned int memorystatus_available_pages, memorystatus_available_pages_pressure;
+extern unsigned int memorystatus_available_pages, memorystatus_available_pages_pressure,
+    memorystatus_available_pages_critical;
 #else
-extern uint64_t memorystatus_available_pages, memorystatus_available_pages_pressure;
+extern uint64_t memorystatus_available_pages, memorystatus_available_pages_pressure,
+    memorystatus_available_pages_critical;
 #endif
 
-static uint64_t ramfs_keep_pages;               /* kept for apps above the pressure line */
+static uint64_t ramfs_keep_pages;               /* kept above jetsam's critical line */
 static struct ramfs_mount *ramfs_first;         /* the first volume mounted, for kern.ramfs */
 static int ramfs_room_chan;                     /* slept on for a while; nobody wakes it */
 
@@ -165,7 +169,7 @@ static uint64_t
 ramfs_memory_room(void)
 {
 	uint64_t have = (uint64_t)memorystatus_available_pages;
-	uint64_t floor = (uint64_t)memorystatus_available_pages_pressure + ramfs_keep_pages;
+	uint64_t floor = (uint64_t)memorystatus_available_pages_critical + ramfs_keep_pages;
 
 	if (have == 0 || have == (uint64_t)(unsigned int)-1 || have == RAMFS_NO_SAY) {
 		return RAMFS_NO_SAY;
@@ -236,10 +240,11 @@ ramfs_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int
 		lck_mtx_unlock(&rm->rm_lock);
 	}
 	snprintf(text, sizeof(text), "used %llu MB of %llu MB, room now %llu MB; memory that can be had %llu MB, "
-	    "pressure line %llu MB, kept for apps %llu MB", (unsigned long long)(ptoa_64(used) >> 20),
+	    "pressure line %llu MB, critical line %llu MB, kept above it %llu MB", (unsigned long long)(ptoa_64(used) >> 20),
 	    (unsigned long long)(ptoa_64(size) >> 20), (unsigned long long)(ptoa_64(room) >> 20),
 	    (unsigned long long)(ptoa_64((uint64_t)memorystatus_available_pages) >> 20),
 	    (unsigned long long)(ptoa_64((uint64_t)memorystatus_available_pages_pressure) >> 20),
+	    (unsigned long long)(ptoa_64((uint64_t)memorystatus_available_pages_critical) >> 20),
 	    (unsigned long long)(ptoa_64(ramfs_keep_pages) >> 20));
 	return SYSCTL_OUT(req, text, strlen(text) + 1);
 }
@@ -600,6 +605,7 @@ ramfs_grow_slots(struct ramfs_node *node, uint64_t index)
 	}
 	slots = kalloc_type(void *, want, Z_NOWAIT | Z_ZERO);
 	if (slots == NULL) {
+		printf("ramfs: no page array of %llu slots (kalloc, no wait)\n", (unsigned long long)want);
 		return ENOSPC;
 	}
 	if (node->rn_pages != NULL) {
@@ -628,6 +634,22 @@ ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, 
 	}
 	if (node->rn_pages[index] == NULL) {
 		if (*spare == NULL || ramfs_room(rm) == 0) {
+			/*
+			 * Why a write came back short, into the log (the first 10, then one in 100): eight apps installed
+			 * during a boot found the volume full half-way through The Sims twice with memory to spare and no
+			 * jetsam at work (2026-11-01 20:29, 20:39).
+			 */
+			static uint32_t told;
+
+			if (told < 10 || told % 100 == 0) {
+				printf("ramfs: no new page (%s): volume %llu of %llu MB; memory that can be had %llu MB, critical "
+				    "line %llu MB, %llu MB in all volumes\n", *spare == NULL ? "kmem_alloc gave none" : "no room",
+				    (unsigned long long)(ptoa_64(rm->rm_pages) >> 20), (unsigned long long)(ptoa_64(rm->rm_max_pages) >> 20),
+				    (unsigned long long)(ptoa_64((uint64_t)memorystatus_available_pages) >> 20),
+				    (unsigned long long)(ptoa_64((uint64_t)memorystatus_available_pages_critical) >> 20),
+				    (unsigned long long)(ptoa_64(os_atomic_load(&ramfs_pages_in_use, relaxed)) >> 20));
+			}
+			told++;
 			return ENOSPC;
 		}
 		node->rn_pages[index] = *spare;
@@ -1861,7 +1883,7 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
 	rm->rm_next_ino = RAMFS_ROOT_INO + 1;
 	/* a runaway writer must not be able to take the whole machine: what memory allows, see ramfs_memory_room() */
 	rm->rm_max_pages = ramfs_size_pages();
-	printf("ramfs: a volume of %llu MB (memory that can be had now, above the pressure line and %llu MB kept)\n",
+	printf("ramfs: a volume of %llu MB (memory that can be had now, above jetsam's critical line and %llu MB kept)\n",
 	    (unsigned long long)(ptoa_64(rm->rm_max_pages) >> 20), (unsigned long long)(ptoa_64(ramfs_keep_pages) >> 20));
 
 	rm->rm_hash = kalloc_type(struct ramfs_node *, RAMFS_HASH_SIZE, Z_WAITOK | Z_ZERO | Z_NOFAIL);
