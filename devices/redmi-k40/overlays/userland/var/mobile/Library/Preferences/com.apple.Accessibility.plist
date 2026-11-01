@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Settings > Accessibility > Side Button > Press and Hold to Speak: Off (the phone's owner, 2026-11-01), as the
+     phone itself writes it (libAccessibility's _AXSSetHomeButtonAssistant; 2 = Off). Siri is off already (it wants
+     Apple's servers and an activated phone), but with the button still given to it a long press of the side button
+     brought up "Turn On Siri". With this the long press does nothing. -->
+<plist version="1.0">
+<dict>
+	<key>HomeButtonAssistantPreference</key>
+	<integer>2</integer>
+</dict>
+</plist>
