@@ -4149,6 +4149,11 @@ fb_reply(const char *code, const char *text)
 	for (; *text && n < 63; text++) {
 		usb_tx_buf[n++] = (uint8_t)*text;
 	}
+	if (running_live == NULL) {
+		/* the answer on the screen too, under its "> command" (the owner's wish, 2026-11-01) */
+		usb_tx_buf[n] = 0;
+		SAY("< %s\n", (const char *)usb_tx_buf);
+	}
 	usb_tx(usb_tx_buf, n);
 }
 
@@ -4158,6 +4163,9 @@ fb_reply_data(uint64_t len)
 	char msg[13] = "DATA00000000";
 	for (int i = 0; i < 8; i++) {
 		msg[4 + i] = "0123456789abcdef"[(len >> (28 - 4 * i)) & 0xf];
+	}
+	if (running_live == NULL) {
+		SAY("< %s\n", msg);
 	}
 	usb_tx((const uint8_t *)msg, 12);
 }
