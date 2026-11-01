@@ -419,12 +419,25 @@ loader_return(void)
 	loader_jump(0, 0);
 }
 
-/* Bring-up aid: stop here if the loader asked for checkpoint n. */
+/*
+ * Bring-up aid: stop here if the loader asked for checkpoint n. And boot-arg test_hang=n (17 and on: the arguments
+ * are read by then): stay at checkpoint n for good, interrupts off, no heartbeat ever -- a kernel that hangs early, as
+ * an 11 GB window seemed to make it (2026-11-01 20:08), for trying the loader's way with one on the usual layout.
+ */
 void
 loader_checkpoint(uint64_t n)
 {
+	uint32_t hang = 0;
+
 	if (loader_stub_slot[2] == n) {
 		loader_jump(2, n);
+	}
+	if (n >= 17 && PE_parse_boot_argn("test_hang", &hang, sizeof(hang)) && hang == n) {
+		loader_log_puts("\n--- test_hang: the kernel stays here for good, as asked ---\n");
+		__asm__ volatile ("msr daifset, #0xf");
+		for (;;) {
+			__asm__ volatile ("wfe");
+		}
 	}
 }
 

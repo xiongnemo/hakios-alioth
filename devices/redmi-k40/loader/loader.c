@@ -1015,6 +1015,12 @@ static int wdt_armed;
 static const struct kernel_live *running_live;
 static uint64_t running_slide;
 static uint64_t run_started, run_budget;    /* (counter ticks, seconds) of the run under way: see kernel_outlives_loader() */
+/*
+ * The kernel's heartbeat as last seen, and when it last moved (counter): told to the host with "getvar result" during
+ * a run. The 11 GB run of 2026-11-01 20:08 left the USB at 50 s -- the silence that counts as hung -- and reset the
+ * phone 40 s later with nothing fetched: the kernel had most likely stopped in its first seconds.
+ */
+static uint64_t run_beat, run_beat_at;
 static void usb_poll_command(void);
 #if defined(LOADER_ALIOTH)
 static void alioth_usb_note(void);
@@ -2357,6 +2363,54 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
 }
 
 /*
+ * The shared interrupts (SPIs) of the interrupt controller: which are on before a run, and after a run that did not end
+ * by the kernel's own way back (it hung, or never came) off again those it switched on. A kernel that returns does
+ * that itself (gic_v3_irq_quiesce); one that hung has left its drivers' interrupts on, none of which UEFI has a
+ * handler for.
+ */
+#define GICD_TYPER              0x0004
+#define GICD_CTLR_RWP           (1u << 31)
+#define GICD_ISENABLER(n)       (0x0100 + 4 * (n))
+#define GICD_ICENABLER(n)       (0x0180 + 4 * (n))
+static uint32_t gic_spis_before[32];
+
+static uint32_t
+gic_words(void)
+{
+	uint32_t words = (*(volatile uint32_t *)(uintptr_t)(PLAT->gic_dist + GICD_TYPER) & 0x1f) + 1;
+
+	return words > 32 ? 32 : words;
+}
+
+static void
+gic_spis_note(void)
+{
+	for (uint32_t n = 1; n < gic_words(); n++) {
+		gic_spis_before[n] = *(volatile uint32_t *)(uintptr_t)(PLAT->gic_dist + GICD_ISENABLER(n));
+	}
+}
+
+static void
+gic_spis_take_back(void)
+{
+	uint64_t off = 0;
+
+	for (uint32_t n = 1; n < gic_words(); n++) {
+		uint32_t extra = *(volatile uint32_t *)(uintptr_t)(PLAT->gic_dist + GICD_ISENABLER(n)) & ~gic_spis_before[n];
+
+		if (extra != 0) {
+			*(volatile uint32_t *)(uintptr_t)(PLAT->gic_dist + GICD_ICENABLER(n)) = extra;
+			for (uint32_t bits = extra; bits != 0; bits &= bits - 1) {
+				off++;
+			}
+		}
+	}
+	for (int i = 0; i < 100000 && (*(volatile uint32_t *)(uintptr_t)PLAT->gic_dist & GICD_CTLR_RWP); i++) {
+	}
+	print("gic: %d shared interrupts the kernel had switched on, off again\n", off);
+}
+
+/*
  * Run the kernel on the core with that MPIDR and wait until it is back. Returns 0 when it has
  * been and gone (the caller goes on as after loader_return_stub), a negative number if the
  * firmware refused to start the core, OTHER_CPU_NOT_STARTED, or OTHER_CPU_HUNG: then the kernel
@@ -2368,10 +2422,12 @@ static int64_t
 run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const struct kernel_live *live, uint64_t slide,
     uint64_t budget)
 {
-	uint64_t daif = 0, group1 = 0, cntkctl = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
+	uint64_t daif = 0, group1 = 0, cntkctl = 0, started, last_pet, last_battery, noted = 0;
 	int64_t status;
 	int arrived = 0, watching_only = 0;
 
+	run_beat = 0;
+	gic_spis_note();
 	running_live = live;
 	running_slide = slide;
 	other_cpu_start.entry = entry;
@@ -2390,7 +2446,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	/* the last argument arrives in that core's x0 */
 	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
 
-	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
+	started = last_pet = last_battery = run_beat_at = READ_SYSREG(CNTVCT_EL0);
 	run_started = started;
 	run_budget = budget;
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
@@ -2464,10 +2520,10 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
-			if (live->heartbeat != last_beat) {
-				last_beat = live->heartbeat;
-				last_beat_at = READ_SYSREG(CNTVCT_EL0);
-			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS) {
+			if (live->heartbeat != run_beat) {
+				run_beat = live->heartbeat;
+				run_beat_at = READ_SYSREG(CNTVCT_EL0);
+			} else if (seconds_since(run_beat_at) >= SILENCE_SECONDS) {
 				log_of_hung_kernel(live, slide);
 				status = OTHER_CPU_HUNG;
 			}
@@ -2496,6 +2552,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	}
 	running_live = NULL;
 
+	if (status != 0) {
+		gic_spis_take_back();   /* (before this core's interrupts are on again) */
+	}
 	if (watching_only) {
 		__asm__ volatile ("msr cntkctl_el1, %0\nisb" : : "r" (cntkctl));
 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
@@ -3767,6 +3826,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
 			wdt_set_ms(WDT_BITE_MS);
+			if (status == OTHER_CPU_HUNG) {
+				/* on the screen too: the step after which a loader that goes no further stopped is then known */
+				SAY("run: THE KERNEL STOPPED: no sign of life for %d s; heartbeat %d, last moved %d s into the run\n",
+				    (uint64_t)SILENCE_SECONDS, run_beat, (run_beat_at - run_started) / READ_SYSREG(CNTFRQ_EL0));
+				SAY("run: taking back the storage and the USB controllers\n");
+			}
 			if (status != 0) {
 				/* a kernel that hung may have left its own transfer list in the controller */
 				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" : "the kernel did not start");
@@ -3778,6 +3843,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				/* the kernel still has that core; what it logged can be had all the same */
 				print("THE KERNEL HUNG on core %x: no sign of life for %d seconds; its log follows\n", kernel_mpidr,
 				    (uint64_t)SILENCE_SECONDS);
+				SAY("run: the controllers are back; the kernel's log can be fetched (oem log)\n");
 				set_result("hung", loader_ctx[CTX_LOG_LEN], 0);
 				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
 				return 1;
@@ -4213,6 +4279,13 @@ fb_command(char *cmd)
 				fb_reply("OKAY", "0.5");
 			} else if (str_eq(var, "max-download-size")) {
 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
+			} else if (str_eq(var, "result") && busy) {
+				/* and the kernel's signs of life: its heartbeat (every 10 s), when it last moved, how long the run has been */
+				uint32_t mark = log_len;
+				print("running, beat %d %d s ago, %d s in", run_beat, seconds_since(run_beat_at), seconds_since(run_started));
+				log_buf[log_len] = 0;
+				fb_reply("OKAY", log_buf + mark);
+				log_len = mark;
 			} else if (str_eq(var, "result")) {
 				fb_reply("OKAY", last_result);
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
