@@ -820,6 +820,9 @@ hakios_ddr_quiesce(void)
  */
 int umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y);
 
+/* the display is off (as iOS last asked): for whoever polls for a person -- the touch screen looks less often then */
+volatile bool hakios_screen_off;
+
 void
 hakios_screen_power(bool on)
 {
@@ -828,6 +831,7 @@ hakios_screen_power(bool on)
 	int rows[EPSS_DOMAINS] = { -1, -1, -1 };
 	int error = 0;
 
+	hakios_screen_off = !on;
 	PE_parse_boot_argn("screen_power", &enabled, sizeof(enabled));
 	if (!enabled || on == !was_off) {
 		return;

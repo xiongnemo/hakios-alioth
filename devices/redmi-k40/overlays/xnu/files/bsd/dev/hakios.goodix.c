@@ -67,6 +67,8 @@ say(const char *format, ...)
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
+extern volatile bool hakios_screen_off;         /* hakios.cpufreq.c: the display is off */
+#define TOUCH_DARK_US           50000           /* the line looked at this often with the display off */
 
 static vm_offset_t tlmm, gcc, se, rsc, cmd_db;
 static vm_offset_t tlmm_north, tlmm_south;
@@ -1737,7 +1739,11 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate, seen.latched, seen.ups,
 			    seen.late_ups);
 		}
-		sleep_us(poll_us);
+		/*
+		 * With the display off (hakios_screen_off) a look every TOUCH_DARK_US: a finger then is not drawn after, the
+		 * line's falling edge stays latched until the next look, and 125 wakeups a second were for nothing.
+		 */
+		sleep_us(hakios_screen_off ? MAX(poll_us, TOUCH_DARK_US) : poll_us);
 	}
 }
 

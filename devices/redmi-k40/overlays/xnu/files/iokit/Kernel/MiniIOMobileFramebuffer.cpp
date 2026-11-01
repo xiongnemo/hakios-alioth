@@ -1777,6 +1777,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 static void backlightDisplayPower(bool on);     /* (the panel's brightness: AppleARMBacklight, below) */
+static IOSimpleLock * gVSyncParkLock;           /* (the refreshes stopped while the display is off: vsyncPark(), below) */
+static volatile bool gDisplayDark;
 
 class IOMobileFramebufferUserClient : public IOUserClient
 {
@@ -1800,6 +1802,7 @@ class IOMobileFramebufferUserClient : public IOUserClient
 	void armVSync(void);
 
 public:
+	void resumeVSync(void);
 	void frameInfo(uint32_t swapID, uint64_t when, uint64_t delta);
 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
@@ -1917,6 +1920,13 @@ IOMobileFramebufferUserClient::start(IOService * provider)
 	}
 	fLock = IOLockAlloc();
 	fVSyncCall = thread_call_allocate(&IOMobileFramebufferUserClient::vsyncFired, this);
+	if (gVSyncParkLock == NULL) {
+		IOSimpleLock * lock = IOSimpleLockAlloc();
+
+		if (lock != NULL && !OSCompareAndSwapPtr(NULL, lock, &gVSyncParkLock)) {
+			IOSimpleLockFree(lock);
+		}
+	}
 	if (gFrameInfoLock == NULL) {
 		IOLock * lock = IOLockAlloc();
 
@@ -2040,6 +2050,86 @@ IOMobileFramebufferUserClient::armVSync(void)
 }
 
 /*
+ * With the display off its refreshes stop (boot-arg fb_vsync_dark=0: they go on, as before): told 120 times a second,
+ * the window server woke as often for nothing on a dark screen. A client whose refresh comes due then is parked here
+ * (retained) and started again the moment the display is back (backlightDisplayPower(): resumeVSync()), on the
+ * panel's TE as armVSync() always places it.
+ */
+static TUNABLE(uint32_t, gVSyncDark, "fb_vsync_dark", 1);
+#define VSYNC_PARKED    8
+static IOMobileFramebufferUserClient * gVSyncParked[VSYNC_PARKED];
+static uint32_t gVSyncParks, gVSyncResumes;
+
+static bool
+vsyncPark(IOMobileFramebufferUserClient * client)
+{
+	bool parked = false;
+
+	if (gVSyncParkLock == NULL) {
+		return false;
+	}
+	IOSimpleLockLock(gVSyncParkLock);
+	/* (looked at again under the lock: a display come back since is not to find a client parked after its resume) */
+	if (!gDisplayDark) {
+		IOSimpleLockUnlock(gVSyncParkLock);
+		return false;
+	}
+	for (unsigned i = 0; i < VSYNC_PARKED && !parked; i++) {
+		if (gVSyncParked[i] == client) {
+			parked = true;
+		}
+	}
+	for (unsigned i = 0; i < VSYNC_PARKED && !parked; i++) {
+		if (gVSyncParked[i] == NULL) {
+			client->retain();
+			gVSyncParked[i] = client;
+			parked = true;
+			gVSyncParks++;
+		}
+	}
+	IOSimpleLockUnlock(gVSyncParkLock);
+	return parked;
+}
+
+static void
+vsyncResumeAll(void)
+{
+	IOMobileFramebufferUserClient * clients[VSYNC_PARKED];
+	unsigned n = 0;
+
+	if (gVSyncParkLock == NULL) {
+		return;
+	}
+	IOSimpleLockLock(gVSyncParkLock);
+	for (unsigned i = 0; i < VSYNC_PARKED; i++) {
+		if (gVSyncParked[i] != NULL) {
+			clients[n++] = gVSyncParked[i];
+			gVSyncParked[i] = NULL;
+		}
+	}
+	IOSimpleLockUnlock(gVSyncParkLock);
+	for (unsigned i = 0; i < n; i++) {
+		clients[i]->resumeVSync();
+		clients[i]->release();
+	}
+	if (n != 0 && gVSyncResumes++ < 8) {
+		hakios_tl("framebuffer: the display is back: the refreshes of %u client(s) start again (%u parked so far)\n", n,
+		    gVSyncParks);
+	}
+}
+
+void
+IOMobileFramebufferUserClient::resumeVSync(void)
+{
+	IOLockLock(fLock);
+	if (!fClosed && !fVSyncRunning && fCallbacks[kFBNotifyVSync] != 0 && fPorts[kFBNotifyVSync] != NULL) {
+		fVSyncRunning = true;
+		armVSync();
+	}
+	IOLockUnlock(fLock);
+}
+
+/*
  * One refresh: tell the client, which gets three 64-bit numbers as six 32-bit halves --
  * the time of this refresh, the same again (the time it was presented), and a counter.
  */
@@ -2054,6 +2144,9 @@ IOMobileFramebufferUserClient::vsync(void)
 	IOLockLock(fLock);
 	now = fVSyncTime;
 	if (fClosed || fCallbacks[kFBNotifyVSync] == 0 || fPorts[kFBNotifyVSync] == NULL) {
+		fVSyncRunning = false;
+	} else if (gVSyncDark && gDisplayDark && vsyncPark(this)) {
+		/* (the display off: no refresh, none armed; resumeVSync() when it is back) */
 		fVSyncRunning = false;
 	} else {
 		fVSyncCount++;
@@ -2899,12 +2992,16 @@ backlightDisplayPower(bool on)
 	/* (the panel awake before its brightness comes back, asleep after it has gone: bsd/dev/alioth_dsi.c) */
 	if (on) {
 		alioth_panel_power(true);
+		/* (the refreshes again, those that stopped while it was dark: see vsyncPark()) */
+		__atomic_store_n(&gDisplayDark, false, __ATOMIC_RELEASE);
+		vsyncResumeAll();
 	}
 	if (gBacklight != NULL) {
 		gBacklight->displayPower(on);
 	}
 	if (!on) {
 		alioth_panel_power(false);
+		__atomic_store_n(&gDisplayDark, true, __ATOMIC_RELEASE);
 	}
 	/* (the cores and the memory slower while nobody looks: there is nothing else that lowers them) */
 	hakios_screen_power(on);

@@ -237,7 +237,12 @@ battery_gauge_poll(bool say)
 	}
 	if (present && batt_spmi(fg_info_channel, 0xa2, current, 2)) {
 		int32_t raw = (int32_t)(current[0] | current[1] << 8);
-		int32_t signed_raw = (raw & 0x4000) ? raw - 0x8000 : raw;      /* 15 bits, two's complement */
+		/*
+		 * 16 bits, two's complement. (Read as 15 -- bit 14 the sign -- a charge came out as a discharge of 16 A: with
+		 * the panel asleep on USB the battery took 11.7 mA, register 0xffe8, and the sysctl said -15988 mA,
+		 * 2026-11-02 06:52.)
+		 */
+		int32_t signed_raw = (int16_t)raw;
 		ua = (int)(((int64_t)signed_raw * 488281) / 1000);
 	}
 	if (smb_usb_channel != 0xffff && batt_spmi(smb_usb_channel, 0x10, usb, 1)) {
