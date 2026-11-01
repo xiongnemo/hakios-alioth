@@ -49,11 +49,6 @@ jobs:
           ln -s ../sdks-git/iPhoneOS16.5.sdk $T/sdks/iPhoneOS16.5.sdk
           echo "THEOS=$T" >> "$GITHUB_ENV"
           $T/toolchain/linux/iphone/bin/clang --version | head -1
-      - name: The IPSW's files, to link against
-        run: |
-          # (the kernel tree's dependencies first: fetch.sh builds its LZBITMAP helper with them)
-          cd sysimage && bash fetch.sh
-          df -h /
       - name: The kit
         run: |
           v=${GITHUB_REF_NAME#kit-v}
@@ -65,7 +60,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs
-          path: ${{ runner.temp }}/kit*.log
+          path: |
+            ${{ runner.temp }}/kit*.log
+            xnu-deps/*.log
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:

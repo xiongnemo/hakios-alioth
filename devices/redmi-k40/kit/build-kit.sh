@@ -24,7 +24,7 @@ git diff --quiet HEAD -- . 2>/dev/null || log "WARNING: the tree has changes tha
 log "the kernel tree and its dependencies"
 python3 devices/redmi-k40/prepare.py kernel > /dev/null
 # (stage 2 exports this tree's headers and builds two libraries against them)
-XNU_SRC="$ROOT/out/redmi-k40/xnu" bash xnu-deps/setup.sh
+XNU_SRC="$ROOT/out/redmi-k40/xnu" bash xnu-deps/setup.sh || { for l in xnu-deps/*.log; do echo "== $l"; tail -40 "$l"; done; die "the kernel's dependencies were not set up"; }
 log "Wi-Fi (ath11k)"
 bash devices/redmi-k40/build-wifi.sh > "$OUT.wifi.log" 2>&1 || { tail -20 "$OUT.wifi.log"; die "Wi-Fi did not build"; }
 log "the kernel (-j$JOBS), without any firmware in it"
@@ -38,7 +38,10 @@ fi
 grep -q 'umi_bt_patch_size = 0u' out/redmi-k40/xnu/bsd/dev/umi_bt_firmware.inc || die "Bluetooth firmware went into the kernel"
 
 log "our programs and libraries, and Mesa"
-[ -d sysimage/rootfs/usr/lib ] || die "no sysimage/rootfs: run sysimage/fetch.sh (the IPSW, to link against)"
+if [ ! -d sysimage/rootfs/usr/lib ]; then
+	log "the IPSW's files from Apple's servers, only to link against (sysimage/fetch.sh)"
+	(cd sysimage && bash fetch.sh) || die "the IPSW's files were not fetched"
+fi
 COMPILE_ONLY=1 bash devices/redmi-k40/build-userland.sh > "$OUT.userland.log" 2>&1 || { tail -30 "$OUT.userland.log"; die "the user space did not build"; }
 U=out/redmi-k40/userland-build/userland/obj
 for f in stage0 init child hello usbmux libhakios.gl.dylib libOSMesa.8.dylib libhakios.ui.dylib ipainstall IPAInstaller; do
