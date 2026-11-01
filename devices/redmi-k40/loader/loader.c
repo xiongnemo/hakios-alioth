@@ -29,13 +29,13 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 /*
  * The most the kernel is given: its largest free block of RAM in the firmware's map, up to this. The alioth comes
  * with 6, 8 or 12 GB, and the firmware's map follows what the phone has (the RAM partitions XBL leaves in SMEM:
- * Silicium's own table stops at 0x9fffffff). 8 GB verified on a 12 GB phone (2026-11-01 19:22, the window from
- * 0xf4000000). 11 GB from 0xc0000000 (the payload moved away first, "oem stage away" + "oem memmax 11264") reset
- * the phone about 90 s into the run (20:10, PS_HOLD, no log): to be told apart -- the low part or the size past 8 GB
- * -- with someone at the phone. (Upstream's 6 GB was for 4 KB pages' bootstrap tables; with 16 KB pages one L2
- * table maps 64 GB.)
+ * Silicium's own table stops at 0x9fffffff); on a 12 GB phone the block is 11 GB from 0xc0000000 once the downloads
+ * are off 0xf0000000 (stage_away). 11 GB VERIFIED 2026-11-02 04:19 (all apps, 5.9 GB available to iOS). Past 8 GB the
+ * kernel needed two things: more bootstrap tables (its hardware pages are 4 KB: start.s maps the window twice, one
+ * L2 page per GB each; 20 pages were 8 GB -- overlay osfmk/arm/pmap/pmap.h, 32 now, 14 GB) and a smaller compressor
+ * pool for its 48 GB of address space (vm_compression_limit, given with the window below).
  */
-#define MAX_MEM_SIZE        0x200000000ULL
+#define MAX_MEM_SIZE        0x2C0000000ULL
 static uint64_t mem_max = MAX_MEM_SIZE;     /* "oem memmax MB" lowers it for a session (before "oem ramdisk") */
 /*
  * A root image too big for the payload area is placed here, at a fixed
@@ -1060,6 +1060,31 @@ reverse(char *p, uint64_t n)
 }
 
 /*
+ * Whether what the kernel shows a watching loader can be read yet. Its pointers are the kernel's own virtual addresses
+ * only once it has relocated itself (arm_slide_rebase_and_sign_image, the first thing arm_init does); before that
+ * they are the image's fixup chains. A kernel with a 10.2 GB window stopped before that (2026-11-02 04:04) and this
+ * core, reading its log for the host, took a fault at 0x10f0000590 (a chain's 0x590 plus the slide) -- the loader
+ * went down with it. So: every pointer inside the kernel's window, the log's sizes sane.
+ */
+static uint64_t win_base, win_size;
+
+static int
+live_ptr_ok(uint64_t va, uint64_t slide)
+{
+	uint64_t pa = va + slide;
+
+	return pa >= win_base && pa < win_base + win_size;
+}
+
+static int
+live_ok(const struct kernel_live *live, uint64_t slide)
+{
+	return live != NULL && live_ptr_ok(live->log, slide) && live_ptr_ok(live->log_len, slide) &&
+	       live_ptr_ok(live->log_ring_at, slide) && live_ptr_ok(live->log_wrapped, slide) &&
+	       live->log_head + live->log_ring <= (64u << 20) && live_ptr_ok(live->log + live->log_head + live->log_ring - 1, slide);
+}
+
+/*
  * The log of a kernel that did not come back to hand it over: put its two parts in order
  * (the ring's oldest character first) and say where it is and how long.
  */
@@ -1070,6 +1095,11 @@ log_of_hung_kernel(const struct kernel_live *live, uint64_t slide)
 	uint32_t len, ring_at;
 
 	loader_ctx[CTX_LOG_PA] = loader_ctx[CTX_LOG_LEN] = 0;
+	if (!live_ok(live, slide)) {
+		print("the kernel's log cannot be read: it had not relocated itself yet (log %x, its length at %x)\n",
+		    live->log, live->log_len);
+		return;
+	}
 	len = *(volatile uint32_t *)(live->log_len + slide);
 	ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
 	if (*(volatile uint8_t *)(live->log_wrapped + slide) && ring_at < live->log_ring) {
@@ -1094,14 +1124,23 @@ static void
 compose_live_log(const struct kernel_live *live, uint64_t slide)
 {
 	static const char sep[] = "\n== KERNEL LOG (the kernel is still running) ==\n";
-	const char *log = (const char *)(live->log + slide);
-	uint32_t len = *(volatile uint32_t *)(live->log_len + slide);
-	uint32_t ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
-	int wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
+	static const char early[] = "\n== NO KERNEL LOG: the kernel has not relocated itself yet (it stopped before arm_init?) ==\n";
+	const char *log;
+	uint32_t len, ring_at;
+	int wrapped;
 	uint64_t n, room = sizeof(out_buf) - 8192;
 
 	compose_logs(NULL, 0);
 	n = staged_len;
+	if (!live_ok(live, slide)) {
+		memcpy(out_buf + n, early, sizeof(early) - 1);
+		staged_len = n + sizeof(early) - 1;
+		return;
+	}
+	log = (const char *)(live->log + slide);
+	len = *(volatile uint32_t *)(live->log_len + slide);
+	ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
+	wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
 #define PUT(from, size) do { \
 	uint64_t take = (size); \
 	if (n + take > room) { \
@@ -2319,8 +2358,8 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 	const char *log;
 	uint32_t len, from;
 
-	if (live == NULL) {
-		print("%d s\n", seconds);
+	if (live == NULL || !live_ptr_ok(live->log, slide) || !live_ptr_ok(live->log_len, slide)) {
+		print("%d s%s\n", seconds, live == NULL ? "" : ": the kernel has not relocated itself yet");
 		return;
 	}
 	log = (const char *)(live->log + slide);
@@ -2666,7 +2705,7 @@ kernel_outlives_loader(void)
 			last_beat = live->heartbeat;
 			beat_at = READ_SYSREG(CNTVCT_EL0);
 		} else if (live != NULL && seconds_since(beat_at) >= SILENCE_SECONDS) {
-			print("the kernel has been quiet for %d s: the cold reset\n", (uint64_t)SILENCE_SECONDS);
+			print("the kernel has been quiet for %d s (heartbeat %d): the cold reset\n", (uint64_t)SILENCE_SECONDS, last_beat);
 			break;
 		}
 		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(run_started) < run_budget + 60) {
@@ -2682,6 +2721,11 @@ kernel_outlives_loader(void)
 static void EFIAPI
 exception_handler(int64_t type, uint64_t *ctx)
 {
+	/*
+	 * On the screen too, even with a kernel running: this core's log goes with the reset that follows, and the screen
+	 * is still the firmware's in a kernel's first seconds (a 10.2 GB window took the loader down then, 2026-11-02 03:58).
+	 */
+	screen_quiet = 0;
 	print("\nUEFI EXCEPTION type=%d elr=%x esr=%x far=%x lr=%x sp=%x spsr=%x\n", (uint64_t)type, ctx[EXC_CTX_ELR],
 	    ctx[EXC_CTX_ESR], ctx[EXC_CTX_FAR], ctx[EXC_CTX_LR], ctx[EXC_CTX_SP], ctx[EXC_CTX_SPSR]);
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
@@ -2744,7 +2788,7 @@ parse_number(const char *c, unsigned base)
 }
 
 /*
- * "oem stage away" (not by default: see MAX_MEM_SIZE): the host's downloads go to 64 MB of the firmware's below
+ * stage_away (on the K40 as the USB commands begin; "oem stage away"/"back" for tests): the host's downloads go to 64 MB of the firmware's below
  * 0xc0000000 (the highest it has there), with the panic log in its last MB, and PAYLOAD_BASE's place is free for the
  * kernel's window. If the firmware has no such 64 MB, all stays at PAYLOAD_BASE.
  */
@@ -3461,6 +3505,22 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ba->commandLine[n++] = *c;
 		}
 	}
+	/*
+	 * Past 8 GB the kernel's virtual address space (48 GB, without ARM_LARGE_MEMORY) no longer holds it all: the
+	 * physical aperture grows with the window, the compressor takes as much address space again (iOS: the pool is
+	 * max_mem), the zone map is a fixed 24 GB, and the system image's 2.4 GB are mapped statically. With 11 GB the
+	 * kernel stopped right after "Maximum number of VM swap files" (2026-11-02 04:17). A 4 GB pool (vm_compression_limit,
+	 * in 16 KB pages) leaves the rest at least what 8 GB left it, and holds far more than jetsam lets apps reach.
+	 */
+	int own_compression = 0;
+	for (const char *c = pi.cmdline; *c; c++) {
+		own_compression |= starts_with(c, "vm_compression_limit=");
+	}
+	if (win_size > 0x200000000ULL && !own_compression) {
+		for (const char *c = "vm_compression_limit=262144 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+	}
 	if (block_enabled) {
 		static const char prefix[] = "ufs_shared_pa=0x";
 		static const char hex[] = "0123456789abcdef";
@@ -3890,7 +3950,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	recording_data = NULL;
 	recording_len = 0;
-	if (kernel_live != NULL && kernel_live->recording != 0 && checkpoint != CHECKPOINT_SELFTEST) {
+	/* (and only from a kernel that had relocated itself: one back from an early checkpoint has its fixup chains there) */
+	if (kernel_live != NULL && live_ptr_ok(kernel_live->recording, slide) && checkpoint != CHECKPOINT_SELFTEST) {
 		const uint64_t *recording = (const uint64_t *)(kernel_live->recording + slide);
 
 		if (recording[0] != 0 && recording[1] > 24 && recording[1] <= (1ULL << 30)) {
@@ -3901,7 +3962,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	sound_data = NULL;
 	sound_len = 0;
-	if (kernel_live != NULL && kernel_live->magic2 == KERNEL_LIVE_MAGIC2 && kernel_live->sound != 0 &&
+	if (kernel_live != NULL && kernel_live->magic2 == KERNEL_LIVE_MAGIC2 && live_ptr_ok(kernel_live->sound, slide) &&
 	    checkpoint != CHECKPOINT_SELFTEST) {
 		const uint64_t *sound = (const uint64_t *)(kernel_live->sound + slide);
 
@@ -4773,6 +4834,10 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {
+#if defined(LOADER_ALIOTH)
+		/* the host's downloads off 0xf0000000, which splits the 11 GB block the kernel's window can now be */
+		stage_away();
+#endif
 		flush_log();
 		usb_command_loop();
 	}
