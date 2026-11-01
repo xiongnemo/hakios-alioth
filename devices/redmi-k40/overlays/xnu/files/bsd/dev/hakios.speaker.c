@@ -1815,20 +1815,51 @@ umi_cs35l41_health_read(uint8_t a, uint32_t reg, uint32_t *value)
 	return false;
 }
 
+/*
+ * A word of all ones is what a read gives that the chip never drove (a bit-banged transfer preempted mid-byte, SDA
+ * left high), not what the chip holds: 2026-11-02 04:35:08 the speaker amp's protection DSP error word read
+ * 0xffffffff, IRQ1_STATUS1 had no fault bit, and the speaker stayed silent for the rest of the run (Minecraft). Such a
+ * word is read again, with the chip's ID as a check of the transfer, before it counts.
+ */
+static bool
+umi_cs35l41_health_word(uint8_t a, uint32_t reg, uint32_t *value)
+{
+	if (!umi_cs35l41_health_read(a, reg, value)) return false;
+	for (unsigned again = 0; *value == 0xffffffffu && again < 3; again++) {
+		uint32_t id = 0;
+
+		wait_ms(2);
+		if (!umi_cs35l41_health_read(a, 0, &id) || !umi_cs35l41_health_read(a, reg, value)) return false;
+		say("umi-audio: amp %#x read %#x as all ones; read again: %#x (chip ID %#x%s)\n", a, reg, *value, id,
+		    id == UMI_CS35L41_CHIP_ID ? "" : ", NOT the CS35L41's");
+	}
+	return true;
+}
+
+/* boot-arg sound_test_fault=S: one health look S seconds after the first fails, as a fault would (the recovery, tried) */
+static uint64_t umi_test_fault_at;
+
 bool
 umi_speaker_healthy(void)
 {
 	if (!umi_output_ready || umi_reset_asserted) return false;
+	if (umi_test_fault_at != 0 && mach_absolute_time() >= umi_test_fault_at) {
+		umi_test_fault_at = 0;
+		say("umi-audio: sound_test_fault: this look fails as a fault would\n");
+		say("umi-audio: both chips held in reset following amp %#x health failure\n", UMI_AMP_SPK_ADDR);
+		umi_speaker_quiesce();
+		return false;
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		uint8_t a = i ? UMI_AMP_RCV_ADDR : UMI_AMP_SPK_ADDR;
 		uint32_t status = 0, error = 0;
-		if (!umi_cs35l41_health_read(a, 0x10010, &status)) goto fault;
+		if (!umi_cs35l41_health_word(a, 0x10010, &status)) goto fault;
 		if (status & 0x800281c0) {
 			say("umi-audio: amp %#x hardware protection: IRQ1_STATUS1=%#x, faults=%#x\n",
 			    a, status, status & 0x800281c0);
 			goto fault;
 		}
-		if (!umi_cs35l41_health_read(a, umi_cspl_xm[i] + 12, &error)) goto fault;
+		if (!umi_cs35l41_health_word(a, umi_cspl_xm[i] + 12, &error)) goto fault;
 		if (error) {
 			say("umi-audio: amp %#x protection DSP error=%#x, IRQ1_STATUS1=%#x\n", a, error, status);
 			goto fault;
@@ -1980,8 +2011,22 @@ umi_speaker_begin(bool keep)
 		}
 	}
 	if (keep && ok) {
-		umi_reset_cfg = cfg;
-		umi_reset_io = io;
+		static bool saved;
+		uint32_t fault_s = 0;
+
+		/* (the pins as they were before the first: a set-up again after a fault finds them holding the reset) */
+		if (!saved) {
+			saved = true;
+			umi_reset_cfg = cfg;
+			umi_reset_io = io;
+			if (PE_parse_boot_argn("sound_test_fault", &fault_s, sizeof(fault_s)) && fault_s != 0) {
+				uint64_t interval;
+
+				nanoseconds_to_absolutetime((uint64_t)fault_s * NSEC_PER_SEC, &interval);
+				umi_test_fault_at = mach_absolute_time() + interval;
+				say("umi-audio: sound_test_fault: a health look fails in %u s\n", fault_s);
+			}
+		}
 		umi_output_on = false;
 		umi_reset_asserted = false;
 		umi_output_ready = true;

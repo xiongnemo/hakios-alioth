@@ -1401,7 +1401,7 @@ watch(void)
 {
 	bool on = false, given_up = false, muted = false;
 	uint64_t last_look = 0, last_monitor = 0;
-	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0;
+	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0, set_ups = 0;
 
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
 
@@ -1431,6 +1431,22 @@ watch(void)
 			} else if (!given_up) {
 				guard_level(sound_attenuation(extra));
 			}
+		}
+		/*
+		 * Amplifiers given up on (a health look failed: they are held in reset) are set up again from scratch -- reset,
+		 * firmware, calibration -- the next time iOS plays, twice a run at most. Before, one bad look was silence until
+		 * the run's end (2026-11-02 04:35, Minecraft: the protection DSP's error word read as all ones).
+		 */
+		if (given_up && umi_profile && set_ups < 2 && !muted && sounded != 0 && now - sounded < 100000) {
+			set_ups++;
+			say_when("iOS plays and the amplifiers had been given up on: they are set up again");
+			if (umi_speaker_prepare()) {
+				given_up = false;
+				say("sound: the amplifiers are set up again (%u of 2 this run)\n", set_ups);
+			} else {
+				say("sound: THE AMPLIFIERS COULD NOT BE SET UP AGAIN (%u of 2 this run)\n", set_ups);
+			}
+			now = now_us();
 		}
 		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
 			say_when("iOS plays: the amplifiers are started");
