@@ -984,6 +984,7 @@ static int wdt_armed;
  */
 static const struct kernel_live *running_live;
 static uint64_t running_slide;
+static uint64_t run_started, run_budget;    /* (counter ticks, seconds) of the run under way: see kernel_outlives_loader() */
 static void usb_poll_command(void);
 #if defined(LOADER_ALIOTH)
 static void alioth_usb_note(void);
@@ -2351,6 +2352,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
 
 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
+	run_started = started;
+	run_budget = budget;
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
 	if (PLAT->log_other_cpu) {
 		flush_log();
@@ -2540,6 +2543,44 @@ wdt_arm(void)
 
 extern char __ImageBase;
 
+/*
+ * A fault on this core while a kernel runs on another: that kernel is all right, and iOS goes on. This core,
+ * whose firmware can no longer be trusted, only does what run_on_other_cpu() must: feed the watchdog for the run's
+ * budget, and see the kernel come back or go quiet -- then the cold reset (Android boots). Before, the reset came
+ * at once and the iOS run went with it (2026-11-01 18:22: a cable pulled and put back during a run, then Android,
+ * the boot reason "bootloader" and a PS_HOLD power-off, as this handler's reset gives).
+ */
+static void
+kernel_outlives_loader(void)
+{
+	const struct kernel_live *live = running_live;
+	uint64_t last_pet = READ_SYSREG(CNTVCT_EL0), beat_at = last_pet;
+	uint64_t last_beat = live != NULL ? live->heartbeat : 0;
+
+	print("the kernel runs on; this core only watches it now (the watchdog fed, no USB) until it is back or quiet\n");
+	for (;;) {
+		flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
+		if (other_cpu_done) {
+			print("the kernel is back: the cold reset\n");
+			break;
+		}
+		if (live != NULL && live->heartbeat != last_beat) {
+			last_beat = live->heartbeat;
+			beat_at = READ_SYSREG(CNTVCT_EL0);
+		} else if (live != NULL && seconds_since(beat_at) >= SILENCE_SECONDS) {
+			print("the kernel has been quiet for %d s: the cold reset\n", (uint64_t)SILENCE_SECONDS);
+			break;
+		}
+		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(run_started) < run_budget + 60) {
+			wdt_pet();
+			last_pet = READ_SYSREG(CNTVCT_EL0);
+		}
+		for (volatile int i = 0; i < 20000; i++) {
+		}
+	}
+	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+}
+
 static void EFIAPI
 exception_handler(int64_t type, uint64_t *ctx)
 {
@@ -2548,6 +2589,9 @@ exception_handler(int64_t type, uint64_t *ctx)
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
 	    ctx[EXC_CTX_ELR] - (uint64_t)(uintptr_t)&__ImageBase);
 	flush_log();
+	if (running_live != NULL) {
+		kernel_outlives_loader();
+	}
 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 	for (;;) {
 	}
@@ -3878,16 +3922,27 @@ usb_start(void)
  * state changed. Keeps the watchdog fed while idle.
  */
 /*
- * The cable out or in: whatever either endpoint still had with the controller belongs to a host that is gone. Left there,
- * a reply queued before went out as the answer to the next host's command -- every reply a command behind, "getvar
- * product" answered with nothing, and the PC took the loader for something else (2026-11-01 12:21, a cable moved).
+ * The cable out or in: as Qualcomm's own fastboot does it with the same driver (ABL, FastbootLib/FastbootMain.c,
+ * HandleUsbEvents): out, nothing; in, the receive for the next command queued afresh (by usb_rx, or at the top of
+ * usb_poll_command). The firmware's driver ends the transfers of a host that went away (UsbDeviceTransferStatus-
+ * Cancelled) and brings the link back by itself. Nothing more is asked of it: two aborts of the endpoints' transfers
+ * as a cable went out and came back during a run, and the loader took a fault and reset the phone (2026-11-01
+ * 18:22); the whole link stopped and started again when the cable came back, and it did not come back at all
+ * (18:38, no kernel running).
+ * Without a kernel running the screen is the loader's: these lines are shown there too, for a look at the phone.
  */
 static void
-usb_drop_transfers(void)
+usb_state_change(uint32_t state, const char *where)
 {
-	(void)USB->abort_xfer(USB_EP_OUT);
-	(void)USB->abort_xfer(USB_EP_IN);
+	int quiet = screen_quiet;
+
+	usb_connected = (state == UsbDeviceStateConnected);
 	usb_rx_queued = 0;
+	if (running_live == NULL) {
+		screen_quiet = 0;
+	}
+	print("usb: %s (%s)\n", usb_connected ? "connected" : "disconnected", where);
+	screen_quiet = quiet;
 }
 
 static int64_t
@@ -3904,19 +3959,15 @@ usb_wait(uint8_t endpoint)
 
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
-			usb_connected = (data.device_state == UsbDeviceStateConnected);
-			print("usb: %s (waiting on endpoint %x)\n", usb_connected ? "connected" : "disconnected", (uint64_t)endpoint);
-			usb_drop_transfers();
+			usb_state_change(data.device_state, endpoint == 0xff ? "waiting for a cable" : "waiting on an endpoint");
 			return -1;
 		}
 		/*
-		 * With a kernel running, a host that went away must not keep this core from watching it -- and the
-		 * transfer goes too: one left with the controller went out later with a later reply's bytes in the
-		 * buffer and its own length (replies empty or a command behind, after the cable moved, 2026-10-31).
+		 * With a kernel running, a host that went away must not keep this core from watching it. The transfer
+		 * is left to the firmware's driver (see usb_state_change: no aborts).
 		 */
 		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
-			(void)USB->abort_xfer(endpoint);
-			print("usb: endpoint %x: nothing for 3 s, the transfer given up\n", (uint64_t)endpoint);
+			print("usb: endpoint %x: nothing for 3 s while a kernel runs, given up\n", (uint64_t)endpoint);
 			return -1;
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
@@ -3931,12 +3982,36 @@ usb_wait(uint8_t endpoint)
 
 static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
 
+/*
+ * A transfer the driver would not take (the cable going out, say): its events are let through for a while, so that
+ * the state change behind it is seen. Else the command loop, still taking itself for connected, asked again and
+ * again without ever calling handle_event -- and the driver, never asked, could not bring the link back.
+ */
+static void
+usb_pump(uint64_t ms)
+{
+	uint64_t until = READ_SYSREG(CNTVCT_EL0) + READ_SYSREG(CNTFRQ_EL0) * ms / 1000;
+
+	while (READ_SYSREG(CNTVCT_EL0) < until) {
+		uint32_t msg = UsbDeviceEventNoEvent;
+		uint64_t size = 0;
+		usb_device_event_data data;
+
+		USB->handle_event(&msg, &size, &data);
+		if (msg == UsbDeviceEventDeviceStateChange) {
+			usb_state_change(data.device_state, "after a transfer refused");
+			return;
+		}
+	}
+}
+
 static int64_t
 usb_rx(uint8_t *buf, uint64_t len)
 {
 	if (usb_rx_queued) {
 		usb_rx_queued = 0;      /* (every command is received the same way, into the same buffer) */
 	} else if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
+		usb_pump(200);
 		return -1;
 	}
 	return usb_wait(USB_EP_OUT);
@@ -3949,6 +4024,7 @@ usb_tx(const uint8_t *data, uint64_t len)
 		memcpy(usb_tx_buf, data, len);
 	}
 	if (EFI_ERROR(USB->send(USB_EP_IN, len, usb_tx_buf))) {
+		usb_pump(200);
 		return -1;
 	}
 	return usb_wait(USB_EP_IN);
@@ -4225,9 +4301,7 @@ usb_poll_command(void)
 	}
 	USB->handle_event(&msg, &size, &data);
 	if (msg == UsbDeviceEventDeviceStateChange) {
-		usb_connected = (data.device_state == UsbDeviceStateConnected);
-		usb_drop_transfers();
-		print("usb: %s while the kernel runs\n", usb_connected ? "connected" : "disconnected");
+		usb_state_change(data.device_state, "while the kernel runs");
 		return;
 	}
 	if (msg != UsbDeviceEventTransferNotification || data.transfer.endpoint_index != USB_EP_OUT) {
