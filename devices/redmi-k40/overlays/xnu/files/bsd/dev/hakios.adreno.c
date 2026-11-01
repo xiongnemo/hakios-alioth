@@ -96,6 +96,8 @@
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -2292,6 +2294,9 @@ struct hfi_bw_table {
 
 static uint32_t hfi_number;
 static bool post_mortem_done;
+static bool hfi_quiet;                  /* the governor's speed votes: no lines but a refusal's (gpu_gov_vote) */
+/* the 3D core's speeds as the GMU was given them (step_core_power), and the one asked for now: the governor's */
+static uint32_t gov_levels, gov_khz[16], gov_level;
 
 /* Everything waiting in a queue of the GMU's; true if the answer to the message numbered `number` was among it. */
 static bool
@@ -2403,7 +2408,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	bool answered = false;
 
 	message[0] = id | words << 8 | number << 20;
-	printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	if (!hfi_quiet) {
+		printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	}
 	snprintf(last_write, sizeof(last_write), "step %u sent the GMU message %u (%s)", step, id, what);
 	hold(true);
 	for (uint32_t i = 0; i < (words + 3) / 4 * 4; i++) {
@@ -2436,7 +2443,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 		}
 		return false;
 	}
-	printf("adreno: %u: the GMU accepts %s\n", step, what);
+	if (!hfi_quiet) {
+		printf("adreno: %u: the GMU accepts %s\n", step, what);
+	}
 	return true;
 }
 
@@ -2567,6 +2576,11 @@ step_core_power(void)
 		vote[2] = 1;
 	}
 	core_khz = speeds[vote[2]].khz;
+	gov_levels = MIN(perf.gpu_levels, 16u);
+	for (unsigned i = 0; i < gov_levels; i++) {
+		gov_khz[i] = perf.gpu[i].khz;
+	}
+	gov_level = vote[2];
 	printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
 	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
 	    "from here on it casts votes in RPMh by itself");
@@ -3453,6 +3467,7 @@ static bool gpu_kept;
 static uint32_t gpu_fence;              /* the number of the last submission */
 static uint32_t gpu_timed;              /* ... of the last whose times have been added up */
 static uint64_t gpu_ticks;              /* how long the core has worked on the submissions added up */
+static volatile uint64_t gpu_busy_total; /* ... the same, never set back: the governor's (gpu_gov_thread) */
 static uint32_t gpu_timed_count;
 static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
@@ -3476,13 +3491,23 @@ static void gpu_block_stop(void);
  * next kernel's step 4 takes it down (stale_stop()). Boot-arg adreno_dirty=1 makes every ending
  * a panic's in this respect, to see that work.
  */
+/*
+ * Between the governor's speed votes and the end of the run: under it the governor sends a vote only while the GPU is
+ * kept, and the end says it is not before the GMU is told to slumber and the block loses its power (a vote after that
+ * would reach registers without power).
+ */
+static LCK_GRP_DECLARE(gpu_gov_grp, "hakios.adreno.gov");
+static LCK_MTX_DECLARE(gpu_gov_mtx, &gpu_gov_grp);
+
 void
 hakios_gpu_stop(void)
 {
 	if (gpu_kept) {
 		uint32_t waited = 0;
 
-		gpu_kept = false;                       /* (nothing more is taken) */
+		lck_mtx_lock(&gpu_gov_mtx);
+		gpu_kept = false;                       /* (nothing more is taken, and no more speed is voted for) */
+		lck_mtx_unlock(&gpu_gov_mtx);
 		quiet = false;
 		/*
 		 * What the core has been given, it finishes first: told to slumber in the middle of a
@@ -3877,6 +3902,7 @@ gpu_times(void)
 			}
 			gpu_timed_by[by]++;
 			gpu_ticks += ticks;
+			gpu_busy_total += ticks;
 			gpu_timed_count++;
 		}
 	}
@@ -3896,6 +3922,131 @@ hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 	bzero(gpu_timed_by, sizeof(gpu_timed_by));
 	gpu_ticks = 0;
 	gpu_timed_count = 0;
+}
+
+/*
+ * The GPU's speed by its load (boot-arg gpugov=1). The 3D core ran at its top speed (alioth: 670 MHz) for the whole
+ * run, a still home screen included; Android starts it at 370 and lets it fall back after 80 ms of idleness. Every
+ * GPU_GOV_MS: the share of the time the core worked (the begin and end times it writes for every submission, as
+ * gpu_times() adds them up), then one level up from GPU_GOV_UP percent, one down after GPU_GOV_DOWN_MS under
+ * GPU_GOV_DOWN, the lowest after GPU_GOV_IDLE_MS with nothing submitted, the top for GPU_GOV_TOUCH_MS after a touch
+ * (the frames that answer a finger). A level is one vote to the GMU (HFI_GX_BW_PERF_VOTE, as at the start); three
+ * refused in a row and the governor stops where it is. Its time at each level: the minute's line
+ * (hakios_adreno_minute()).
+ */
+#define GPU_GOV_MS              50
+#define GPU_GOV_UP              80
+#define GPU_GOV_DOWN            30
+#define GPU_GOV_DOWN_MS         150
+#define GPU_GOV_IDLE_MS         100
+#define GPU_GOV_TOUCH_MS        500
+
+extern volatile uint64_t hakios_input_at;       /* hakios.input.c: the last touch or button */
+static uint64_t gov_level_us[16];               /* since the last minute's line */
+static uint32_t gov_votes, gov_refused;
+static bool gov_running;
+
+static bool
+gpu_gov_vote(uint32_t level)
+{
+	uint32_t vote[4] = { 0, 1, level, HFI_NO_INDEX };
+	bool done = false;
+
+	lck_mtx_lock(&gpu_gov_mtx);
+	if (gpu_kept && gov_running) {
+		hfi_quiet = true;
+		done = hfi_send("a speed (the governor)", HFI_GX_BW_PERF_VOTE, vote, 4);
+		hfi_quiet = false;
+	}
+	lck_mtx_unlock(&gpu_gov_mtx);
+	return done;
+}
+
+static void
+gpu_gov_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	uint64_t then = mach_absolute_time(), busy_then = gpu_busy_total, touch_window, low_since = 0, idle_since = then;
+	uint64_t idle_window, down_window;
+	uint32_t fence_then = gpu_fence, refused_in_row = 0, top = gov_levels - 1;
+
+	nanoseconds_to_absolutetime((uint64_t)GPU_GOV_TOUCH_MS * NSEC_PER_MSEC, &touch_window);
+	nanoseconds_to_absolutetime((uint64_t)GPU_GOV_IDLE_MS * NSEC_PER_MSEC, &idle_window);
+	nanoseconds_to_absolutetime((uint64_t)GPU_GOV_DOWN_MS * NSEC_PER_MSEC, &down_window);
+	printf("adreno: gpugov: the GPU's speed follows its load: every %u ms, a level up from %u%% busy, down after %u ms "
+	    "under %u%%, the lowest after %u ms with nothing to do, the top for %u ms after a touch; levels", GPU_GOV_MS,
+	    GPU_GOV_UP, GPU_GOV_DOWN_MS, GPU_GOV_DOWN, GPU_GOV_IDLE_MS, GPU_GOV_TOUCH_MS);
+	for (uint32_t i = 1; i < gov_levels; i++) {
+		printf(" %u", gov_khz[i] / 1000);
+	}
+	printf(" MHz, now %u\n", gov_khz[gov_level] / 1000);
+	while (gpu_kept && gov_running) {
+		uint64_t now, span_ns, busy_ns, busy_now, input_at;
+		uint32_t pct, fence_now, want = gov_level;
+
+		delay_for_interval(GPU_GOV_MS, NSEC_PER_MSEC);
+		now = mach_absolute_time();
+		busy_now = gpu_busy_total;
+		fence_now = gpu_fence;
+		absolutetime_to_nanoseconds(now - then, &span_ns);
+		busy_ns = (busy_now - busy_then) * 10000 / 192;        /* (19.2 ticks of the core's counter a microsecond) */
+		pct = span_ns ? (uint32_t)MIN(100, 100 * busy_ns / span_ns) : 0;
+		gov_level_us[gov_level] += span_ns / 1000;
+		if (fence_now != fence_then) {
+			idle_since = now;
+		}
+		input_at = hakios_input_at;
+		if (input_at != 0 && now - input_at < touch_window) {
+			want = top;
+			low_since = 0;
+		} else if (now - idle_since >= idle_window) {
+			want = 1;
+			low_since = 0;
+		} else if (pct >= GPU_GOV_UP) {
+			want = MIN(top, gov_level + 1);
+			low_since = 0;
+		} else if (pct < GPU_GOV_DOWN) {
+			if (low_since == 0) {
+				low_since = now;
+			} else if (now - low_since >= down_window) {
+				want = MAX(1u, gov_level - 1);
+				low_since = now;
+			}
+		} else {
+			low_since = 0;
+		}
+		if (want != gov_level) {
+			if (gpu_gov_vote(want)) {
+				gov_level = want;
+				core_khz = gov_khz[want];
+				gov_votes++;
+				refused_in_row = 0;
+			} else if (gpu_kept && ++gov_refused && ++refused_in_row >= 3) {
+				printf("adreno: gpugov: THE GMU REFUSED THREE SPEEDS IN A ROW: the governor stops at %u MHz\n",
+				    gov_khz[gov_level] / 1000);
+				gov_running = false;
+			}
+		}
+		then = now;
+		busy_then = busy_now;
+		fence_then = fence_now;
+	}
+}
+
+static void
+gpu_gov_start(void)
+{
+	uint32_t on = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("gpugov", &on, sizeof(on)) || !on || gov_levels < 3 || gov_level == 0) {
+		return;
+	}
+	gov_running = true;
+	if (kernel_thread_start(gpu_gov_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		gov_running = false;
+	}
 }
 
 /*
@@ -4018,6 +4169,22 @@ hakios_adreno_minute(void)
 		printf("adreno: gpu: clients' own spaces: %u made, %u switches, %u refused; the core in %s; %u submissions\n",
 		    gpu_spaces_made, gpu_space_switches, gpu_space_refused, gpu_space_now != NULL ? "a client's" : "the shared one",
 		    gpu_fence);
+	}
+	if (gov_running || gov_votes != 0) {
+		uint64_t all = 0;
+		char line[160];
+		int at;
+
+		for (uint32_t i = 0; i < gov_levels; i++) {
+			all += gov_level_us[i];
+		}
+		at = snprintf(line, sizeof(line), "adreno: gpugov: since the last line:");
+		for (uint32_t i = 1; i < gov_levels && all != 0 && at < (int)sizeof(line) - 24; i++) {
+			at += snprintf(line + at, sizeof(line) - at, " %u MHz %llu%%", gov_khz[i] / 1000, 100 * gov_level_us[i] / all);
+		}
+		printf("%s; %u votes, %u refused%s\n", line, gov_votes, gov_refused, gov_running ? "" : " (STOPPED)");
+		bzero(gov_level_us, sizeof(gov_level_us));
+		gov_votes = gov_refused = 0;
 	}
 }
 
@@ -4283,6 +4450,7 @@ hakios_adreno_init(void)
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
 			HakiosGPUStart();
+			gpu_gov_start();
 			return;
 		}
 		if (!by_itself) {
