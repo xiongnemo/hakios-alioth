@@ -73,6 +73,21 @@ time: 81 of 83 pass. The two left need Metal, which this port does not have yet.
 Settings; About (iOS 16.5 as an iPhone X); Battery, from the phone's fuel gauge; Display & Brightness; Wi-Fi;
 Bluetooth pairing with another phone, then connected.
 
+### Accessibility
+
+<p>
+  <img src="docs/alioth/screenshots/accessibility/assistivetouch.png" width="260" alt="AssistiveTouch menu">
+  <img src="docs/alioth/screenshots/accessibility/control-center.png" width="260" alt="Control Center with the AssistiveTouch button">
+  <img src="docs/alioth/screenshots/accessibility/color-filters.png" width="260" alt="Color Filters: grayscale">
+  <img src="docs/alioth/screenshots/accessibility/classic-invert.png" width="260" alt="Classic Invert on">
+  <img src="docs/alioth/screenshots/accessibility/night-shift.png" width="260" alt="Night Shift">
+  <img src="docs/alioth/screenshots/accessibility/auto-brightness.png" width="260" alt="Auto-Brightness">
+</p>
+
+AssistiveTouch and its menu; Control Center with the AssistiveTouch button; Color Filters; Classic Invert; Night Shift;
+Auto-Brightness. Invert, Color Filters and Night Shift are done by the display engine's colour correction, as on an
+iPhone, so screenshots do not show their colours: the screen does.
+
 ### Sensors
 
 <p>
@@ -93,7 +108,8 @@ Each item has been checked on the phone.
 
 | Area | |
 |---|---|
-| Display | 120 Hz (the panel's TE every 8.2 ms); brightness; dark mode; automatic brightness from the ambient light sensor; rotation; Invert Colors, Color Filters and Night Shift in the display engine's colour correction, as on an iPhone |
+| Display | 120 Hz (the panel's TE every 8.2 ms); brightness; dark mode; rotation |
+| Accessibility | AssistiveTouch (the button, its menu, Control Center from it); Bold Text; Smart and Classic Invert; Color Filters (grayscale, the colour-blindness filters, tint); Night Shift; Auto-Brightness from the ambient light sensor. The colour effects are made by the display engine's colour correction, as on an iPhone |
 | Graphics | The compositor and applications on the Adreno 650 through Mesa (freedreno): OpenGL ES 1, 2 and 3, GLKit, SceneKit, SpriteKit, Core Image; PVRTC textures decoded on the CPU; a GPU address space per process |
 | Input | Touch screen with multitouch, power and volume buttons, vibration |
 | Sound | Speakers (CS35L41), microphone (Voice Memos records) |
@@ -109,11 +125,14 @@ Each item has been checked on the phone.
 
 Apps written for this port: [GPU Check](https://github.com/xiongnemo/ios-gpu-check),
 [Sensor Check](https://github.com/xiongnemo/ios-sensor-check), [Motion Test](https://github.com/xiongnemo/ios-motion-test)
-and [Map](https://github.com/xiongnemo/ios-map) (OpenStreetMap; Apple Maps needs Metal).
+and [Map](https://github.com/xiongnemo/ios-map) (OpenStreetMap; Apple Maps needs Metal). Their IPAs are on each repository's
+Releases page.
 
 ## Not yet
 
-- **Metal**: apps that need it close at once (Measure, many newer 3D games). OpenGL ES works.
+- **Metal**: apps that need it close at once (many newer 3D games; Apple's Maps and Measure, which need it, are left out
+  of the system image). OpenGL ES works.
+- AssistiveTouch's Home action does nothing yet (its button, menu and Control Center work).
 - **Persistence**: iOS runs from RAM, so settings, photos and installed apps are gone after a reboot.
 - GPS, cellular, NFC, fingerprint, the proximity sensor.
 - Recovery from a GPU hang: an app that hangs the GPU stops the whole screen until the phone is restarted.

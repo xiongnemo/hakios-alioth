@@ -71,6 +71,20 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 设置；关于本机（iOS 16.5，iPhone X）；电池（来自手机的电量计）；显示与亮度；Wi-Fi；
 和另一台手机蓝牙配对，然后连接成功。
 
+### 辅助功能
+
+<p>
+  <img src="docs/alioth/screenshots/accessibility/assistivetouch.png" width="260" alt="辅助触控菜单">
+  <img src="docs/alioth/screenshots/accessibility/control-center.png" width="260" alt="控制中心和辅助触控按钮">
+  <img src="docs/alioth/screenshots/accessibility/color-filters.png" width="260" alt="色彩滤镜：灰度">
+  <img src="docs/alioth/screenshots/accessibility/classic-invert.png" width="260" alt="经典反转已打开">
+  <img src="docs/alioth/screenshots/accessibility/night-shift.png" width="260" alt="夜览">
+  <img src="docs/alioth/screenshots/accessibility/auto-brightness.png" width="260" alt="自动亮度">
+</p>
+
+辅助触控和它的菜单；控制中心和辅助触控按钮；色彩滤镜；经典反转；夜览；自动亮度。反转颜色、色彩滤镜和夜览由显示引擎的
+颜色校正实现，和真 iPhone 一样，所以截图里看不到它们的颜色效果，屏幕上能看到。
+
 ### 传感器
 
 <p>
@@ -90,7 +104,8 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 
 | 方面 | |
 |---|---|
-| 显示 | 120 Hz（面板 TE 每 8.2 ms 一次）；亮度；深色模式；根据环境光自动调节亮度；自动旋转；反转颜色、色彩滤镜、夜览由显示引擎的颜色校正实现，和真 iPhone 一样 |
+| 显示 | 120 Hz（面板 TE 每 8.2 ms 一次）；亮度；深色模式；自动旋转 |
+| 辅助功能 | 辅助触控（悬浮按钮、菜单、从菜单打开控制中心）；粗体文本；智能反转和经典反转；色彩滤镜（灰度、色盲滤镜、色调）；夜览；根据环境光的自动亮度。颜色效果由显示引擎的颜色校正实现，和真 iPhone 一样 |
 | 图形 | 系统合成和 App 都通过 Mesa（freedreno）在 Adreno 650 上渲染：OpenGL ES 1、2、3，GLKit、SceneKit、SpriteKit、Core Image；PVRTC 纹理由处理器解码；每个进程独立的 GPU 地址空间 |
 | 输入 | 多点触摸、电源键和音量键、振动 |
 | 声音 | 扬声器（CS35L41）、麦克风（语音备忘录能录音） |
@@ -106,11 +121,13 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 
 为这个移植写的 App：[GPU Check](https://github.com/xiongnemo/ios-gpu-check)、
 [Sensor Check](https://github.com/xiongnemo/ios-sensor-check)、[Motion Test](https://github.com/xiongnemo/ios-motion-test)
-和 [Map](https://github.com/xiongnemo/ios-map)（OpenStreetMap 地图；苹果地图需要 Metal）。
+和 [Map](https://github.com/xiongnemo/ios-map)（OpenStreetMap 地图；苹果地图需要 Metal）。IPA 在各个仓库的 Releases 页面。
 
 ## 还不能用的
 
-- **Metal**：需要 Metal 的 App 会打开就闪退（测距仪、很多较新的 3D 游戏）。OpenGL ES 可以用。
+- **Metal**：需要 Metal 的 App 会打开就闪退（很多较新的 3D 游戏；需要 Metal 的苹果地图和测距仪已从系统镜像中去掉）。
+  OpenGL ES 可以用。
+- 辅助触控里的「主屏幕」点了还没反应（悬浮按钮、菜单、控制中心都能用）。
 - **数据保存**：iOS 在内存里运行，重启后设置、照片、装的 App 都会消失。
 - GPS、蜂窝网络、NFC、指纹、距离传感器。
 - GPU 卡死后的恢复：一个 App 让 GPU 卡住，整个屏幕都会停，只能重启手机。

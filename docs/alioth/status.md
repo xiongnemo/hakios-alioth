@@ -51,6 +51,7 @@ The one-click release does all of this from a PC script; development runs do it 
   Core Location (true north from the WMM2025 magnetic model), rotation, the camera's sensor selection.
 - **Apps without signatures** install through LaunchServices: from the PC at every boot, or with an on-phone
   installer.
+- **Accessibility**: iOS's accessibility bundles are in the system image, so AssistiveTouch, Bold Text and the rest work; the display's colour settings (Invert, Color Filters, Night Shift) reach the display engine's colour correction through the framebuffer driver, as on an iPhone.
 - **USB as an iPhone**: our usbmux daemon carries the PC's connections to lockdownd and the services it starts.
 
 ## Measurements
@@ -77,6 +78,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | USB after re-plugging | Release: data of the old USB session was read in front of the new session's first packet. Development: transfers queued before the cable moved went out as later replies. Fixed in the source, being tested. |
 | Safari cannot pick photos | The photo picker does not reach the library here; not investigated yet. |
 | A game asks for notifications at every boot | The answer is kept in the data volume, which is in RAM. |
+| AssistiveTouch's Home does nothing | Its button, menu and Control Center work; the Home action is not wired to anything here yet. |
 
 ## Next
 
