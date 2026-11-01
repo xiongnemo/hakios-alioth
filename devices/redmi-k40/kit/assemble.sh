@@ -91,6 +91,8 @@ if [ -n "${SYSIMAGE_FROM:-}" ]; then
 		[ -e "$ROOT/sysimage/$d" ] || cp -al "$SYSIMAGE_FROM/$d" "$ROOT/sysimage/$d"
 	done
 	cp -p "$SYSIMAGE_FROM"/{system.manifest,system.files,var.skel,rootfs.slt,.done-*} "$ROOT/sysimage/" 2> /dev/null || true
+	# (an extraction made before this kit's files were unpacked: as new as they are, or build.sh takes it for stale)
+	touch "$ROOT"/sysimage/.done-* "$ROOT/sysimage/system.manifest"
 else
 	(cd "$ROOT/sysimage" && bash fetch.sh)
 fi
