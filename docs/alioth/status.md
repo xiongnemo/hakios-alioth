@@ -75,7 +75,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | Nothing persists | The data volume is a RAM disk: settings, photos and apps are gone after a reboot. |
 | A GPU hang stops the screen | There is no hang detection or GPU reset yet. |
 | Warm with the screen off | The CPU slows down, but the display link and the GPU stay on; no GPU power management yet (fixed clock). |
-| USB after re-plugging | Release: data of the old USB session was read in front of the new session's first packet. Development: transfers queued before the cable moved went out as later replies. Fixed in the source, being tested. |
+| USB after re-plugging | Fixed: a race in select() panicked the kernel at the unplug; the controller's EP0 stayed dead or answered wrongly after a replug (the controller is now restarted when the computer resets it in vain); the old session's data and a waiting write leaked into the new one. Tested with the port leaving and coming back by itself, three times a run (boot-arg usb_bounce); a hand-pulled cable is to be tried with this version. |
 | Safari cannot pick photos | The photo picker does not reach the library here; not investigated yet. |
 | A game asks for notifications at every boot | The answer is kept in the data volume, which is in RAM. |
 | AssistiveTouch's Home does nothing | Its button, menu and Control Center work; the Home action is not wired to anything here yet. |

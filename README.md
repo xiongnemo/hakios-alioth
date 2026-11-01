@@ -137,7 +137,6 @@ Releases page.
 - GPS, cellular, NFC, fingerprint, the proximity sensor.
 - Recovery from a GPU hang: an app that hangs the GPU stops the whole screen until the phone is restarted.
 - Power: the display link and the GPU stay on with the screen off.
-- Pulling the USB cable while iOS runs: the PC does not see the phone again until the next boot (a fix is being tested).
 - Safari cannot pick photos from the library.
 
 How each part works, what was measured and what comes next: [docs/alioth/status.md](docs/alioth/status.md).

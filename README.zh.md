@@ -132,7 +132,6 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 - GPS、蜂窝网络、NFC、指纹、距离传感器。
 - GPU 卡死后的恢复：一个 App 让 GPU 卡住，整个屏幕都会停，只能重启手机。
 - 功耗：熄屏后屏幕链路和 GPU 仍然开着。
-- iOS 运行时拔掉 USB 线：重新插上后电脑认不出手机，要等下次启动（修复正在测试）。
 - Safari 不能从相册里选照片。
 
 各部分怎么实现、测到了什么、接下来做什么：[docs/alioth/status.zh.md](docs/alioth/status.zh.md)。
