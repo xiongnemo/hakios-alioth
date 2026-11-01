@@ -26,7 +26,10 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define KERNEL_VIRT_BASE    0xFFFFFFF004000000ULL /* boot_args.virtBase */
 #define KERNEL_LINK_OFFSET  0x03000000ULL         /* kernel text sits 48 MB above the base */
 #define BASE_ALIGN          0x02000000ULL         /* 32 MB: L2 block size with 16K pages */
-#define MAX_MEM_SIZE        0x180000000ULL        /* 6 GB; the kernel's bootstrap page tables cover 8 */
+/* 8 GB: what the kernel's bootstrap page tables cover (more and it says "BOOTSTRAP_TABLE_SIZE too small for memory
+ * config"). The K40 has 12 GB, one free block of 11 GB from 0xc0000000; upstream gave 6. A phone with less gets its
+ * largest free block, as before. */
+#define MAX_MEM_SIZE        0x200000000ULL
 /*
  * A root image too big for the payload area is placed here, at a fixed
  * offset inside the kernel's memory window, once; it then survives any
@@ -170,6 +173,19 @@ str_eq(const char *a, const char *b)
  * the screen is left to the kernel (and to "oem screenshot").
  */
 static int screen_quiet;
+
+/*
+ * What the loader is doing, on the screen as well as in the log, while no kernel runs (then the screen is the
+ * kernel's): commands, uploads, the cable, the run's start and end -- for whoever looks at the phone.
+ */
+#define SAY(...) do { \
+	int quiet_ = screen_quiet; \
+	if (running_live == NULL) { \
+		screen_quiet = 0; \
+	} \
+	print(__VA_ARGS__); \
+	screen_quiet = quiet_; \
+} while (0)
 
 static void
 put_char(char c)
@@ -995,6 +1011,15 @@ static usb_device_protocol *USB;
 static int usb_connected;
 static int usb_rx_queued;
 static int usb_lent;            /* this run has the controller (usb=2 with the kernel on another core): no USB until it is back */
+/*
+ * (counter) When the host last got a command through. A cable moved during a run is not heard of by the firmware's
+ * USB driver, nor by its charger driver (their cable detection waits on timer interrupts, and this core has none
+ * during a run): after it the PC saw the loader come and go every 7 s or so, for good, until the cable was moved
+ * again with no kernel running (2026-11-01 18:58-19:16). A host that had been asking and then got nothing through
+ * is how it shows (usb_host_gone).
+ */
+static uint64_t usb_last_command_at;
+static int usb_lost_in_run;     /* the PC lost this link during the last run: the screen asks for the cable */
 
 static uint64_t
 seconds_since(uint64_t then)
@@ -3931,33 +3956,84 @@ usb_start(void)
  * (18:38, no kernel running).
  * Without a kernel running the screen is the loader's: these lines are shown there too, for a look at the phone.
  */
+/*
+ * What else the driver says, into the log (30 lines at most): its OEM events, and transfers that ended other than
+ * well. After a cable put back during a run the PC saw the loader come and go every 7 s or so for good, with no
+ * state change on this side at all (2026-11-01 18:58-19:15) -- this is to see what the driver saw meanwhile.
+ */
+static void
+usb_note_event(uint32_t msg, const usb_device_event_data *data)
+{
+	static int noted;
+
+	if (noted >= 30) {
+		return;
+	}
+	if (msg == UsbDeviceEventOemEvent || msg > UsbDeviceEventOemEvent) {
+		noted++;
+		print("usb: event %d from the driver\n", (uint64_t)msg);
+	} else if (msg == UsbDeviceEventTransferNotification && data->transfer.status != UsbDeviceTransferStatusCompleteOK) {
+		noted++;
+		print("usb: endpoint %x: a transfer ended with status %d after %d bytes\n",
+		    (uint64_t)data->transfer.endpoint_index, (uint64_t)data->transfer.status, (uint64_t)data->transfer.bytes_completed);
+	}
+}
+
 static void
 usb_state_change(uint32_t state, const char *where)
 {
-	int quiet = screen_quiet;
-
 	usb_connected = (state == UsbDeviceStateConnected);
 	usb_rx_queued = 0;
-	if (running_live == NULL) {
-		screen_quiet = 0;
-	}
-	print("usb: %s (%s)\n", usb_connected ? "connected" : "disconnected", where);
-	screen_quiet = quiet;
+	usb_lost_in_run = 0;        /* (the cable moved: what brings such a link back) */
+	SAY("usb: %s (%s)\n", usb_connected ? "connected" : "disconnected", where);
 }
+
+/*
+ * The host gone quiet during a run: it had been asking (a k40.py run asks for the result every 2 s) and has got
+ * nothing through for 30 s. With the cable moved during a run that is what can be seen, and all: the USB driver
+ * does not hear of the cable then, nor does the charger's firmware (both wait on timer interrupts, which this core
+ * has none of during a run), and the link stayed dead until the cable moved again with no kernel running
+ * (2026-11-01 18:58, 19:28).
+ */
+static int
+usb_host_gone(void)
+{
+	return usb_last_command_at > run_started && seconds_since(usb_last_command_at) >= 30;
+}
+
+/*
+ * Nothing is done about it during the run, nor after: the firmware's own stop and start (in a run, after one, and
+ * once with no kernel running) left a link the PC never saw again -- with the wrapper's VBUS override set by hand
+ * too, and the cable then moved: no event from the driver ever again ("idle: no cable", 2026-11-01 19:56). Its stop
+ * powers down what only its cable detection brings up. What brings the link back is the cable moved once with no
+ * kernel running (19:16), which the screen asks for after such a run (usb_lost_in_run). The lasting fix is a link
+ * of the loader's own on the controller, as the kernel's hakios.dwc3.c has for iOS (work/TODO.md).
+ */
 
 static int64_t
 usb_wait(uint8_t endpoint)
 {
 	/* static: a long transfer is many short waits, and the watchdog must be fed across them */
 	static uint64_t last_pet;
-	uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
+	uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0), said = began;
 
 	for (;;) {
 		uint32_t msg = UsbDeviceEventNoEvent;
 		uint64_t size = 0;
 		usb_device_event_data data;
 
+		/* a minute and more of waiting for a command or a cable, no kernel running: say so once a minute */
+		if (running_live == NULL && (endpoint == USB_EP_OUT || endpoint == 0xff) && READ_SYSREG(CNTVCT_EL0) - said >= 60 * freq) {
+			said = READ_SYSREG(CNTVCT_EL0);
+			SAY("idle: %s; %s; last run: %s\n", usb_connected ? "waiting for a command" : "no cable",
+			    resident_rd_size != 0 ? "a system image is in" : "no system image yet", last_result);
+			if (usb_lost_in_run) {
+				SAY("      the PC lost this link during that run: unplug the cable and plug it in again\n");
+			}
+		}
+
 		USB->handle_event(&msg, &size, &data);
+		usb_note_event(msg, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_state_change(data.device_state, endpoint == 0xff ? "waiting for a cable" : "waiting on an endpoint");
 			return -1;
@@ -3998,6 +4074,7 @@ usb_pump(uint64_t ms)
 		usb_device_event_data data;
 
 		USB->handle_event(&msg, &size, &data);
+		usb_note_event(msg, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_state_change(data.device_state, "after a transfer refused");
 			return;
@@ -4073,6 +4150,9 @@ fb_command(char *cmd)
 {
 	int busy = running_live != NULL;
 
+	if (!busy) {
+		SAY("> %s\n", cmd);
+	}
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
@@ -4116,9 +4196,12 @@ fb_command(char *cmd)
 			parse_payload(&pi, 0);
 			log_len = 0;
 			if (!choose_window(&pi) || win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE) {
+				SAY("memory: no window for the kernel\n");
 				fb_reply("FAIL", "no memory window");
 				return;
 			}
+			SAY("memory: %d MB for the kernel from %x; the system image goes at %x\n", win_size >> 20, win_base,
+			    win_base + RESIDENT_RD_OFFSET);
 			download_to_ramdisk = 1;
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "download:")) {
@@ -4138,6 +4221,7 @@ fb_command(char *cmd)
 				return;
 			}
 			fb_reply_data(total);
+			uint64_t began = READ_SYSREG(CNTVCT_EL0), shown = 0;
 			while (got < total) {
 				uint64_t want = total - got > USB_CHUNK ? USB_CHUNK : total - got;
 				int64_t r = usb_rx(usb_rx_buf, want);
@@ -4146,13 +4230,20 @@ fb_command(char *cmd)
 				}
 				memcpy(dest + got, usb_rx_buf, (size_t)r);
 				got += (uint64_t)r;
+				if (got - shown >= (256ULL << 20)) {
+					shown = got;
+					SAY("  %d of %d MB\n", got >> 20, total >> 20);
+				}
 			}
 			if (got == total) {
 				if (to_ramdisk) {
 					resident_rd_size = total;
 				}
+				SAY("  %s: %d MB in %d s\n", to_ramdisk ? "the system image is in" : "received", (total + (1 << 19)) >> 20,
+				    seconds_since(began));
 				fb_reply("OKAY", "");
 			} else {
+				SAY("  the upload stopped at %d of %d MB\n", got >> 20, total >> 20);
 				fb_reply("FAIL", "short download");
 			}
 		} else if (starts_with(cmd, "upload")) {
@@ -4244,10 +4335,16 @@ fb_command(char *cmd)
 			completed_log_len = 0;
 			fb_reply("OKAY", "");
 			log_len = 0;
+			SAY("run: the kernel starts; the screen is its own until it is back\n");
 			print("== XNULOADER run (usb) ==\n");
 			if (!run_kernel(have_cp, cp)) {
 				set_result("not-started", 0, 0);
 				compose_logs(NULL, 0);
+			}
+			SAY("run: over -- %s\n", last_result);
+			usb_lost_in_run = usb_host_gone();
+			if (usb_lost_in_run) {
+				SAY("usb: the PC lost this link during the run (the cable moved?): unplug it and plug it in again\n");
 			}
 		} else if (starts_with(cmd, "oem hang")) {
 			fb_reply("OKAY", "watchdog test: not petting any more");
@@ -4300,6 +4397,7 @@ usb_poll_command(void)
 		usb_rx_queued = 1;
 	}
 	USB->handle_event(&msg, &size, &data);
+	usb_note_event(msg, &data);
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		usb_state_change(data.device_state, "while the kernel runs");
 		return;
@@ -4311,6 +4409,7 @@ usb_poll_command(void)
 	if (data.transfer.status != UsbDeviceTransferStatusCompleteOK || data.transfer.bytes_completed == 0) {
 		return;
 	}
+	usb_last_command_at = READ_SYSREG(CNTVCT_EL0);
 	n = data.transfer.bytes_completed < sizeof(cmd) - 1 ? data.transfer.bytes_completed : sizeof(cmd) - 1;
 	memcpy(cmd, usb_rx_buf, (size_t)n);
 	cmd[n] = 0;
@@ -4380,6 +4479,7 @@ usb_command_loop(void)
 		if (n <= 0) {
 			continue;
 		}
+		usb_last_command_at = READ_SYSREG(CNTVCT_EL0);
 		if (n > (int64_t)sizeof(cmd) - 1) {
 			n = sizeof(cmd) - 1;
 		}
