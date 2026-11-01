@@ -1,0 +1,20 @@
+# Stock applications left out of the Redmi K40's system image (overlays/userland/build.sh, "the system image"):
+# one bundle of /Applications a line (staged_system_apps are moved there first), then why. A line taken out puts the
+# application back at the next build. Chosen with the phone's owner, 2026-11-01 (News stays: it works here).
+Maps.app            Apple Maps draws with Metal (VectorKit): blank here; the release carries Map (OpenStreetMap)
+Bridge.app          the Watch app: no Apple Watch
+FindMy.app          wants an Apple ID and an activated phone
+Weather.app         Apple's weather service wants an activated phone; the release carries OSS Weather
+Stocks.app          the same service as Weather
+Home.app            no HomeKit accessories
+Fitness.app         no Apple Watch, no activity sensors
+Health.app          no Apple Watch, no health sensors
+Measure.app         ARKit, which wants Metal: it closes at once
+AppleTV.app         Apple's TV service
+Tips.app            not wanted
+FaceTime.app        no cellular network, no Apple ID
+Freeform.app        not wanted
+Books.app           not wanted
+Podcasts.app        not wanted
+Music.app           not wanted
+MobileSMS.app       Messages: no cellular network

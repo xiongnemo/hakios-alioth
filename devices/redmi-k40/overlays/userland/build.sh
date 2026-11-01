@@ -748,9 +748,11 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 fi
 
 # --- the system image -----------------------------------------------------------------------------
+REMOVED_APPS=../devices/redmi-k40/system-apps-removed.txt
 if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	{ [ ! -f system.apfs ] || [ obj/stage0 -nt system.apfs ] || [ $IOS/system.manifest -nt system.apfs ] ||
-	  [ $IOS/cryptex -nt system.apfs ] || [ $IOS/cryptex-app -nt system.apfs ] || [ -n "$SYSTEM" ]; }; then
+	  [ $IOS/cryptex -nt system.apfs ] || [ $IOS/cryptex-app -nt system.apfs ] || [ $REMOVED_APPS -nt system.apfs ] ||
+	  [ -n "$SYSTEM" ]; }; then
 	# what sysimage/select-system.py has chosen since sysimage/rootfs was extracted is not in it, and would not be
 	# in the image either (so it was once with the audio plug-ins and the system's sounds: iOS found no
 	# speaker and played nothing, though our device was there and the kernel's side worked)
@@ -772,6 +774,19 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	if [ -d sysroot/private/var/staged_system_apps ]; then
 		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
 		rm -rf sysroot/private/var
+	fi
+	# ... but not the stock ones this phone has no use for (one bundle a line in $REMOVED_APPS, with why): ~300 MB
+	# less of the system image, which stays in memory the whole time iOS runs
+	if [ -f $REMOVED_APPS ]; then
+		while read -r app _; do
+			case "$app" in ''|'#'*) continue ;; esac
+			if [ -d "sysroot/Applications/$app" ]; then
+				rm -rf "sysroot/Applications/$app"   # (hard links: sysimage/rootfs keeps its own)
+				echo "  without $app"
+			else
+				echo "build.sh: $REMOVED_APPS: there is no $app in the system" >&2
+			fi
+		done < $REMOVED_APPS
 	fi
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
 	cp obj/stage0 sysroot/sbin/launchd
