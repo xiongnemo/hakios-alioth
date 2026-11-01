@@ -61,9 +61,15 @@ tell(const char *format, ...)
 #define EPSS_DOMAINS            3
 #define EPSS_FREQ_TABLE         0x100           /* a word per row: [31:30] clock source, [7:0] multiple of 19.2 MHz */
 #define EPSS_TABLE_ROWS         40
-#define EPSS_PERF_STATE         0x320           /* the row that is wanted */
+#define EPSS_PERF_STATE         0x320           /* the row that is wanted (with per-core DCVS: core n of the group at + 4n) */
+#define EPSS_DOMAIN_STATE       0x20            /* [7:0] the clock the group runs at now, in 19.2 MHz (limits included) */
+#define EPSS_DCVS_CTRL          0xb0            /* bit 0: per-core DCVS -- each core of the group votes in its own word */
 #define XO_KHZ                  19200
 #define ALTERNATE_KHZ           300000          /* source 0: a fixed 300 MHz */
+
+/* the cores of each group in the hardware (SM8250: 4 small, 3 big, 1 biggest), for the per-core vote words */
+static const uint32_t epss_group_cores[3] = { 4, 3, 1 };
+static bool epss_per_core[3];
 
 /* How fast a simple loop runs, in thousands of iterations per millisecond. */
 static uint32_t
@@ -93,6 +99,28 @@ static vm_offset_t epss_base[EPSS_DOMAINS];
 static int epss_top[EPSS_DOMAINS] = { -1, -1, -1 };
 static uint32_t epss_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS];
 
+/*
+ * The row a group is to run at. With per-core DCVS every core of the group has a word of its own and the group runs at
+ * the highest of them, so all are written (Linux, qcom-cpufreq-hw.c, target_index): a word left at what the boot
+ * loader voted would hold the group up whatever is asked in the first.
+ */
+static void
+epss_write(uint32_t domain, uint32_t row)
+{
+	uint32_t words = epss_per_core[domain] ? epss_group_cores[domain] : 1;
+
+	for (uint32_t i = 0; i < words; i++) {
+		*(volatile uint32_t *)(epss_base[domain] + EPSS_PERF_STATE + 4 * i) = row;
+	}
+}
+
+/* (kHz) what the group's clock is now, as the hardware says -- a row asked for and any limit's cut included */
+static uint32_t
+epss_now_khz(uint32_t domain)
+{
+	return epss_base[domain] ? XO_KHZ * (*(volatile uint32_t *)(epss_base[domain] + EPSS_DOMAIN_STATE) & 0xff) : 0;
+}
+
 static void
 raise_domain(uint32_t domain, uint32_t cores)
 {
@@ -100,6 +128,7 @@ raise_domain(uint32_t domain, uint32_t cores)
 	vm_offset_t base;
 
 	base = ml_io_map(EPSS_PHYS + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
+	epss_per_core[domain] = (*(volatile uint32_t *)(base + EPSS_DCVS_CTRL) & 1) != 0;
 	for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
 		uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
 		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
@@ -114,10 +143,11 @@ raise_domain(uint32_t domain, uint32_t cores)
 	epss_base[domain] = base;
 	epss_top[domain] = (int)top;
 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
-	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
+	epss_write(domain, top);
 	delay_for_interval(20, NSEC_PER_MSEC);
-	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
-	    top_khz / 1000);
+	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz (the hardware says %u MHz; "
+	    "per-core votes %s)\n", domain, cores, was, top, top_khz / 1000, epss_now_khz(domain) / 1000,
+	    epss_per_core[domain] ? "on: every core's word written" : "off");
 }
 
 /*
@@ -142,22 +172,27 @@ hakios_cpufreq_khz(uint32_t domain, int row)
 }
 
 /*
- * Two may want a group slower: the thermal service (its cap, hakios_cpufreq_cap()) and the display being off
- * (hakios_screen_power()). A group runs at the lower of the two rows; the lock keeps one of them from
- * writing a row computed with what the other had before it changed.
+ * Three may want a group slower: the thermal service (its cap, hakios_cpufreq_cap()), the display being off
+ * (hakios_screen_power()) and the governor (cpugov=1: the load, below). A group runs at the lowest of the
+ * rows; the lock keeps one of them from writing a row computed with what another had before it changed.
  */
 static int thermal_row[EPSS_DOMAINS] = { 0x7fffffff, 0x7fffffff, 0x7fffffff };
 static int screen_row[EPSS_DOMAINS] = { 0x7fffffff, 0x7fffffff, 0x7fffffff };
+static int gov_row[EPSS_DOMAINS] = { 0x7fffffff, 0x7fffffff, 0x7fffffff };
+static int applied_row[EPSS_DOMAINS] = { -1, -1, -1 };
 static LCK_GRP_DECLARE(cpufreq_lock_grp, "hakios.cpufreq");
 static LCK_SPIN_DECLARE(cpufreq_lock, &cpufreq_lock_grp);
 
 static int
 apply_row_locked(uint32_t domain)
 {
-	int row = MIN(thermal_row[domain], screen_row[domain]);
+	int row = MIN(MIN(thermal_row[domain], screen_row[domain]), gov_row[domain]);
 
 	row = MAX(0, MIN(row, epss_top[domain]));
-	*(volatile uint32_t *)(epss_base[domain] + EPSS_PERF_STATE) = (uint32_t)row;
+	if (row != applied_row[domain]) {
+		epss_write(domain, (uint32_t)row);
+		applied_row[domain] = row;
+	}
 	return row;
 }
 
@@ -171,6 +206,159 @@ hakios_cpufreq_cap(uint32_t domain, int row)
 	thermal_row[domain] = row;
 	apply_row_locked(domain);
 	lck_spin_unlock(&cpufreq_lock);
+}
+
+/*
+ * The governor (boot-arg cpugov=1). cpufreq=1 alone leaves every group at its top row for good: the biggest core idles
+ * at 3.2 GHz and its top voltage, the phone warm on a still home screen. Every GOV_MS each group's busiest core of ours
+ * (its share of the time not idle, ml_cpu_idle_time, as cpuload= counts it) asks for what it used plus a quarter: the
+ * slowest row at or above that (Linux's schedutil, 1.25 x); at GOV_FULL percent or more, the top at once (a burst does
+ * not climb a quarter per step). Up at once; down only once GOV_DOWN_MS in a row have all asked for less, and then to
+ * the most any of them asked for. A touch or a button lifts the big and the biggest group to their top for
+ * GOV_TOUCH_MS: the frames that answer a finger do not wait for a clock to rise. The rows are the governor's third of
+ * apply_row_locked(): the thermal cap and the screen's still win when lower.
+ */
+#define GOV_MS          20
+#define GOV_FULL        90
+#define GOV_DOWN_MS     80
+#define GOV_TOUCH_MS    500
+#define GOV_REPORT_S    60
+
+extern volatile uint64_t hakios_input_at;      /* hakios.input.c */
+
+static uint32_t
+row_for_khz(uint32_t domain, uint64_t khz)
+{
+	for (int r = 0; r < epss_top[domain]; r++) {
+		if (epss_khz[domain][r] >= khz) {
+			return (uint32_t)r;
+		}
+	}
+	return (uint32_t)epss_top[domain];
+}
+
+static void
+gov_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	uint64_t idle_before[MAX_CPUS] = { 0 }, then = mach_absolute_time(), touch_window, report_at, report_every;
+	uint64_t row_time[EPSS_DOMAINS][EPSS_TABLE_ROWS], khz_time[EPSS_DOMAINS], window_time = 0;
+	uint32_t want_max[EPSS_DOMAINS] = { 0 }, lower_for[EPSS_DOMAINS] = { 0 }, ups = 0, downs = 0, touches = 0;
+	int row[EPSS_DOMAINS];
+	bool touching = false;
+
+	bzero(row_time, sizeof(row_time));
+	bzero(khz_time, sizeof(khz_time));
+	nanoseconds_to_absolutetime((uint64_t)GOV_TOUCH_MS * NSEC_PER_MSEC, &touch_window);
+	nanoseconds_to_absolutetime((uint64_t)GOV_REPORT_S * NSEC_PER_SEC, &report_every);
+	report_at = mach_absolute_time();
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		row[d] = epss_top[d];
+	}
+	for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+		(void)ml_cpu_idle_time((int)i, &idle_before[i]);
+	}
+	tell("cpugov: the cores' speed follows their load: every %u ms, 1.25 x what the busiest core of a group used (the "
+	    "top from %u%%), down after %u ms, the big cores at their top for %u ms after a touch\n", GOV_MS, GOV_FULL,
+	    GOV_DOWN_MS, GOV_TOUCH_MS);
+	for (;;) {
+		uint32_t busy_pct[EPSS_DOMAINS] = { 0 };
+		uint64_t now, span, input_at;
+		bool touched;
+
+		delay_for_interval(GOV_MS, NSEC_PER_MSEC);
+		now = mach_absolute_time();
+		span = now - then;
+		if (span == 0) {
+			continue;
+		}
+		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+			uint64_t idle = 0, busy;
+			uint32_t d = domain_of(topology->cpus[i].phys_id), pct;
+
+			if (!ml_cpu_idle_time((int)i, &idle)) {
+				continue;
+			}
+			busy = span > idle - idle_before[i] ? span - (idle - idle_before[i]) : 0;
+			idle_before[i] = idle;
+			pct = (uint32_t)(100 * busy / span);
+			busy_pct[d] = MAX(busy_pct[d], MIN(pct, 100));
+		}
+		input_at = hakios_input_at;
+		touched = input_at != 0 && now - input_at < touch_window;
+		if (touched && !touching) {
+			touches++;
+		}
+		touching = touched;
+		/* (the time each group spent at its row, for the report: counter ticks, and kHz x ticks) */
+		for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+			if (epss_top[d] >= 0 && applied_row[d] >= 0) {
+				row_time[d][applied_row[d]] += span;
+				khz_time[d] += (uint64_t)epss_khz[d][applied_row[d]] * span;
+			}
+		}
+		window_time += span;
+		then = now;
+		for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+			uint32_t want;
+
+			if (epss_top[d] < 0) {
+				continue;
+			}
+			if (busy_pct[d] >= GOV_FULL || (touched && d > 0)) {
+				want = (uint32_t)epss_top[d];
+			} else {
+				/* (of the row the group ran at: a thermal or the screen's cap may have held it under ours) */
+				int ran = applied_row[d] >= 0 ? applied_row[d] : row[d];
+
+				want = row_for_khz(d, (uint64_t)epss_khz[d][ran] * busy_pct[d] * 125 / 10000);
+			}
+			if ((int)want >= row[d]) {
+				if ((int)want > row[d]) {
+					ups++;
+				}
+				row[d] = (int)want;
+				lower_for[d] = 0;
+				want_max[d] = 0;
+				continue;
+			}
+			want_max[d] = lower_for[d] == 0 ? want : MAX(want_max[d], want);
+			if (++lower_for[d] * GOV_MS >= GOV_DOWN_MS) {
+				row[d] = (int)want_max[d];
+				lower_for[d] = 0;
+				want_max[d] = 0;
+				downs++;
+			}
+		}
+		lck_spin_lock(&cpufreq_lock);
+		for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+			if (epss_top[d] >= 0 && gov_row[d] != row[d]) {
+				gov_row[d] = row[d];
+				apply_row_locked(d);
+			}
+		}
+		lck_spin_unlock(&cpufreq_lock);
+		if (now - report_at >= report_every && window_time != 0) {
+			char line[320];
+			int at = snprintf(line, sizeof(line), "cpugov: the last %u s:", GOV_REPORT_S);
+
+			for (uint32_t d = 0; d < EPSS_DOMAINS && at < (int)sizeof(line) - 80; d++) {
+				if (epss_top[d] < 0) {
+					continue;
+				}
+				at += snprintf(line + at, sizeof(line) - at, " %s %llu MHz avg, %llu%% top, %llu%% bottom, now %u;",
+				    d == 0 ? "small" : d == 1 ? "big" : "biggest", khz_time[d] / window_time / 1000,
+				    100 * row_time[d][epss_top[d]] / window_time, 100 * row_time[d][0] / window_time,
+				    epss_now_khz(d) / 1000);
+			}
+			tell("%s %u up, %u down, %u touches\n", line, ups, downs, touches);
+			bzero(row_time, sizeof(row_time));
+			bzero(khz_time, sizeof(khz_time));
+			window_time = 0;
+			ups = downs = touches = 0;
+			report_at = now;
+		}
+	}
 }
 
 /*
@@ -707,6 +895,14 @@ hakios_cpufreq_init(void)
 		}
 	}
 	printf("cpufreq: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
+	if (PE_parse_boot_argn("cpugov", &enabled, sizeof(enabled)) && enabled) {
+		thread_t thread;
+
+		if (kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+	}
+	enabled = 0;
 	if (PE_parse_boot_argn("membench", &enabled, sizeof(enabled)) && enabled == 1) {
 		memory_bench();
 	} else if (enabled == 2) {

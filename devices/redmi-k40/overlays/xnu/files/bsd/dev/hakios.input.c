@@ -188,9 +188,13 @@ touch_hold(uint32_t finger, uint32_t x, uint32_t y)
 	return true;
 }
 
+/* (mach_absolute_time()) the last touch or button: the CPU governor lifts the big cores for a while after it (hakios.cpufreq.c) */
+volatile uint64_t hakios_input_at;
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
+	hakios_input_at = mach_absolute_time();
 	lck_mtx_lock(&touch_lock);
 	/* (a driver's moves and a program's alike: rwtouch's swipes stand for fingers in the frame-rate checks) */
 	if (type == HAKIOS_TOUCH_MOVE && touch_hold(finger, x, y)) {
