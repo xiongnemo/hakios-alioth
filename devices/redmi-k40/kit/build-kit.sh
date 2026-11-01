@@ -64,5 +64,15 @@ EOF
 (cd "$D/prebuilt" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 # nothing of iOS and no firmware: a last look at what goes out
 if find "$D/prebuilt" -type f | grep -E -i '\.(apfs|dmg|ipsw|mdt|mbn|tlv|fw|elf)$'; then die "a file that does not belong in the kit"; fi
-(cd "$OUT" && zip -q -r -9 "$NAME.zip" "$NAME")
+# (Python's zipfile: it keeps the programs' modes, and needs no zip installed)
+python3 - "$OUT" "$NAME" <<'EOF'
+import os, sys, zipfile
+out, name = sys.argv[1:]
+with zipfile.ZipFile(os.path.join(out, name + '.zip'), 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    for top, dirs, files in os.walk(os.path.join(out, name)):
+        dirs.sort()
+        for f in sorted(files):
+            path = os.path.join(top, f)
+            z.write(path, os.path.relpath(path, out))
+EOF
 log "$OUT/$NAME.zip: $(du -h "$OUT/$NAME.zip" | cut -f1) (kernel $(du -h "$D/prebuilt/kernel-k40.bin" | cut -f1), $(ls "$D/prebuilt/userland" | wc -l) programs and libraries)"

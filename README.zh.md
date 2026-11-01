@@ -155,7 +155,7 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 **在你电脑上生成的部分**，因为不能再分发：系统镜像（苹果的 iOS 文件）、手机固件（厂商的）、引导程序里的 iPhone 身份信息
 （取自苹果的设备树），以及你的 Wi-Fi 密码。
 
-你需要：已解锁 Bootloader、打开了 USB 调试的 Redmi K40 / POCO F3；一台装有 WSL 的 Windows 10 或 11 电脑，或者 Linux；
+你需要：已解锁 Bootloader、打开了 USB 调试、Android 里有 root（Magisk 之类：DSP 固件、蓝牙固件和传感器校准数据只有 root 能读；不会往手机写任何东西）的 Redmi K40 / POCO F3；一台装有 WSL 的 Windows 10 或 11 电脑，或者 Linux；
 约 15 GB 可用磁盘空间；能上网。
 
 1. 从 Releases 页面下载套件并解压。

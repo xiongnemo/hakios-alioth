@@ -162,8 +162,10 @@ A bootable package has two halves, and only one of them can be published.
 **What is made on your computer**, because it cannot be redistributed: the system image (Apple's iOS files), the
 phone's firmware (the vendor's), the loader's iPhone identity (taken from Apple's device tree) and your Wi-Fi password.
 
-What you need: a Redmi K40 / POCO F3 with its bootloader unlocked and USB debugging on; a PC with Windows 10 or 11
-and WSL, or Linux; about 15 GB of free disk space; an Internet connection.
+What you need: a Redmi K40 / POCO F3 with its bootloader unlocked, USB debugging on and root in Android (Magisk or the
+like: the DSPs' firmware, the Bluetooth firmware and the sensors' calibration are readable by root only; nothing is
+written to the phone); a PC with Windows 10 or 11 and WSL, or Linux; about 15 GB of free disk space; an Internet
+connection.
 
 1. Download the kit from the Releases page and unpack it.
 2. With the phone in Android and connected, run `assemble.bat` (or `assemble/assemble.sh` on Linux). It
