@@ -2989,8 +2989,13 @@ backlightDisplayPower(bool on)
 	if (logged++ < 16) {
 		hakios_tl("backlight: the framebuffer's power change: %s\n", on ? "on" : "off");
 	}
-	/* (the panel awake before its brightness comes back, asleep after it has gone: bsd/dev/alioth_dsi.c) */
+	/*
+	 * (the panel awake before its brightness comes back, asleep after it has gone: bsd/dev/alioth_dsi.c; and the cores
+	 * and the memory's bandwidth up before the panel takes frames again -- with the display off the memory's vote may be
+	 * far under what scanning out at 120 Hz needs, ddr_off)
+	 */
 	if (on) {
+		hakios_screen_power(true);
 		alioth_panel_power(true);
 		/* (the refreshes again, those that stopped while it was dark: see vsyncPark()) */
 		__atomic_store_n(&gDisplayDark, false, __ATOMIC_RELEASE);
@@ -3002,9 +3007,9 @@ backlightDisplayPower(bool on)
 	if (!on) {
 		alioth_panel_power(false);
 		__atomic_store_n(&gDisplayDark, true, __ATOMIC_RELEASE);
+		/* (the cores and the memory slower while nobody looks: there is nothing else that lowers them) */
+		hakios_screen_power(false);
 	}
-	/* (the cores and the memory slower while nobody looks: there is nothing else that lowers them) */
-	hakios_screen_power(on);
 }
 
 /*
