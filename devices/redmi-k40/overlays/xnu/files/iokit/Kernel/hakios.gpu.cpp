@@ -56,6 +56,13 @@ void hakios_gpu_unmap(uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void * start, uint64_t size);
 void hakios_gpu_from_memory(void * start, uint64_t size);
 uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+/* a client's own address space (boot-arg gpu_spaces=1; NULL: the shared one) */
+void * hakios_gpu_space_new(void);
+void hakios_gpu_space_free(void * space);
+bool hakios_gpu_map_in(void * space, uint64_t address, uint64_t phys, bool read_only);
+void hakios_gpu_mapped_in(void * space);
+void hakios_gpu_unmap_in(void * space, uint64_t address, uint64_t size);
+uint32_t hakios_gpu_submit_in(void * space, const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
 uint32_t hakios_gpu_last(void);
@@ -450,6 +457,7 @@ class HakiosGPUUserClient : public IOUserClient
 	uint32_t                fLeftCount;
 	struct gpu_kept         fKept[GPU_KEPT];
 	uint64_t                fKeptBytes;
+	void *                  fSpace;                 /* its own GPU address space; NULL (gpu_spaces=0): the shared one */
 
 	struct gpu_buffer * buffer(uint32_t handle);
 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
@@ -492,6 +500,9 @@ HakiosGPUUserClient::start(IOService * provider)
 		return false;
 	}
 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
+	IOLockLock(gGPULock);
+	fSpace = hakios_gpu_space_new();
+	IOLockUnlock(gGPULock);
 	return fBuffers != NULL;
 }
 
@@ -532,7 +543,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * b)
 		} else if (b->surface == NULL && hakios_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
 			b->memory = NULL;               /* (now the kept one's) */
 		} else if (hakios_gpu_ready()) {
-			hakios_gpu_unmap(b->address, b->size);
+			hakios_gpu_unmap_in(fSpace, b->address, b->size);
 			hakios_gpu_address_free(b->address, b->size);
 		}
 		if (b->memory != NULL) {
@@ -563,7 +574,7 @@ HakiosGPUUserClient::reap(void)
 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
 			left->memory = NULL;
 		} else if (hakios_gpu_ready()) {
-			hakios_gpu_unmap(left->address, left->size);
+			hakios_gpu_unmap_in(fSpace, left->address, left->size);
 			hakios_gpu_address_free(left->address, left->size);
 		}
 		if (left->memory != NULL) {
@@ -596,7 +607,10 @@ HakiosGPUUserClient::clientClose(void)
 		}
 		if (fLeftCount != 0) {
 			IOLog("HakiosGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
+		} else if (fSpace != NULL) {
+			hakios_gpu_space_free(fSpace);          /* (the GPU is done with it: waited for above) */
 		}
+		fSpace = NULL;
 		IOLockUnlock(gGPULock);
 	}
 	if (!isInactive()) {
@@ -656,11 +670,11 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 		IOByteCount length = 0;
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
 
-		mapped = phys != 0 && hakios_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
+		mapped = phys != 0 && hakios_gpu_map_in(fSpace, b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
 	}
-	hakios_gpu_mapped();
+	hakios_gpu_mapped_in(fSpace);
 	if (!mapped) {
-		hakios_gpu_unmap(b->address, size);
+		hakios_gpu_unmap_in(fSpace, b->address, size);
 		hakios_gpu_address_free(b->address, size);
 		hakios_tl("HakiosGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
 		return NULL;
@@ -685,7 +699,7 @@ HakiosGPUUserClient::dropKept(struct gpu_kept * k)
 		return;
 	}
 	if (hakios_gpu_ready()) {
-		hakios_gpu_unmap(k->address, k->size);
+		hakios_gpu_unmap_in(fSpace, k->address, k->size);
 		hakios_gpu_address_free(k->address, k->size);
 	}
 	k->memory->release();
@@ -995,7 +1009,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		addresses[count] = b->address + cmds[i].submit_offset;
 		words[count++] = cmds[i].size / 4;
 	}
-	request->fence = hakios_gpu_submit(addresses, words, count);
+	request->fence = hakios_gpu_submit_in(fSpace, addresses, words, count);
 	if (gpu_log && request->fence != 0) {
 		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
 		uint32_t big = 0, all_words = 0;
