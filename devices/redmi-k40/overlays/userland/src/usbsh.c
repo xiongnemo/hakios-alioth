@@ -179,6 +179,63 @@ cmd_cat(const char *path)
 	}
 }
 
+/*
+ * A file whole, for the computer to keep (tools/netsh.py --get): "b64: BEGIN SIZE", its bytes in base64 lines of 76
+ * characters, "b64: END". Screenshots in the photo library, crash reports: nothing else on a test image reads them out.
+ */
+static void
+cmd_b64(const char *path)
+{
+	static const char digits[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	unsigned char in[57 * 64];
+	char line[80];
+	struct stat st;
+	ssize_t n;
+	int f = open(path, O_RDONLY);
+
+	if (f < 0 || fstat(f, &st) != 0) {
+		out("b64: %s: %s\n", path, strerror(errno));
+		if (f >= 0) {
+			close(f);
+		}
+		return;
+	}
+	out("b64: BEGIN %lld\n", (long long)st.st_size);
+	for (;;) {
+		ssize_t got;
+
+		for (n = 0; n < (ssize_t)sizeof(in) && (got = read(f, in + n, sizeof(in) - (size_t)n)) > 0; n += got) {
+		}                                       /* (whole buffers: padding only at the very end) */
+		if (n == 0) {
+			break;
+		}
+		for (ssize_t at = 0; at < n; at += 57) {
+			ssize_t take = n - at < 57 ? n - at : 57;
+			size_t m = 0;
+
+			for (ssize_t i = 0; i < take; i += 3) {
+				unsigned v = (unsigned)in[at + i] << 16;
+				int have = take - i;
+
+				if (have > 1) {
+					v |= (unsigned)in[at + i + 1] << 8;
+				}
+				if (have > 2) {
+					v |= in[at + i + 2];
+				}
+				line[m++] = digits[v >> 18 & 63];
+				line[m++] = digits[v >> 12 & 63];
+				line[m++] = have > 1 ? digits[v >> 6 & 63] : '=';
+				line[m++] = have > 2 ? digits[v & 63] : '=';
+			}
+			line[m++] = '\n';
+			out_bytes(line, m);
+		}
+	}
+	close(f);
+	out("b64: END\n");
+}
+
 static void
 cmd_uname(void)
 {
@@ -325,7 +382,7 @@ static void
 help(void)
 {
 	out("usbsh: commands over USB, run on iOS\n"
-	    "  ls [DIR]  cat FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
+	    "  ls [DIR]  cat FILE  b64 FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
 	    "  anything else: a program and its arguments; names are looked for in\n"
 	    "  /redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec -- e.g. battery_test, vol_ls /, net_test\n"
 	    "  Ctrl-C interrupts a program; 'log' gives the port back to the kernel's log\n");
@@ -354,6 +411,8 @@ execute(char *line)
 		for (int i = 1; i < argc; i++) {
 			cmd_cat(argv[i]);
 		}
+	} else if (!strcmp(argv[0], "b64") && argc > 1) {
+		cmd_b64(argv[1]);
 	} else if (!strcmp(argv[0], "cd")) {
 		if (chdir(argc > 1 ? argv[1] : "/") != 0) {
 			out("cd: %s\n", strerror(errno));
