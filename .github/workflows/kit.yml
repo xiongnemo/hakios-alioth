@@ -39,9 +39,11 @@ jobs:
         run: |
           T=$HOME/theos
           mkdir -p $T/toolchain/linux/iphone $T/sdks /tmp/tc
-          curl -fsSL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain.tar.xz | tar -xJ -C /tmp/tc
-          bin=$(dirname "$(find /tmp/tc -type f -name clang -path '*/bin/*' | head -1)")
-          cp -a "$bin/.."/. $T/toolchain/linux/iphone/
+          curl -fsSL https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz | tar -xJ -C /tmp/tc
+          # (clang may be a link to clang-11: whichever it is, the directory above its bin/ is the toolchain)
+          c=$(find /tmp/tc -path '*/bin/clang' \( -type f -o -type l \) | head -1)
+          [ -n "$c" ] || { echo "no bin/clang in the toolchain archive"; find /tmp/tc -maxdepth 3; exit 1; }
+          cp -a "$(dirname "$(dirname "$c")")"/. $T/toolchain/linux/iphone/
           git clone -q --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks $T/sdks-git
           git -C $T/sdks-git sparse-checkout set iPhoneOS16.5.sdk
           ln -s ../sdks-git/iPhoneOS16.5.sdk $T/sdks/iPhoneOS16.5.sdk
