@@ -1,6 +1,6 @@
 # HakiOS
 
-[English](README.md) · [中文](README.zh.md) · Українська
+[English](README.hakios.md) · [中文](README.hakios.zh.md) · Українська
 
 HakiOS запускає відкрите ядро XNU (xnu-8796.121.2) з власним завантажувачем і власними драйверами
 на Android-телефоні з процесором Qualcomm, а поверх нього — стандартний користувацький простір

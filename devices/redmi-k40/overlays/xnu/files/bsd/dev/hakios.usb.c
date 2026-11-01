@@ -264,6 +264,14 @@ static uint32_t usb_failures;
 /* /dev/hakios-usb */
 static uint8_t rx_ring[RX_RING];
 static uint32_t rx_head, rx_tail;       /* (under usb_lock; free-running counters) */
+/*
+ * Sessions of the port: one more at every bus reset (the cable out and in again, the computer resetting the port) and
+ * at every restart of the controller. What the computer sent before is of a session that is over, and is dropped; the
+ * program asks for the number (HAKIOS_USB_GENERATION) and starts its side again when it changes -- the usbmux did not,
+ * kept half a packet of the old session in front of the new one's first, and the computer's usbmuxd, unanswered, let
+ * the iPhone go: no Trust, no photos after the cable was pulled once (2026-11-01).
+ */
+static uint32_t usb_generation, seen_rx_generation;
 static volatile UInt32 user_open;
 static volatile bool log_mode = true;   /* the log goes to the port: until the computer sends something to the program that has it */
 static struct selinfo usb_rsel, usb_wsel;
@@ -279,6 +287,8 @@ struct hakios_usb_iphone {
 #define HAKIOS_USB_IPHONE       _IOW('u', 2, struct hakios_usb_iphone)
 /* usb=3: the computer's usbmux has come (1) or gone (0) -- for AppleUSBDeviceMux's clients (iokit/Kernel/hakios.usbmux.cpp) */
 #define HAKIOS_USB_HOST         _IOW('u', 3, int)
+/* the port's session (see usb_generation) */
+#define HAKIOS_USB_GENERATION   _IOR('u', 4, uint32_t)
 extern int hakios_usbmux_publish(void);
 extern void hakios_usbmux_host(bool connected);
 static volatile bool usb_taken;         /* /dev/hakios-usb is there, the thread runs */
@@ -490,7 +500,7 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	log_at = loader_log_tee_total > LOG_BACKLOG ? loader_log_tee_total - LOG_BACKLOG : 0;
 	while (!usb_stopping) {
-		bool readable = false, writable;
+		bool readable = false, writable, restarted = false;
 		uint8_t buf[2048];
 		size_t n;
 
@@ -501,6 +511,7 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		r = dwc3_poll(usb_dev, 64);
 		if (r < 0) {
+			restarted = true;
 			/*
 			 * The device side from scratch: stopped, reset and started again (the computer sees the port
 			 * leave and come back), not the shared core's dwc3_recover(), which reconfigures the endpoints
@@ -516,6 +527,15 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 				lck_mtx_unlock(&usb_lock);
 				say("usb: the controller does not start again: the port is gone until the run ends\n");
 				break;
+			}
+		}
+		if (restarted || dwc3_rx_generation(usb_dev) != seen_rx_generation) {
+			static unsigned told;
+
+			seen_rx_generation = dwc3_rx_generation(usb_dev);
+			rx_head = rx_tail = 0;
+			if (usb_generation++ != 0 && told++ < 20) {
+				say("usb: a new session of the port (%u): what came before it is dropped\n", usb_generation);
 			}
 		}
 		if (!user_open) {
@@ -733,6 +753,11 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 	case FIONREAD:
 		lck_mtx_lock(&usb_lock);
 		*(int *)data = (int)(rx_head - rx_tail);
+		lck_mtx_unlock(&usb_lock);
+		return 0;
+	case HAKIOS_USB_GENERATION:
+		lck_mtx_lock(&usb_lock);
+		*(uint32_t *)(void *)data = usb_generation;
 		lck_mtx_unlock(&usb_lock);
 		return 0;
 	case HAKIOS_USB_HOST: {

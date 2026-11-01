@@ -1,196 +1,171 @@
-# HakiOS
+# iOS 16 on the Redmi K40 / POCO F3 (alioth)
 
-English · [中文](README.zh.md) · [Українська](README.uk.md)
+English · [中文](README.zh.md)
 
-HakiOS runs the open-source XNU kernel (xnu-8796.121.2) with my own boot loader and my own drivers
-on an Android phone with a Qualcomm SoC, and boots the stock iOS 16.5 user space on top of it:
-launchd, backboardd, SpringBoard, the apps. The same thing runs in QEMU (`virt`, aarch64) on a
-Linux PC.
+The stock iOS 16.5 (20F66) user space on the Redmi K40 / POCO F3 (`alioth`, Snapdragon 870), running on the
+open-source XNU kernel with our own boot loader and drivers. It is a port of [HakiOS](https://github.com/oosexgang/hakios-os)
+to this phone, built on the Mi 10 port of the same SoC family
+([hackios-xnu-kernel-umi](https://github.com/JopangJovan/hackios-xnu-kernel-umi)).
 
-Nothing is flashed. The loader goes into RAM through `fastboot boot`, the system lives in RAM for
-the length of a session, and a reboot brings the phone back to its own Android. This is a research
-bench, not a ROM.
+**Nothing is flashed.** The loader goes into RAM through `fastboot boot`, iOS runs from RAM for one session, and a
+reboot brings the phone back to its own Android with its data untouched. iOS sees the phone as an iPhone X
+(`iPhone10,3`).
 
-The first phone is the **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G). The kernel knows nothing
-about it in advance: every address, interrupt, power rail and firmware comes from the phone's own
-device tree and its own Android, so a port to another Qualcomm phone is a new directory under
-`devices/`, not a rewrite.
+## Screenshots
 
-The Xiaomi Mi 10 (UMI) integration is maintained in [devices/xiaomi-mi-10/](devices/xiaomi-mi-10/README.md), with isolated device overlays and build scripts.
+Taken on the phone with the side button and volume up. Network names and the phone's own addresses are hidden.
 
-## What is in the repository
+### Games
 
-Only my code and my data:
+OpenGL ES 1/2/3 games run on the Adreno 650 in their own process, each in a GPU address space of its own.
 
-- the kernel: a patch to Apple's open-source XNU (`xnu/hakios.patch`, APSL 2.0) and my driver
-  files (`xnu/files/`), laid over a fresh clone by `xnu/apply.sh`;
-- the boot loader (`xnuloader/`), my programs and libraries (`userland/src/`), tools (`tools/`),
-  build and run scripts;
-- `prebuilt/`: the kernel, loader and libraries built from this repository;
-- `devices/poco-x5-pro/`: what one phone needs (its UEFI port, device tree, firmware script).
+<p>
+  <img src="docs/alioth/screenshots/games/minecraft-title.png" width="420" alt="Minecraft PE 1.2.10: title screen">
+  <img src="docs/alioth/screenshots/games/minecraft-world-1.png" width="420" alt="Minecraft: in a world">
+  <img src="docs/alioth/screenshots/games/minecraft-world-2.png" width="420" alt="Minecraft: in a world">
+</p>
 
-Not in the repository, never:
+Minecraft PE 1.2.10: title screen, and in a world at 60 fps.
 
-- any file of iOS: no binary, image, cache, font, picture or screenshot. You build the system
-  image on your machine from the iOS 16.5 IPSW, which `sysimage/fetch.sh` downloads from Apple's
-  public servers for you, without decrypting or circumventing anything;
-- the phone's firmware (GPU, Wi-Fi, audio DSP, modem, haptics, cameras): it is the vendor's and
-  is pulled from your own phone into `fw-*/`, which git ignores;
-- keys, certificates, activation, or anything that would make the phone pass as an iPhone to
-  Apple's services. Signing in to an Apple account is impossible here and not a goal.
+<p>
+  <img src="docs/alioth/screenshots/games/terraria-title.png" width="420" alt="Terraria 1.2: title screen">
+  <img src="docs/alioth/screenshots/games/terraria-world-1.png" width="420" alt="Terraria: in a world">
+  <img src="docs/alioth/screenshots/games/terraria-world-2.png" width="420" alt="Terraria: in a world">
+</p>
 
-## Status
+Terraria 1.2: title screen, and in a world at 60 fps.
 
-| Works | Not yet |
+<p>
+  <img src="docs/alioth/screenshots/games/sims3-title.png" width="420" alt="The Sims 3 Ambitions: title screen">
+  <img src="docs/alioth/screenshots/games/sims3-create-a-sim.png" width="420" alt="The Sims 3 Ambitions: Create a Sim">
+  <img src="docs/alioth/screenshots/games/sims3-house.png" width="420" alt="The Sims 3 Ambitions: at home">
+  <img src="docs/alioth/screenshots/games/sims3-house-2.png" width="420" alt="The Sims 3 Ambitions: at home">
+  <img src="docs/alioth/screenshots/games/sims3-town.png" width="420" alt="The Sims 3 Ambitions: the town">
+</p>
+
+The Sims 3 Ambitions (OpenGL ES 1, PVRTC textures decoded on the CPU): title screen, Create a Sim, at home, the
+town; 62 fps.
+
+### Graphics
+
+<p>
+  <img src="docs/alioth/screenshots/graphics/gpu-check-summary.png" width="260" alt="GPU Check: summary">
+  <img src="docs/alioth/screenshots/graphics/gpu-check-scenekit.png" width="260" alt="GPU Check: SceneKit and SpriteKit">
+</p>
+
+[GPU Check](https://github.com/xiongnemo/ios-gpu-check) tests every graphics capability a game may need, one at a
+time: 81 of 83 pass. The two left need Metal, which this port does not have yet.
+
+### System and settings
+
+<p>
+  <img src="docs/alioth/screenshots/system/settings.png" width="260" alt="Settings">
+  <img src="docs/alioth/screenshots/system/about.png" width="260" alt="About">
+  <img src="docs/alioth/screenshots/system/battery.png" width="260" alt="Battery">
+  <img src="docs/alioth/screenshots/system/display.png" width="260" alt="Display and Brightness">
+  <img src="docs/alioth/screenshots/system/wifi.png" width="260" alt="Wi-Fi">
+  <img src="docs/alioth/screenshots/system/bluetooth-pairing.png" width="260" alt="Bluetooth pairing">
+  <img src="docs/alioth/screenshots/system/bluetooth-connected.png" width="260" alt="Bluetooth connected">
+</p>
+
+Settings; About (iOS 16.5 as an iPhone X); Battery, from the phone's fuel gauge; Display & Brightness; Wi-Fi;
+Bluetooth pairing with another phone, then connected.
+
+### Sensors
+
+<p>
+  <img src="docs/alioth/screenshots/sensors/sensor-check-light.png" width="260" alt="Ambient light and proximity">
+  <img src="docs/alioth/screenshots/sensors/sensor-check-motion.png" width="260" alt="Motion sensors">
+  <img src="docs/alioth/screenshots/sensors/sensor-check-power.png" width="260" alt="Battery, thermal state, microphone, cameras">
+  <img src="docs/alioth/screenshots/sensors/sensor-check-display.png" width="260" alt="Orientation, volume buttons, display">
+  <img src="docs/alioth/screenshots/sensors/sensor-check-touch.png" width="260" alt="Touch and haptics">
+</p>
+
+[Sensor Check](https://github.com/xiongnemo/ios-sensor-check) lists every sensor and hardware input an app can
+reach, live: ambient light, accelerometer, gyroscope, device motion, battery, thermal state, microphone, cameras,
+the display at 121 fps, touch and haptics.
+
+## What works
+
+Each item has been checked on the phone.
+
+| Area | |
 |---|---|
-| Lock screen, home screen, Control Center, gestures, the stock apps | Cellular: the modem boots, sees the network, the SIM is bound, the IPA data path and `en1` are in place; registration, the data session and the status bar bars are in progress (`docs/cellular.md`) |
-| Touch screen, multitouch, power and volume buttons | Bluetooth |
-| All 8 CPU cores, the big core at 2.4 GHz | Charging under this kernel |
-| GPU rendering on Adreno (`gpu=1`, OpenGL ES through Mesa) | Metal (there is a shader compiler, no Metal) |
-| Speakers and microphone (`adsp=1 sound=4 mic=4`) | Apple account: no Secure Enclave |
-| Battery level in the UI (through the audio DSP, `adsp=1`) | |
-| Vibration (`haptic=5`) | |
-| Wi-Fi: radio, driver, network connection (`wifi=1`) | |
-| Cameras in Camera.app (`cam=5`) | |
-| `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
-| Sileo, Procursus packages, SSH into the phone | |
+| Display | 120 Hz (the panel's TE every 8.2 ms); brightness; dark mode; automatic brightness from the ambient light sensor; rotation; Invert Colors, Color Filters and Night Shift in the display engine's colour correction, as on an iPhone |
+| Graphics | The compositor and applications on the Adreno 650 through Mesa (freedreno): OpenGL ES 1, 2 and 3, GLKit, SceneKit, SpriteKit, Core Image; PVRTC textures decoded on the CPU; a GPU address space per process |
+| Input | Touch screen with multitouch, power and volume buttons, vibration |
+| Sound | Speakers (CS35L41), microphone (Voice Memos records) |
+| Wi-Fi | Joins the network configured at build time, 5 GHz preferred |
+| Bluetooth | Discoverable, scan, pairing, Bluetooth audio to speakers and headphones |
+| Cameras | Camera.app preview and photos: the main camera (IMX582, autofocus) and the front one (S5K3T2); the ultra-wide (IMX355) or the macro (S5K5E9) as the back camera instead, chosen at boot |
+| Flashlight | From Control Center |
+| Power | Battery level and charging |
+| Sensors | Ambient light, accelerometer, gyroscope, device motion, compass (true north with location) through the sensor DSP |
+| Location | Wi-Fi positioning through Apple's location service |
+| USB | The PC sees an iPhone: pairing ("Trust This Computer"), files over AFC |
+| Apps | Unsigned, decrypted IPAs install from the PC at boot or with the on-phone installer |
 
-## Quick start in QEMU
+Apps written for this port: [GPU Check](https://github.com/xiongnemo/ios-gpu-check),
+[Sensor Check](https://github.com/xiongnemo/ios-sensor-check), [Motion Test](https://github.com/xiongnemo/ios-motion-test)
+and [Map](https://github.com/xiongnemo/ios-map) (OpenStreetMap; Apple Maps needs Metal).
 
-Linux x86-64, about 12 GB of disk, 7-Zip 23 or newer, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
+## Not yet
 
-```sh
-git clone https://github.com/oosexgang/hakios-os.git hakios
-cd hakios
-sysimage/fetch.sh             # the iOS 16.5 IPSW from Apple's servers, the needed parts unpacked (7.4 GB)
-REST=1 userland/build.sh      # the APFS images: userland/root.apfs and userland/system.apfs
-mkdir -p logs
-qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # a 20-minute session
-```
+- **Metal**: apps that need it close at once (Measure, many newer 3D games). OpenGL ES works.
+- **Persistence**: iOS runs from RAM, so settings, photos and installed apps are gone after a reboot.
+- GPS, cellular, NFC, fingerprint, the proximity sensor.
+- Recovery from a GPU hang: an app that hangs the GPU stops the whole screen until the phone is restarted.
+- Power: the display link and the GPU stay on with the screen off.
+- Pulling the USB cable while iOS runs: the PC does not see the phone again until the next boot (a fix is being tested).
+- Safari cannot pick photos from the library.
 
-The lock screen appears after two or three minutes. The mouse with the button held is a finger;
-`H` is Home, `L` is the power button, `↑`/`↓` are volume.
+How each part works, what was measured and what comes next: [docs/alioth/status.md](docs/alioth/status.md).
 
-## On the phone
+## Getting a package you can boot
 
-A phone with a port (`devices/poco-x5-pro/`, POCO X5 Pro 5G), its boot loader unlocked, `adb` and
-`fastboot` on the PC, the images from the previous section, and the phone's own firmware:
+> The workflow and the assembly script described here are being set up. Until the first kit is on the Releases page,
+> the only way is to build everything from source.
 
-```sh
-devices/poco-x5-pro/pull-firmware.sh    # GPU, Wi-Fi, audio/battery, haptics, modem, cameras -> fw-*/
-./xl enter                          # Android -> fastboot -> our loader in RAM
-./xl ramdisk userland/system.apfs   # the system image into the phone's RAM (~80 s), once per loader session
-XL_SB_DELAY=8 XL_SECS=600 \
-XL_CMDLINE="bootcpu=7 cpus=8 cpufreq=1 ufs=2 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1" \
-./xl run                            # a 10-minute session, the log goes to logs/
-./xl reboot                         # back to Android
-```
+A bootable package has two halves, and only one of them can be published.
 
-`tools/modem-cycle.sh "ARGS" SECS` does all of that in one command and returns the phone to Android.
+**What GitHub Actions builds** (from this repository's sources alone, published on the Releases page as
+`alioth-kit-<version>.zip`):
 
-The main kernel arguments (the full list is in `docs/ru/notes.md`):
-
-| Argument | What it does |
+| Folder | What is in it |
 |---|---|
-| `cpus=8 bootcpu=7 cpufreq=1` | all CPU cores and their clocks |
-| `touchscreen=1` | the touch screen |
-| `gpu=1` | rendering on Adreno (an image built with `GL=1`, firmware in `fw-gpu/`) |
-| `adsp=1 sound=4 mic=4` | the audio DSP: speakers, microphone; battery and charging come with it |
-| `haptic=5` | the vibration motor |
-| `wifi=1` | Wi-Fi (the network from `fw-wifi/network`) |
-| `cam=5` | the cameras |
-| `modem=1` | the modem beside the system: its firmware, file systems, IPA, SIM, NAS |
-| `modem_step=N` | the modem step by step, for debugging (`docs/cellular.md`) |
-| `var_store=1 ufs_write=1` | keep `/private/var` across reboots |
+| `kernel/` | The XNU kernel with this phone's drivers |
+| `userland/` | Our programs and libraries for iOS (OpenGL ES on Mesa, the USB daemon, the IPA installer and the rest), Mesa's OSMesa library, and the apps written for this port |
+| `boot/` | The UEFI stage for this phone (Project Silicium) and its boot shim |
+| `assemble/` | The scripts that make the other half on your computer, and `start.bat` |
 
-## Building from source
+**What is made on your computer**, because it cannot be redistributed: the system image (Apple's iOS files), the
+phone's firmware (the vendor's), the loader's iPhone identity (taken from Apple's device tree) and your Wi-Fi password.
 
-The kernel (Linux: theos with its cctools and `iPhoneOS16.5.sdk`; macOS: Xcode or cctools, the SDK
-is fetched for you):
+What you need: a Redmi K40 / POCO F3 with its bootloader unlocked and USB debugging on; a PC with Windows 10 or 11
+and WSL, or Linux; about 15 GB of free disk space; an Internet connection.
 
-```sh
-xnu/apply.sh             # XNU sources from Apple's GitHub + my changes -> xnu-src/
-xnu-deps/setup.sh        # dependencies, tools and the SDK
-./xnu-build.sh -j8 -k    # -> xnu-src/.../BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
-```
+1. Download the kit from the Releases page and unpack it.
+2. With the phone in Android and connected, run `assemble.bat` (or `assemble/assemble.sh` on Linux). It
+   - downloads the iOS 16.5 IPSW for the iPhone X (`iPhone10,3`) from Apple's public servers and builds the system
+     image from it, without decrypting or circumventing anything;
+   - pulls the firmware the drivers need (GPU, audio, Wi-Fi, Bluetooth, sensors, cameras) from the phone's own Android;
+   - asks for the Wi-Fi network iOS should join;
+   - makes the loader's identity from the IPSW and builds the boot image;
+   - writes the package folder, `ios-alioth-k40/`.
+3. Run `start.bat` in that folder with the phone in Android. Nothing is flashed; a reboot brings Android back.
 
-The loader: `xnuloader/build.sh` (clang + lld-link, an EFI application without EDK2). The header
-`xnuloader/identity.h`, the properties by which iOS tells which iPhone it is, is not kept in the
-repository: `xnuloader/mkidentity.sh` makes it at build time from the device tree in your own IPSW
-(one 34 KB file; LZFSE is decoded by `lzfse`, macOS's `compression_tool` or the Python `lzfse`
-module, or the open lzfse library gets built). User space and the images: `REST=1 userland/build.sh`
-(`MODEM=1 SYSTEM=1` put the modem's firmware into the system image). Details: `xnu/README.md`,
-`docs/ru/notes.md`.
+Keep the package to yourself: it holds Apple's files, the vendor's firmware and your Wi-Fi password.
 
-## Layout
+## Not in this repository
 
-| Directory | Contents |
-|---|---|
-| `xnu/` | the kernel patch and files; `apply.sh`, `export.sh`; a README about the kernel |
-| `xnu/files/bsd/dev/hakios.*.c` | my drivers: display, touch, UFS, GPU, Wi-Fi, audio, modem (`hakios.mpss.c`), its packets (`hakios.ipa.c`, `hakios.cell.c`), SIM/NAS, haptics, cameras |
-| `xnuloader/` | the boot loader (a UEFI application) |
-| `userland/` | my programs and libraries (`src/`), the image build, launchd jobs |
-| `sysimage/` | scripts that fetch and unpack the OS files from the IPSW (none of the files themselves) |
-| `devices/poco-x5-pro/` | one phone: its UEFI port, device tree, prebuilt UEFI images, firmware script, tools |
-| `tools/` | APFS, firmware, QMI tests, run scripts |
-| `qemu/` | running in QEMU |
-| `docs/` | `notes.md`: the detailed notes (Russian); `cellular.md`: cellular; `air.md`, `metal.md`: the GPU |
-| `prebuilt/` | the built kernel, loader and libraries |
+Apart from the screenshots above, no file of iOS: you build the system image from your own copy of the iOS 16.5
+IPSW. No vendor firmware either (it is pulled from your own phone), and no keys, certificates or activation. Signing
+in to an Apple account is not possible and not a goal.
 
-## Devices
+## Thanks
 
-The kernel, loader and user space are shared. Everything about one phone lives in
-`devices/<name>/`: its UEFI, device tree, firmware list and tools. Today there is one,
-`devices/poco-x5-pro/`, and its README is the map of what a port to another Qualcomm phone must bring.
-The phone's drivers are the files `xnu/files/bsd/dev/hakios.*.c`; the head of each says where its
-numbers came from.
-
-## Cellular
-
-The modem (the Hexagon MPSS) is brought up from XNU: firmware through TrustZone, shared memory,
-SMP2P, GLINK, QRTR, QMI; its file systems are served from the UFS (read-only, writes stay in kernel
-memory), TFTP and the service registry are mine. The IPA packet engine runs with its firmware,
-clock and SMMU context, and the handshake with the modem goes through. The SIM is bound to the
-subscription and NAS reads the signal. The current state and the whole story are in
-`docs/cellular.md`.
-
-## Independent, and Apple-free at the core
-
-HakiOS is an independent research project. It is **not affiliated with or endorsed by Apple**;
-"iOS", "iPhone", "XNU" and "Apple" are named only to describe what the code works with. The core
-kernel, the boot loader and the open tools build and run with nothing of Apple's:
-
-```sh
-make qemu-open      # the open kernel + a placeholder loader + a tiny raw-syscall user space, in QEMU
-```
-
-No IPSW, no iOS user space, no firmware. Booting the stock iOS user space (`make qemu`,
-`make phone`) is an optional path that needs the IPSW and the phone's firmware, which you supply
-from your own device.
-
-## Licenses and the legal side
-
-My code is under the license of the files it changes: the XNU patch under the Apple Public Source
-License 2.0 (Apple publishes XNU under it; the terms are met: changes are published as source,
-notices are kept), the rest as the file headers say. iOS, its images, Apple's trademarks and the
-phone's firmware belong to their owners, are not in this repository and are not distributed by me;
-everyone takes them from their own phone and their own IPSW. "iOS", "iPhone" and "Apple" are
-named only to describe what the code works with. If you believe a file here infringes anyone's
-rights, open an issue and I will remove it.
-
-The detail is in separate files: `LEGAL.md` (what is and is not distributed, and the limits of
-these statements), `COMPLIANCE.md` (how the APSL 2.0 and other terms are met, and the items still
-to verify), `THIRD_PARTY_LICENSES.md` (every third-party component with origin and license), and
-`NOTICE` (the short canonical list). None of this is legal advice.
-
-hakios is an experimental project focused on bringing ios to android hardware. our goal is to make hackios free and accessible to everyone.
-
-owners:
-@oodze - founder
-@netusd - adversting / ceo-dev
-@wannqn - dev 
-@hxfuxyyXD - dev
-Rhaenja Hun（杭润嘉） — Developer / Sponsor
-
-tym sicilium for the sources!
-
+[HakiOS](https://github.com/oosexgang/hakios-os) (the kernel, loader and user space this is built on),
+[hackios-xnu-kernel-umi](https://github.com/JopangJovan/hackios-xnu-kernel-umi) (the Mi 10 port),
+[Project Silicium](https://github.com/Project-Silicium/Mu-Silicium) (the UEFI stage), [ios-alioth](https://github.com/MrMoxing/ios-alioth)
+(the first boot package for this phone, which this started from), FFT-infra's QcomXnuUsbDebug (the USB device driver)
+and [Mesa](https://mesa3d.org/) (freedreno).

@@ -48,8 +48,12 @@ struct hakios_usb_iphone {
 #define HAKIOS_USB_IPHONE       _IOW('u', 2, struct hakios_usb_iphone)
 /* the computer's usbmux has come (1) or gone (0): for lockdownd, through the kernel's AppleUSBDeviceMux */
 #define HAKIOS_USB_HOST         _IOW('u', 3, int)
+/* the port's session: one more at every bus reset -- the cable out and in again -- and restart of the controller */
+#define HAKIOS_USB_GENERATION   _IOR('u', 4, uint32_t)
 
 static int port = -1;
+static uint32_t generation;             /* the port's session these packets are of */
+static int generation_known = 1;
 
 static void
 host_here(int here)
@@ -491,6 +495,10 @@ main(int argc, char **argv)
 		return 0;
 	}
 	say("an iPhone to the computer, serial %s: waiting for its usbmux", ask.serial);
+	if (ioctl(port, HAKIOS_USB_GENERATION, &generation) != 0) {
+		say("the kernel does not tell the port's sessions apart (%s): the cable must stay in", strerror(errno));
+		generation_known = 0;
+	}
 	for (;;) {
 		/*
 		 * select(), not poll(): XNU's poll() takes no character device (it answers POLLNVAL at once), and with
@@ -549,6 +557,23 @@ main(int argc, char **argv)
 				return 1;
 			}
 			if (r > 0) {
+				uint32_t now;
+
+				/*
+				 * A new session of the port (the cable was pulled, the computer reset it): what is left of the
+				 * old one goes -- half a packet of it in front of the new session's version packet swallowed
+				 * that, and the computer let the iPhone go unanswered -- and so do its connections.
+				 */
+				if (generation_known && ioctl(port, HAKIOS_USB_GENERATION, &now) == 0 && now != generation) {
+					say("a new session of the port (%u -> %u): %zu bytes of the old one dropped", generation, now, used);
+					generation = now;
+					memmove(in, in + used, (size_t)r);
+					used = 0;
+					close_all("the port's session is over");
+					v2 = 0;
+					tx_seq = rx_seq = 0;
+					host_here(0);
+				}
 				used += (size_t)r;
 				port_input(in, &used);
 			}

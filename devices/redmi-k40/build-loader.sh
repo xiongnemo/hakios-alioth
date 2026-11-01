@@ -15,6 +15,17 @@ fi
 if [ ! -f "$OUT/darwin_identity.h" ] || [ -n "${DARWIN_ID:-}" ]; then
   python3 "$DEVICE_DIR/tools/darwinid.py" header "${DARWIN_ID:-}" "$OUT/darwin_identity.h"
 fi
+# the USB serial the loader shows to fastboot: $LOADER_SERIAL, else the first line of fw-usb/serial (your phone's own
+# serial, kept out of the repository like the rest of fw-*), else "xnuloader"
+SERIAL=${LOADER_SERIAL:-}
+[ -n "$SERIAL" ] || [ ! -f "$ROOT/fw-usb/serial" ] || SERIAL=$(head -1 "$ROOT/fw-usb/serial" | tr -d '\r\n ')
+SERIAL=${SERIAL:-xnuloader}
+python3 - "$SERIAL" > "$OUT/loader_serial.h" <<'EOF'
+import sys
+s = sys.argv[1]
+d = [2 + 2 * len(s), 3] + [x for c in s for x in (ord(c), 0)]
+print('static const uint8_t usb_str_serial[%d] = { %s };' % (len(d), ', '.join(map(str, d))))
+EOF
 clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar \
   -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter -DLOADER_UMI -DLOADER_ALIOTH \
   -I"$OUT" -I"$DEVICE_DIR/loader" -c "$DEVICE_DIR/loader/loader.c" -o "$OUT/loader.obj"

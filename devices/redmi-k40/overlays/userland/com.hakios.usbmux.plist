@@ -13,6 +13,13 @@
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<!-- ended by an error (the port failed under it): started again, or the computer keeps an iPhone nobody answers
+	     for; ended at once without usb=3 (status 0): left so -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>/dev/console</string>
 	<key>StandardErrorPath</key>

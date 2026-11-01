@@ -3816,8 +3816,9 @@ static const uint8_t usb_str0[4] = { 4, 3, 0x09, 0x04 };
 static const uint8_t usb_str_mfr[8] = { 8, 3, 'X', 0, 'N', 0, 'U', 0 };
 static const uint8_t usb_str_prod[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
 #ifdef LOADER_ALIOTH
-/* The phone's own serial (adb/fastboot SERIAL): `fastboot -s SERIAL` reaches this loader too. */
-static const uint8_t usb_str_serial[18] = { 18, 3, 'h', 0, 'a', 0, 'k', 0, 'i', 0, 'o', 0, 's', 0, '4', 0, '0', 0 };
+/* usb_str_serial, made by build-loader.sh: the phone's own serial when it is given, so that one `fastboot -s` reaches
+ * both the phone's bootloader and this one; "xnuloader" otherwise */
+#include "loader_serial.h"
 #else
 static const uint8_t usb_str_serial[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
 #endif
@@ -3876,6 +3877,19 @@ usb_start(void)
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
  * state changed. Keeps the watchdog fed while idle.
  */
+/*
+ * The cable out or in: whatever either endpoint still had with the controller belongs to a host that is gone. Left there,
+ * a reply queued before went out as the answer to the next host's command -- every reply a command behind, "getvar
+ * product" answered with nothing, and the PC took the loader for something else (2026-11-01 12:21, a cable moved).
+ */
+static void
+usb_drop_transfers(void)
+{
+	(void)USB->abort_xfer(USB_EP_OUT);
+	(void)USB->abort_xfer(USB_EP_IN);
+	usb_rx_queued = 0;
+}
+
 static int64_t
 usb_wait(uint8_t endpoint)
 {
@@ -3892,6 +3906,7 @@ usb_wait(uint8_t endpoint)
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
 			print("usb: %s (waiting on endpoint %x)\n", usb_connected ? "connected" : "disconnected", (uint64_t)endpoint);
+			usb_drop_transfers();
 			return -1;
 		}
 		/*
@@ -4095,14 +4110,28 @@ fb_command(char *cmd)
 				 * where it fits; tools/k40.py keeps the rows beyond the panel's, tools/fixshot.py cuts them again.
 				 */
 				uint64_t scanned = *(volatile uint32_t *)(uintptr_t)0x0ae05014ULL, surface = 4608ULL * 2436;
+				char where[24];
 				if (scanned >= 0x9C000000ULL && scanned + staged_len <= 0x9E300000ULL) {
 					staged_data = (const char *)(uintptr_t)scanned;
 					if (scanned != SCREEN.base && surface > staged_len && scanned + surface <= 0x9E300000ULL)
 						staged_len = surface;
 				}
+				/*
+				 * The address VIG0 scans, in the reply: once (2026-11-01, a game on the screen) the copy was the
+				 * panel buffer's, the scanned one outside the display's memory -- which is not read from here
+				 * (who knows what is there), only said, to find out where the kernel put it.
+				 */
+				static const char hex[] = "0123456789abcdef";
+				where[0] = '0';
+				where[1] = 'x';
+				for (int i = 0; i < 8; i++)
+					where[2 + i] = hex[(scanned >> (28 - 4 * i)) & 15];
+				where[10] = 0;
+				fb_reply("OKAY", where);
 			}
-#endif
+#else
 			fb_reply("OKAY", "");
+#endif
 		} else if (starts_with(cmd, "oem recording")) {
 			/* stage what the kernel's display driver recorded (boot-arg rec_secs) */
 			if (recording_data == NULL) {
@@ -4197,7 +4226,7 @@ usb_poll_command(void)
 	USB->handle_event(&msg, &size, &data);
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		usb_connected = (data.device_state == UsbDeviceStateConnected);
-		usb_rx_queued = 0;
+		usb_drop_transfers();
 		print("usb: %s while the kernel runs\n", usb_connected ? "connected" : "disconnected");
 		return;
 	}
