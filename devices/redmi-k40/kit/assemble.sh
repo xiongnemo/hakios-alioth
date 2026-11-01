@@ -58,9 +58,9 @@ if ! command -v lld-link > /dev/null; then
 fi
 command -v lld-link > /dev/null || die "no lld-link (install lld)"
 # 7-Zip 23 or newer reads APFS; distributions often have older ones: the official build then, beside the kit
-if ! { command -v 7z > /dev/null && [ "$(7z | grep -o '7-Zip [0-9]*' | grep -o '[0-9]*' | head -1)" -ge 23 ]; }; then
+if ! { command -v 7z > /dev/null && [ "$(7z 2>&1 | grep -o '7-Zip [0-9]*' | head -1 | awk '{print $2}')" -ge 23 ] 2> /dev/null; }; then
 	echo "7-Zip 23 or newer: fetching the official Linux build"
-	curl -fsSL https://www.7-zip.org/a/7z2409-linux-x64.tar.xz | tar -xJ -C "$TOOLS" 7zz
+	curl -fsSL https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz | tar -xJ -C "$TOOLS" 7zz
 	ln -sf "$TOOLS/7zz" "$TOOLS/7z"
 fi
 # lzfse, for the IPSW's device tree (xnuloader/mkidentity.sh), when there is none: built from its BSD source

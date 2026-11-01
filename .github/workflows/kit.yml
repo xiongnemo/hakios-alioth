@@ -32,7 +32,7 @@ jobs:
           # (XNU's build wants GNU awk: mawk breaks its system call table)
           sudo update-alternatives --set awk /usr/bin/gawk
           # 7-Zip 23 or newer reads APFS
-          curl -fsSL https://www.7-zip.org/a/7z2409-linux-x64.tar.xz | sudo tar -xJ -C /usr/local/bin 7zz
+          curl -fsSL https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz | sudo tar -xJ -C /usr/local/bin 7zz
           sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
           7z | head -2
       - name: theos (its Linux toolchain and the iOS 16.5 SDK)
