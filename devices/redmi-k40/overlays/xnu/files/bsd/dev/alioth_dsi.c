@@ -83,6 +83,7 @@ static vm_offset_t intf;
 static lck_grp_t *dsi_grp;
 static lck_mtx_t *dsi_lock;
 static lck_mtx_t *panel_mtx;            /* the panel's sleep and wake against the switches for a still screen */
+static bool dsi_alone;                  /* on the way back to the loader: one processor, its interrupts off -- no lock, no printf */
 static bool dsi_dead;
 static unsigned dsi_failures, mdp_waits;
 static uint32_t panel_rate;              /* what the panel was last switched to, 0 = the UEFI's */
@@ -166,9 +167,9 @@ alioth_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp, uint8_t force_ty
 	uint32_t bytes = n * 4;
 	if (n & 1u) words[n++] = 0;     /* the FIFO takes an even number of words */
 
-	lck_mtx_lock(dsi_lock);
+	if (!dsi_alone) lck_mtx_lock(dsi_lock);
 	if (dsi_dead) {
-		lck_mtx_unlock(dsi_lock);
+		if (!dsi_alone) lck_mtx_unlock(dsi_lock);
 		return -1;
 	}
 	for (i = 0; i < 250 && (dsi_rd(DSI_STATUS) & STATUS_DMA_BUSY); i++) spin_us(20);
@@ -178,7 +179,7 @@ alioth_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp, uint8_t force_ty
 	}
 	/* between frames: the auto-refresh sends one per TE (about 5 ms of a 16.7 or 8.3 ms frame) */
 	for (i = 0; i < 1000 && (dsi_rd(DSI_STATUS) & STATUS_MDP_BUSY); i++) spin_us(20);
-	if (i == 1000 && mdp_waits++ < 4) printf("alioth dsi: MDP stream busy for 20 ms; sending anyway\n");
+	if (i == 1000 && mdp_waits++ < 4 && !dsi_alone) printf("alioth dsi: MDP stream busy for 20 ms; sending anyway\n");
 	{
 		uint32_t tpg = dsi_rd(DSI_TPG_CTRL), dma = dsi_rd(DSI_CMD_DMA_CTRL), trig = dsi_rd(DSI_TRIG_CTRL);
 		bool done = false;
@@ -212,16 +213,18 @@ alioth_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp, uint8_t force_ty
 out:
 	if (rc != 0) {
 		dsi_failures++;
-		printf("alioth dsi: DCS %#x (%u bytes) failed %d, status %#x int %#x (failure %u)\n",
-		    buf[0], len, rc, dsi_rd(DSI_STATUS), dsi_rd(DSI_INT_CTRL), dsi_failures);
+		if (!dsi_alone) {
+			printf("alioth dsi: DCS %#x (%u bytes) failed %d, status %#x int %#x (failure %u)\n",
+			    buf[0], len, rc, dsi_rd(DSI_STATUS), dsi_rd(DSI_INT_CTRL), dsi_failures);
+		}
 		if (dsi_failures >= 3) {
 			dsi_dead = true;
-			printf("alioth dsi: DCS disabled after 3 failures\n");
+			if (!dsi_alone) printf("alioth dsi: DCS disabled after 3 failures\n");
 		}
 	} else {
 		dsi_failures = 0;
 	}
-	lck_mtx_unlock(dsi_lock);
+	if (!dsi_alone) lck_mtx_unlock(dsi_lock);
 	return rc;
 }
 
@@ -438,6 +441,31 @@ alioth_mdp_clock(uint32_t hz)
 }
 
 static void refresh_arm(void);
+static int panel_wake_steps(void);
+
+/*
+ * Whether frames go out at all, once at the kernel's start (the flips' probe, the first of the display's calls):
+ * none in 40 ms means the panel was handed over asleep -- a kernel before this one in the loader's session put it to
+ * sleep with the display and did not wake it on the way back (2026-11-02, before alioth_display_quiesce() did).
+ * Sleep in stops the panel's TE and the auto-refresh waits on TE: the flips' check failed, 60 Hz, and the screen
+ * stayed black the whole run. Then it is woken as the display's power does it (the backlight's start lights it).
+ */
+static void
+panel_awake_at_start(void)
+{
+	static bool checked;
+	uint32_t f0;
+
+	if (checked || intf == 0) return;
+	checked = true;
+	f0 = intf_rd(INTF_FRAME_COUNT);
+	delay_for_interval(40, NSEC_PER_MSEC);
+	if (intf_rd(INTF_FRAME_COUNT) == f0) {
+		int rc = panel_wake_steps();
+
+		printf("alioth panel: no frame went out in 40 ms: the panel was handed over asleep; woken (%d)\n", rc);
+	}
+}
 
 /*
  * Switch the panel to `hz` (60, 90, 120) and the tear check with it. 1 when done. Called with the
@@ -462,6 +490,7 @@ alioth_panel_set_rate(uint32_t hz)
 		printf("alioth panel: the tear check is not counting: refresh left alone\n");
 		return 0;
 	}
+	panel_awake_at_start();
 	if (now_hz == hz && count == want) {
 		panel_rate = hz;
 		printf("alioth panel: already at %u Hz (vsync_count %u)\n", hz, count);
@@ -617,11 +646,32 @@ refresh_arm(void)
  * common setting), the refresh rate's switch set again, display on. Only with boot-arg panel_sleep=1 until it is
  * known on the phone that the panel comes back (2026-10-31); a DCS that fails leaves it as it was.
  */
+static int
+panel_wake_steps(void)                  /* (panel_mtx held, or alone: the kernel's start, the way back to the loader) */
+{
+	static const uint8_t sleep_out[] = { 0x11, 0x00 }, te_on[] = { 0x35, 0x00 }, display_on[] = { 0x29, 0x00 };
+	int rc = alioth_dsi_dcs_write(sleep_out, 2, true, 0x05);
+
+	delay_for_interval(120, NSEC_PER_MSEC);
+	if (rc == 0) {
+		rc = alioth_dsi_dcs_write(te_on, 2, true, 0x39);
+	}
+	for (unsigned i = 0; rc == 0 && panel_rate != 0 && i < sizeof(k11a_timings) / sizeof(k11a_timings[0]); i++) {
+		if (k11a_timings[i].hz == panel_rate) {
+			rc = send_switch(&k11a_timings[i]);
+		}
+	}
+	if (rc == 0) {
+		rc = alioth_dsi_dcs_write(display_on, 2, true, 0x05);
+	}
+	panel_asleep = false;
+	return rc;
+}
+
 int
 alioth_panel_power(bool on)
 {
 	static const uint8_t display_off[] = { 0x28, 0x00 }, control[] = { 0x53, 0x20 }, sleep_in[] = { 0x10, 0x00 };
-	static const uint8_t sleep_out[] = { 0x11, 0x00 }, te_on[] = { 0x35, 0x00 }, display_on[] = { 0x29, 0x00 };
 	uint32_t enabled = 0;
 	int rc;
 
@@ -649,20 +699,7 @@ alioth_panel_power(bool on)
 		lck_mtx_unlock(panel_mtx);
 		return rc;
 	}
-	rc = alioth_dsi_dcs_write(sleep_out, 2, true, 0x05);
-	delay_for_interval(120, NSEC_PER_MSEC);
-	if (rc == 0) {
-		rc = alioth_dsi_dcs_write(te_on, 2, true, 0x39);
-	}
-	for (unsigned i = 0; rc == 0 && panel_rate != 0 && i < sizeof(k11a_timings) / sizeof(k11a_timings[0]); i++) {
-		if (k11a_timings[i].hz == panel_rate) {
-			rc = send_switch(&k11a_timings[i]);
-		}
-	}
-	if (rc == 0) {
-		rc = alioth_dsi_dcs_write(display_on, 2, true, 0x05);
-	}
-	panel_asleep = false;
+	rc = panel_wake_steps();
 	printf("alioth panel: awake at %u Hz%s (%d)\n", panel_rate, rc == 0 ? "" : ": SOMETHING FAILED", rc);
 	if (rc == 0 && panel_rate == 120) {
 		refresh_arm();
@@ -821,6 +858,7 @@ alioth_flip_probe(uint64_t fb_phys, uint32_t stride, uint32_t width, uint32_t he
 	if (!hakios_board_is_alioth() || !dsi_init()) return 0;
 	if (mdss == 0) mdss = ml_io_map(MDSS_PHYS, 0x90000);
 	if (mdss == 0) return 0;
+	panel_awake_at_start();
 	{
 		uint32_t at = md_rd(VIG0_OFF + SSPP_SRC0_ADDR), sz = md_rd(VIG0_OFF + SSPP_SRC_SIZE);
 
@@ -1012,11 +1050,34 @@ alioth_scan_source(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride)
  * On the way back to the loader (osfmk/arm64/loader_return.c): VIG0 as the UEFI had it, on its framebuffer,
  * whatever this kernel last showed -- a buffer of its own or one of CoreAnimation's surfaces, scaled -- so
  * that what the loader draws is seen. No waiting: it is taken at the next frame.
+ *
+ * If the display was off when the run ended (the side button, then a test run's minutes up; or a panic meanwhile),
+ * the panel is woken first and lit -- DBV 511, where iOS starts; the display's off left 0 -- or nothing the loader
+ * draws is seen and the phone looks dead in its loader (2026-11-02). One processor is left, its interrupts off: no
+ * lock is taken and nothing printed (dsi_alone); the waits are loops; what happened goes to the loader's log.
  */
+extern void loader_log_putc(char c);
+
 void
 alioth_display_quiesce(void)
 {
 	if (mdss == 0) return;
+	if (panel_asleep && dsi != NULL && !dsi_dead) {
+		static const uint8_t lit[] = { 0x51, 0x01, 0xff };
+		const char *said;
+		int rc;
+
+		dsi_alone = true;
+		rc = panel_wake_steps();
+		if (rc == 0) {
+			rc = alioth_dsi_dcs_write(lit, 3, true, 0);
+		}
+		said = rc == 0 ? "alioth panel: awake and lit again for the loader (the display was off at the run's end)\n" :
+		    "alioth panel: THE PANEL DID NOT WAKE for the loader (the display was off at the run's end)\n";
+		for (; *said != 0; said++) {
+			loader_log_putc(*said);
+		}
+	}
 	if (intf != 0) {
 		refresh_full_rate();            /* (the UEFI's auto-refresh as it left it: a frame every TE) */
 	}
