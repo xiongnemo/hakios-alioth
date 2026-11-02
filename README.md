@@ -117,7 +117,7 @@ Each item has been checked on the phone.
 | Bluetooth | Discoverable, scan, pairing, Bluetooth audio to speakers and headphones |
 | Cameras | Camera.app preview and photos: the main camera (IMX582, autofocus) and the front one (S5K3T2); the ultra-wide (IMX355) or the macro (S5K5E9) as the back camera instead, chosen at boot |
 | Flashlight | From Control Center |
-| Power | Battery level and charging |
+| Power | Battery level and charging; the cores' and the GPU's speed follow the load; the panel sleeps with the screen off |
 | Sensors | Ambient light, accelerometer, gyroscope, device motion, compass (true north with location) through the sensor DSP |
 | Location | Wi-Fi positioning through Apple's location service |
 | USB | The PC sees an iPhone: pairing ("Trust This Computer"), files over AFC |
@@ -136,7 +136,7 @@ Releases page.
 - **Persistence**: iOS runs from RAM, so settings, photos and installed apps are gone after a reboot.
 - GPS, cellular, NFC, fingerprint, the proximity sensor.
 - Recovery from a GPU hang: an app that hangs the GPU stops the whole screen until the phone is restarted.
-- Power: the display link and the GPU stay on with the screen off.
+- Power: with the screen off the panel sleeps, but the GPU and the display engine stay powered.
 
 How each part works, what was measured and what comes next: [docs/alioth/status.md](docs/alioth/status.md).
 

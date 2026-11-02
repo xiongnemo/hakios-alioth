@@ -24,8 +24,8 @@ The one-click release does all of this from a PC script; development runs do it 
 
 | Part | How | State |
 |---|---|---|
-| Display | DSI video panel 1080 x 2400 at 120 Hz. iOS's frames go straight to the display engine: page flips of pipe VIG0 between two scan-out slots in the display's reserved memory, scaled from 1125 x 2436 by the engine (no CPU copy). Frames are paced on the panel's TE (8.24 ms). The colour correction block (DSPP PCC) does Invert Colors, Color Filters and Night Shift. Brightness by DCS. | Works |
-| GPU | Adreno 650 brought up by the kernel itself: GMU, SMMU page tables, ring buffer, the SQE microcode from the phone's firmware; 670 MHz. Mesa's freedreno talks to it through an msm-style interface (buffers, submissions, fences, IOSurface import). Every client has its own GPU address space: before a client's commands the core is let go idle and the SMMU context gets that client's tables. | Works |
+| Display | DSI video panel 1080 x 2400 at 120 Hz. iOS's frames go straight to the display engine: page flips of pipe VIG0 between two scan-out slots in the display's reserved memory, scaled from 1125 x 2436 by the engine (no CPU copy). Frames are paced on the panel's TE (8.24 ms). The colour correction block (DSPP PCC) does Invert Colors, Color Filters and Night Shift. Brightness by DCS. With the screen off the panel is put to sleep (DCS) and the frame clients wait. | Works |
+| GPU | Adreno 650 brought up by the kernel itself: GMU, SMMU page tables, ring buffer, the SQE microcode from the phone's firmware; 370–670 MHz, chosen every 50 ms from its busy time and voted to the GMU. Mesa's freedreno talks to it through an msm-style interface (buffers, submissions, fences, IOSurface import). Every client has its own GPU address space: before a client's commands the core is let go idle and the SMMU context gets that client's tables. | Works |
 | Touch, keys, haptics | FocalTech touch controller with multitouch; power and volume keys from the PMIC; vibration motor | Works |
 | Sound | The audio DSP started and driven over APR; two CS35L41 amplifiers; the WCD938x codec's microphone over SoundWire | Works |
 | Wi-Fi | PCIe and MHI to the Qualcomm Wi-Fi chip, its firmware, Linux's ath11k under a compatibility layer; joins WPA2 networks, prefers 5 GHz | Works |
@@ -35,7 +35,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | Sensors | The sensor DSP (SLPI) started; FastRPC and its sensor service: ambient light, accelerometer, gyroscope, magnetometer, rotation vector, orientation | Works |
 | Battery | The fuel gauge: level and charging state | Works |
 | USB | DWC3 in device mode: a serial port for development, or an iPhone with Apple's usbmux for the PC (pairing, AFC) | Works; re-plugging during a session is being fixed |
-| CPU | Frequency scaling and thermal limits on seven cores | Works |
+| CPU | Frequency scaling by load (every 20 ms, full speed at a touch) and thermal limits on seven cores | Works |
 | Modem | The external SDX55 over PCIe: its boot loader refuses the image after authentication | Not working |
 | GPS, NFC, fingerprint, proximity | — | Not started |
 
@@ -66,6 +66,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | GPU address spaces | 6 clients, 33 012 switches in 25 minutes, none refused, no SMMU fault; a present costs the same 0.2–0.5 ms as without |
 | System image | 2.4 GB, in RAM for the whole session |
 | Memory for iOS | 11 GB of a 12 GB phone (the whole free block from 0xc0000000; the rest is firmware's and the loader's); with the bundled apps installed iOS still has about 5.5 GB available, and the data volume (sized by memory) can grow to about 8 GB. 6 and 8 GB phones get their own largest block (not tried on one). |
+| Battery current with the frequency scaling and the panel sleep (on USB, so differences only) | home screen at rest 239 → 147 mA, Minecraft 443 → 296 mA, screen off about 180 mA less; frame rates and the scrolling pace unchanged |
 | Boot from the PC | about 3 minutes, most of it the system image over USB |
 
 ## Known problems
@@ -75,14 +76,15 @@ The one-click release does all of this from a PC script; development runs do it 
 | No Metal | No Metal device is published. Plan below. |
 | Nothing persists | The data volume is a RAM disk: settings, photos and apps are gone after a reboot. |
 | A GPU hang stops the screen | There is no hang detection or GPU reset yet. |
-| Warm with the screen off | The CPU slows down, but the display link and the GPU stay on; no GPU power management yet (fixed clock). |
+| Power with the screen off | The panel sleeps and the cores and the GPU drop to their lowest speed, but the GPU is not put to sleep and the display engine keeps its clocks. |
 | USB after re-plugging | Fixed: a race in select() panicked the kernel at the unplug; the controller's EP0 stayed dead or answered wrongly after a replug (the controller is now restarted when the computer resets it in vain); the old session's data and a waiting write leaked into the new one. Tested with the port leaving and coming back by itself, three times a run (boot-arg usb_bounce); a hand-pulled cable is to be tried with this version. |
 | A game asks for notifications at every boot | The answer is kept in the data volume, which is in RAM. |
 | AssistiveTouch's Home does nothing | Its button, menu and Control Center work; the Home action is not wired to anything here yet. |
 
 ## Next
 
-- **Power**: GPU frequency scaling and idle power collapse, the display link at screen-off, interrupts instead of polling.
+- **Power**: the GPU asleep and the display engine's clocks down with the screen off, 60 Hz when nothing moves, the
+  cores' idle states, interrupts instead of polling.
 - **Smoothness**: a third scan-out slot and swaps that do not wait for the flip.
 - **GPU robustness**: per-buffer fences, a fence interrupt, hang recovery.
 - **Metal** (estimated 2.5–3.5 months): a Metal plug-in published on the accelerator service, Metal translated to
