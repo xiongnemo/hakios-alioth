@@ -64,7 +64,9 @@ static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
 /*
  * The way out when nothing else is at hand: five fingers held on the screen for a second and a
  * half end the run -- control goes back to the loader, as when loader_return_after expires.
- * Only a driver's fingers count, not samples a program writes to the device.
+ * Only a driver's fingers count, not samples a program writes to the device. Boot-arg touch_exit=0:
+ * not at all -- the release's (tools/mkrelease.py), where a hand on Sensor Check's touch pad ended
+ * iOS (2026-11-02) and a reboot is the way back anyway.
  */
 #define EXIT_FINGERS    5
 #define EXIT_HOLD_MS    1500
@@ -314,11 +316,17 @@ void
 hakios_input_init(void)
 {
 	int major = cdevsw_add(-1, &touch_cdevsw);
+	uint32_t touch_exit = 1;
 
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-touch") == NULL) {
 		printf("hakios-touch: cannot create the device\n");
 	}
-	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	PE_parse_boot_argn("touch_exit", &touch_exit, sizeof(touch_exit));
+	if (touch_exit) {
+		exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	} else {
+		printf("hakios-touch: five fingers held do not end the run (touch_exit=0)\n");
+	}
 	touch_sync_call = thread_call_allocate_with_priority(touch_sync_elapsed, NULL, THREAD_CALL_PRIORITY_HIGH);
 	hakios_cpufreq_init();
 	hakios_virtio_input_init();

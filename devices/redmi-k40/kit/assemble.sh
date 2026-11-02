@@ -137,13 +137,16 @@ mac=
 [ -f "$ROOT/fw-wifi/mac" ] && mac=$(head -1 "$ROOT/fw-wifi/mac" | tr -d '\r ')
 mkdir -p "$OUT/boot" "$OUT/bin" "$OUT/apps"
 # the payload as the one-click script expects it (start.ps1 adds the clock, the camera and the apps' token at boot):
-# "XNUP", the kernel, the root disk, the kernel's arguments -- this phone's verified set, usb=3 (the PC sees an iPhone)
+# "XNUP", the kernel, the root disk, the kernel's arguments -- this phone's verified set, usb=3 (the PC sees an iPhone),
+# touch_exit=0 (five fingers held on the screen do not end iOS: that is the test runs' way out)
 python3 - "$KIT/prebuilt/kernel-k40.bin" "$U/root.apfs" "$ROOT/devices/redmi-k40/boot.args" "$mac" "$OUT/boot/run-payload.bin" <<'EOF'
 import struct, sys
 kernel, root, args, mac, out = sys.argv[1:]
 words = open(args).read().split()
 if not any(w.startswith('usb=') for w in words):
     words.append('usb=3')
+if not any(w.startswith('touch_exit=') for w in words):
+    words.append('touch_exit=0')
 if mac and not any(w.startswith('wifi_mac=') for w in words):
     words.append('wifi_mac=' + mac)
 cmdline = ' '.join(['sb_delay=8'] + words)
