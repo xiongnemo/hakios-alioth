@@ -3200,6 +3200,47 @@ choose_window(const struct payload_info *pi)
 	return 1;
 }
 
+/* The value of the kernel's argument NAME= (just past the '='), or NULL. */
+static const char *
+arg_of(const char *cmdline, const char *name)
+{
+	int len = 0;
+
+	while (name[len] != 0) {
+		len++;
+	}
+	for (const char *c = cmdline; *c; c++) {
+		if ((c == cmdline || c[-1] == ' ') && starts_with(c, name)) {
+			return c + len;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Which kind of run this is and what it allows, on the screen before the kernel takes it (the owner, 2026-11-02:
+ * five fingers on Sensor Check's pad ended iOS, and nothing had said that a test run's way out was on). A test run
+ * is one k40.py started, which always gives loader_return_after=; a release's (start.ps1) gives none.
+ */
+static void
+say_kind_of_run(const char *cmdline)
+{
+	const char *after = arg_of(cmdline, "loader_return_after="), *usb = arg_of(cmdline, "usb="),
+	    *fingers = arg_of(cmdline, "touch_exit=");
+
+	if (after != NULL) {
+		SAY("run: a TEST run (k40.py): back to this loader by itself after %d min\n", (int)(parse_number(after, 10) / 60));
+	} else {
+		SAY("run: the RELEASE (start.ps1): iOS until it is restarted\n");
+	}
+	SAY("run:   USB: %s\n", usb != NULL && *usb == '3' ? "an iPhone to the computer (tap Trust on the phone)" :
+	    "this loader's -- the kernel's log, screenshots, the end of the run");
+	SAY("run:   five fingers held 1.5 s: %s\n", fingers != NULL && *fingers == '0' ? "nothing" : "back to this loader");
+	SAY("run:   iOS's Restart or Shut Down: back to this loader\n");
+	SAY("run:   back to Android: %s\n", after != NULL ? "fastboot reboot once the run is over" :
+	    "hold the power button about 10 s");
+}
+
 /*
  * Load and run the kernel from the payload. Returns when the kernel comes
  * back (panic, checkpoint, early exception); the combined log is staged and
@@ -3335,6 +3376,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("resident image at pa %x size %x: it is the root (md0), the payload ramdisk is md1\n", rd1_pa, rd1_size);
 	}
 
+	say_kind_of_run(pi.cmdline);
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
