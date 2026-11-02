@@ -243,6 +243,11 @@ said_write(u32 offset, u32 value)
 			}
 		}
 	}
+	if (bus.said >= SAID_FIRST) {
+		/* (nor how many followed in a row, once the first lines are said: with traffic that was a line every 2 ms,
+		 * the whole run long, wifi_quiet or not -- 2026-11-02) */
+		return (false);
+	}
 	row = offset == bus.last ? row + 1 : 0;
 	if (row >= 3) {
 		bus.again++;

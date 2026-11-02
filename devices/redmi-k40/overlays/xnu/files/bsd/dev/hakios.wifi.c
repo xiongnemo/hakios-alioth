@@ -200,6 +200,7 @@ static char last_write[96] = "nothing written";
 
 /* As in hakios.adreno.c: every line goes to the log the loader reads from another core as well. */
 extern void loader_log_putc(char c);
+extern bool hakios_sta_retrying(void);          /* (hakios.sta.c, this device's overlay) */
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -216,6 +217,28 @@ static char kept[64 * 1024];
 static uint32_t kept_at;
 static bool kept_wrapped;
 
+/*
+ * The lines said aloud (outcomes: the joins, the access point's deauthentications, the driver's state), kept once
+ * more with the seconds since boot and said again at the run's end (hakios_wifi_quiesce()): a long run's log keeps
+ * its first 256 KB and its last 1 MB, and a join that failed minutes in fell in between (2026-11-02, AP reason 6).
+ * Not the access points a scan heard, one line each (they would push the joins out), nor what was kept and is shown.
+ */
+static char told[64 * 1024];
+static uint32_t told_at;
+static bool told_wrapped, telling_kept;
+
+static void
+told_put(const char *s)
+{
+	for (const char *c = s; *c != 0; c++) {
+		told[told_at] = *c;
+		if (++told_at == sizeof(told)) {
+			told_at = 0;
+			told_wrapped = true;
+		}
+	}
+}
+
 static void
 say_line(const char *line, bool aloud)
 {
@@ -226,6 +249,15 @@ say_line(const char *line, bool aloud)
 		return;
 	}
 	lck_mtx_lock(&say_lock);
+	if (aloud && !telling_kept && strncmp(line, "lx: heard:", 10) != 0) {
+		char when[24];
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		snprintf(when, sizeof(when), "[%5llu.%01llu] ", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 10));
+		told_put(when);
+		told_put(line);
+	}
 	if (quiet && !aloud) {
 		for (const char *c = line; *c != 0; c++) {
 			kept[kept_at] = *c;
@@ -294,6 +326,7 @@ say_kept(void)
 	char piece[201];
 
 	quiet = false;
+	telling_kept = true;
 	for (uint32_t i = length - show; i < length; i += sizeof(piece) - 1) {
 		uint32_t n = length - i < sizeof(piece) - 1 ? length - i : sizeof(piece) - 1;
 
@@ -303,6 +336,7 @@ say_kept(void)
 		piece[n] = 0;
 		say_line(piece, true);
 	}
+	telling_kept = false;
 }
 #define printf say
 
@@ -4316,6 +4350,20 @@ hakios_wifi_stop(void)
 void
 hakios_wifi_quiesce(void)
 {
+	if (told_at != 0 || told_wrapped) {
+		/* (no lock: one processor is left, its interrupts off) */
+		static const char banner[] = "\n--- wifi: what was said aloud during the run, again ---\n";
+		uint32_t length = told_wrapped ? sizeof(told) : told_at;
+
+		for (const char *c = banner; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+		for (uint32_t i = 0; i < length; i++) {
+			loader_log_putc(told[(told_wrapped ? told_at + i : i) % sizeof(told)]);
+		}
+		told_at = 0;
+		told_wrapped = false;
+	}
 	hakios_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
 	if (umi_wifi_is_board()) {
 		umi_wifi_quiesce();
@@ -4393,6 +4441,10 @@ join_given(uint64_t began)
 	if (state->phase == HAKIOS_STA_JOINED) {
 		tell("wifi: THE NETWORK OF THE FILE IS JOINED, %llu.%llu s after the kernel began on the radio\n", (now_us() - began) /
 		    1000000, (now_us() - began) / 100000 % 10);
+	} else if (hakios_sta_retrying()) {
+		tell("wifi: the network of the file is not joined yet (%d, %d): it is tried again by itself (hakios.sta.c). The last "
+		    "of what was said:\n", error, state->last_error);
+		say_kept();
 	} else {
 		tell("wifi: THE NETWORK OF THE FILE IS NOT JOINED (%d, %d): the radio waits to be asked. The last of what was said:\n",
 		    error, state->last_error);

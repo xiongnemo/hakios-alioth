@@ -903,9 +903,14 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
 		queue_work(radio->work, &radio->ba_work);
 		return;
 	} else if (f[0] == 0xc0 || f[0] == 0xa0) {	/* the access point shows us the door: with a reason */
+		static const char *const phase[] = { "before the join", "while we authenticate", "while we associate",
+			                             "in the handshake", "joined" };
+
 		status = f[24] | f[25] << 8;
 		answer = ANSWER_GONE;
-		lx_tell("lx: THE ACCESS POINT %s US, reason %u\n", f[0] == 0xc0 ? "DEAUTHENTICATES" : "DISASSOCIATES", status);
+		lx_tell("lx: THE ACCESS POINT %s US, reason %u (%s; %u MHz)\n", f[0] == 0xc0 ? "DEAUTHENTICATES" : "DISASSOCIATES",
+		    status, radio->reached >= 0 && radio->reached <= IEEE80211_STA_AUTHORIZED ? phase[radio->reached] : "?",
+		    radio->target.frequency);
 		if (radio->joined) {
 			radio->joined = false;
 			radio->last_error = ECONNRESET;
@@ -1706,8 +1711,9 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		channel = linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band));
 	}
 	obstacle = what->security == HAKIOS_STA_OPEN ? NULL : protection(target, &group_cipher, &pairwise_cipher);
-	lx_tell("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "
-	    "%u units; HT %s, VHT %s, WMM %s; %s%s\n", channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
+	lx_tell("lx: the network that is wanted: an access point (..:%02x:%02x:%02x) on channel %u (%u MHz) at %d dBm, capabilities "
+	    "%#x, beacons every %u units; HT %s, VHT %s, WMM %s; %s%s\n", target->address[3], target->address[4], target->address[5],
+	    channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
 	    channel->center_freq : 0, target->signal, target->capability, target->interval, element(target->elements,
 	    target->elements_length, 45) ? "yes" : "no", element(target->elements, target->elements_length, 191) ? "yes" : "no",
 	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle == NULL ?
@@ -1795,6 +1801,21 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 	}
 	radio->reached = IEEE80211_STA_NONE;
 
+	/*
+	 * Boot-arg wifi_predeauth=1: a deauthentication first (reason 3; a frame of the first class, taken in any state), so
+	 * that what the access point still holds of this address -- the run before, which may not have been heard leaving
+	 * -- is gone before the new authentication (2026-11-02: a run straight after another was deauthenticated with
+	 * reason 6 from the moment its handshake was done, the whole run).
+	 */
+	if (lx_os_option("wifi_predeauth") && (skb = frame_new(radio, 26, &frame)) != NULL) {
+		frame = management(radio, frame, 0xc0);
+		frame[0] = 3;
+		frame[1] = 0;
+		frame_send(radio, skb);
+		lx_pause_ms(100);
+		radio->answer = ANSWER_NONE;	/* (whatever the access point said to that is not the answer to what follows) */
+	}
+
 	/* authentication, of the kind that asks nothing ("open system": the passphrase is proved in the handshake) */
 	for (unsigned attempt = 0; attempt < 3 && answer == ANSWER_NONE; attempt++) {
 		radio->answer = ANSWER_NONE;
@@ -1806,11 +1827,13 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		frame_send(radio, skb);
 		answer = answer_wait(radio, 500);
 	}
-	lx_tell("lx: AUTHENTICATION: %s (status %u)\n", answer == ANSWER_AUTHENTICATED ? "the access point accepts" : answer ==
-	    ANSWER_NONE ? "NO ANSWER from the access point to three requests" : "THE ACCESS POINT REFUSES", radio->answer_status);
+	lx_tell("lx: AUTHENTICATION: %s (%s %u)\n", answer == ANSWER_AUTHENTICATED ? "the access point accepts" : answer ==
+	    ANSWER_NONE ? "NO ANSWER from the access point to three requests" : answer == ANSWER_GONE ? "THE ACCESS POINT SHOWS US "
+	    "THE DOOR" : "THE ACCESS POINT REFUSES", answer == ANSWER_GONE ? "reason" : "status", radio->answer_status);
 	if (answer != ANSWER_AUTHENTICATED || (ret = station_state(radio, IEEE80211_STA_NONE, IEEE80211_STA_AUTH)) != 0) {
 		error = answer == ANSWER_NONE ? ETIMEDOUT : ECONNREFUSED;
-		radio->turned_away = answer == ANSWER_REFUSED;
+		/* (shown the door is turned away too: another access point of the network may take us -- 2026-11-02) */
+		radio->turned_away = answer == ANSWER_REFUSED || answer == ANSWER_GONE;
 		goto out;
 	}
 	radio->reached = IEEE80211_STA_AUTH;
@@ -1833,12 +1856,13 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		frame_send(radio, skb);
 		answer = answer_wait(radio, 500);
 	}
-	lx_tell("lx: ASSOCIATION: %s (status %u); we are its station number %u; its answer has %u bytes of elements\n", answer ==
+	lx_tell("lx: ASSOCIATION: %s (%s %u); we are its station number %u; its answer has %u bytes of elements\n", answer ==
 	    ANSWER_ASSOCIATED ? "THE ACCESS POINT ACCEPTS" : answer == ANSWER_NONE ? "NO ANSWER from the access point to three "
-	    "requests" : "THE ACCESS POINT REFUSES", radio->answer_status, radio->aid, radio->answer_length);
+	    "requests" : answer == ANSWER_GONE ? "THE ACCESS POINT SHOWS US THE DOOR" : "THE ACCESS POINT REFUSES", answer ==
+	    ANSWER_GONE ? "reason" : "status", radio->answer_status, radio->aid, radio->answer_length);
 	if (answer != ANSWER_ASSOCIATED) {
 		error = answer == ANSWER_NONE ? ETIMEDOUT : ECONNREFUSED;
-		radio->turned_away = answer == ANSWER_REFUSED;
+		radio->turned_away = answer == ANSWER_REFUSED || answer == ANSWER_GONE;
 		goto out;
 	}
 	station_abilities(radio, radio->answer_elements, radio->answer_length);
@@ -1932,10 +1956,29 @@ out:
 	return (error);
 }
 
+/* Whether the last scan heard another access point of the network, one that has not turned us away in this join. */
+static bool
+another_heard(struct lx_radio *radio, const struct hakios_sta_join *what)
+{
+	bool there = false;
+
+	lx_os_lock();
+	for (unsigned i = 0; i < radio->heard_count && !there; i++) {
+		const struct lx_heard *network = &radio->heard[i];
+
+		there = network->name_length == what->ssid_length && memcmp(network->name, what->ssid, what->ssid_length) == 0 &&
+		    network->elements_length != 0 && (is_zero_ether_addr(what->bssid) || memcmp(what->bssid, network->sender,
+		    ETH_ALEN) == 0) && !was_refused(radio, network->sender);
+	}
+	lx_os_unlock();
+	return (there);
+}
+
 /*
  * A join, and if the access point taken turns us away (authentication or association refused: a router steering
- * stations to its other band, an access point that is full), the next best of the network's that was heard, up to
- * three more (see preference()).
+ * stations to its other band, an access point that is full; or shown the door during them), the next best of the
+ * network's that was heard, up to three more (see preference()). When none is left, the caller tries again later
+ * (hakios.sta.c), not this.
  */
 static int
 station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
@@ -1950,6 +1993,11 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 			break;
 		}
 		memcpy(radio->refused[radio->refused_count++], radio->target.address, ETH_ALEN);
+		if (!another_heard(radio, what)) {
+			lx_tell("lx: that access point (%u MHz) turned us away, and no other of the network was heard\n",
+			    radio->target.frequency);
+			break;
+		}
 		lx_tell("lx: that access point (%u MHz) turned us away: the next one of the network that was heard\n",
 		    radio->target.frequency);
 	}
