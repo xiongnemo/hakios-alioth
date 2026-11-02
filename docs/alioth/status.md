@@ -34,7 +34,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | Flashlight | PM8150L flash module | Works |
 | Sensors | The sensor DSP (SLPI) started; FastRPC and its sensor service: ambient light, accelerometer, gyroscope, magnetometer, rotation vector, orientation | Works |
 | Battery | The fuel gauge: level and charging state | Works |
-| USB | DWC3 in device mode: a serial port for development, or an iPhone with Apple's usbmux for the PC (pairing, AFC) | Works; re-plugging during a session is being fixed |
+| USB | DWC3 in device mode: a serial port for development, or an iPhone with Apple's usbmux for the PC (pairing, AFC) | Works, the cable pulled and put back too |
 | CPU | Frequency scaling by load (every 20 ms, full speed at a touch) and thermal limits on seven cores | Works |
 | Modem | The external SDX55 over PCIe: its boot loader refuses the image after authentication | Not working |
 | GPS, NFC, fingerprint, proximity | — | Not started |
@@ -77,7 +77,8 @@ The one-click release does all of this from a PC script; development runs do it 
 | Nothing persists | The data volume is a RAM disk: settings, photos and apps are gone after a reboot. |
 | A GPU hang stops the screen | There is no hang detection or GPU reset yet. |
 | Power with the screen off | The panel sleeps and the cores and the GPU drop to their lowest speed, but the GPU is not put to sleep and the display engine keeps its clocks. |
-| USB after re-plugging | Fixed: a race in select() panicked the kernel at the unplug; the controller's EP0 stayed dead or answered wrongly after a replug (the controller is now restarted when the computer resets it in vain); the old session's data and a waiting write leaked into the new one. Tested with the port leaving and coming back by itself, three times a run (boot-arg usb_bounce); a hand-pulled cable is to be tried with this version. |
+| USB after re-plugging | Fixed: a race in select() panicked the kernel at the unplug; the controller's EP0 stayed dead or answered wrongly after a replug (the controller is now restarted when the computer resets it in vain); the old session's data and a waiting write leaked into the new one; and about half the time the first packet one way or the other was dropped as a repeat, because the data endpoints kept the DATA0/DATA1 sequence of the session before (they are initialized again at every configuration now). Verified with the cable pulled by hand, quick and slow, in test runs and the release: the computer lists the iPhone again about 10 s after it is back, still trusted. |
+| Wi-Fi at times does not join | Once in a day of boots the access point deauthenticated the phone over and over (reason 6, "class 2 frame from a nonauthenticated station") and the session stayed offline; being looked into. |
 | A game asks for notifications at every boot | The answer is kept in the data volume, which is in RAM. |
 | AssistiveTouch's Home does nothing | Its button, menu and Control Center work; the Home action is not wired to anything here yet. |
 
