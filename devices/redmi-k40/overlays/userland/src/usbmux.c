@@ -50,6 +50,12 @@ struct hakios_usb_iphone {
 #define HAKIOS_USB_HOST         _IOW('u', 3, int)
 /* the port's session: one more at every bus reset -- the cable out and in again -- and restart of the controller */
 #define HAKIOS_USB_GENERATION   _IOR('u', 4, uint32_t)
+/* a line of ours into the kernel's own history of the port, which comes back with the run's log whole -- the
+   console's lines of a long run lose their middle, and with it a cable pulled minutes in (2026-11-02) */
+struct hakios_usb_note {
+	char text[160];
+};
+#define HAKIOS_USB_NOTE         _IOW('u', 5, struct hakios_usb_note)
 
 static int port = -1;
 static uint32_t generation;             /* the port's session these packets are of */
@@ -89,31 +95,70 @@ static uint16_t tx_seq, rx_seq;
 static struct conn conns[CONNS];
 static unsigned verbose = 1;
 static unsigned long packets_in, packets_out;
+static unsigned session_packets_in;     /* (the first few of each session shown) */
 
-static void say(const char *format, ...) __printflike(1, 2);
+static void tell(int to_kernel, const char *format, va_list list) __printflike(2, 0);
 
+/*
+ * A line into the kernel's history of the port, which also puts it on the console (HAKIOS_USB_NOTE: once the kernel
+ * knows us as the mux) -- to_kernel 0, or before then: the console ourselves. And into /var/tmp/usbmux.log, which can
+ * be read over the network while the run goes on.
+ */
 static void
-say(const char *format, ...)
+tell(int to_kernel, const char *format, va_list list)
 {
-	/* (and into /var/tmp/usbmux.log: a run's console log may lose its middle; that file can be read over the network) */
 	static FILE *copy;
-	va_list list;
+	struct hakios_usb_note note;
+	va_list again;
 
 	if (copy == NULL) {
 		copy = fopen("/var/tmp/usbmux.log", "a");
 	}
-	va_start(list, format);
-	fputs("usbmux: ", stderr);
-	vfprintf(stderr, format, list);
-	fputc('\n', stderr);
-	va_end(list);
+	memset(&note, 0, sizeof(note));
+	va_copy(again, list);
+	vsnprintf(note.text, sizeof(note.text), format, again);
+	va_end(again);
+	if (!to_kernel || port < 0 || ioctl(port, HAKIOS_USB_NOTE, &note) != 0) {
+		va_copy(again, list);
+		fputs("usbmux: ", stderr);
+		vfprintf(stderr, format, again);
+		fputc('\n', stderr);
+		va_end(again);
+	}
 	if (copy != NULL) {
-		va_start(list, format);
-		vfprintf(copy, format, list);
+		va_copy(again, list);
+		vfprintf(copy, format, again);
 		fputc('\n', copy);
 		fflush(copy);
-		va_end(list);
+		va_end(again);
 	}
+}
+
+static void say(const char *format, ...) __printflike(1, 2);
+static void chat(const char *format, ...) __printflike(1, 2);
+
+static void
+say(const char *format, ...)
+{
+	va_list list;
+
+	va_start(list, format);
+	tell(1, format, list);
+	va_end(list);
+}
+
+/*
+ * A connection's opening and closing: the console and the file only. A computer opens one to lockdownd every second
+ * or so (297 in four minutes, 2026-11-02): in the kernel's history of the port they pushed out what matters.
+ */
+static void
+chat(const char *format, ...)
+{
+	va_list list;
+
+	va_start(list, format);
+	tell(0, format, list);
+	va_end(list);
 }
 
 static uint32_t
@@ -204,7 +249,7 @@ conn_close(struct conn *c, int send_rst, const char *why)
 		(void)send_tcp(NULL, c->host_port, c->port, c->seq, c->host_next, TH_RST, NULL, 0);
 	}
 	if (verbose) {
-		say("connection %u -> %u closed (%s)", c->host_port, c->port, why);
+		chat("connection %u -> %u closed (%s)", c->host_port, c->port, why);
 	}
 	close(c->fd);
 	c->fd = -1;
@@ -292,7 +337,7 @@ tcp_open(const struct tcphdr *th)
 	slot->seq++;            /* (the SYN counts one) */
 	slot->host_acked = slot->seq;
 	if (verbose) {
-		say("connection %u -> %u (127.0.0.1:%u) open", host_port, our_port, our_port);
+		chat("connection %u -> %u (127.0.0.1:%u) open", host_port, our_port, our_port);
 	}
 }
 
@@ -376,7 +421,8 @@ packet_input(const uint8_t *p, size_t len, size_t hdr)
 {
 	uint32_t protocol = be32(p);
 
-	if (packets_in++ < 12) {
+	packets_in++;
+	if (session_packets_in++ < 6) {
 		char hex[3 * 48 + 1] = "";
 
 		for (size_t i = 0; i < len && i < 48; i++) {
@@ -572,6 +618,7 @@ main(int argc, char **argv)
 					close_all("the port's session is over");
 					v2 = 0;
 					tx_seq = rx_seq = 0;
+					session_packets_in = 0;
 					host_here(0);
 				}
 				used += (size_t)r;

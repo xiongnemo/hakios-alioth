@@ -109,20 +109,28 @@ static void say(const char *format, ...) __printflike(1, 2);
 /*
  * What was said, kept again in a ring of its own and said once more at the run's end (hakios_usb_quiesce()):
  * a long run's log keeps its first 256 KB and its last 1 MB, and the port's first seconds -- the computer
- * finding it -- fall in between (2026-10-30, usb=3).
+ * finding it -- fall in between (2026-10-30, usb=3). Each line here with the seconds since boot, and the mux's own
+ * lines too (HAKIOS_USB_NOTE): a cable pulled minutes into a run fell in that gap, the mux's console lines with it,
+ * and 8 KB without times held only the port's requests (2026-11-02).
  */
-static char usb_history[8192];
+static char usb_history[128 * 1024];
 static uint32_t usb_history_at;
 
 static void
 say(const char *format, ...)
 {
-	char line[400];
+	char line[400], when[24];
 	va_list list;
+	uint64_t ns;
 
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	snprintf(when, sizeof(when), "[%5llu.%02llu] ", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 100));
+	for (const char *c = when; *c != 0; c++) {
+		usb_history[usb_history_at++ % sizeof(usb_history)] = *c;
+	}
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 		usb_history[usb_history_at++ % sizeof(usb_history)] = *c;
@@ -289,6 +297,11 @@ struct hakios_usb_iphone {
 #define HAKIOS_USB_HOST         _IOW('u', 3, int)
 /* the port's session (see usb_generation) */
 #define HAKIOS_USB_GENERATION   _IOR('u', 4, uint32_t)
+/* usb=3: a line of the mux's own, into the loader's log and the port's history (see usb_history) */
+struct hakios_usb_note {
+	char text[160];
+};
+#define HAKIOS_USB_NOTE         _IOW('u', 5, struct hakios_usb_note)
 extern int hakios_usbmux_publish(void);
 extern void hakios_usbmux_host(bool connected);
 static volatile bool usb_taken;         /* /dev/hakios-usb is there, the thread runs */
@@ -379,7 +392,8 @@ io_trace(__unused void *cookie, enum dwc3_trace event, uint32_t a, uint32_t b)
 		    (b & 0x100) ? "without ever configuring it" : "and got no request through");
 		break;
 	case DWC3_TRACE_SETUP:
-		if (setups_said++ < 24 || (session_said++ < 6 && said_all++ < 300)) {
+		/* (40 a session: past the configuration, SET_CONFIGURATION being the 18th of a Windows enumeration) */
+		if (setups_said++ < 24 || (session_said++ < 40 && said_all++ < 1500)) {
 			say("usb: request %02x %02x value %#x index %#x length %u\n", a >> 24, (a >> 16) & 0xff, a & 0xffff, b >> 16, b & 0xffff);
 		}
 		break;
@@ -400,6 +414,37 @@ io_trace(__unused void *cookie, enum dwc3_trace event, uint32_t a, uint32_t b)
 			say("usb: request %02x %02x answered with a stall\n", a, b);
 		}
 		break;
+	/* (the three below once a bus session each: the controller's count of resets, dwc3_rx_generation()) */
+	case DWC3_TRACE_CONFIGURED: {
+		static unsigned configured_said;
+
+		if (configured_said++ < 200) {
+			say("usb: bus session %u: the computer chose configuration %u%s\n", dwc3_rx_generation(usb_dev), a,
+			    b ? " (iPhone mode)" : "");
+		}
+		break;
+	}
+	case DWC3_TRACE_ARMED: {
+		static uint32_t armed_said = 0xffffffffu;
+
+		if (armed_said != dwc3_rx_generation(usb_dev)) {
+			armed_said = dwc3_rx_generation(usb_dev);
+			say("usb: bus session %u: endpoint %u ready for what the computer sends (%u bytes in the ring)\n",
+			    armed_said, a, b);
+		}
+		break;
+	}
+	case DWC3_TRACE_NOT_READY: {
+		static uint32_t not_ready_said[2] = { 0xffffffffu, 0xffffffffu };
+		uint32_t *said = &not_ready_said[a & 1];
+
+		if (*said != dwc3_rx_generation(usb_dev)) {
+			*said = dwc3_rx_generation(usb_dev);
+			say("usb: bus session %u: the computer tried endpoint %u (%s) with nothing there: active %u, configured %u, "
+			    "%u bytes in the ring\n", *said, a, (a & 1) ? "IN" : "OUT", b & 0xff, (b >> 8) & 0xff, b >> 16);
+		}
+		break;
+	}
 	default:
 		break;
 	}
@@ -561,17 +606,35 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 
 			seen_rx_generation = dwc3_rx_generation(usb_dev);
 			rx_head = rx_tail = 0;
-			if (usb_generation++ != 0 && told++ < 20) {
+			if (usb_generation++ != 0 && told++ < 200) {
 				say("usb: a new session of the port (%u): what came before it is dropped\n", usb_generation);
 			}
 		}
 		if (!user_open) {
+			static uint32_t dropped_said;
+
 			log_mode = level != 3;
-			while (dwc3_read(usb_dev, buf, sizeof(buf)) > 0) {
+			while ((n = dwc3_read(usb_dev, buf, sizeof(buf))) > 0) {
 				/* what the computer sends with no program to take it is dropped */
+				if (level == 3 && dropped_said != usb_generation) {
+					dropped_said = usb_generation;
+					say("usb: session %u: %zu bytes from the computer dropped: no program has the port\n", usb_generation, n);
+				}
 			}
 		} else {
+			/* usb=3: each session's first bytes for the mux (its version packet -- did it come at all?) */
+			static uint32_t first_in_said;
+
 			while (rx_head - rx_tail <= RX_RING - sizeof(buf) && (n = dwc3_read(usb_dev, buf, sizeof(buf))) > 0) {
+				if (level == 3 && first_in_said != usb_generation) {
+					char hex[3 * 16 + 1] = "";
+
+					first_in_said = usb_generation;
+					for (size_t i = 0; i < n && i < 16; i++) {
+						snprintf(hex + 3 * i, sizeof(hex) - 3 * i, " %02x", buf[i]);
+					}
+					say("usb: session %u: the computer's first %zu bytes for the mux:%s\n", usb_generation, n, hex);
+				}
 				for (size_t i = 0; i < n; i++) {
 					rx_ring[rx_head++ % RX_RING] = buf[i];
 				}
@@ -679,8 +742,12 @@ usbdev_write_packet(struct uio *uio, int ioflag)
 {
 	static uint8_t packet[DWC3_PACKET_MAX];         /* (under usb_write_lock) */
 	static LCK_MTX_DECLARE(usb_write_lock, &usb_lck_grp);
+	/* (said once a session: its first packet out, a packet the computer has not taken for 2 s) */
+	static uint32_t first_out_said, wait_said;
+	static unsigned reset_said;
 	user_ssize_t n = uio_resid(uio);
 	int error;
+	unsigned waits = 0;
 
 	uint32_t session;
 
@@ -707,14 +774,28 @@ usbdev_write_packet(struct uio *uio, int ioflag)
 		 * usbmuxd waited for the answer to its version packet. The program learns of the new session from this.
 		 */
 		if (usb_generation != session) {
+			uint32_t now = usb_generation;
+
 			lck_mtx_unlock(&usb_lock);
+			if (reset_said++ < 50) {
+				say("usb: session %u: a packet of %lld bytes of session %u not sent (ENETRESET)\n", now, (long long)n, session);
+			}
 			error = ENETRESET;
 			break;
 		}
 		sent = dwc3_send_packet(usb_dev, packet, (size_t)n) == 0;
 		lck_mtx_unlock(&usb_lock);
 		if (sent) {
+			if (level == 3 && first_out_said != session) {
+				first_out_said = session;
+				say("usb: session %u: the mux's first packet to the computer, %lld bytes\n", session, (long long)n);
+			}
 			break;
+		}
+		/* (a tick a wait: 200 of them about 2 s) */
+		if (++waits == 200 && wait_said != session) {
+			wait_said = session;
+			say("usb: session %u: a packet of %lld bytes has waited 2 s for the computer to take it\n", session, (long long)n);
 		}
 		if (ioflag & IO_NDELAY) {
 			error = EWOULDBLOCK;
@@ -809,15 +890,45 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 		lck_mtx_unlock(&usb_lock);
 		return 0;
 	case HAKIOS_USB_HOST: {
-		static unsigned said;
+		/*
+		 * Only the changes said, with how often the state before was said again: the mux says "come" at every
+		 * connection to lockdownd, and 24 of a boot's first minute used up the 40 lines there were before the
+		 * cable was ever pulled (2026-11-02).
+		 */
+		static int host_was = -1;
+		static unsigned changes, again;
+		int here = *(const int *)(const void *)data != 0;
 
 		if (level != 3 || mux_pid != proc_selfpid()) {
 			return level != 3 ? ENOTSUP : EPERM;
 		}
-		if (said++ < 40) {
-			say("usb: the mux says the computer's usbmux has %s\n", *(const int *)(const void *)data ? "come" : "gone");
+		if (here != host_was) {
+			if (changes++ < 400) {
+				if (again != 0) {
+					say("usb: session %u: the mux says the computer's usbmux has %s (\"%s\" said %u times more before)\n",
+					    usb_generation, here ? "come" : "gone", here ? "gone" : "come", again);
+				} else {
+					say("usb: session %u: the mux says the computer's usbmux has %s\n", usb_generation, here ? "come" : "gone");
+				}
+			}
+			host_was = here;
+			again = 0;
+		} else {
+			again++;
 		}
-		hakios_usbmux_host(*(const int *)(const void *)data != 0);
+		hakios_usbmux_host(here);
+		return 0;
+	}
+	case HAKIOS_USB_NOTE: {
+		static unsigned notes;
+		const struct hakios_usb_note *note = (const struct hakios_usb_note *)(const void *)data;
+
+		if (level != 3 || mux_pid != proc_selfpid()) {
+			return level != 3 ? ENOTSUP : EPERM;
+		}
+		if (notes++ < 3000) {
+			say("usbmux: %.*s\n", (int)strnlen(note->text, sizeof(note->text)), note->text);
+		}
 		return 0;
 	}
 	case HAKIOS_USB_IPHONE: {
