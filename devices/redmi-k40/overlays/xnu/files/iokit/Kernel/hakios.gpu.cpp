@@ -72,6 +72,12 @@ void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
 int hakios_gpu_sleep(void);
 bool hakios_gpu_wake(void);
+bool hakios_gpu_hung(void);
+bool hakios_gpu_recover(void);
+bool hakios_gpu_fence_failed(uint32_t fence);
+bool hakios_gpu_space_faulted(void * space);
+void hakios_gpu_test_hang(void);
+extern volatile bool hakios_screen_off;         /* bsd/dev/hakios.cpufreq.c */
 
 void HakiosGPUStart(void);
 void HakiosGPUStop(void);
@@ -364,6 +370,35 @@ static thread_call_t gGPUSleepCall, gGPUWakeCall;      /* (the GPU asleep while 
 static void gpuSleepWork(thread_call_param_t, thread_call_param_t);
 static void gpuWakeWork(thread_call_param_t, thread_call_param_t);
 
+/*
+ * A hung GPU found and brought back (boot-arg gpu_recover=1; hakios.adreno.c hakios_gpu_recover()): a look every
+ * quarter of a second while the screen is on, every two while it is off; after a recovery the waits are waited for
+ * again (gGPUReported). Boot-arg gpu_test_hang=S: S seconds after the start, the core is given a wait that never ends.
+ */
+static thread_call_t gGPUWatchCall, gGPUTestHangCall;
+
+static void
+gpuWatchWork(thread_call_param_t, thread_call_param_t)
+{
+	uint64_t deadline;
+
+	IOLockLock(gGPULock);
+	if (hakios_gpu_hung() && hakios_gpu_recover()) {
+		gGPUReported = false;
+	}
+	IOLockUnlock(gGPULock);
+	clock_interval_to_deadline(hakios_screen_off ? 2000 : 250, kMillisecondScale, &deadline);
+	thread_call_enter_delayed(gGPUWatchCall, deadline);
+}
+
+static void
+gpuTestHangWork(thread_call_param_t, thread_call_param_t)
+{
+	IOLockLock(gGPULock);
+	hakios_gpu_test_hang();
+	IOLockUnlock(gGPULock);
+}
+
 void
 HakiosGPUStart(void)
 {
@@ -378,6 +413,20 @@ HakiosGPUStart(void)
 		gGPUSleepCall = thread_call_allocate_with_options(gpuSleepWork, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
 		gGPUWakeCall = thread_call_allocate_with_options(gpuWakeWork, NULL, THREAD_CALL_PRIORITY_HIGH, 0);
 		IOLog("HakiosGPU: the GPU sleeps while the screen is off (gpu_sleep=1)\n");
+	}
+	uint32_t recover = 0, testHang = 0;
+	if (gGPULock != NULL && PE_parse_boot_argn("gpu_recover", &recover, sizeof(recover)) && recover != 0) {
+		uint64_t deadline;
+
+		gGPUWatchCall = thread_call_allocate_with_options(gpuWatchWork, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
+		clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gGPUWatchCall, deadline);
+		IOLog("HakiosGPU: a hung GPU is brought back (gpu_recover=1)\n");
+		if (PE_parse_boot_argn("gpu_test_hang", &testHang, sizeof(testHang)) && testHang != 0) {
+			gGPUTestHangCall = thread_call_allocate_with_options(gpuTestHangWork, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
+			clock_interval_to_deadline(testHang, kSecondScale, &deadline);
+			thread_call_enter_delayed(gGPUTestHangCall, deadline);
+		}
 	}
 	gpu = OSTypeAlloc(HakiosGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
@@ -1007,6 +1056,12 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		goto out;
 	}
 	IOLockLock(gGPULock);
+	if (hakios_gpu_space_faulted(fSpace)) {
+		/* (this client's work hung the GPU, which was brought back without it: hakios_gpu_recover()) */
+		IOLockUnlock(gGPULock);
+		ret = kIOReturnNotResponding;
+		goto out;
+	}
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
@@ -1292,6 +1347,8 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			if (patience == 0) {
 				waitOver(&r.waitFence.timeout, r.waitFence.fence);
 			}
+		} else if (hakios_gpu_fence_failed(r.waitFence.fence)) {
+			ret = kIOReturnNotResponding;   /* (lost when the hung GPU was brought back) */
 		}
 		IOLockUnlock(gGPULock);
 		slowWait("fence", waitBegan);

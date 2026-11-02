@@ -968,6 +968,7 @@ static struct block gmu = { "gmu", 0x03d6a000, 0x34000 };
 #define GMU_RSCC_CONTROL_ACK    GMU_WORD(0x9308)
 #define GMU_AO_GPU_CX_BUSY_STATUS GMU_WORD(0x930c)
 #define GMU_AHB_FENCE_STATUS    GMU_WORD(0x9313)
+#define GMU_AHB_FENCE_STATUS_CLR GMU_WORD(0x9314)   /* (Linux a6xx_gmu.xml.h; write 7: all of it cleared) */
 
 /*
  * dt: qcom,kgsl-3d0 "kgsl_3d0_reg_memory" at 0x3d00000 is the 3D core, and without power (the GMU
@@ -2662,6 +2663,7 @@ step_core_power(void)
 #define GBIF_QSB_SIDE0          (4 * 0x03)      /* of the bus interface (step 6) */
 #define RBBM_GBIF_CLIENT_QOS_CNTL GPU_WORD(0x0011)
 #define RBBM_GBIF_HALT          GPU_WORD(0x0016)
+#define RBBM_SW_RESET_CMD       GPU_WORD(0x0043)        /* (Linux a6xx.xml.h; the core's own reset: hakios_gpu_recover()) */
 #define RBBM_GBIF_HALT_ACK      GPU_WORD(0x0017)
 #define RBBM_INTERFACE_HANG_INT_CNTL GPU_WORD(0x001f)
 #define RBBM_PERFCTR_CNTL       GPU_WORD(0x0500)
@@ -4266,6 +4268,186 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	ring(gpu_fence);
 	ring_send();
 	return gpu_fence;
+}
+
+/*
+ * A hung GPU, found and brought back (boot-arg gpu_recover=1; HakiosGPU's watch, iokit/Kernel/hakios.gpu.cpp, looks
+ * every quarter of a second with gGPULock held). Before, a client that hung the core (a shader that never ends) stopped
+ * the whole screen: one report, then every wait failed, and only a restart of the phone helped.
+ * Hung: work is outstanding and for 2 s neither the fence word, nor the ring's read pointer, nor where the core is in
+ * its first command buffer (address, words left) has moved. The work under way is then all one client's (every
+ * client has its own address space, and the core is switched only when it has drained): gpu_space_now's.
+ * Brought back as Linux's and KGSL's GMU-era GPUs are, by a full reset -- the core's bus halted for good, the hold
+ * on the core given up, the GMU in reset, GX off, the RPMh channel asleep -- and the wake of gpu_sleep (steps 14-17,
+ * 20, 21). Then the fence word is set to the last submission, so that every waiter is let go; the waits of the
+ * client whose work it was, on the work that was lost, fail, and so do its submissions from then on
+ * (hakios_gpu_space_faulted()); everyone else goes on. At most 3 times a minute; then the GPU is left as before.
+ */
+void hakios_gpu_report(const char *why);
+bool hakios_gpu_hung(void);
+bool hakios_gpu_recover(void);
+bool hakios_gpu_fence_failed(uint32_t fence);
+bool hakios_gpu_space_faulted(void *space);
+void hakios_gpu_test_hang(void);
+static uint32_t gpu_recoveries, gpu_failed_after, gpu_failed_upto;
+static struct gpu_space *gpu_failed_space;
+static bool gpu_failed_any;
+static uint64_t gpu_recovered_at[3];
+static uint32_t hang_seen[4];
+static uint64_t hang_still_since;
+
+bool
+hakios_gpu_hung(void)
+{
+	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+	uint32_t now_seen[4];
+	uint64_t now = mach_absolute_time(), window;
+	bool hung = false;
+
+	if (!gpu_kept) {
+		return false;
+	}
+	lck_mtx_lock(&gpu_gov_mtx);             /* (GX is not put to sleep under the reads) */
+	to_memory((vm_offset_t)word, 4);
+	now_seen[0] = *word;
+	if (gpu_asleep || !core_runs || (int32_t)(now_seen[0] - gpu_fence) >= 0) {
+		hang_still_since = 0;           /* (nothing outstanding) */
+	} else {
+		now_seen[1] = rd(gpu.base + CP_RB_RPTR);
+		now_seen[2] = rd(gpu.base + CP_IB1_BASE);
+		now_seen[3] = rd(gpu.base + CP_IB1_REM_SIZE);
+		if (hang_still_since == 0 || memcmp(now_seen, hang_seen, sizeof(hang_seen)) != 0) {
+			memcpy(hang_seen, now_seen, sizeof(hang_seen));
+			hang_still_since = now;
+		} else {
+			nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &window);
+			hung = now - hang_still_since >= window;
+		}
+	}
+	lck_mtx_unlock(&gpu_gov_mtx);
+	return hung;
+}
+
+bool
+hakios_gpu_recover(void)
+{
+	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+	uint64_t began = mach_absolute_time(), minute, ns;
+	uint32_t done;
+	bool ok;
+
+	nanoseconds_to_absolutetime(60 * NSEC_PER_SEC, &minute);
+	if (gpu_recovered_at[2] != 0 && began - gpu_recovered_at[2] < minute) {
+		if (gpu_recoveries < 1000) {
+			printf("adreno: THE GPU HAS HUNG AGAIN: three times within a minute; it is not brought back any more\n");
+			gpu_recoveries = 1000;
+		}
+		return false;
+	}
+	to_memory((vm_offset_t)word, 4);
+	done = *word;
+	printf("adreno: THE GPU HAS HUNG: submission %u is the last, the core has done %u, nothing has moved for 2 s; the work "
+	    "is %s's; bringing it back (%u)\n", gpu_fence, done, gpu_space_now != NULL ? "a client" : "the shared space's",
+	    gpu_recoveries + 1);
+	hakios_gpu_report("hung");
+	lck_mtx_lock(&gpu_gov_mtx);
+	step = 0;
+	newest_step = 0;
+	/*
+	 * The order of KGSL's gmu_suspend for a GMU that is not asked (iOSPlus10 0287): the AHB fence open and its status
+	 * cleared first -- a GMU put in reset while it runs can leave the fence closed, and the next one never gets
+	 * through its own registers (2026-11-02: its firmware did not start, fw_init_result 0, its state all deadbeef) --
+	 * then the GMU in reset, the core's bus halted for good, GX off, and the halts lifted before the GMU starts
+	 * again through the same bus.
+	 */
+	put(&gmu, "ahb_fence_status_clr", GMU_AHB_FENCE_STATUS_CLR, 7);
+	put(&gmu, "ao_ahb_fence_ctrl", GMU_AO_AHB_FENCE_CTRL, 0);
+	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
+	gmu_runs = gmu_talks = false;
+	core_bus_halt(true);
+	core_is_on = core_runs = false;
+	/* the core reset too, before it loses its power (0287, after ios-flame): what it had under way is let go of */
+	if (rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) {
+		wr(gpu.base + RBBM_SW_RESET_CMD, 1);
+		(void) rd(gpu.base + RBBM_SW_RESET_CMD);
+		delay_for_interval(100, NSEC_PER_USEC);
+		wr(gpu.base + RBBM_SW_RESET_CMD, 0);
+	}
+	gx_off();
+	put(&gbif, "halt", GBIF_HALT, 0);
+	if (rsc_awake && rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0) {
+		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
+		(void) wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100);
+		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
+	}
+	rsc_awake = false;
+	gpu_asleep = true;                      /* (what gpu_wake_core() brings back from) */
+	ok = gpu_wake_core();
+	if (ok) {
+		gpu_failed_after = done;
+		gpu_failed_upto = gpu_fence;
+		gpu_failed_space = gpu_space_now;
+		gpu_failed_any = true;
+		*word = gpu_fence;              /* (every waiter let go: what it waited for will not come) */
+		to_memory((vm_offset_t)word, 4);
+		gpu_recoveries++;
+		gpu_recovered_at[2] = gpu_recovered_at[1];
+		gpu_recovered_at[1] = gpu_recovered_at[0];
+		gpu_recovered_at[0] = began;
+		hang_still_since = 0;
+	}
+	lck_mtx_unlock(&gpu_gov_mtx);
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	printf("adreno: %s after %llu ms; submissions %u to %u are lost\n", ok ? "THE GPU IS BACK" : "THE GPU DID NOT COME BACK",
+	    ns / NSEC_PER_MSEC, done + 1, gpu_fence);
+	return ok;
+}
+
+/* (with gGPULock held) A submission that was under way when the GPU was brought back: it will never be done. */
+bool
+hakios_gpu_fence_failed(uint32_t fence)
+{
+	return gpu_failed_any && (int32_t)(fence - gpu_failed_after) > 0 && (int32_t)(fence - gpu_failed_upto) <= 0;
+}
+
+/* (with gGPULock held) The client whose work hung the GPU: refused from then on. */
+bool
+hakios_gpu_space_faulted(void *space)
+{
+	return gpu_failed_any && space != NULL && space == gpu_failed_space;
+}
+
+/* Boot-arg gpu_test_hang=S (HakiosGPU, S seconds after the start): the core given a wait that never ends. */
+#define CP_WAIT_REG_MEM         0x3c
+void
+hakios_gpu_test_hang(void)
+{
+	if (!gpu_kept || (gpu_asleep && !hakios_gpu_wake())) {
+		return;
+	}
+	/* (in the shared space: the hang is then nobody's, and no client is refused for it) */
+	if (gpu_space_now != NULL && !space_switch(&core_space)) {
+		printf("adreno: TEST: the core could not be switched to the shared space: no hang given\n");
+		return;
+	}
+	if (++gpu_fence == 0) {
+		gpu_fence = 1;
+	}
+	ring_command(CP_WAIT_REG_MEM, 6);       /* until a word of the scratch page that stays 0 is 0xdeadbeef */
+	ring(3u | 1u << 4);                     /* "equal", in memory */
+	ring(CORE_SCRATCH_ADDRESS + 0x80);
+	ring(0);
+	ring(0xdeadbeef);
+	ring(0xffffffff);
+	ring(16);
+	ring_register(CP_SCRATCH_REG2, gpu_fence);
+	ring_command(CP_EVENT_WRITE, 4);
+	ring(EVENT_CACHE_FLUSH);
+	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
+	ring(0);
+	ring(gpu_fence);
+	ring_send();
+	printf("adreno: TEST: the 3D core is given a wait that never ends (submission %u)\n", gpu_fence);
 }
 
 /* A submission does not come back: what the 3D core and its SMMU context say. */
