@@ -924,8 +924,10 @@ cx_ready(void)
 			printf("adreno: %u: Kona's GPU AHB clock is not reported running (gpu_cc_ahb %#x)\n", step, ahb);
 			return false;
 		}
-		printf("adreno: %u: Kona's GPU AHB clock reports enabled (gpu_cc_ahb %#x); validating with register reads\n",
-		    step, ahb);
+		if (!quiet) {
+			printf("adreno: %u: Kona's GPU AHB clock reports enabled (gpu_cc_ahb %#x); validating with register reads\n",
+			    step, ahb);
+		}
 		return true;
 	}
 	ahb_hz = measure_quietly(GPUCC_DEBUG_AHB);
@@ -2043,7 +2045,9 @@ step_gmu_start(void)
 	if (!cx_ready() || !gmu_space_is_on) {
 		return false;
 	}
-	hfi = (volatile struct hfi_table *)block_uncached(&gmu_hfi);
+	if (hfi == NULL) {                      /* (once: a wake from sleep comes here again, gpu_wake_core()) */
+		hfi = (volatile struct hfi_table *)block_uncached(&gmu_hfi);
+	}
 	if (hfi == NULL) {
 		printf("adreno: %u: the page for the messages is not in one piece\n", step);
 		return false;
@@ -2057,6 +2061,8 @@ step_gmu_start(void)
 		hfi->queue[i].type = i | (uint32_t)priority[i] << 8;
 		hfi->queue[i].words = HFI_QUEUE_WORDS;
 		hfi->queue[i].status = 1;
+		/* (empty: a GMU started again reads from the start, as Linux's a6xx_hfi_stop() leaves the queues) */
+		hfi->queue[i].read = hfi->queue[i].write = 0;
 	}
 
 	announce("tell the GMU where things are, by its registers: the message table, the log, which GPU this is; its "
@@ -3525,6 +3531,160 @@ hakios_gpu_stop(void)
 	}
 }
 
+/*
+ * The GPU asleep (boot-arg gpu_sleep_test=N: N times right after the steps, before the system has it): the 3D
+ * core's half (GX) without power, the GMU stopped, its RPMh channel handed to the always-on sequencer -- the first
+ * half of gpu_block_stop(), in its order and KGSL's: the core's bus halted and let go, the hold on the core (OOB)
+ * given up, "slumber" (the GMU takes GX down and drops its votes), the GMU in reset, GX off if it is still on, the
+ * channel asleep. What stays: CX with the SMMU and its tables (the clients' address spaces), the zap shader with
+ * TrustZone, the memory of the steps -- so that gpu_wake() is steps 14-17, 20 and 21 again, as Linux's
+ * a6xx_gmu_resume() starts an A650's GMU cold (it is never warm-booted) and its hw_init() leaves secure mode again.
+ * Afterwards nothing may read or write the 3D core's registers (that hangs the bus): core_runs, core_is_on,
+ * gmu_talks, gmu_runs and rsc_awake say so to every path that looks at them, the run's end and a panic's included.
+ */
+bool hakios_gpu_done(uint32_t fence);
+static volatile bool gpu_asleep;
+static uint32_t gpu_sleeps, gpu_wakes, gpu_wake_failures;
+static uint64_t gpu_wake_us_last, gpu_wake_us_most;
+
+static bool
+gpu_sleep_core(void)
+{
+	uint32_t slumber[3] = { 0, 0, 0 };
+	bool was_quiet = quiet;
+
+	if (gpu_asleep || !core_runs || !core_is_on || !gmu_talks || !hakios_gpu_done(gpu_fence)) {
+		return false;
+	}
+	quiet = gpu_sleeps >= 2;                /* (the first two in full: what the block said on the way) */
+	step = 0;
+	newest_step = 0;
+	core_bus_halt(false);
+	put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, 1u << 31);
+	core_is_on = core_runs = false;
+	hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3);
+	if (!wait_for(&gmu, GMU_AO_GPU_CX_BUSY_STATUS, 1u << 23, 0, 100)) {
+		get(&gmu, "ao_gpu_cx_busy_status", GMU_AO_GPU_CX_BUSY_STATUS);
+	}
+	gmu_talks = false;
+	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
+	gmu_runs = false;
+	gx_off();
+	if (rsc_awake && rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0) {
+		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
+		if (!wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100)) {
+			printf("adreno: asleep: the GMU's RPMh channel does not go to sleep\n");
+		}
+		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
+	}
+	rsc_awake = false;
+	gpu_asleep = true;
+	gpu_sleeps++;
+	quiet = was_quiet;
+	if (gpu_sleeps <= 20) {
+		printf("adreno: THE GPU SLEEPS (%u): the 3D core %s, the GMU's channel %s\n", gpu_sleeps,
+		    (rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) ? "STILL POWERED" : "without power",
+		    (rd(rscc.base + RSCC_RSC_STATUS0_DRV0) & RSCC_ASLEEP) ? "asleep" : "AWAKE");
+	}
+	return true;
+}
+
+static bool
+gpu_wake_core(void)
+{
+	static bool (*const again[])(void) = { step_gmu_firmware, step_gmu_start, step_gmu_queues, step_core_power };
+	static const uint32_t again_step[] = { 14, 15, 16, 17 };
+	uint64_t began = mach_absolute_time(), ns;
+	bool was_quiet = quiet, ok = true;
+
+	if (!gpu_asleep) {
+		return true;
+	}
+	quiet = gpu_wakes >= 2;
+	newest_step = 0;
+	for (unsigned i = 0; ok && i < sizeof(again) / sizeof(again[0]); i++) {
+		step = again_step[i];
+		ok = again[i]();
+	}
+	if (ok) {
+		uint32_t context = smmu_context(&core_space);
+
+		/* the core reads its ring from the start again; a fault the context still holds from before would fail step 20 */
+		ring_at = ring_sent = 0;
+		wr(smmu.base + context + SMMU_CB_FSR, SMMU_FSR_ALL);
+		step = 20;
+		ok = step_core_start();
+	}
+	if (ok) {
+		step = 21;
+		ok = step_core_commands();      /* out of secure mode, and a word written on command: the core works */
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	quiet = was_quiet;
+	if (!ok) {
+		gpu_wake_failures++;
+		printf("adreno: THE GPU DOES NOT WAKE: step %u failed (%llu ms)\n", step, ns / NSEC_PER_MSEC);
+		step = 0;
+		return false;
+	}
+	step = 0;
+	gpu_asleep = false;
+	gpu_wakes++;
+	gpu_wake_us_last = ns / NSEC_PER_USEC;
+	gpu_wake_us_most = MAX(gpu_wake_us_most, gpu_wake_us_last);
+	if (gpu_wakes <= 20) {
+		printf("adreno: THE GPU IS AWAKE AGAIN (%u) after %llu ms\n", gpu_wakes, ns / NSEC_PER_MSEC);
+	}
+	return true;
+}
+
+/*
+ * While the screen is off (boot-arg gpu_sleep=1; HakiosGPU's thread calls, iokit/Kernel/hakios.gpu.cpp, with gGPULock
+ * held): asleep two seconds after the display went off if the core has done all it was given; awake when the display
+ * comes back, or at the first submission meanwhile (hakios_gpu_submit()). Under gpu_gov_mtx as well: the governor's
+ * speed votes are HFI messages too, and must not come between those of a sleep or a wake (gpu_gov_vote()).
+ * hakios_gpu_sleep(): 1 asleep, 0 not now (the core has work: look again), -1 not at all.
+ */
+extern volatile bool hakios_screen_off;         /* bsd/dev/hakios.cpufreq.c */
+extern void hakios_gpu_screen(bool on);         /* iokit/Kernel/hakios.gpu.cpp: (off) asleep in two seconds */
+int hakios_gpu_sleep(void);
+bool hakios_gpu_wake(void);
+
+int
+hakios_gpu_sleep(void)
+{
+	bool slept;
+
+	if (!gpu_kept || gpu_asleep || gpu_wake_failures != 0 || !hakios_screen_off) {
+		return -1;
+	}
+	if (!hakios_gpu_done(gpu_fence)) {
+		return 0;
+	}
+	lck_mtx_lock(&gpu_gov_mtx);
+	slept = gpu_kept && gpu_sleep_core();
+	lck_mtx_unlock(&gpu_gov_mtx);
+	return slept ? 1 : -1;
+}
+
+bool
+hakios_gpu_wake(void)
+{
+	bool awake;
+
+	if (!gpu_asleep) {
+		return true;
+	}
+	lck_mtx_lock(&gpu_gov_mtx);
+	awake = gpu_kept && gpu_wake_core();
+	if (!awake && gpu_kept) {
+		printf("adreno: the GPU's wake, once more\n");
+		awake = gpu_wake_core();
+	}
+	lck_mtx_unlock(&gpu_gov_mtx);
+	return awake;
+}
+
 void
 hakios_adreno_stop(void)
 {
@@ -3953,7 +4113,9 @@ gpu_gov_vote(uint32_t level)
 	bool done = false;
 
 	lck_mtx_lock(&gpu_gov_mtx);
-	if (gpu_kept && gov_running) {
+	if (gpu_asleep) {
+		done = true;                    /* (no GMU to tell, and not a refusal: the wake sends its own speed) */
+	} else if (gpu_kept && gov_running) {
 		hfi_quiet = true;
 		done = hfi_send("a speed (the governor)", HFI_GX_BW_PERF_VOTE, vote, 4);
 		hfi_quiet = false;
@@ -4059,6 +4221,14 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 {
 	uint32_t wanted = 26 + 4 * count, room = 0;
 
+	if (gpu_asleep) {
+		if (!hakios_gpu_wake()) {
+			return 0;               /* (asleep with the screen off, and it did not wake: see the lines above) */
+		}
+		if (hakios_screen_off) {
+			hakios_gpu_screen(false);       /* (woken for this while dark: asleep again two seconds after it is done) */
+		}
+	}
 	for (int i = 0; i < 20000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
 		if (room >= wanted) {
@@ -4104,6 +4274,12 @@ hakios_gpu_report(const char *why)
 {
 	uint32_t context = smmu_context(&core_space);
 
+	if (gpu_asleep) {
+		/* (the core's registers without power: reading them would hang the bus) */
+		printf("adreno: gpu: %s: submission %u is the last, the core has done %u; THE GPU SLEEPS\n", why, gpu_fence,
+		    *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT));
+		return;
+	}
 	printf("adreno: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
 	    "%#x, interrupts %#x; command processor: fault %#x, interrupts %#x, protection %#x\n", why, gpu_fence,
 	    *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT), rd(gpu.base + CP_RB_RPTR), ring_at,
@@ -4165,6 +4341,11 @@ hakios_adreno_minute(void)
 	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz\n", tenths[0] / 10,
 	    tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
 	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000);
+	if (gpu_sleeps != 0 || gpu_wake_failures != 0) {
+		printf("adreno: gpu: %s; slept %u times, woke %u times (%u failed), the last wake %llu ms, the longest %llu ms\n",
+		    gpu_asleep ? "ASLEEP" : "awake", gpu_sleeps, gpu_wakes, gpu_wake_failures, gpu_wake_us_last / 1000,
+		    gpu_wake_us_most / 1000);
+	}
 	if (gpu_spaces > 0) {
 		printf("adreno: gpu: clients' own spaces: %u made, %u switches, %u refused; the core in %s; %u submissions\n",
 		    gpu_spaces_made, gpu_space_switches, gpu_space_refused, gpu_space_now != NULL ? "a client's" : "the shared one",
@@ -4437,6 +4618,23 @@ hakios_adreno_init(void)
 		done = step;
 	}
 	PE_parse_boot_argn("adreno_keep", &keep, sizeof(keep));
+	if (keep && done >= 21 && core_runs) {
+		/* boot-arg gpu_sleep_test=N: the GPU sleeps and wakes N times before the system has it; if it does not come back, the system draws without it */
+		uint32_t tests = 0;
+
+		PE_parse_boot_argn("gpu_sleep_test", &tests, sizeof(tests));
+		for (uint32_t i = 0; i < tests && core_runs; i++) {
+			if (!gpu_sleep_core() || !gpu_wake_core()) {
+				printf("adreno: THE GPU DID NOT COME BACK FROM SLEEP (test %u of %u): the system draws without it\n", i + 1,
+				    tests);
+				core_runs = false;
+			}
+		}
+		if (tests != 0 && core_runs) {
+			printf("adreno: the GPU slept and woke %u times before the system had it; waking took %llu ms at most\n", tests,
+			    gpu_wake_us_most / 1000);
+		}
+	}
 	if (keep) {
 		if (done >= 21 && core_runs) {
 			gpu_free[0].start = GPU_ADDRESSES_START;

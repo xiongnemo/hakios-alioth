@@ -31,6 +31,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -81,6 +82,7 @@ static volatile uint32_t *dsi;
 static vm_offset_t intf;
 static lck_grp_t *dsi_grp;
 static lck_mtx_t *dsi_lock;
+static lck_mtx_t *panel_mtx;            /* the panel's sleep and wake against the switches for a still screen */
 static bool dsi_dead;
 static unsigned dsi_failures, mdp_waits;
 static uint32_t panel_rate;              /* what the panel was last switched to, 0 = the UEFI's */
@@ -124,6 +126,7 @@ dsi_init(void)
 	}
 	dsi_grp = lck_grp_alloc_init("alioth_dsi", LCK_GRP_ATTR_NULL);
 	dsi_lock = lck_mtx_alloc_init(dsi_grp, LCK_ATTR_NULL);
+	panel_mtx = lck_mtx_alloc_init(dsi_grp, LCK_ATTR_NULL);
 	dsi = d;
 	return true;
 }
@@ -434,6 +437,8 @@ alioth_mdp_clock(uint32_t hz)
 	    (rcg[0] & RCG_CMD_UPDATE) ? "STILL PENDING" : "taken");
 }
 
+static void refresh_arm(void);
+
 /*
  * Switch the panel to `hz` (60, 90, 120) and the tear check with it. 1 when done. Called with the
  * display's bus clocks running (hakios.display.c, before its TE calibration).
@@ -462,6 +467,9 @@ alioth_panel_set_rate(uint32_t hz)
 		printf("alioth panel: already at %u Hz (vsync_count %u)\n", hz, count);
 		alioth_mdp_clock(hz);
 		alioth_panel_check(hz);
+		if (hz == 120) {
+			refresh_arm();
+		}
 		return 1;
 	}
 	int rc = send_switch(t);
@@ -475,7 +483,128 @@ alioth_panel_set_rate(uint32_t hz)
 	alioth_mdp_clock(hz);
 	delay_for_interval(50, NSEC_PER_MSEC);
 	alioth_panel_check(hz);
+	if (hz == 120) {
+		refresh_arm();
+	}
 	return 1;
+}
+
+/*
+ * Half the frames while nothing moves (boot-arg refresh_idle=1; refresh_idle_ms=N, default 1500). The display
+ * engine sends the panel a whole frame at every TE whether anything changed or not (the UEFI's auto-refresh,
+ * TEAR_AUTOREFRESH_CONFIG 0x80000001: 6.5 ms of every 8.2), so a still screen cost as much as an animation. After
+ * refresh_idle_ms with no frame swapped (MiniIOMobileFramebuffer.cpp present()) and no touch (hakios.input.c),
+ * the auto-refresh sends one frame every second TE (frame count 2): the engine's reads of the scan-out buffer
+ * and the link's transfers are halved, while the command-mode panel shows what it holds. The next swap or touch
+ * brings every TE back at once. One register, no DCS: the panel's timing, its TE and its gamma stay those of
+ * 120 Hz, the tear check and gTEAt stay right; nothing changes for iOS. The first frame after a still screen
+ * waits at most one TE more. (The panel's own 60 Hz timing would save its scan as well; a DCS switch has its
+ * own risks -- a rate's gamma, three failures turning every DCS off -- and is left for later.)
+ */
+static bool panel_asleep;               /* the panel was put to sleep with the display (alioth_panel_power) */
+static thread_call_t refresh_call;
+static volatile uint64_t refresh_activity_at;   /* mach time of the last swap or touch */
+static volatile bool refresh_slow;      /* a frame every second TE, for a still screen */
+static bool refresh_checked, refresh_off;
+static uint64_t refresh_idle_abs, refresh_since;
+static uint32_t refresh_frames_since;
+static unsigned refresh_switches;
+
+static void
+refresh_work(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t idle_at, now, ns;
+	uint32_t cfg, frames;
+	bool slow;
+
+	if (refresh_off || panel_mtx == NULL) {
+		return;
+	}
+	lck_mtx_lock(panel_mtx);
+	now = mach_absolute_time();
+	idle_at = refresh_activity_at + refresh_idle_abs;
+	slow = now >= idle_at;
+	if (panel_asleep || refresh_off) {
+		lck_mtx_unlock(panel_mtx);
+		return;
+	}
+	if (slow != refresh_slow) {
+		cfg = intf_rd(TEAR_AUTOREFRESH_CONFIG);
+		if (!(cfg & (1u << 31)) || (cfg & 0xffffu) != (refresh_slow ? 2u : 1u)) {
+			refresh_off = true;
+			printf("alioth panel: the auto-refresh is %#x, not what it was left at: no half rate for a still screen in this run\n", cfg);
+		} else {
+			intf_wr(TEAR_AUTOREFRESH_CONFIG, (cfg & ~0xffffu) | (slow ? 2u : 1u));
+			refresh_slow = slow;
+			/* (the frames the interface sent since the last switch: about 60 or 121 a second) */
+			frames = intf_rd(INTF_FRAME_COUNT);
+			absolutetime_to_nanoseconds(now - refresh_since, &ns);
+			if (refresh_switches++ < 40) {
+				printf("alioth panel: %s (switch %u; before it %u frames in %llu ms)\n", slow ?
+				    "a still screen: a frame every second TE" : "moving again: a frame every TE", refresh_switches,
+				    frames - refresh_frames_since, ns / NSEC_PER_MSEC);
+			}
+			refresh_since = now;
+			refresh_frames_since = frames;
+		}
+	}
+	if (!refresh_slow && !refresh_off) {
+		thread_call_enter_delayed(refresh_call, idle_at);      /* (to look again when it may have become still) */
+	}
+	lck_mtx_unlock(panel_mtx);
+}
+
+/* A frame every TE again, now (the display going off, the run's end): no lock, no print. */
+static void
+refresh_full_rate(void)
+{
+	if (refresh_slow) {
+		uint32_t cfg = intf_rd(TEAR_AUTOREFRESH_CONFIG);
+
+		if ((cfg & (1u << 31)) && (cfg & 0xffffu) == 2u) {
+			intf_wr(TEAR_AUTOREFRESH_CONFIG, (cfg & ~0xffffu) | 1u);
+		}
+		refresh_slow = false;
+	}
+}
+
+/* (a swap, a touch) A frame every TE again at once if a still screen had every second. Cheap: called for every swap. */
+void alioth_refresh_activity(void);
+
+void
+alioth_refresh_activity(void)
+{
+	refresh_activity_at = mach_absolute_time();
+	if (refresh_slow && refresh_call != NULL) {
+		thread_call_enter(refresh_call);
+	}
+}
+
+/* The panel is at 120 Hz and awake (its start, a wake): from now on, still for refresh_idle_ms means 60 Hz. */
+static void
+refresh_arm(void)
+{
+	uint32_t on = 0, ms = 1500;
+
+	if (!refresh_checked) {
+		refresh_checked = true;
+		if (!PE_parse_boot_argn("refresh_idle", &on, sizeof(on)) || on == 0) {
+			refresh_off = true;
+			return;
+		}
+		PE_parse_boot_argn("refresh_idle_ms", &ms, sizeof(ms));
+		nanoseconds_to_absolutetime((uint64_t)(ms > 200u ? ms : 200u) * NSEC_PER_MSEC, &refresh_idle_abs);
+		refresh_call = thread_call_allocate_with_options(refresh_work, NULL, THREAD_CALL_PRIORITY_USER, 0);
+		refresh_off = refresh_call == NULL;
+		printf("alioth panel: a frame every second TE after %u ms with nothing moving%s\n", ms,
+		    refresh_off ? ": NO THREAD CALL" : "");
+	}
+	if (refresh_off) {
+		return;
+	}
+	refresh_activity_at = refresh_since = mach_absolute_time();
+	refresh_frames_since = intf_rd(INTF_FRAME_COUNT);
+	thread_call_enter_delayed(refresh_call, refresh_activity_at + refresh_idle_abs);
 }
 
 /*
@@ -491,17 +620,21 @@ alioth_panel_set_rate(uint32_t hz)
 int
 alioth_panel_power(bool on)
 {
-	static bool asleep;
 	static const uint8_t display_off[] = { 0x28, 0x00 }, control[] = { 0x53, 0x20 }, sleep_in[] = { 0x10, 0x00 };
 	static const uint8_t sleep_out[] = { 0x11, 0x00 }, te_on[] = { 0x35, 0x00 }, display_on[] = { 0x29, 0x00 };
 	uint32_t enabled = 0;
 	int rc;
 
 	PE_parse_boot_argn("panel_sleep", &enabled, sizeof(enabled));
-	if (!enabled || on == !asleep || !dsi_init()) {
+	if (!enabled || on == !panel_asleep || !dsi_init()) {
 		return 0;
 	}
+	lck_mtx_lock(panel_mtx);
 	if (!on) {
+		if (refresh_call != NULL) {
+			thread_call_cancel(refresh_call);
+		}
+		refresh_full_rate();            /* (the panel wakes with a frame every TE) */
 		rc = alioth_dsi_dcs_write(display_off, 2, true, 0x05);
 		delay_for_interval(20, NSEC_PER_MSEC);
 		if (rc == 0) {
@@ -511,8 +644,9 @@ alioth_panel_power(bool on)
 			rc = alioth_dsi_dcs_write(sleep_in, 2, true, 0x05);
 		}
 		delay_for_interval(120, NSEC_PER_MSEC);
-		asleep = rc == 0;
+		panel_asleep = rc == 0;
 		printf("alioth panel: asleep with the display off%s (%d)\n", rc == 0 ? "" : ": NOT ALL OF IT", rc);
+		lck_mtx_unlock(panel_mtx);
 		return rc;
 	}
 	rc = alioth_dsi_dcs_write(sleep_out, 2, true, 0x05);
@@ -528,8 +662,12 @@ alioth_panel_power(bool on)
 	if (rc == 0) {
 		rc = alioth_dsi_dcs_write(display_on, 2, true, 0x05);
 	}
-	asleep = false;
+	panel_asleep = false;
 	printf("alioth panel: awake at %u Hz%s (%d)\n", panel_rate, rc == 0 ? "" : ": SOMETHING FAILED", rc);
+	if (rc == 0 && panel_rate == 120) {
+		refresh_arm();
+	}
+	lck_mtx_unlock(panel_mtx);
 	return rc;
 }
 
@@ -879,6 +1017,9 @@ void
 alioth_display_quiesce(void)
 {
 	if (mdss == 0) return;
+	if (intf != 0) {
+		refresh_full_rate();            /* (the UEFI's auto-refresh as it left it: a frame every TE) */
+	}
 	if (scan_saved) {
 		scan_restore(0x9c000000ULL, uefi_stride, uefi_src_size & 0xffff, uefi_src_size >> 16);
 	} else if (md_rd(VIG0_OFF + SSPP_SRC0_ADDR) != 0x9c000000u) {

@@ -36,6 +36,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <mach/mach_time.h>
 #include <mach/vm_param.h>
 #include <sys/systm.h>
@@ -69,9 +70,12 @@ uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
+int hakios_gpu_sleep(void);
+bool hakios_gpu_wake(void);
 
 void HakiosGPUStart(void);
 void HakiosGPUStop(void);
+void hakios_gpu_screen(bool on);
 void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
 }
 
@@ -356,6 +360,10 @@ HakiosGPU::start(IOService * provider)
 	return true;
 }
 
+static thread_call_t gGPUSleepCall, gGPUWakeCall;      /* (the GPU asleep while the screen is off: hakios_gpu_screen()) */
+static void gpuSleepWork(thread_call_param_t, thread_call_param_t);
+static void gpuWakeWork(thread_call_param_t, thread_call_param_t);
+
 void
 HakiosGPUStart(void)
 {
@@ -365,6 +373,12 @@ HakiosGPUStart(void)
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	gGPULock = IOLockAlloc();
+	uint32_t sleepWanted = 0;
+	if (gGPULock != NULL && PE_parse_boot_argn("gpu_sleep", &sleepWanted, sizeof(sleepWanted)) && sleepWanted != 0) {
+		gGPUSleepCall = thread_call_allocate_with_options(gpuSleepWork, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
+		gGPUWakeCall = thread_call_allocate_with_options(gpuWakeWork, NULL, THREAD_CALL_PRIORITY_HIGH, 0);
+		IOLog("HakiosGPU: the GPU sleeps while the screen is off (gpu_sleep=1)\n");
+	}
 	gpu = OSTypeAlloc(HakiosGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);
@@ -385,6 +399,52 @@ HakiosGPUStop(void)
 	IOLockLock(gGPULock);
 	hakios_gpu_stop();
 	IOLockUnlock(gGPULock);
+}
+
+/*
+ * The GPU asleep while the screen is off (boot-arg gpu_sleep=1; hakios.adreno.c gpu_sleep_core()): two seconds
+ * after the display went off, if the 3D core has done all it was given (else once a second after that); awake when
+ * the display comes back -- early, the panel itself takes 120 ms -- or at the first submission meanwhile
+ * (hakios_gpu_submit(), which wakes it under gGPULock). Called by MiniIOMobileFramebuffer's display power.
+ */
+static void
+gpuSleepWork(thread_call_param_t, thread_call_param_t)
+{
+	uint64_t deadline;
+	int slept;
+
+	IOLockLock(gGPULock);
+	slept = hakios_gpu_sleep();
+	IOLockUnlock(gGPULock);
+	if (slept == 0) {
+		clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gGPUSleepCall, deadline);
+	}
+}
+
+static void
+gpuWakeWork(thread_call_param_t, thread_call_param_t)
+{
+	IOLockLock(gGPULock);
+	(void) hakios_gpu_wake();
+	IOLockUnlock(gGPULock);
+}
+
+void
+hakios_gpu_screen(bool on)
+{
+	uint64_t deadline;
+
+	if (gGPUSleepCall == NULL || gGPUWakeCall == NULL) {
+		return;                 /* (no GPU kept, or no gpu_sleep=1) */
+	}
+	if (on) {
+		thread_call_cancel(gGPUSleepCall);
+		thread_call_enter(gGPUWakeCall);
+	} else {
+		clock_interval_to_deadline(2000, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gGPUSleepCall, deadline);
+	}
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1220,6 +1280,12 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	case kMsmWaitFence:
 		waitBegan = mach_absolute_time();
 		IOLockLock(gGPULock);
+		/* (a fence not yet given out is never reached: refused, not waited for -- the wait would end in a report) */
+		if ((int32_t)(r.waitFence.fence - hakios_gpu_last()) > 0) {
+			IOLockUnlock(gGPULock);
+			ret = kIOReturnBadArgument;
+			break;
+		}
 		patience = millisecondsUntil(&r.waitFence.timeout);
 		if (!gpuWait(r.waitFence.fence, patience)) {
 			ret = kIOReturnTimeout;

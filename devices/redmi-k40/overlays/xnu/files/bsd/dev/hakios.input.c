@@ -192,11 +192,15 @@ touch_hold(uint32_t finger, uint32_t x, uint32_t y)
 
 /* (mach_absolute_time()) the last touch or button: the CPU governor lifts the big cores for a while after it (hakios.cpufreq.c) */
 volatile uint64_t hakios_input_at;
+extern void alioth_refresh_activity(void);     /* (alioth_dsi.c: a frame every TE again, if a still screen had fewer) */
 
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
 	hakios_input_at = mach_absolute_time();
+	if (type == HAKIOS_TOUCH_DOWN) {
+		alioth_refresh_activity();      /* (before the app has drawn anything: the frame after this is at full rate) */
+	}
 	lck_mtx_lock(&touch_lock);
 	/* (a driver's moves and a program's alike: rwtouch's swipes stand for fingers in the frame-rate checks) */
 	if (type == HAKIOS_TOUCH_MOVE && touch_hold(finger, x, y)) {

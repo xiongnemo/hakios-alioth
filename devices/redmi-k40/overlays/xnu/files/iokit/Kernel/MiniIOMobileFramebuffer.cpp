@@ -41,7 +41,9 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 extern "C" void hakios_screen_power(bool on);           /* bsd/dev/hakios.cpufreq.c */
+extern "C" void hakios_gpu_screen(bool on);             /* iokit/Kernel/hakios.gpu.cpp: the GPU asleep while dark (gpu_sleep=1) */
 extern "C" int alioth_panel_power(bool on);             /* bsd/dev/alioth_dsi.c */
+extern "C" void alioth_refresh_activity(void);          /* (a swap: a frame every TE again, if a still screen had fewer) */
 /* the panel's scan (bsd/dev/hakios.display.c; sys/hakios.display.h, which iokit/ does not see) */
 struct hakios_display_scan {
 	int ok;
@@ -1352,6 +1354,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	if (gTouchLat) {
 		hakios_tl("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
 	}
+	alioth_refresh_activity();
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
 	fSwapTime = now;
@@ -2996,6 +2999,7 @@ backlightDisplayPower(bool on)
 	 */
 	if (on) {
 		hakios_screen_power(true);
+		hakios_gpu_screen(true);        /* (on a thread of its own: it wakes while the panel takes its 120 ms) */
 		alioth_panel_power(true);
 		/* (the refreshes again, those that stopped while it was dark: see vsyncPark()) */
 		__atomic_store_n(&gDisplayDark, false, __ATOMIC_RELEASE);
@@ -3009,6 +3013,7 @@ backlightDisplayPower(bool on)
 		__atomic_store_n(&gDisplayDark, true, __ATOMIC_RELEASE);
 		/* (the cores and the memory slower while nobody looks: there is nothing else that lowers them) */
 		hakios_screen_power(false);
+		hakios_gpu_screen(false);       /* (asleep in two seconds, if it has done all it was given) */
 	}
 }
 
