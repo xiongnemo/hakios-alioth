@@ -220,6 +220,8 @@ static int end_noncontrol(struct dwc3 *d)
     d->zlp_pending = 0;
     return 0;
 }
+/* modify: 0 initialized, with its transfer resource (dwc3_init); 1 modified (its state kept); 2 (hakios)
+ * initialized again, the resource it has kept -- see set_configuration() */
 static int configure_ep(struct dwc3 *d, unsigned ep, unsigned type,
                         unsigned packet, int modify)
 {
@@ -229,7 +231,7 @@ static int configure_ep(struct dwc3 *d, unsigned ep, unsigned type,
     /* FIFO number is the USB IN endpoint number, not physical endpoint index. */
     if (ep & 1u) p0 |= DWC3_DEPCFG_FIFO_NUMBER(ep >> 1);
     if (type == DWC3_DEPCMD_TYPE_INTR) p1 |= DWC3_DEPCFG_BINTERVAL_M1(9);
-    if (modify) p0 |= CONFIG_ACTION_MODIFY;
+    if (modify == 1) p0 |= CONFIG_ACTION_MODIFY;
     if (ep_command(d, ep, DWC3_DEPCMD_SETEPCONFIG, p0, p1, 0)) return -4;
     if (!modify && ep_command(d, ep, DWC3_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) return -4;
     return 0;
@@ -296,8 +298,20 @@ static int set_configuration(struct dwc3 *d, unsigned value)
 {
     if (value > (d->mux ? MUX_CONFIGS : 1u)) return -1;
     if (d->configured && end_noncontrol(d)) return -4;
+    /*
+     * hakios: the data endpoints initialized again, as Linux's dwc3 enables an endpoint at SET_CONFIGURATION: that
+     * puts their data sequence (DATA0/DATA1) back to DATA0, where the host starts it after a configuration. CONNECTDONE
+     * only modifies them, which keeps the sequence of the session before -- after a cable was put back, half the time
+     * the first packet either way had the toggle the other side took for a repeat: acknowledged and dropped. The
+     * computer's usbmux version packet vanished on its way in, or the answer on its way out, and Windows never listed
+     * the iPhone again (2026-11-02, the K40: "the mux's first packet to the computer", then nothing more from it).
+     */
+    if (value && (configure_ep(d, EP_OUT, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 2) ||
+                  configure_ep(d, EP_IN, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 2) ||
+                  (!d->mux && configure_ep(d, EP_NOTIFY, DWC3_DEPCMD_TYPE_INTR, 16, 2)))) return -4;
     d->configured = (uint8_t)value;
     d->dtr = 0;
+    trace(d, DWC3_TRACE_CONFIGURED, value, d->mux);
     if (d->mux) {
         /* (a new configuration is a new session: what was queued for the last one is not sent) */
         d->tx_head = d->tx_tail = d->tx_used = 0;
@@ -420,8 +434,10 @@ static uint8_t tx_at(const struct dwc3 *d, uint32_t i) { return d->tx[(d->tx_tai
 static int pump_mux(struct dwc3 *d)
 {
     uint32_t n, i;
-    if (!d->active[EP_OUT] && DWC3_RX_BYTES - d->rx_used >= EP_BUFFER_BYTES &&
-        transfer(d, EP_OUT, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
+    if (!d->active[EP_OUT] && DWC3_RX_BYTES - d->rx_used >= EP_BUFFER_BYTES) {
+        if (transfer(d, EP_OUT, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
+        trace(d, DWC3_TRACE_ARMED, EP_OUT, d->rx_used);
+    }
     if (d->active[EP_IN]) return 0;
     if (d->zlp_pending) {
         d->zlp_pending = 0;
@@ -574,6 +590,11 @@ static int handle_event(struct dwc3 *d, uint32_t event)
         }
     } else if (type == DWC3_DEPEVT_XFERNOTREADY && !d->active[ep] && ep < 2) {
         return control_not_ready(d, ep, status);
+    } else if (type == DWC3_DEPEVT_XFERNOTREADY && ep >= 2) {
+        /* hakios: the host tried a bulk endpoint with nothing there (after a cable was put back, the computer's usbmux
+         * never got through: was its first packet refused here, 2026-11-02?) */
+        trace(d, DWC3_TRACE_NOT_READY, ep, (uint32_t)d->active[ep] | (uint32_t)d->configured << 8 |
+              (d->rx_used < 0xffffu ? d->rx_used : 0xffffu) << 16);
     }
     return 0;
 }
