@@ -45,6 +45,9 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 #define CS_OPS_ENTITLEMENTS_BLOB        7
 #define CS_OPS_DER_ENTITLEMENTS_BLOB    16
 
+/* libproc (libSystem exports it; the iOS SDK has no header): the kernel's message buffer, oldest first; 0 on failure */
+extern int proc_kmsgbuf(void *buffer, uint32_t buffersize);
+
 static int port = -1;
 static int talking;                     /* the computer has typed since the log last had the port */
 static int network;                     /* -l: port is a TCP connection ("log" ends it) */
@@ -476,12 +479,34 @@ cmd_udp(int udp_port, int seconds)
 	close(s);
 }
 
+/*
+ * The kernel's message buffer as it is now -- what printf() and IOLog() wrote, oldest first -- during the run: the loader
+ * gets it only when the kernel is back, and it holds about 16 minutes of a game (2026-11-03: the minute that mattered
+ * had gone round). tools/klog-pull.py takes it every 2 minutes over the network, so a long run keeps all of it and one
+ * that ends in a reset keeps what came before.
+ */
+static void
+cmd_dmesg(void)
+{
+	static char buf[(1 << 20) + 2];
+	int n = proc_kmsgbuf(buf, sizeof(buf));
+
+	if (n <= 0) {
+		out("dmesg: the kernel gave nothing (%s)\n", strerror(errno));
+		return;
+	}
+	out_bytes(buf, (size_t)n);
+	if (buf[n - 1] != '\n') {
+		out("\n");
+	}
+}
+
 static void
 help(void)
 {
 	out("usbsh: commands over USB, run on iOS\n"
 	    "  ls [DIR]  cat FILE  b64 FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
-	    "  fill FILE MB (0: remove it)  udp PORT SECONDS\n"
+	    "  fill FILE MB (0: remove it)  udp PORT SECONDS  dmesg (the kernel's message buffer)\n"
 	    "  anything else: a program and its arguments; names are looked for in\n"
 	    "  /redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec -- e.g. battery_test, vol_ls /, net_test\n"
 	    "  Ctrl-C interrupts a program; 'log' gives the port back to the kernel's log\n");
@@ -566,6 +591,8 @@ execute(char *line)
 		cmd_fill(argv[1], atol(argv[2]));
 	} else if (!strcmp(argv[0], "udp") && argc > 2) {
 		cmd_udp(atoi(argv[1]), atoi(argv[2]));
+	} else if (!strcmp(argv[0], "dmesg")) {
+		cmd_dmesg();
 	} else if (!strcmp(argv[0], "uname")) {
 		cmd_uname();
 	} else if (!strcmp(argv[0], "ps")) {
