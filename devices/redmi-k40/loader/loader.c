@@ -1030,6 +1030,7 @@ struct dwc3;
 int dwc3_stop(struct dwc3 *dev);
 static int usb_own;
 static struct dwc3 *usb_dwc;
+static int usb_own_powered(void);
 #endif
 /* (the USB link's state, defined with it below: run_kernel() may lend the controller to the kernel) */
 static usb_device_protocol *USB;
@@ -1371,6 +1372,26 @@ ufs_crc32(const uint8_t *p, uint64_t n)
 		}
 	}
 	return ~c;
+}
+
+/*
+ * The same CRC-32 (zlib's) with the cores' CRC32 instructions, eight bytes a step, carried on from `c` (start with
+ * 0xffffffff, invert at the end): "oem verify" runs it over a 2.4 GB system image, which the bit loop above would
+ * take half a minute for.
+ */
+__attribute__((target("crc"))) static uint32_t
+crc32_fast(uint32_t c, const uint8_t *p, uint64_t n)
+{
+	for (; n != 0 && ((uintptr_t)p & 7) != 0; n--) {
+		c = __builtin_arm_crc32b(c, *p++);
+	}
+	for (; n >= 8; n -= 8, p += 8) {
+		c = __builtin_arm_crc32d(c, *(const uint64_t *)p);
+	}
+	for (; n != 0; n--) {
+		c = __builtin_arm_crc32b(c, *p++);
+	}
+	return c;
 }
 
 /*
@@ -3530,7 +3551,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    USB != NULL && !usb_lent) {
 			print("usb: lent to the kernel for this run (usb=%c): this link stops until the kernel is back\n", (uint64_t)c[4]);
 			if (usb_own) {
-				(void)dwc3_stop(usb_dwc);       /* (the loader's own link: the kernel's core takes it from scratch) */
+				if (usb_own_powered()) {
+					(void)dwc3_stop(usb_dwc);   /* (the loader's own link: the kernel's core takes it from scratch) */
+				}
 			} else {
 				(void)USB->stop();
 			}
@@ -4061,6 +4084,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 /*   fastboot getvar result        blocks until the kernel is back          */
 /*   fastboot get_staged log.txt   fetch loader + kernel log                */
 /*   fastboot oem hang             stop petting the watchdog (test)         */
+/*   fastboot oem verify           CRC-32 of the last download (INFO line)  */
 /*   fastboot reboot               cold reset                               */
 
 #define USB_EP_OUT   0x01
@@ -4069,6 +4093,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 static usb_device_protocol *USB;
 static int download_to_ramdisk;     /* set by "oem ramdisk" for the one download that follows */
+static uint64_t last_download_at, last_download_len;     /* the last download that came whole ("oem verify") */
 static uint8_t *usb_rx_buf, *usb_tx_buf;
 static int usb_connected;
 
@@ -4161,12 +4186,19 @@ usb_start(void)
  * firmware's link hears of a cable only from its timer, which this core has none of during a run -- a cable moved
  * then left the loader unreachable until the run was over and the cable moved again (work/TODO.md, 2026-11-01) --
  * and it moves 25 MB/s through a 1 MB buffer, where the controller can put a download straight where it goes.
- * Off until asked for: the firmware's link stays what a session starts with. (Written 2026-11-03, NOT YET RUN.)
+ * Off until asked for: the firmware's link stays what a session starts with. First run 2026-11-03 23:00: up in
+ * 0.5 s, commands and uploads through it, then lost for good to a cable pulled and put back with the loader idle
+ * (usb_own_watch() since).
  */
 #include "hakios.dwc3.h"
 
 #define ALIOTH_DWC3_BASE        0x0a600000ULL
 #define ALIOTH_HS_PHY_CTRL      0x0a6f8810ULL   /* the Qualcomm wrapper's QSCRATCH HS_PHY_CTRL: the VBUS override */
+#define USB_OWN_VBUS            ((1u << 20) | (1u << 28))       /* UTMI_OTG_VBUS_VALID, SW_SESSVLD_SEL */
+#define ALIOTH_GCC_USB30_GDSCR  0x0010f004ULL   /* GCC: the controller's power domain (bit 31 on, bit 0 collapse) */
+#define ALIOTH_GCC_USB30_MASTER 0x0010f010ULL   /* GCC branch clocks (bit 31 off, bit 0 enable): master, sleep, */
+#define ALIOTH_GCC_USB30_SLEEP  0x0010f018ULL   /* mock UTMI -- with the power, what the registers need */
+#define ALIOTH_GCC_USB30_UTMI   0x0010f01cULL
 #define USB_OWN_CHUNK           (8u << 20)      /* one transfer of a download, straight into its place */
 
 static int usb_own;
@@ -4268,7 +4300,7 @@ usb_own_bring_up(void)
 		return r;
 	}
 	usb_dwc = (struct dwc3 *)(void *)usb_own_context;
-	*hs |= (1u << 20) | (1u << 28);
+	*hs |= USB_OWN_VBUS;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	r = dwc3_start(usb_dwc);
 	usb_connected = 0;
@@ -4276,12 +4308,144 @@ usb_own_bring_up(void)
 	return r;
 }
 
+/* The controller's power and the clocks its registers need: without them a read of one is an external abort. */
+static int
+usb_own_powered(void)
+{
+	return (*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_GDSCR & (1u << 31)) &&
+	    !(*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_MASTER & (1u << 31)) &&
+	    !(*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_SLEEP & (1u << 31));
+}
+
+/*
+ * What the firmware may do to the controller behind the loader's back, looked at every 10 ms (usb_own_poll, with
+ * interrupts held off). Its timers run while the loader waits for a command, and its stopped USB driver may still
+ * hear of the cable: pulled and put back with the loader idle, the computer never saw the device again and nothing
+ * more was said here (2026-11-03 23:05, the first try) -- the wrapper's VBUS override cleared (the firmware's stop
+ * clears it, hakios.usb.c: then no pull-up, and the computer sees nothing), or the controller's power or clocks
+ * turned off (a register read then an external abort: the loader dead). So: the power and clocks looked at before
+ * any of its registers; off, that is said, the controller left alone, and after 2 s the power and the clocks turned
+ * on again from here; on again, the device side from scratch (a power collapse forgets it all); the override set
+ * again if cleared; the bus's state (DSTS link state) said as it changes, the cable's comings and goings with it.
+ * 1 = the controller may be touched.
+ */
+static int
+usb_own_watch(void)
+{
+	static uint64_t looked, off_since, disconnected_since, restarted_at;
+	static uint32_t state = 0xff, restarts;
+	static int powered = 1, tried, told, cleared;
+	volatile uint32_t *gdscr = (volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_GDSCR;
+	volatile uint32_t *hs = (volatile uint32_t *)(uintptr_t)ALIOTH_HS_PHY_CTRL;
+	uint64_t now = READ_SYSREG(CNTVCT_EL0), freq = READ_SYSREG(CNTFRQ_EL0);
+	uint32_t v;
+
+	if (now - looked < freq / 100) {
+		return powered;
+	}
+	looked = now;
+	if (!usb_own_powered()) {
+		if (powered) {
+			powered = 0;
+			tried = 0;
+			off_since = now;
+			usb_connected = 0;
+			usb_rx_queued = 0;
+			SAY("usb (own): THE CONTROLLER'S POWER OR CLOCKS WENT OFF (GDSC %x, master %x, sleep %x): left alone\n",
+			    (uint64_t)*gdscr, (uint64_t)*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_MASTER,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_SLEEP);
+		}
+		if (!tried && now - off_since >= 2 * freq) {
+			static const uint64_t clocks[] = { ALIOTH_GCC_USB30_MASTER, ALIOTH_GCC_USB30_SLEEP, ALIOTH_GCC_USB30_UTMI };
+
+			tried = 1;
+			*gdscr &= ~1u;
+			for (int i = 0; i < 100 && !(*gdscr & (1u << 31)); i++) {
+				usb_own_delay(NULL, 10);
+			}
+			for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+				*(volatile uint32_t *)(uintptr_t)clocks[i] |= 1u;
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			usb_own_delay(NULL, 100);
+			SAY("usb (own): its power and clocks turned on from here: GDSC %x, master %x, sleep %x\n", (uint64_t)*gdscr,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_MASTER,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_SLEEP);
+		}
+		if (!usb_own_powered()) {
+			return 0;
+		}
+	}
+	if (!powered) {
+		int r = usb_own_bring_up();
+
+		powered = 1;
+		state = 0xff;
+		SAY("usb (own): the controller has its power and clocks again: the device side from scratch, %s\n",
+		    r == 0 ? "started" : "WOULD NOT START");
+	}
+	v = *hs;
+	if ((v & USB_OWN_VBUS) != USB_OWN_VBUS) {
+		*hs = v | USB_OWN_VBUS;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		cleared = 1;
+		if (told++ < 40) {
+			SAY("usb (own): THE VBUS OVERRIDE HAD BEEN CLEARED (HS_PHY_CTRL %x): set again\n", (uint64_t)v);
+		}
+	}
+	v = (usb_own_read32(NULL, 0xc70c /* DSTS */) >> 18) & 0xf;
+	if (v != state) {
+		if (state != 0xff && told++ < 40) {
+			SAY("usb (own): the bus: %s (link state %d)\n", v == 0 ? "on" : v == 2 ? "asleep (L1)" : v == 3 ?
+			    "suspended, no traffic (the cable out, or the computer asleep)" : v == 4 ? "disconnected" : v == 5 ?
+			    "early suspend" : v == 14 ? "reset by the computer" : v == 15 ? "resuming" : "?", (uint64_t)v);
+		}
+		if (v == 4) {
+			disconnected_since = now;
+		}
+		state = v;
+	}
+	/*
+	 * What the firmware does with the cable pulled (2026-11-04 00:40, the second try): its timer clears the
+	 * override's VBUS valid (HS_PHY_CTRL 0x10000000: SW_SESSVLD_SEL kept, UTMI_OTG_VBUS_VALID gone), the controller
+	 * ends the session (a disconnect, link state 4) -- and with the override set again 10 ms later it stays
+	 * disconnected, its pull-up off: the cable put back, the computer saw nothing. The device side from scratch
+	 * then, as the kernel's usb_bounce does it (the computer sees the port leave and come back): at once after a
+	 * cleared override, and after 3 s of "disconnected" whatever the reason; again every 5 s while it stays so.
+	 */
+	if ((cleared || (state == 4 && now - disconnected_since >= 3 * freq)) && now - restarted_at >= (cleared ? 1 : 5) * freq) {
+		int r;
+
+		cleared = 0;
+		restarted_at = now;
+		restarts++;
+		(void)dwc3_stop(usb_dwc);
+		r = usb_own_bring_up();
+		if (restarts <= 3 || restarts % 20 == 0) {
+			SAY("usb (own): the device side from scratch (%d so far): %s; DCTL %x, DSTS %x, HS_PHY_CTRL %x\n",
+			    (uint64_t)restarts, r == 0 ? "started" : "WOULD NOT START", (uint64_t)usb_own_read32(NULL, 0xc704),
+			    (uint64_t)usb_own_read32(NULL, 0xc70c), (uint64_t)*hs);
+		}
+		state = 0xff;
+		disconnected_since = now;
+	}
+	return 1;
+}
+
 /* Events taken; the link's state followed; a link stuck, or a controller that failed, started again. */
 static void
 usb_own_poll(void)
 {
-	int r = dwc3_poll(usb_dwc, 64), ready;
+	uint64_t daif = READ_SYSREG(DAIF);
+	int r, ready;
 
+	/* (the firmware's timers held off: what usb_own_watch() found must hold while the registers are read) */
+	__asm__ volatile ("msr daifset, #2" ::: "memory");
+	if (!usb_own_watch()) {
+		__asm__ volatile ("msr daif, %0" : : "r" (daif) : "memory");
+		return;
+	}
+	r = dwc3_poll(usb_dwc, 64);
 	if (r == -9) {
 		print("usb (own): bus resets with no request between them: the device side from scratch\n");
 		(void)dwc3_stop(usb_dwc);
@@ -4297,6 +4461,7 @@ usb_own_poll(void)
 		usb_lost_in_run = 0;
 		SAY("usb: %s (the loader's own link)\n", ready ? "connected" : "disconnected");
 	}
+	__asm__ volatile ("msr daif, %0" : : "r" (daif) : "memory");
 }
 
 /*
@@ -4319,7 +4484,7 @@ usb_own_transfer(int in, uint8_t *buf, uint64_t len)
 			len = (len + packet - 1) / packet * packet;
 			flush_dcache((uint64_t)(uintptr_t)buf, (uint64_t)(uintptr_t)buf + len);
 		}
-		if (!usb_connected || dwc3_bulk(usb_dwc, in, (uint64_t)(uintptr_t)buf, (uint32_t)len) != 0) {
+		if (!usb_connected || !usb_own_powered() || dwc3_bulk(usb_dwc, in, (uint64_t)(uintptr_t)buf, (uint32_t)len) != 0) {
 			usb_own_poll();
 			return -1;
 		}
@@ -4329,6 +4494,9 @@ usb_own_transfer(int in, uint8_t *buf, uint64_t len)
 	}
 	for (;;) {
 		usb_own_poll();
+		if (!usb_connected) {
+			return -1;      /* (a reset, or the controller's power gone: usb_own_watch) */
+		}
 		r = dwc3_bulk_done(usb_dwc, in, &moved);
 		if (r == 1) {
 			if (!in) {
@@ -4341,7 +4509,9 @@ usb_own_transfer(int in, uint8_t *buf, uint64_t len)
 		}
 		/* (a host gone away must not keep this core from the kernel it watches: see usb_wait) */
 		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
-			(void)dwc3_bulk_cancel(usb_dwc, in);
+			if (usb_own_powered()) {
+				(void)dwc3_bulk_cancel(usb_dwc, in);
+			}
 			return -1;
 		}
 		if (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {
@@ -4828,6 +4998,8 @@ fb_command(char *cmd)
 				if (to_ramdisk) {
 					resident_rd_size = total;
 				}
+				last_download_at = (uint64_t)(uintptr_t)dest;
+				last_download_len = total;
 				SAY("  %s: %d MB in %d s\n", to_ramdisk ? "the system image is in" : "received", (total + (1 << 19)) >> 20,
 				    seconds_since(began));
 				fb_reply("OKAY", "");
@@ -4849,6 +5021,37 @@ fb_command(char *cmd)
 			if (sent == staged_len) {
 				fb_reply("OKAY", "");
 			}
+		} else if (starts_with(cmd, "oem verify")) {
+			/*
+			 * The CRC-32 (zlib's) of the last download, in an INFO line for the host to compare with its file's: the
+			 * loader's own link puts a download straight into its place by DMA, above 4 GB too, and nothing else would
+			 * see a byte of it wrong. The instructions are checked against the bit loop on the first 4 KB first.
+			 */
+			const uint8_t *p = (const uint8_t *)(uintptr_t)last_download_at;
+			uint64_t began = READ_SYSREG(CNTVCT_EL0), probe = last_download_len < 4096 ? last_download_len : 4096;
+			uint32_t mark = log_len, c = 0xffffffffu;
+
+			if (busy || last_download_len == 0) {
+				fb_reply("FAIL", busy ? "a kernel is running" : "no download yet");
+				return;
+			}
+			if (~crc32_fast(0xffffffffu, p, probe) != ufs_crc32(p, probe)) {
+				fb_reply("FAIL", "the CRC32 instructions disagree with the bit loop");
+				return;
+			}
+			for (uint64_t done = 0; done < last_download_len;) {
+				uint64_t n = last_download_len - done > (64ULL << 20) ? (64ULL << 20) : last_download_len - done;
+
+				c = crc32_fast(c, p + done, n);
+				done += n;
+				wdt_pet();
+			}
+			print("crc32 %x, %d bytes at %x, %d ms", (uint64_t)(uint32_t)~c, last_download_len, last_download_at,
+			    (READ_SYSREG(CNTVCT_EL0) - began) * 1000 / READ_SYSREG(CNTFRQ_EL0));
+			log_buf[log_len] = 0;
+			fb_reply("INFO", log_buf + mark);
+			log_len = mark;
+			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem screenshot")) {
 			/* stage the raw framebuffer; "getvar screen" gives its geometry */
 			if (SCREEN.base == 0) {
@@ -4988,7 +5191,7 @@ usb_poll_command(void)
 		int r;
 
 		usb_own_poll();
-		if (!usb_rx_queued && usb_connected) {
+		if (!usb_rx_queued && usb_connected && usb_own_powered()) {
 			flush_dcache((uint64_t)(uintptr_t)usb_rx_buf, (uint64_t)(uintptr_t)usb_rx_buf + 512);
 			usb_rx_queued = dwc3_bulk(usb_dwc, 0, (uint64_t)(uintptr_t)usb_rx_buf, 512) == 0;
 		}
@@ -5064,9 +5267,9 @@ alioth_usb_take_back(void)
 	    now != usb_event_buffer_before ? "drove the controller" : "had the controller lent but left it as it was", (uint64_t)now,
 	    (uint64_t)usb_event_buffer_before);
 	if (usb_own) {
-		/* (the loader's own link: from scratch again, as the kernel's core left the controller) */
+		/* (the loader's own link: from scratch again, as the kernel's core left the controller; unpowered, the watch) */
 		usb_lent = 0;
-		if (usb_own_bring_up() != 0) {
+		if (usb_own_powered() && usb_own_bring_up() != 0) {
 			print("usb: THE LOADER'S OWN LINK DID NOT COME BACK: cold reset (Android boots)\n");
 			BS->stall(200000);
 			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
