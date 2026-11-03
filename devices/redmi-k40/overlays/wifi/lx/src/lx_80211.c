@@ -133,6 +133,10 @@ struct lx_radio {
 	 * sent to everybody that came as Ethernet -- an access point's multicast made unicast -- and as 802.11, deciphered
 	 * with the group's key) */
 	unsigned received_broadcast, data_not_taken, group_as_ethernet, group_as_80211;
+	/* (TODO 2k) message 4 of the handshake as handed to the driver, and what became of it: 0 not known yet, 1 the
+	 * access point acknowledged it, 2 it did not, or the driver let it go unsent */
+	struct sk_buff *message4;
+	volatile int message4_fate;
 	unsigned long long joined_at;		/* nanoseconds */
 };
 
@@ -489,9 +493,28 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
 {
 }
 
+/*
+ * A frame the driver is done with: if it is message 4 of the handshake, the join is told whether the access point
+ * acknowledged it (station_join_once() gives the keys to the driver only then: see there).
+ */
+static void
+frame_done(struct ieee80211_hw *hw, struct sk_buff *skb, bool acknowledged)
+{
+	struct lx_radio *radio = radio_of(hw);
+
+	if (radio != NULL && skb != NULL && skb == radio->message4) {
+		lx_os_lock();
+		radio->message4 = NULL;
+		radio->message4_fate = acknowledged ? 1 : 2;
+		lx_os_wakeup(&radio->message4_fate);
+		lx_os_unlock();
+	}
+}
+
 void
 linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
+	frame_done(hw, skb, (IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_STAT_ACK) != 0);
 	dev_kfree_skb_any(skb);
 }
 
@@ -499,6 +522,7 @@ void
 linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
 {
 	if (status->skb != NULL) {
+		frame_done(hw, status->skb, (IEEE80211_SKB_CB(status->skb)->flags & IEEE80211_TX_STAT_ACK) != 0);
 		dev_kfree_skb_any(status->skb);
 	}
 }
@@ -506,6 +530,7 @@ linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_st
 void
 linuxkpi_ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb, int status)
 {
+	frame_done(hw, skb, false);
 	dev_kfree_skb_any(skb);
 }
 
@@ -759,9 +784,12 @@ management(struct lx_radio *radio, uint8_t *frame, unsigned kind)
 	return (frame + 24);
 }
 
-/* An Ethernet frame, through the driver's data path: the firmware makes 802.11 of it, and ciphers it once there is a key. */
+/*
+ * An Ethernet frame, through the driver's data path: the firmware makes 802.11 of it, and ciphers it once there is a key.
+ * message4: it is the handshake's message 4, whose fate the join waits for (frame_done()).
+ */
 static bool
-ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
+ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length, bool message4)
 {
 	struct sk_buff *skb;
 	uint8_t *bytes;
@@ -773,6 +801,12 @@ ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 	memcpy(bytes, frame, length);
 	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
 	IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
+	if (message4) {
+		lx_os_lock();
+		radio->message4 = skb;
+		radio->message4_fate = 0;
+		lx_os_unlock();
+	}
 	radio->sent++;
 	frame_send(radio, skb);
 	return (true);
@@ -831,7 +865,7 @@ handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 		memcpy(reply + 6, radio->vif->addr, ETH_ALEN);
 		reply[12] = 0x88;
 		reply[13] = 0x8e;
-		ethernet_send(radio, reply, 14 + reply_length);
+		ethernet_send(radio, reply, 14 + reply_length, said == LX_WPA_KEYS);
 	}
 	printf("lx: the handshake: a message of %u bytes from the access point: %s%s\n", length - 14, said == LX_WPA_ANSWER ?
 	    "its first; answered with ours (message 2)" : said == LX_WPA_KEYS ? "its second, SIGNED WITH THE KEY WE HAVE TOO, and "
@@ -1946,7 +1980,30 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		error = EAUTH;
 		goto out;
 	}
-	lx_pause_ms(30);			/* (for message 4 to have left unciphered, before there is a key to cipher with) */
+	/*
+	 * Message 4 has to have left -- unciphered -- before there is a key to cipher with: the keys go to the driver once
+	 * the access point has acknowledged it (frame_done()). Not acknowledged: the access point sends message 3 again
+	 * and it is answered again, up to 2 s; no word of it at all: 500 ms. Before 2026-11-03 a fixed 30 ms, and an
+	 * access point twice dropped us 3 s after such a join with reason 15, its handshake timed out (TODO 2k): a message
+	 * 4 still queued when the key came would have left ciphered.
+	 */
+	{
+		unsigned long long waited = lx_os_nanoseconds();
+		int fate;
+
+		lx_os_lock();
+		while (radio->message4_fate != 1 && lx_os_nanoseconds() - waited < 2000000000ull &&
+		    !(radio->message4_fate == 0 && lx_os_nanoseconds() - waited >= 500000000ull)) {
+			lx_os_sleep(&radio->message4_fate, 20 * 1000000ull);
+		}
+		fate = radio->message4_fate;
+		radio->message4 = NULL;
+		lx_os_unlock();
+		lx_tell("lx: message 4 %s (%llu ms waited)\n", fate == 1 ? "acknowledged by the access point" : fate == 2 ?
+		    "NOT ACKNOWLEDGED, nor an answer to message 3 sent again" : "never reported by the driver",
+		    (lx_os_nanoseconds() - waited) / 1000000ull);
+		lx_pause_ms(5);
+	}
 	if (radio->wpa.group_length != (group_cipher == 2 ? 32u : 16u)) {
 		lx_tell("lx: the access point's group key has the wrong length for its advertised cipher\n");
 		error = EPROTO;
@@ -2098,7 +2155,7 @@ lx_station_send(const unsigned char *frame, unsigned long length)
 	if (radio == NULL || !radio->joined) {
 		return (ENETDOWN);
 	}
-	return (ethernet_send(radio, frame, (unsigned)length) ? 0 : ENOBUFS);
+	return (ethernet_send(radio, frame, (unsigned)length, false) ? 0 : ENOBUFS);
 }
 
 /* ---- the station boundary: what the kernel asks through sys/hakios.sta.h --------------------------------- */
