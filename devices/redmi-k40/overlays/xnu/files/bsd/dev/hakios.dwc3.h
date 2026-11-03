@@ -26,6 +26,12 @@ struct dwc3_identity {
     int mux;
     uint16_t bcd_device;
 };
+/* hakios: mux == DWC3_FASTBOOT -- Android's fastboot (the loader's link): one vendor interface (class 0xff, subclass
+ * 0x42, protocol 3), bulk OUT 0x02 and IN 0x82, one configuration. Nothing is armed by itself: each bulk transfer is
+ * started by the caller into or out of memory of its own (dwc3_bulk()) and seen to end (dwc3_bulk_done()). */
+#define DWC3_FASTBOOT 2
+/* one bulk transfer at most (a TRB's size field has 24 bits), a multiple of 4096 */
+#define DWC3_BULK_MAX 0x00fff000u
 
 enum dwc3_sync_direction {
     DWC3_TO_DEVICE,
@@ -100,6 +106,17 @@ struct dwc3_snapshot {
 };
 /* Read-only diagnostics, for callers that already own powered MMIO access. */
 void dwc3_snapshot(struct dwc3 *dev, struct dwc3_snapshot *snapshot);
+/* hakios, fastboot mode: one bulk transfer started -- in (to the host) from `dma`, or out (from the host) into it;
+ * out, `bytes` is a multiple of the packet size, and a short packet ends it early. The memory stays the caller's
+ * to keep, and to clean or invalidate in its caches; it is not touched here. 0, or negative: one runs already in
+ * that direction, the device is not configured, or the size will not do. */
+int dwc3_bulk(struct dwc3 *dev, int in, uint64_t dma, uint32_t bytes);
+/* 1 and the bytes moved once it is over; 0 while it runs; negative if none runs or a reset ended it */
+int dwc3_bulk_done(struct dwc3 *dev, int in, uint32_t *bytes);
+/* A running one ended: its memory is the caller's again. */
+int dwc3_bulk_cancel(struct dwc3 *dev, int in);
+/* The packet size of the bulk endpoints now (512 at high speed, 64 at full); 0 while not configured. */
+uint32_t dwc3_packet_size(const struct dwc3 *dev);
 /* Stops DMA. Do not release mapping until this succeeds. */
 int dwc3_stop(struct dwc3 *dev);
 int dwc3_recover(struct dwc3 *dev);

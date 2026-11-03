@@ -44,6 +44,9 @@ struct dwc3 {
     uint64_t dropped;
     uint8_t device_descriptor[18], manufacturer[130], product[130], serial[130];
     uint8_t mux;                /* hakios: the iPhone's usbmux interface, packets (see dwc3_identity) */
+    /* hakios: fastboot (DWC3_FASTBOOT): the caller's bulk transfers, [0] out, [1] in -- asked, moved, over, running */
+    uint8_t fastboot, bulk_over[2], bulk_running[2];
+    uint32_t bulk_asked[2], bulk_moved[2];
     /* hakios: requests since the last CONNECTDONE, and bus resets in a row that came with none (device_event()) */
     uint32_t setups_since_conn, empty_sessions, unconfigured_resets;
     uint8_t conn_seen;
@@ -90,6 +93,16 @@ static const uint8_t mux_config[2][2][4][41] = {
       { {MUX_CONFIG_BYTES(64, 0, 7, 1)}, {MUX_CONFIG_BYTES(64, 0, 7, 2)}, {MUX_CONFIG_BYTES(64, 0, 7, 3)}, {MUX_CONFIG_BYTES(64, 0, 7, 4)} } },
 };
 #define MUX_CONFIGS 4u
+/* hakios: fastboot, as the stock bootloader's: one configuration, one interface (0xff, 0x42, 3), its two endpoints */
+#define FASTBOOT_CONFIG_BYTES(mpslo, mpshi, dtype) \
+    9, dtype, 32, 0, 1, 1, 0, 0x80, 250, \
+    9, 4, 0, 0, 2, 0xff, 0x42, 3, 0, \
+    7, 5, 0x02, 2, mpslo, mpshi, 0, \
+    7, 5, 0x82, 2, mpslo, mpshi, 0
+static const uint8_t fastboot_config[2][2][32] = {
+    { {FASTBOOT_CONFIG_BYTES(0, 2, 2)}, {FASTBOOT_CONFIG_BYTES(64, 0, 2)} },
+    { {FASTBOOT_CONFIG_BYTES(0, 2, 7)}, {FASTBOOT_CONFIG_BYTES(64, 0, 7)} },
+};
 static const uint8_t language[] = {4, 3, 9, 4};
 /* Per-instance fixed storage; identity does not retain caller pointers. */
 static size_t identity_chars(const char *text)
@@ -274,6 +287,8 @@ const void *dwc3_descriptor(const struct dwc3 *d, unsigned type, unsigned index,
     if (d->mux && (type == 2 || type == 7) && index < MUX_CONFIGS) {
         /* (other-speed: the descriptor of the speed we are not at) */
         p = mux_config[type == 7][type == 7 ? !fs : !!fs][index]; n = sizeof(mux_config[0][0][0]);
+    } else if (d->fastboot && (type == 2 || type == 7) && index == 0) {
+        p = fastboot_config[type == 7][type == 7 ? !fs : !!fs]; n = sizeof(fastboot_config[0][0]);
     } else if (index == 0) {
         switch (type) {
         case 1: p = d->device_descriptor; n = sizeof(d->device_descriptor); break;
@@ -308,10 +323,15 @@ static int set_configuration(struct dwc3 *d, unsigned value)
      */
     if (value && (configure_ep(d, EP_OUT, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 2) ||
                   configure_ep(d, EP_IN, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 2) ||
-                  (!d->mux && configure_ep(d, EP_NOTIFY, DWC3_DEPCMD_TYPE_INTR, 16, 2)))) return -4;
+                  (!d->mux && !d->fastboot && configure_ep(d, EP_NOTIFY, DWC3_DEPCMD_TYPE_INTR, 16, 2)))) return -4;
     d->configured = (uint8_t)value;
     d->dtr = 0;
-    trace(d, DWC3_TRACE_CONFIGURED, value, d->mux);
+    trace(d, DWC3_TRACE_CONFIGURED, value, d->mux | d->fastboot << 1);
+    if (d->fastboot) {
+        /* (the caller's transfers of the session before were ended with it: end_noncontrol() above) */
+        wr(d, DWC3_DALEPENA, 3u | (value ? ((1u << EP_OUT) | (1u << EP_IN)) : 0u));
+        return 0;
+    }
     if (d->mux) {
         /* (a new configuration is a new session: what was queued for the last one is not sent) */
         d->tx_head = d->tx_tail = d->tx_used = 0;
@@ -456,6 +476,7 @@ static int pump(struct dwc3 *d)
 {
     uint32_t n, i;
     if (!d->configured) return 0;
+    if (d->fastboot) return 0;     /* hakios: nothing armed but what the caller starts (dwc3_bulk()) */
     if (d->mux) return pump_mux(d);
     /* Keep one bulk-OUT transfer armed. Completed bytes are copied into the
      * finite RX ring by handle_event before this function rearms it. */
@@ -567,6 +588,14 @@ static int handle_event(struct dwc3 *d, uint32_t event)
             return setup_phase(d);
         if (ep < 2) return control_complete(d, ep, residual);
         if (DWC3_TRB_SIZE_TRBSTS(trb(d, ep)->size) != DWC3_TRBSTS_OK) return -8;
+        if (d->fastboot && (ep == EP_OUT || ep == EP_IN)) {
+            /* hakios: the caller's transfer over (an OUT one ended early by a short packet: less was moved) */
+            unsigned in = ep == EP_IN;
+            if (residual > d->bulk_asked[in]) return -8;
+            d->bulk_moved[in] = d->bulk_asked[in] - residual;
+            d->bulk_over[in] = 1;
+            return 0;
+        }
         if (ep == EP_OUT) {
             if (residual > EP_BUFFER_BYTES) return -8;
             sync(d, buffer(d, EP_OUT), EP_BUFFER_BYTES, DWC3_FROM_DEVICE);
@@ -627,7 +656,14 @@ int dwc3_init(void *context, size_t context_bytes,
     d->device_descriptor[9] = (uint8_t)(identity->vid >> 8);
     d->device_descriptor[10] = (uint8_t)identity->pid;
     d->device_descriptor[11] = (uint8_t)(identity->pid >> 8);
-    if (identity->mux) {
+    if (identity->mux == DWC3_FASTBOOT) {
+        /* hakios: class per interface, the device's release, one configuration */
+        d->fastboot = 1;
+        d->device_descriptor[4] = 0;
+        d->device_descriptor[12] = (uint8_t)identity->bcd_device;
+        d->device_descriptor[13] = (uint8_t)(identity->bcd_device >> 8);
+        d->qualifier[4] = 0;
+    } else if (identity->mux) {
         /* hakios: class per interface (not the CDC device class), the device's release, four configurations */
         d->mux = 1;
         d->device_descriptor[4] = 0;
@@ -790,7 +826,51 @@ size_t dwc3_read(struct dwc3 *d, void *bytes, size_t count)
     d->rx_used -= (uint32_t)n;
     return n;
 }
-int dwc3_ready(const struct dwc3 *d) { return d && d->running && !d->failed && d->configured && (d->dtr || d->mux); }
+int dwc3_ready(const struct dwc3 *d)
+{
+    return d && d->running && !d->failed && d->configured && (d->dtr || d->mux || d->fastboot);
+}
+/* hakios, fastboot mode: the caller's bulk transfers (see hakios.dwc3.h) */
+int dwc3_bulk(struct dwc3 *d, int in, uint64_t dma, uint32_t bytes)
+{
+    unsigned ep = in ? EP_IN : EP_OUT, i = in ? 1u : 0u;
+    struct dwc3_trb *t;
+    uint64_t trb_dma;
+    if (!d || !d->fastboot || !d->running || d->failed || !d->configured || d->active[ep] ||
+        bytes > DWC3_BULK_MAX || (!in && (bytes == 0 || bytes % d->packet_size))) return -1;
+    t = trb(d, ep);
+    trb_dma = d->dma_device + TRB_OFFSET + ep * 64u;
+    t->bpl = (uint32_t)dma;
+    t->bph = (uint32_t)(dma >> 32);
+    t->size = bytes;
+    t->ctrl = DWC3_TRBCTL_NORMAL | DWC3_TRB_CTRL_HWO | DWC3_TRB_CTRL_LST | DWC3_TRB_CTRL_ISP_IMI | DWC3_TRB_CTRL_IOC;
+    sync(d, t, 64, DWC3_TO_DEVICE);
+    d->bulk_asked[i] = bytes; d->bulk_moved[i] = 0; d->bulk_over[i] = 0;
+    if (ep_command(d, ep, DWC3_DEPCMD_STARTTRANSFER, (uint32_t)(trb_dma >> 32), (uint32_t)trb_dma, 0)) return -4;
+    d->active[ep] = 1;
+    d->bulk_running[i] = 1;
+    return 0;
+}
+int dwc3_bulk_done(struct dwc3 *d, int in, uint32_t *bytes)
+{
+    unsigned ep = in ? EP_IN : EP_OUT, i = in ? 1u : 0u;
+    if (!d || !d->bulk_running[i]) return -1;
+    if (d->bulk_over[i]) {
+        d->bulk_running[i] = 0;
+        if (bytes) *bytes = d->bulk_moved[i];
+        return 1;
+    }
+    if (!d->active[ep]) { d->bulk_running[i] = 0; return -2; }     /* (a reset or a new configuration ended it) */
+    return 0;
+}
+int dwc3_bulk_cancel(struct dwc3 *d, int in)
+{
+    unsigned ep = in ? EP_IN : EP_OUT, i = in ? 1u : 0u;
+    if (!d) return -1;
+    d->bulk_running[i] = 0;
+    return end_transfer(d, ep);
+}
+uint32_t dwc3_packet_size(const struct dwc3 *d) { return d && d->configured ? d->packet_size : 0; }
 int dwc3_packet_room(const struct dwc3 *d, size_t count)
 {
     return d && d->mux && count >= 1 && count <= DWC3_PACKET_MAX && TX_BYTES - d->tx_used >= count + 2u;

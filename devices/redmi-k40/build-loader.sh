@@ -26,9 +26,13 @@ s = sys.argv[1]
 d = [2 + 2 * len(s), 3] + [x for c in s for x in (ord(c), 0)]
 print('static const uint8_t usb_str_serial[%d] = { %s };' % (len(d), ', '.join(map(str, d))))
 EOF
-clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar \
-  -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter -DLOADER_UMI -DLOADER_ALIOTH \
-  -I"$OUT" -I"$DEVICE_DIR/loader" -c "$DEVICE_DIR/loader/loader.c" -o "$OUT/loader.obj"
+# the kernel's DWC3 core (its fastboot mode) for the loader's own USB link ("oem usb-own")
+DWC3_DIR="$DEVICE_DIR/overlays/xnu/files/bsd/dev"
+CFLAGS=(--target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar
+  -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter)
+clang "${CFLAGS[@]}" -DLOADER_UMI -DLOADER_ALIOTH \
+  -I"$OUT" -I"$DEVICE_DIR/loader" -I"$DWC3_DIR" -c "$DEVICE_DIR/loader/loader.c" -o "$OUT/loader.obj"
+clang "${CFLAGS[@]}" -I"$DWC3_DIR" -c "$DWC3_DIR/hakios.dwc3.c" -o "$OUT/dwc3.obj"
 lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 \
-  /out:"$OUT/loader.efi" "$OUT/loader.obj"
+  /out:"$OUT/loader.efi" "$OUT/loader.obj" "$OUT/dwc3.obj"
 ls -l "$OUT/loader.efi"
