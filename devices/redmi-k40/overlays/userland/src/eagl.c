@@ -66,6 +66,7 @@
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -5077,6 +5078,142 @@ app_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable
 }
 
 /*
+ * The application's main thread looked after (boot-arg appgl_watch=0: not). Minecraft once put its first frame up and
+ * never another, three launches in a row, and did not quit when swiped away (2026-11-03 23:52, work/TODO.md 2p): its
+ * main thread was stuck, and nothing said where. From the first present on, a thread of ours asks the main queue for
+ * a sign every second; with none for 4 s it says so with where the main thread is -- its pc, lr and the return
+ * addresses of its frame records, read with the thread held, then named by dladdr() once it runs again (the raw
+ * addresses first: a thread stuck in dyld would hold the lock dladdr() takes) -- again every 10 s while it stays so,
+ * and once more when it answers. A process the system suspended (in the background) is not counted as stuck.
+ */
+static bool app_watch = true;
+static pthread_t app_main;                  /* (the constructor runs on the main thread) */
+static mach_port_t app_main_port;
+static uint64_t watch_asked_us;
+static int watch_pending;
+
+static void
+watch_ping(void *context)
+{
+	(void)context;
+	__atomic_store_n(&watch_pending, 0, __ATOMIC_RELEASE);
+}
+
+/* pc, lr, then the return address of each frame record on the main thread's stack: at most `most` */
+static unsigned
+watch_frames(uint64_t *at, unsigned most)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(app_main), bottom = top - pthread_get_stacksize_np(app_main);
+	unsigned n = 0;
+
+	if (thread_suspend(app_main_port) != KERN_SUCCESS) {
+		return 0;
+	}
+	if (thread_get_state(app_main_port, ARM_THREAD_STATE64, (thread_state_t)&state, &count) == KERN_SUCCESS) {
+		uintptr_t fp = (uintptr_t)arm_thread_state64_get_fp(state);
+
+		at[n++] = (uint64_t)arm_thread_state64_get_pc(state);
+		at[n++] = (uint64_t)arm_thread_state64_get_lr(state);
+		while (n < most && fp >= bottom && fp + 16 <= top && (fp & 7) == 0) {
+			uintptr_t next = ((const uintptr_t *)fp)[0], ret = ((const uintptr_t *)fp)[1];
+
+			if (ret == 0) {
+				break;
+			}
+			at[n++] = ret;
+			if (next <= fp) {
+				break;
+			}
+			fp = next;
+		}
+	}
+	(void)thread_resume(app_main_port);
+	return n;
+}
+
+static void
+watch_say(uint64_t stuck_us)
+{
+	uint64_t at[34];
+	unsigned n = watch_frames(at, 34);
+	char raw[34 * 19 + 1];
+	size_t used = 0;
+
+	for (unsigned i = 0; i < n && used < sizeof(raw) - 19; i++) {
+		used += (size_t)snprintf(raw + used, sizeof(raw) - used, " %llx", (unsigned long long)at[i]);
+	}
+	raw[used] = 0;
+	say("hakios-gl: %s: THE MAIN THREAD HAS NOT ANSWERED FOR %llu s; pc, lr, frames:%s\n", getprogname(),
+	    (unsigned long long)(stuck_us / 1000000), raw);
+	for (unsigned i = 0; i < n; i++) {
+		Dl_info info;
+
+		if (dladdr((const void *)(uintptr_t)at[i], &info) != 0 && info.dli_fname != NULL) {
+			const char *image = strrchr(info.dli_fname, '/');
+			uint64_t from = (uint64_t)(uintptr_t)(info.dli_sname != NULL ? info.dli_saddr : info.dli_fbase);
+
+			say("hakios-gl: %s:   %2u %s %s+%#llx\n", getprogname(), i, image != NULL ? image + 1 : info.dli_fname,
+			    info.dli_sname != NULL ? info.dli_sname : "(image)", (unsigned long long)(at[i] - from));
+		}
+	}
+}
+
+static void *
+watch_main(void *argument)
+{
+	uint64_t stuck_since = 0, said_at = 0, looked = now_us();
+
+	(void)argument;
+	pthread_setname_np("hakios-gl watch");
+	for (;;) {
+		uint64_t now = now_us();
+
+		if (now - looked > 3000000) {
+			/* (this thread did not run for seconds: the process was suspended, not its main thread stuck) */
+			watch_asked_us = now;
+			stuck_since = 0;
+		}
+		looked = now;
+		if (__atomic_exchange_n(&watch_pending, 1, __ATOMIC_ACQ_REL) == 0) {
+			if (stuck_since != 0) {
+				say("hakios-gl: %s: the main thread answered again after %llu s\n", getprogname(),
+				    (unsigned long long)((now - stuck_since) / 1000000));
+				stuck_since = 0;
+			}
+			watch_asked_us = now;
+			dispatch_async_f(dispatch_get_main_queue(), NULL, watch_ping);
+		} else if (now - watch_asked_us >= 4000000) {
+			if (stuck_since == 0) {
+				stuck_since = watch_asked_us;
+				said_at = 0;
+			}
+			if (said_at == 0 || now - said_at >= 10000000) {
+				said_at = now;
+				watch_say(now - watch_asked_us);
+			}
+		}
+		sleep(1);
+	}
+	return NULL;
+}
+
+static void
+watch_start(void)
+{
+	static int started;
+	pthread_t thread;
+
+	if (!app_watch || app_main_port == MACH_PORT_NULL || __atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL) != 0) {
+		return;
+	}
+	if (pthread_create(&thread, NULL, watch_main, NULL) == 0) {
+		pthread_detach(thread);
+	}
+}
+
+/*
  * -presentRenderbuffer: -- the frame copied by the GPU from the renderbuffer into the next of the layer's surfaces,
  * turned over on the way (OpenGL's rows go up, an IOSurface's down), waited for, and the surface made the layer's
  * contents. The render server (backboardd) then draws the layer with that surface, as any other.
@@ -5408,6 +5545,7 @@ handed:
 	if (d->presents++ == 0) {
 		d->first_us = d->window_us = now_us();
 		say("hakios-gl: %s: its first frame is on its layer\n", getprogname());
+		watch_start();
 	} else if (now_us() - d->window_us >= 2000000) {
 		uint64_t span = now_us() - d->window_us;
 
@@ -5551,6 +5689,10 @@ install(void)
 	if (app_role) {
 		check_errors = 0;               /* (glGetError after every call would take the application's errors from it) */
 		pthread_key_create(&app_held, app_held_end);
+		if (pthread_main_np()) {
+			app_main = pthread_self();      /* (for watch_main(): the thread that has to answer) */
+			app_main_port = pthread_mach_thread_np(app_main);
+		}
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 			app_finish = strstr(arguments, "appgl_finish=1") != NULL;
 			app_seed = strstr(arguments, "appgl_seed=0") == NULL;
@@ -5558,6 +5700,7 @@ install(void)
 			app_mark = strstr(arguments, "appgl_mark=1") != NULL;
 			app_ways = strstr(arguments, "appgl_ways=1") != NULL;
 			app_discard = strstr(arguments, "appgl_discard=1") != NULL;
+			app_watch = strstr(arguments, "appgl_watch=0") == NULL;
 			if ((argument = strstr(arguments, "appgl_fps=")) != NULL) {
 				unsigned long fps = strtoul(argument + 10, NULL, 10);
 
