@@ -129,10 +129,15 @@ struct lx_radio {
 	int8_t signal;				/* dBm, of the last beacon of the network joined */
 	int last_error;
 	unsigned sent, sent_lost, received, received_group, eapol, rekeys;
+	/* (TODO 2n: of those sent to everybody, how many to the broadcast address; data frames not made Ethernet of; those
+	 * sent to everybody that came as Ethernet -- an access point's multicast made unicast -- and as 802.11, deciphered
+	 * with the group's key) */
+	unsigned received_broadcast, data_not_taken, group_as_ethernet, group_as_80211;
 	unsigned long long joined_at;		/* nanoseconds */
 };
 
 static struct lx_radio *the_radio;
+void lx_rx_errors(void);			/* (lx_bus.c) */
 static const uint8_t no_network[ETH_ALEN];	/* the address of the network an interface has joined, while it has joined none */
 
 static struct lx_radio *
@@ -852,6 +857,7 @@ ethernet_received(struct lx_radio *radio, struct sk_buff *skb)
 		handshake_message(radio, skb->data, skb->len);
 	} else if (radio->joined && skb->len >= 14) {
 		*(skb->data[0] & 1 ? &radio->received_group : &radio->received) += 1;
+		radio->received_broadcast += memcmp(skb->data, "\xff\xff\xff\xff\xff\xff", ETH_ALEN) == 0;
 		lx_os_net_input(skb->data, skb->len);
 	}
 }
@@ -940,6 +946,7 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 
 	radio->frames++;
 	if (status->flag & RX_FLAG_8023) {
+		radio->group_as_ethernet += skb->len >= 14 && (skb->data[0] & 1);
 		ethernet_received(radio, skb);
 	} else if (skb->len >= 36 && (skb->data[0] == 0x80 || skb->data[0] == 0x50)) {	/* a beacon, an answer to a probe */
 		heard(radio, skb->data, skb->len, status->freq, status->signal);
@@ -947,9 +954,21 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 		radio->others++;
 		management_received(radio, skb->data, skb->len);
 	} else if (to_ethernet(skb, (status->flag & RX_FLAG_IV_STRIPPED) != 0)) {
+		radio->group_as_80211 += skb->data[0] & 1;
 		ethernet_received(radio, skb);
 	} else {
 		radio->others++;
+		/* (TODO 2n: a broadcast to port 19132 reached no socket -- what data frames go no further, the first few) */
+		if (skb->len >= 24 && (skb->data[0] & 0x0c) == 0x08 && radio->data_not_taken++ < 8) {
+			const uint8_t *f = skb->data;
+
+			lx_tell("lx: a data frame not made Ethernet of: control %02x%02x, to %02x:..:%02x:%02x, %u bytes, the driver's "
+			    "flags %#x (Ethernet %d, deciphered %d, cipher header gone %d), then %02x %02x %02x %02x\n", f[0], f[1],
+			    f[4], f[8], f[9], skb->len, (unsigned)status->flag, (status->flag & RX_FLAG_8023) != 0,
+			    (status->flag & RX_FLAG_DECRYPTED) != 0, (status->flag & RX_FLAG_IV_STRIPPED) != 0,
+			    skb->len > 27 ? f[24] : 0, skb->len > 27 ? f[25] : 0, skb->len > 27 ? f[26] : 0,
+			    skb->len > 27 ? f[27] : 0);
+		}
 	}
 	dev_kfree_skb_any(skb);
 }
@@ -1901,6 +1920,7 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		}
 		radio->reached = IEEE80211_STA_AUTHORIZED;
 		radio->sent = radio->sent_lost = radio->received = radio->received_group = radio->rekeys = 0;
+		radio->received_broadcast = radio->data_not_taken = radio->group_as_ethernet = radio->group_as_80211 = 0;
 		radio->joined_at = lx_os_nanoseconds();
 		radio->signal = target->signal;
 		radio->joined = true;
@@ -1945,6 +1965,7 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 	}
 	radio->reached = IEEE80211_STA_AUTHORIZED;
 	radio->sent = radio->sent_lost = radio->received = radio->received_group = radio->rekeys = 0;
+	radio->received_broadcast = radio->data_not_taken = radio->group_as_ethernet = radio->group_as_80211 = 0;
 	radio->joined_at = lx_os_nanoseconds();
 	radio->signal = target->signal;
 	radio->joined = true;
@@ -2041,10 +2062,13 @@ lx_station_say(void)
 
 	if (radio != NULL) {
 		lx_tell("lx: the network is %s, %llu s after it was joined: %u frames sent (%u could not be), %u received for us and "
-		    "%u sent to everybody; %u messages of the handshake, the group's key changed %u times; block ack: %u classes "
-		    "taken, %u refused\n", radio->joined ? "joined" : "NOT joined", radio->joined_at != 0 ? (lx_os_nanoseconds() -
-		    radio->joined_at) / 1000000000ull : 0, radio->sent, radio->sent_lost, radio->received, radio->received_group,
-		    radio->eapol, radio->rekeys, radio->ba_sessions, radio->ba_refused);
+		    "%u sent to everybody (%u of them to the broadcast address; %u came as Ethernet, %u deciphered with the group's "
+		    "key); %u data frames not made Ethernet of; %u messages of the handshake, the group's key changed %u times; "
+		    "block ack: %u classes taken, %u refused\n", radio->joined ? "joined" : "NOT joined", radio->joined_at != 0 ?
+		    (lx_os_nanoseconds() - radio->joined_at) / 1000000000ull : 0, radio->sent, radio->sent_lost, radio->received,
+		    radio->received_group, radio->received_broadcast, radio->group_as_ethernet, radio->group_as_80211,
+		    radio->data_not_taken, radio->eapol, radio->rekeys, radio->ba_sessions, radio->ba_refused);
+		lx_rx_errors();
 	}
 }
 

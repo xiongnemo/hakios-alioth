@@ -783,6 +783,39 @@ say_radio(struct ath11k_base *ab)
 
 static struct ath11k_base *volatile driver;	/* the driver, while it is up: between lx_start() and lx_stop() */
 
+/*
+ * (TODO 2n: no frame to the broadcast address reaches us) what the driver's receive path has thrown away so far: frames
+ * to its error ring, and by code those of the DMA (3: could not be deciphered, 5: not ciphered) and of the reorder
+ * engine -- for lx_station_say().
+ */
+void lx_rx_errors(void);
+
+void
+lx_rx_errors(void)
+{
+	struct ath11k_base *ab = driver;
+	char line[320];
+	int at;
+
+	if (ab == NULL) {
+		return;
+	}
+	at = snprintf(line, sizeof(line), "lx: the driver's receive errors: %u frames to its error ring; DMA's by code:",
+	    ab->soc_stats.err_ring_pkts);
+	for (int i = 0; i < HAL_REO_ENTR_RING_RXDMA_ECODE_MAX && at < (int)sizeof(line) - 24; i++) {
+		if (ab->soc_stats.rxdma_error[i] != 0) {
+			at += snprintf(line + at, sizeof(line) - at, " %d: %u", i, ab->soc_stats.rxdma_error[i]);
+		}
+	}
+	at += snprintf(line + at, sizeof(line) - at, "; reordering's by code:");
+	for (int i = 0; i < HAL_REO_DEST_RING_ERROR_CODE_MAX && at < (int)sizeof(line) - 24; i++) {
+		if (ab->soc_stats.reo_error[i] != 0) {
+			at += snprintf(line + at, sizeof(line) - at, " %d: %u", i, ab->soc_stats.reo_error[i]);
+		}
+	}
+	lx_tell("%s\n", line);
+}
+
 int
 lx_start(void)
 {

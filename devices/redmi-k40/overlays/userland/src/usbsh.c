@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -378,11 +379,109 @@ run(char **argv)
 	}
 }
 
+/*
+ * fill FILE MB: a file of so many megabytes written (not zeros), for filling the data volume -- ramfs's pages and
+ * the kernel's address space (TODO 2m, 2026-11-03). "fill FILE 0" removes it.
+ */
+static void
+cmd_fill(const char *path, long mb)
+{
+	static char chunk[1 << 20];
+	struct timespec began, done;
+	long written = 0;
+	int fd;
+
+	if (mb <= 0) {
+		out("fill: %s %s\n", path, unlink(path) == 0 ? "removed" : strerror(errno));
+		return;
+	}
+	memset(chunk, 0x5a, sizeof(chunk));
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		out("fill: %s: %s\n", path, strerror(errno));
+		return;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &began);
+	while (written < mb) {
+		ssize_t n = write(fd, chunk, sizeof(chunk));
+
+		if (n != (ssize_t)sizeof(chunk)) {
+			out("fill: after %ld MB: %s\n", written, n < 0 ? strerror(errno) : "a short write");
+			break;
+		}
+		written++;
+	}
+	close(fd);
+	clock_gettime(CLOCK_MONOTONIC, &done);
+	out("fill: %s: %ld MB in %ld ms\n", path, written, (long)((done.tv_sec - began.tv_sec) * 1000 +
+	    (done.tv_nsec - began.tv_nsec) / 1000000));
+}
+
+/*
+ * udp PORT SECONDS: what comes to a UDP port in so long -- each datagram's sender, the address it was sent to (a
+ * broadcast or ours) and its first bytes. For a world of Minecraft's on LAN that the iPad does not find (TODO 2n):
+ * whether a broadcast to port 19132 reaches a socket at all.
+ */
+static void
+cmd_udp(int udp_port, int seconds)
+{
+	struct sockaddr_in at = { .sin_len = sizeof(at), .sin_family = AF_INET, .sin_port = htons((uint16_t)udp_port) };
+	int s = socket(AF_INET, SOCK_DGRAM, 0), on = 1, got = 0;
+	time_t end = time(NULL) + seconds;
+
+	if (s < 0) {
+		out("udp: socket: %s\n", strerror(errno));
+		return;
+	}
+	(void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	(void)setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+	(void)setsockopt(s, IPPROTO_IP, IP_RECVDSTADDR, &on, sizeof(on));
+	if (bind(s, (struct sockaddr *)&at, sizeof(at)) != 0) {
+		out("udp: bind to port %d: %s\n", udp_port, strerror(errno));
+		close(s);
+		return;
+	}
+	out("udp: listening on port %d for %d s\n", udp_port, seconds);
+	while (time(NULL) < end) {
+		struct timeval wait = { .tv_sec = 1 };
+		fd_set ready;
+		unsigned char data[64];
+		char control[64], to[32] = "?", from[32];
+		struct sockaddr_in sender;
+		struct iovec iov = { .iov_base = data, .iov_len = sizeof(data) };
+		struct msghdr msg = { .msg_name = &sender, .msg_namelen = sizeof(sender), .msg_iov = &iov, .msg_iovlen = 1,
+			              .msg_control = control, .msg_controllen = sizeof(control) };
+		ssize_t n;
+
+		FD_ZERO(&ready);
+		FD_SET(s, &ready);
+		if (select(s + 1, &ready, NULL, NULL, &wait) <= 0) {
+			continue;
+		}
+		n = recvmsg(s, &msg, 0);
+		if (n < 0) {
+			continue;
+		}
+		for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c != NULL; c = CMSG_NXTHDR(&msg, c)) {
+			if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_RECVDSTADDR) {
+				inet_ntop(AF_INET, CMSG_DATA(c), to, sizeof(to));
+			}
+		}
+		inet_ntop(AF_INET, &sender.sin_addr, from, sizeof(from));
+		out("udp: %zd bytes from %s:%u to %s, first byte %#x\n", n, from, ntohs(sender.sin_port), to,
+		    n > 0 ? data[0] : 0);
+		got++;
+	}
+	out("udp: %d datagrams in %d s\n", got, seconds);
+	close(s);
+}
+
 static void
 help(void)
 {
 	out("usbsh: commands over USB, run on iOS\n"
 	    "  ls [DIR]  cat FILE  b64 FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
+	    "  fill FILE MB (0: remove it)  udp PORT SECONDS\n"
 	    "  anything else: a program and its arguments; names are looked for in\n"
 	    "  /redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec -- e.g. battery_test, vol_ls /, net_test\n"
 	    "  Ctrl-C interrupts a program; 'log' gives the port back to the kernel's log\n");
@@ -463,6 +562,10 @@ execute(char *line)
 			    argc > 2 && length <= sizeof(blob) && memmem(blob, length, argv[2], strlen(argv[2])) != NULL ?
 			    ", has the name" : "");
 		}
+	} else if (!strcmp(argv[0], "fill") && argc > 2) {
+		cmd_fill(argv[1], atol(argv[2]));
+	} else if (!strcmp(argv[0], "udp") && argc > 2) {
+		cmd_udp(atoi(argv[1]), atoi(argv[2]));
 	} else if (!strcmp(argv[0], "uname")) {
 		cmd_uname();
 	} else if (!strcmp(argv[0], "ps")) {
