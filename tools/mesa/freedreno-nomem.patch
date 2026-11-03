@@ -1,0 +1,97 @@
+A buffer the kernel refuses is no longer a NULL dereference (hakios, Redmi K40).
+
+bo_new(): the process's cached buffers let go and the buffer asked for again, with pauses, for up to
+30 s (said in the log through /dev/console); fd_bo_heap_alloc(): a heap block that could not be had gives
+NULL, which bo_new() answers with a buffer of its own -- instead of fd_bo_mark_for_dump(NULL) at 0x18
+(backboardd, 2026-11-02 00:01, work/TODO.md 2m). Made by work/wsl/mk-nomem-patch.py.
+
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -117,6 +117,61 @@
+    return bo;
+ }
+ 
++#ifdef __APPLE__
++#include <stdarg.h>
++
++/* hakios: a line for the run's log -- an application's standard error goes nowhere, the console is read */
++static void
++hakios_say(const char *format, ...)
++{
++   static int console = -1;
++   char line[256];
++   va_list ap;
++   int n;
++
++   if (console < 0)
++      console = open("/dev/console", O_WRONLY);
++   va_start(ap, format);
++   n = vsnprintf(line, sizeof(line), format, ap);
++   va_end(ap);
++   if (n > 0)
++      write(console >= 0 ? console : 2, line, MIN2((size_t)n, sizeof(line) - 1));
++}
++#endif
++
++/*
++ * hakios: a buffer the kernel refused. Its range for big buffers once filled up (2026-11-02: backboardd took the NULL
++ * for a buffer of the ring heap and faulted at 0x18, SpringBoard reloaded with it); gpu_test_nomem=S refuses on
++ * purpose. The buffers this process keeps for reuse are let go first -- the kernel may have room then -- and the
++ * buffer asked for again, with pauses growing to half a second, for up to 30 s: a frame that waits is better than a
++ * render server that dies. Said in the log, the first time and every 100th.
++ */
++static struct fd_bo *
++bo_new_refused(struct fd_device *dev, uint32_t size, uint32_t flags)
++{
++   static unsigned refusals;
++   struct fd_bo *bo;
++   unsigned waited_ms = 0, pause_ms = 10;
++
++   /* (time 0 lets every cached buffer go; the cleanup skips a time it saw last, so make it one it did not) */
++   dev->bo_cache.time = (time_t)-1;
++   fd_bo_cache_cleanup(&dev->bo_cache, 0);
++   dev->ring_cache.time = (time_t)-1;
++   fd_bo_cache_cleanup(&dev->ring_cache, 0);
++   while ((bo = dev->funcs->bo_new(dev, size, flags)) == NULL && waited_ms < 30000) {
++      usleep(pause_ms * 1000);
++      waited_ms += pause_ms;
++      pause_ms = MIN2(pause_ms * 2, 500);
++   }
++   refusals++;
++#ifdef __APPLE__
++   if (refusals % 100 == 1)
++      hakios_say("freedreno: %s: a buffer of %u bytes refused by the kernel (%u so far): %s after %u ms, the cached "
++                 "ones let go\n", getprogname(), size, refusals, bo ? "had" : "STILL REFUSED", waited_ms);
++#endif
++   return bo;
++}
++
+ static struct fd_bo *
+ bo_new(struct fd_device *dev, uint32_t size, uint32_t flags,
+        struct fd_bo_cache *cache)
+@@ -142,6 +197,8 @@
+       return bo;
+ 
+    bo = dev->funcs->bo_new(dev, size, flags);
++   if (!bo)
++      bo = bo_new_refused(dev, size, flags);
+    if (!bo)
+       return NULL;
+ 
+--- a/src/freedreno/drm/freedreno_bo_heap.c
++++ b/src/freedreno/drm/freedreno_bo_heap.c
+@@ -233,6 +233,14 @@
+       heap->blocks[idx] = fd_bo_new(
+             heap->dev, FD_BO_HEAP_BLOCK_SIZE, heap->flags | _FD_BO_HINT_HEAP,
+             "heap-%x-block-%u", heap->flags, idx);
++      /* hakios: no block (the kernel refused it even after bo_new_refused()): no piece of one -- the caller,
++       * bo_new(), then asks for a buffer of its own; this took the NULL for a block and faulted at 0x18 */
++      if (!heap->blocks[idx]) {
++         util_vma_heap_free(&heap->heap, s->offset, size);
++         simple_mtx_unlock(&heap->lock);
++         free(s);
++         return NULL;
++      }
+       if (heap->flags == RING_FLAGS)
+          fd_bo_mark_for_dump(heap->blocks[idx]);
+    }
