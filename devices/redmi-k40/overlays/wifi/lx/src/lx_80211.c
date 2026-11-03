@@ -1919,6 +1919,32 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		goto out;
 	}
 	station_abilities(radio, radio->answer_elements, radio->answer_length);
+	{
+		/*
+		 * (TODO 2n: frames to ff:ff:ff:ff:ff:ff never reach us, multicast does, and the owner's iPad on the same
+		 * network gets them.) An access point that answers ARP for its stations (802.11v proxy ARP, capability bit 12)
+		 * or hands them group frames one by one (DMS, bit 26) says so in its extended capabilities, in its beacons or
+		 * its answer; our request has none of that element at all (request_elements). Said once a join.
+		 */
+		const uint8_t *x = element(radio->target.elements, radio->target.elements_length, 127);
+		static const struct { unsigned bit; const char *name; } bits[] = {
+			{ 12, "proxy ARP" }, { 16, "TFS" }, { 17, "WNM sleep" }, { 18, "TIM broadcast" }, { 19, "BSS transition" },
+			{ 26, "DMS" }, { 46, "WNM notification" },
+		};
+		char line[200] = "";
+		size_t used = 0;
+
+		if (x == NULL) {
+			x = element(radio->answer_elements, radio->answer_length, 127);
+		}
+		for (unsigned i = 0; x != NULL && i < sizeof(bits) / sizeof(bits[0]); i++) {
+			if (bits[i].bit / 8 < x[1] && (x[2 + bits[i].bit / 8] >> (bits[i].bit % 8) & 1) && used < sizeof(line) - 24) {
+				used += (size_t)snprintf(line + used, sizeof(line) - used, "%s%s", used ? ", " : "", bits[i].name);
+			}
+		}
+		lx_tell("lx: the access point's extended capabilities: %s%s%s\n", x == NULL ? "none said" : "", x != NULL && used ?
+		    line : "", x != NULL && !used ? "none of proxy ARP, TFS, WNM sleep, TIM broadcast, BSS transition, DMS" : "");
+	}
 	radio->sta->aid = radio->aid;
 	if ((ret = station_state(radio, IEEE80211_STA_AUTH, IEEE80211_STA_ASSOC)) != 0) {
 		error = -ret;
