@@ -26,6 +26,9 @@
 #include <pexpert/arm64/board_config.h>
 #include <vm/vm_page.h>
 #include <vm/vm_compressor.h>
+#include <vm/vm_object.h>
+#include <vm/vm_map.h>
+#include <vm/vm_kern.h>
 
 /*
  * The console log handed back to the loader. A long session writes more than fits, and both
@@ -587,14 +590,130 @@ hakios_memory_line(char *buf, size_t len)
 #undef MB
 }
 
+/*
+ * The part of the kernel's DATA range that allocations of 256 KB and more come from (kmem_large_ranges: the GPU's
+ * buffers, the surfaces, big kalloc data), in MB: how big, how much is taken, and the biggest hole in it. A buffer
+ * of 4-11 MB is refused once no hole is that big, however much memory is free (2026-11-03 00:01, 233734-play.log:
+ * with 3 GB free, the screen garbled and backboardd faulted). Also for the GPU's and the surfaces' refusals.
+ */
+void hakios_data_range(uint32_t *size_mb, uint32_t *used_mb, uint32_t *hole_mb);
+
+void
+hakios_data_range(uint32_t *size_mb, uint32_t *used_mb, uint32_t *hole_mb)
+{
+	const struct mach_vm_range r = kmem_large_ranges[KMEM_RANGE_ID_DATA];
+	mach_vm_offset_t at = r.min_address;
+	uint64_t used = 0, hole = 0;
+	vm_map_entry_t e;
+
+	vm_map_lock_read(kernel_map);
+	for (e = vm_map_first_entry(kernel_map); e != vm_map_to_entry(kernel_map); e = e->vme_next) {
+		mach_vm_offset_t s = e->vme_start, t = e->vme_end;
+
+		if (t <= r.min_address) {
+			continue;
+		}
+		if (s >= r.max_address) {
+			break;
+		}
+		s = MAX(s, r.min_address);
+		t = MIN(t, r.max_address);
+		if (s > at && s - at > hole) {
+			hole = s - at;
+		}
+		used += t - s;
+		at = t;
+	}
+	vm_map_unlock_read(kernel_map);
+	if (r.max_address > at && r.max_address - at > hole) {
+		hole = r.max_address - at;
+	}
+	*size_mb = (uint32_t)((r.max_address - r.min_address) >> 20);
+	*used_mb = (uint32_t)(used >> 20);
+	*hole_mb = (uint32_t)(hole >> 20);
+}
+
 static void
 memory_report(void)
 {
 	char line[256];
+	uint32_t size, used, hole;
 
 	hakios_memory_line(line, sizeof(line));
 	printf("%s", line);
+	hakios_data_range(&size, &used, &hole);
+	printf("memory: the kernel's range for big data buffers (%#llx-%#llx): %u MB, %u taken, the biggest hole %u MB\n",
+	    (unsigned long long)kmem_large_ranges[KMEM_RANGE_ID_DATA].min_address,
+	    (unsigned long long)kmem_large_ranges[KMEM_RANGE_ID_DATA].max_address, size, used, hole);
 	hakios_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
+}
+
+/* ---- the pages of ramfs's files, out of the kernel's address space ------------------------------------------- */
+
+/*
+ * (ramfs_physmap=1, bsd/miscfs/ramfs/ramfs.c.) A page of a file is a page of the VM's own: wired, in an object of
+ * its own at its physical address, and reached through the physical map -- as the pmap keeps its tables
+ * (arm/pmap/pmap_data.c). Before 2026-11-03 each was an allocation in kernel_map's DATA range: 1.3 GB of files were
+ * 333,000 of them, scattered through the part of the range big buffers come from, and the GPU's and the surfaces'
+ * buffers of 4-11 MB found no room any more (233734-play.log). A data volume of 8 GB could never have been filled.
+ */
+static vm_object_t hakios_file_object;
+
+void hakios_file_pages_init(void);
+void *hakios_file_page_alloc(bool wait);
+void hakios_file_page_free(void *page);
+
+void
+hakios_file_pages_init(void)
+{
+	if (hakios_file_object == VM_OBJECT_NULL) {
+		hakios_file_object = vm_object_allocate((vm_object_size_t)64 << 30);
+		hakios_file_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+	}
+}
+
+/* wait=false: never wait for memory (the page-out path may be the one asking) */
+void *
+hakios_file_page_alloc(bool wait)
+{
+	vm_page_t mem;
+	pmap_paddr_t pa;
+
+	if (hakios_file_object == VM_OBJECT_NULL) {
+		hakios_file_pages_init();       /* (ramfs_init() makes it; should a page be asked for before that) */
+	}
+	while ((mem = vm_page_grab()) == VM_PAGE_NULL) {
+		if (!wait) {
+			return NULL;
+		}
+		VM_PAGE_WAIT();
+	}
+	vm_page_lock_queues();
+	vm_page_wire(mem, VM_KERN_MEMORY_FILE, TRUE);
+	vm_page_unlock_queues();
+	pa = (pmap_paddr_t)ptoa(VM_PAGE_GET_PHYS_PAGE(mem));
+	vm_object_lock(hakios_file_object);
+	vm_page_insert_wired(mem, hakios_file_object, (vm_object_offset_t)(pa - gPhysBase), VM_KERN_MEMORY_FILE);
+	vm_object_unlock(hakios_file_object);
+	bzero((void *)phystokv(pa), PAGE_SIZE);
+	return (void *)phystokv(pa);
+}
+
+void
+hakios_file_page_free(void *page)
+{
+	pmap_paddr_t pa = kvtophys((vm_offset_t)page);
+	vm_page_t mem;
+
+	vm_object_lock(hakios_file_object);
+	mem = vm_page_lookup(hakios_file_object, (vm_object_offset_t)(pa - gPhysBase));
+	if (mem == VM_PAGE_NULL) {
+		panic("hakios_file_page_free: %p (%#llx) is not a page of a file", page, (unsigned long long)pa);
+	}
+	vm_page_lock_queues();
+	vm_page_free(mem);
+	vm_page_unlock_queues();
+	vm_object_unlock(hakios_file_object);
 }
 
 /* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */

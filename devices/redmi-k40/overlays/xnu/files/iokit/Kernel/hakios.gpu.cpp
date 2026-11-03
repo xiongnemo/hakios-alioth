@@ -549,6 +549,9 @@ struct gpu_kept {
 #define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
 #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
 static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
+/* boot-arg gpu_test_nomem=S (a test): from second S of the run on, 20 s of buffers refused as if there were no room */
+static TUNABLE(uint32_t, gGPUTestNoMem, "gpu_test_nomem", 0);
+extern "C" void hakios_data_range(uint32_t *size_mb, uint32_t *used_mb, uint32_t *hole_mb);
 
 class HakiosGPUUserClient : public IOUserClient
 {
@@ -905,13 +908,48 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 		}
 	}
 	IOLockUnlock(gGPULock);
+	if (gGPUTestNoMem != 0) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(began, &ns);
+		if (ns / NSEC_PER_SEC >= gGPUTestNoMem && ns / NSEC_PER_SEC < gGPUTestNoMem + 20ull) {
+			hakios_tl("HakiosGPU: gpu_test_nomem: a buffer of %llu bytes refused, as if there were no room for it\n", size);
+			return kIOReturnNoMemory;
+		}
+	}
 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
 	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
 	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
 	if (memory == NULL) {
-		hakios_tl("HakiosGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
-		    fBufferBytes >> 20);
-		return kIOReturnNoMemory;
+		/*
+		 * No room in the kernel's range for big data buffers (not no memory: 2026-11-03 00:01 it was refused with 3 GB
+		 * free). This client's kept buffers are in that range too: they are let go, and it is tried once more.
+		 */
+		static uint32_t refused;
+		uint32_t range = 0, taken = 0, hole = 0;
+		uint64_t kept;
+
+		IOLockLock(gGPULock);
+		kept = fKeptBytes;
+		for (uint32_t i = 0; i < GPU_KEPT; i++) {
+			dropKept(&fKept[i]);
+		}
+		IOLockUnlock(gGPULock);
+		if (kept != 0) {
+			memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+			    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
+		}
+		if (refused < 8 || refused % 100 == 0) {
+			hakios_data_range(&range, &taken, &hole);
+			hakios_tl("HakiosGPU: no room for a buffer of %llu bytes (%u buffers, %llu MB with this client): %s %llu MB kept "
+			    "were let go; the kernel's range for big data buffers %u MB, %u taken, the biggest hole %u MB\n", size,
+			    fBufferCount, fBufferBytes >> 20, memory != NULL ? "made once this client's" : "refused although its",
+			    kept >> 20, range, taken, hole);
+		}
+		refused++;
+		if (memory == NULL) {
+			return kIOReturnNoMemory;
+		}
 	}
 	if (gGPUCached) {
 		hakios_gpu_to_memory(memory->getBytesNoCopy(), size);

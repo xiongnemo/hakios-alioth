@@ -317,12 +317,27 @@ ramfs_node_alloc(struct ramfs_mount *rm, enum vtype type, struct vnode_attr *vap
  * of kernel_map each, as the contents of a RAM disk are. wait=false: never wait for memory (the
  * page-out path, which may be the pageout daemon looking for some).
  */
+/*
+ * Since 2026-11-03 (ramfs_physmap=1, the default) not even that: a page each from the VM, reached through the
+ * physical map, which takes none of the kernel's address space (hakios_file_page_alloc(), osfmk/arm64/
+ * loader_return.c). A page of kernel_map each had put 1.3 GB of files as 333,000 allocations into the range the
+ * GPU's buffers and the surfaces come from, and those of 4-11 MB were refused with 3 GB of memory free.
+ */
+extern void hakios_file_pages_init(void);
+extern void *hakios_file_page_alloc(bool wait);
+extern void hakios_file_page_free(void *page);
+
+static bool ramfs_physmap = true;
+
 static void *
 ramfs_page_alloc(bool wait)
 {
 	vm_offset_t addr = 0;
 	kma_flags_t flags = KMA_KOBJECT | KMA_DATA | KMA_ZERO | (wait ? KMA_NONE : KMA_NOPAGEWAIT);
 
+	if (ramfs_physmap) {
+		return hakios_file_page_alloc(wait);
+	}
 	return kmem_alloc(kernel_map, &addr, PAGE_SIZE, flags, VM_KERN_MEMORY_FILE) == KERN_SUCCESS ?
 	       (void *)addr : NULL;
 }
@@ -330,6 +345,10 @@ ramfs_page_alloc(bool wait)
 static void
 ramfs_page_free(void *page)
 {
+	if (ramfs_physmap) {
+		hakios_file_page_free(page);
+		return;
+	}
 	kmem_free(kernel_map, (vm_offset_t)page, PAGE_SIZE);
 }
 
@@ -643,7 +662,8 @@ ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, 
 
 			if (told < 10 || told % 100 == 0) {
 				printf("ramfs: no new page (%s): volume %llu of %llu MB; memory that can be had %llu MB, critical "
-				    "line %llu MB, %llu MB in all volumes\n", *spare == NULL ? "kmem_alloc gave none" : "no room",
+				    "line %llu MB, %llu MB in all volumes\n", *spare == NULL ? (ramfs_physmap ? "the VM gave none" :
+				    "kmem_alloc gave none") : "no room",
 				    (unsigned long long)(ptoa_64(rm->rm_pages) >> 20), (unsigned long long)(ptoa_64(rm->rm_max_pages) >> 20),
 				    (unsigned long long)(ptoa_64((uint64_t)memorystatus_available_pages) >> 20),
 				    (unsigned long long)(ptoa_64((uint64_t)memorystatus_available_pages_critical) >> 20),
@@ -2148,6 +2168,14 @@ ramfs_sync(__unused mount_t mp, __unused int waitfor, __unused vfs_context_t ctx
 static int
 ramfs_init(__unused struct vfsconf *vfsc)
 {
+	uint32_t physmap = 1;
+
+	if (PE_parse_boot_argn("ramfs_physmap", &physmap, sizeof(physmap)) && physmap == 0) {
+		ramfs_physmap = false;
+		printf("ramfs: ramfs_physmap=0: a page of a file is an allocation of kernel_map, as before 2026-11-03\n");
+	} else {
+		hakios_file_pages_init();
+	}
 	return 0;
 }
 

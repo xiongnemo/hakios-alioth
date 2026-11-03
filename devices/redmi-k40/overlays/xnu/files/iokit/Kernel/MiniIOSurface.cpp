@@ -102,6 +102,7 @@ static uint32_t         gSurfaceTraced;                         /* (a tunable is
 static char             gSurfaceTraceOf[32];
 
 extern "C" void loader_log_line(const char *line);
+extern "C" void hakios_data_range(uint32_t *size_mb, uint32_t *used_mb, uint32_t *hole_mb);
 
 /* A line about a traced surface: to the loader's log too, where it outlives the kernel's own, short log. */
 static void
@@ -192,18 +193,29 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
  */
 #define SCANOUT_SLOTS   4
 static uint32_t gScanoutWidth, gScanoutHeight, gScanoutRefused;
-static uint64_t gScanoutPhys, gScanoutSlotBytes;
+static uint64_t gScanoutSlotBytes, gScanoutSlotPhys[SCANOUT_SLOTS];
 static unsigned gScanoutSlots;
 static bool gScanoutUsed[SCANOUT_SLOTS];
 
 void
 MiniIOSurfaceSetScanout(uint32_t width, uint32_t height, uint64_t phys, uint64_t slotBytes, unsigned slots)
 {
-	gScanoutPhys = phys;
 	gScanoutSlotBytes = slotBytes;
 	gScanoutSlots = slots < SCANOUT_SLOTS ? slots : SCANOUT_SLOTS;
+	for (unsigned i = 0; i < gScanoutSlots; i++) {
+		gScanoutSlotPhys[i] = phys + i * slotBytes;
+	}
 	gScanoutWidth = width;
 	gScanoutHeight = height;
+}
+
+/* One slot more, somewhere else (as big as the others; below 4 GB, one piece), before any surface is made. */
+void
+MiniIOSurfaceAddScanoutSlot(uint64_t phys)
+{
+	if (gScanoutSlots < SCANOUT_SLOTS) {
+		gScanoutSlotPhys[gScanoutSlots++] = phys;
+	}
 }
 
 /* A slot for `bytes` of pixels: its physical address, 0 if none is free. */
@@ -215,7 +227,7 @@ scanoutTake(uint64_t bytes)
 	}
 	for (unsigned i = 0; i < gScanoutSlots; i++) {
 		if (!__atomic_exchange_n(&gScanoutUsed[i], true, __ATOMIC_ACQUIRE)) {
-			return gScanoutPhys + i * gScanoutSlotBytes;
+			return gScanoutSlotPhys[i];
 		}
 	}
 	if (gScanoutRefused++ < 4) {
@@ -227,8 +239,10 @@ scanoutTake(uint64_t bytes)
 static void
 scanoutGive(uint64_t phys)
 {
-	if (phys >= gScanoutPhys && gScanoutSlotBytes != 0 && (phys - gScanoutPhys) / gScanoutSlotBytes < gScanoutSlots) {
-		__atomic_store_n(&gScanoutUsed[(phys - gScanoutPhys) / gScanoutSlotBytes], false, __ATOMIC_RELEASE);
+	for (unsigned i = 0; i < gScanoutSlots; i++) {
+		if (gScanoutSlotPhys[i] == phys) {
+			__atomic_store_n(&gScanoutUsed[i], false, __ATOMIC_RELEASE);
+		}
 	}
 }
 
@@ -261,6 +275,39 @@ surfaceMemory(vm_size_t bytes)
 	if (memory == NULL) {
 		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
 		    PAGE_SIZE);
+	}
+	if (memory == NULL && bytes >= SURFACE_KEEP_FROM && gSurfaceKeptLock != NULL) {
+		/*
+		 * No room in the kernel's range for big data buffers (2026-11-03: 11 MB refused with 3 GB of memory free). The
+		 * pieces kept are in that range too: they are let go, and it is tried once more.
+		 */
+		IOBufferMemoryDescriptor * gone[SURFACE_KEPT];
+		unsigned n = 0;
+		static uint32_t refused;
+		uint32_t range = 0, taken = 0, hole = 0;
+
+		IOLockLock(gSurfaceKeptLock);
+		for (unsigned i = 0; i < SURFACE_KEPT; i++) {
+			if (gSurfaceKept[i].memory != NULL && !gSurfaceKept[i].busy) {
+				gone[n++] = gSurfaceKept[i].memory;
+				gSurfaceKept[i].memory = NULL;
+			}
+		}
+		IOLockUnlock(gSurfaceKeptLock);
+		for (unsigned i = 0; i < n; i++) {
+			gone[i]->release();
+		}
+		if (n != 0) {
+			memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
+			    bytes, PAGE_SIZE);
+		}
+		if (refused < 8 || refused % 100 == 0) {
+			hakios_data_range(&range, &taken, &hole);
+			IOLog("MiniIOSurface: no room for a surface of %lu KB: %s %u kept pieces were let go; the kernel's range for big "
+			    "data buffers %u MB, %u taken, the biggest hole %u MB\n", (unsigned long)(bytes >> 10),
+			    memory != NULL ? "made once" : "refused although", n, range, taken, hole);
+		}
+		refused++;
 	}
 	return memory;
 }
