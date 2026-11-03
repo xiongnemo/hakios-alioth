@@ -1031,6 +1031,7 @@ int dwc3_stop(struct dwc3 *dev);
 static int usb_own;
 static struct dwc3 *usb_dwc;
 static int usb_own_powered(void);
+static void usb_own_say_regs(const char *when);
 #endif
 /* (the USB link's state, defined with it below: run_kernel() may lend the controller to the kernel) */
 static usb_device_protocol *USB;
@@ -3554,6 +3555,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				if (usb_own_powered()) {
 					(void)dwc3_stop(usb_dwc);   /* (the loader's own link: the kernel's core takes it from scratch) */
 				}
+				usb_own_say_regs("lent to the kernel");
 			} else {
 				(void)USB->stop();
 			}
@@ -4255,7 +4257,8 @@ usb_own_trace(void *cookie, enum dwc3_trace event, uint32_t a, uint32_t b)
 		return;
 	}
 	said++;
-	print("usb (own): %s %x %x\n", event == DWC3_TRACE_STUCK ? "stuck, started again:" : event == DWC3_TRACE_TIMEOUT ?
+	/* (on the screen too: what dwc3_init() timed out on is what a link that will not come up shows first) */
+	SAY("usb (own): %s %x %x\n", event == DWC3_TRACE_STUCK ? "stuck, started again:" : event == DWC3_TRACE_TIMEOUT ?
 	    "TIMEOUT on register" : event == DWC3_TRACE_COMMAND ? "ENDPOINT COMMAND FAILED:" : event == DWC3_TRACE_BAD_EVENT ?
 	    "an event not understood:" : "configured:", (uint64_t)a, (uint64_t)b);
 }
@@ -4315,6 +4318,37 @@ usb_own_powered(void)
 	return (*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_GDSCR & (1u << 31)) &&
 	    !(*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_MASTER & (1u << 31)) &&
 	    !(*(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_SLEEP & (1u << 31));
+}
+
+/* The controller's state in one line, in the log and on the screen: what a link that would not come back left. */
+static void
+usb_own_say_regs(const char *when)
+{
+	uint64_t g = *(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_GDSCR;
+	uint64_t m = *(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_MASTER;
+	uint64_t s = *(volatile uint32_t *)(uintptr_t)ALIOTH_GCC_USB30_SLEEP;
+
+	if (!usb_own_powered()) {
+		SAY("usb (own), %s: GDSC %x, master clock %x, sleep clock %x -- no power or clocks: its registers not read\n", when,
+		    g, m, s);
+		return;
+	}
+	SAY("usb (own), %s: GCTL %x DCTL %x DSTS %x GUSB2PHYCFG %x GEVNTADRLO %x GEVNTCOUNT %x HS_PHY_CTRL %x GDSC %x\n", when,
+	    (uint64_t)usb_own_read32(NULL, 0xc110), (uint64_t)usb_own_read32(NULL, 0xc704), (uint64_t)usb_own_read32(NULL, 0xc70c),
+	    (uint64_t)usb_own_read32(NULL, 0xc200), (uint64_t)usb_own_read32(NULL, 0xc400), (uint64_t)usb_own_read32(NULL, 0xc40c),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)ALIOTH_HS_PHY_CTRL, g);
+}
+
+/* A wait of `ms`, the watchdog fed meanwhile. */
+static void
+usb_own_wait_ms(uint64_t ms)
+{
+	for (uint64_t done = 0; done < ms; done += 100) {
+		BS->stall(100000);
+		if (done % 1000 == 0) {
+			wdt_pet();
+		}
+	}
 }
 
 /*
@@ -5267,15 +5301,39 @@ alioth_usb_take_back(void)
 	    now != usb_event_buffer_before ? "drove the controller" : "had the controller lent but left it as it was", (uint64_t)now,
 	    (uint64_t)usb_event_buffer_before);
 	if (usb_own) {
-		/* (the loader's own link: from scratch again, as the kernel's core left the controller; unpowered, the watch) */
+		/*
+		 * The loader's own link: from scratch again, as the kernel's core left the controller. The first usb=3 run lent
+		 * from it ended in the cold reset here with nothing left to read (2026-11-04 00:58: Android up 169 s after the
+		 * epoch of a 150 s run, no log) -- so the controller's state first, three tries, and a failure kept on the
+		 * screen for a minute before the reset, for a photo. Without power or clocks, the watch brings them back.
+		 */
 		usb_lent = 0;
-		if (usb_own_powered() && usb_own_bring_up() != 0) {
-			print("usb: THE LOADER'S OWN LINK DID NOT COME BACK: cold reset (Android boots)\n");
-			BS->stall(200000);
-			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+		usb_own_say_regs("back from the kernel");
+		if (!usb_own_powered()) {
+			SAY("usb (own): no power or clocks after the run: the watch turns them on and starts the device side\n");
+			return;
 		}
-		alioth_usb_note();
-		return;
+		for (int attempt = 1; attempt <= 3; attempt++) {
+			int r = usb_own_bring_up();
+
+			if (r == 0) {
+				if (attempt > 1) {
+					SAY("usb (own): the link came back at try %d\n", (uint64_t)attempt);
+				}
+				alioth_usb_note();
+				return;
+			}
+			SAY("usb (own): THE LINK DID NOT COME BACK, try %d of 3 (-%d)\n", (uint64_t)attempt, (uint64_t)-r);
+			usb_own_say_regs("after that try");
+			(void)dwc3_stop(usb_dwc);
+			usb_own_wait_ms(1000);
+		}
+		for (int left = 60; left > 0; left -= 10) {
+			SAY("usb: THE LOADER'S OWN LINK DID NOT COME BACK AFTER THE RUN -- a cold reset (Android) in %d s; "
+			    "please photograph the lines above\n", (uint64_t)left);
+			usb_own_wait_ms(10000);
+		}
+		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 	}
 	if (!usb_lent) {
 		(void)USB->stop();
