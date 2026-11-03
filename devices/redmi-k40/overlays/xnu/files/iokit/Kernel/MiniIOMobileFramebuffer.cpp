@@ -337,7 +337,9 @@ public:
 	uint32_t        fDirectStride, fDirectWidth, fDirectHeight;     /* the source geometry VIG0 has now */
 	uint32_t        fPendingSwapID;         /* the swap whose (drawn) frame the pending flip shows */
 	uint32_t        fStatDirect;
+	IOBufferMemoryDescriptor * fThirdSlot;  /* (fb_slots=3) a third slot, in XNU's memory below 4 GB */
 	bool aliothDirectTest(void);
+	void aliothThirdSlot(void);
 	MiniIOSurface * directSurface(const uint8_t * swap, MiniIOSurface ** surfaces);
 	uint32_t        fFlipFlips, fFlipMissed;
 	bool            fFlipPending;           /* a flip issued, not yet seen taken: fComposeBase is still scanned */
@@ -626,8 +628,71 @@ IOMobileFramebuffer::aliothFlipStart(void)
 		fFlipFront = 0;
 		fComposeBase = fFlipBase[0];
 		MiniIOSurfaceSetScanout(fWidth, fHeight, kSlotsPhys, kSlotBytes, 2);
+		aliothThirdSlot();
 	}
 	return true;
+}
+
+/*
+ * fb_slots=3 (the default; 2: as before 2026-11-03): a third slot for CoreAnimation's surfaces. It asks for three of
+ * the display's size, and the third came in ordinary memory ("all 2 scan-out slots taken"): every frame drawn into
+ * that one was then scaled by the processors instead of the engine. The bootloader's display memory holds two; XNU's
+ * own memory begins at 0xc0000000 since 2026-11-02, so a piece of it below 4 GB (the engine's source address has 32
+ * bits) can be the third -- if the engine is seen to read it, by the same signature test as aliothDirectTest()'s.
+ */
+static void fillPixels(uint8_t * base, uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t value);
+
+void
+IOMobileFramebuffer::aliothThirdSlot(void)
+{
+	const uint32_t colour = 0xff3a6ea5, other = 0xffa53a6e;
+	uint32_t slots = 3, stride = (fWidth * 4 + 63) & ~63u;
+	uint64_t phys;
+
+	PE_parse_boot_argn("fb_slots", &slots, sizeof(slots));
+	if (slots < 3 || fSlotMap == NULL) {
+		return;
+	}
+	fThirdSlot = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
+	    kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, kSlotBytes, 0x00000000fffff000ULL);
+	phys = fThirdSlot != NULL ? fThirdSlot->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+	if (phys == 0 || phys + kSlotBytes > 0x100000000ULL) {
+		hakios_tl("alioth scan: no piece of %llu KB below 4 GB for a third slot (%#llx): two slots\n", kSlotBytes >> 10, phys);
+		if (fThirdSlot != NULL) {
+			fThirdSlot->release();
+			fThirdSlot = NULL;
+		}
+		return;
+	}
+	uint8_t * ref = (uint8_t *) fSlotMap->getVirtualAddress(), * src = (uint8_t *) fThirdSlot->getBytesNoCopy();
+
+	/* the panel's size all of one colour in the first slot, shown as it is; then the third, scaled, the same */
+	fillPixels(ref, fRowBytes, fPanelWidth, fPanelHeight, colour);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	alioth_flip_to(kSlotsPhys, 100000);
+	uint32_t a = alioth_flip_misr(2);
+	fillPixels(src, stride, fWidth, fHeight, colour);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	alioth_scan_source(phys, fWidth, fHeight, stride);
+	int taken = alioth_flip_wait(100000);
+	uint32_t b = alioth_flip_misr(2);
+	fillPixels(src, stride, fWidth, fHeight, other);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	uint32_t c = alioth_flip_misr(2);
+	alioth_scan_source(fFlipPhys[0], 0, 0, 0);
+	int back_taken = alioth_flip_wait(100000);
+	alioth_flip_misr_off();
+	bool pass = taken && back_taken && a != 0 && b == a && c != a;
+	hakios_tl("alioth scan: a third slot at %#llx: panel-size %#x, scaled %#x (%s), other colour %#x (%s); %s\n", phys, a, b,
+	    b == a ? "same" : "DIFFERENT", c, c != a ? "different" : "SAME", pass ? "three slots" : "two slots");
+	if (!pass) {
+		fThirdSlot->release();
+		fThirdSlot = NULL;
+		return;
+	}
+	bzero(src, kSlotBytes);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	MiniIOSurfaceAddScanoutSlot(phys);
 }
 
 static void

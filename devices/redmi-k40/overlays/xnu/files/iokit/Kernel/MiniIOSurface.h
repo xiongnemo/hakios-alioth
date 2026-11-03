@@ -177,6 +177,8 @@ MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint3
  * framebuffer says where (width 0: none).
  */
 void            MiniIOSurfaceSetScanout(uint32_t width, uint32_t height, uint64_t phys, uint64_t slotBytes, unsigned slots);
+/* one slot more, of the same size, elsewhere (below 4 GB, one piece), before the first surface */
+void            MiniIOSurfaceAddScanoutSlot(uint64_t phys);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
