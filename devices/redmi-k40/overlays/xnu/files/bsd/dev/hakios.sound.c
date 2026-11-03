@@ -1400,10 +1400,17 @@ static void
 watch(void)
 {
 	bool on = false, given_up = false, muted = false;
-	uint64_t last_look = 0, last_monitor = 0;
+	uint64_t last_look = 0, last_monitor = 0, setup_next = 0, set_up_at = 0, last_test = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0, set_ups = 0;
+	uint32_t i2c_test = 0;
+	/* (after a set-up that failed, the next one no sooner than this, in seconds: the last one for ever after) */
+	static const uint32_t setup_gap_s[] = { 2, 10, 60, 300 };
 
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
+	if (umi_profile && PE_parse_boot_argn("sound_i2c_test", &i2c_test, sizeof(i2c_test)) && i2c_test != 0) {
+		say("sound: sound_i2c_test=%u: the amplifiers' chip IDs read so many times now and every 2 minutes while "
+		    "nothing plays\n", i2c_test);
+	}
 
 	while (!stopping) {
 		uint64_t now = now_us(), sounded = last_sound_us;
@@ -1434,19 +1441,35 @@ watch(void)
 		}
 		/*
 		 * Amplifiers given up on (a health look failed: they are held in reset) are set up again from scratch -- reset,
-		 * firmware, calibration -- the next time iOS plays, twice a run at most. Before, one bad look was silence until
-		 * the run's end (2026-11-02 04:35, Minecraft: the protection DSP's error word read as all ones).
+		 * firmware, calibration -- the next time iOS plays. Before, one bad look was silence until the run's end
+		 * (2026-11-02 04:35, Minecraft: the protection DSP's error word read as all ones); then two set-ups were
+		 * allowed a run, and both went in 18 s (2026-11-03 00:53, the bus's timing: umi_i2c_careful). Now a failed
+		 * one is tried again after 2, 10 and 60 s, then every 5 minutes, and ten good minutes begin the count again.
 		 */
-		if (given_up && umi_profile && set_ups < 2 && !muted && sounded != 0 && now - sounded < 100000) {
+		if (given_up && umi_profile && now >= setup_next && !muted && sounded != 0 && now - sounded < 100000) {
+			uint32_t gap = setup_gap_s[set_ups < 3 ? set_ups : 3];
+
 			set_ups++;
 			say_when("iOS plays and the amplifiers had been given up on: they are set up again");
 			if (umi_speaker_prepare()) {
 				given_up = false;
-				say("sound: the amplifiers are set up again (%u of 2 this run)\n", set_ups);
+				set_up_at = now_us();
+				say("sound: the amplifiers are set up again (try %u)\n", set_ups);
 			} else {
-				say("sound: THE AMPLIFIERS COULD NOT BE SET UP AGAIN (%u of 2 this run)\n", set_ups);
+				say("sound: THE AMPLIFIERS COULD NOT BE SET UP AGAIN (try %u): once more in %u s, if iOS plays then\n",
+				    set_ups, gap);
 			}
 			now = now_us();
+			setup_next = now + (uint64_t)gap * 1000000;
+		}
+		if (set_ups != 0 && !given_up && now - set_up_at >= 600000000ull) {
+			say("sound: ten minutes well since the amplifiers were set up again: the count of tries begins again\n");
+			set_ups = 0;
+			setup_next = 0;
+		}
+		if (i2c_test != 0 && !on && !given_up && (last_test == 0 || now - last_test >= 120000000ull)) {
+			umi_speaker_i2c_test(i2c_test);
+			now = last_test = now_us();
 		}
 		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
 			say_when("iOS plays: the amplifiers are started");
@@ -1510,6 +1533,9 @@ static void
 take_down(void)
 {
 	stopping = true;
+	if (umi_profile) {
+		umi_speaker_abort();            /* (a set-up of 12-25 s on the way gives up: not two of us on the bus) */
+	}
 	if (level >= 4) {
 		hakios_audio_set_sink("nothing", NULL);
 	}

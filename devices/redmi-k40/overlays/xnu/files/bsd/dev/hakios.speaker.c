@@ -1222,12 +1222,27 @@ probe_thread(__unused void *parameter, __unused wait_result_t result)
 static uint32_t umi_saved_cfg[2], umi_saved_io[2];
 static uint32_t umi_amp_probe_level;
 
+/*
+ * The bus's timing (sound_i2c_fix=0: as it was before 2026-11-03). A repeated START came within a microsecond of the
+ * clock's fall on the ACK before it, while the low time is 4.7 us at the least and the ACK may still be driven then.
+ * Now and then the amplifier missed that START and took the read for a write: the read address and the ones clocked
+ * in after it went into the register asked for (233734-play.log: IRQ1_STATUS1 read as all ones, then 0 -- cleared by
+ * that write; the protection DSP's error word read as all ones, then 0x00ffffff -- written so, and both chips were
+ * reset; firmware read back wrong at a different address each time). Now a change of a line is read back before its
+ * delay counts, the clock stays low a whole low time before a START, the data line has to be seen high before the
+ * clock goes up, and a clock held low by the other side for 500 us, or a data line it holds, fails the transfer.
+ */
+static bool umi_i2c_careful = true, umi_i2c_fault;
+
 static void
 umi_i2c_line(unsigned pin, bool release)
 {
 	/* GPIO function, 2 mA, no internal pull; the SE3 bus has board pull-ups. */
 	wr(GPIO_IO(pin), 0);
 	wr(GPIO_CFG(pin), release ? 0 : CFG_OUTPUT);
+	if (umi_i2c_careful) {
+		(void) rd(GPIO_CFG(pin));       /* (the write has reached the pin once this read is back) */
+	}
 }
 
 static bool
@@ -1267,11 +1282,41 @@ umi_i2c_bus_give(void)
 	}
 }
 
+/* The clock let go, and up once the line is (a device may hold it low until it is ready): 500 us of that is a fault. */
+static void
+umi_i2c_clock_up(void)
+{
+	unsigned waited = 0;
+
+	umi_i2c_line(UMI_I2C_SCL, true);
+	while (!umi_i2c_level(UMI_I2C_SCL) && waited < 100) {
+		spin_us(5);
+		waited++;
+	}
+	if (waited == 100 && umi_i2c_careful) {
+		umi_i2c_fault = true;
+	}
+}
+
 static void
 umi_i2c_start(void)
 {
-	umi_i2c_line(UMI_I2C_SDA, true);
-	umi_i2c_line(UMI_I2C_SCL, true);
+	if (umi_i2c_careful) {
+		spin_us(5);                     /* (the clock low a whole low time: an ACK before is let go of) */
+		umi_i2c_line(UMI_I2C_SDA, true);
+		for (unsigned waited = 0; !umi_i2c_level(UMI_I2C_SDA); waited++) {
+			if (waited == 20) {
+				umi_i2c_fault = true;   /* (the other side holds the data line) */
+				break;
+			}
+			spin_us(5);
+		}
+		spin_us(1);
+		umi_i2c_clock_up();
+	} else {
+		umi_i2c_line(UMI_I2C_SDA, true);
+		umi_i2c_line(UMI_I2C_SCL, true);
+	}
 	spin_us(5);
 	umi_i2c_line(UMI_I2C_SDA, false);
 	spin_us(5);
@@ -1284,7 +1329,11 @@ umi_i2c_stop(void)
 {
 	umi_i2c_line(UMI_I2C_SDA, false);
 	spin_us(5);
-	umi_i2c_line(UMI_I2C_SCL, true);
+	if (umi_i2c_careful) {
+		umi_i2c_clock_up();
+	} else {
+		umi_i2c_line(UMI_I2C_SCL, true);
+	}
 	spin_us(5);
 	umi_i2c_line(UMI_I2C_SDA, true);
 	spin_us(5);
@@ -1295,13 +1344,20 @@ umi_i2c_bit(bool output)
 {
 	umi_i2c_line(UMI_I2C_SDA, output);
 	spin_us(5);
-	umi_i2c_line(UMI_I2C_SCL, true);
-	for (unsigned waited = 0; !umi_i2c_level(UMI_I2C_SCL) && waited < 100; waited++) {
-		spin_us(5);
+	if (umi_i2c_careful) {
+		umi_i2c_clock_up();
+	} else {
+		umi_i2c_line(UMI_I2C_SCL, true);
+		for (unsigned waited = 0; !umi_i2c_level(UMI_I2C_SCL) && waited < 100; waited++) {
+			spin_us(5);
+		}
 	}
 	spin_us(5);
 	bool input = umi_i2c_level(UMI_I2C_SDA);
 	umi_i2c_line(UMI_I2C_SCL, false);
+	if (umi_i2c_careful) {
+		spin_us(1);                     /* (the data line held past the clock's fall before it changes) */
+	}
 	return input;
 }
 
@@ -1335,6 +1391,7 @@ umi_cs35l41_read(uint8_t address, uint32_t reg, uint32_t *value)
 		return false;
 	}
 
+	umi_i2c_fault = false;
 	umi_i2c_start();
 	ack = umi_i2c_write_byte((uint8_t)(address << 1));
 	for (int shift = 24; ack && shift >= 0; shift -= 8) {
@@ -1352,7 +1409,7 @@ umi_cs35l41_read(uint8_t address, uint32_t reg, uint32_t *value)
 	}
 	umi_i2c_stop();
 	umi_i2c_bus_give();
-	return ack;
+	return ack && !umi_i2c_fault;
 }
 
 /* UMI firmware staging follows Cirrus wmfw.h/wm_adsp.c: HALO v3 packed
@@ -1376,6 +1433,7 @@ umi_cs35l41_bytes(uint8_t address, uint32_t reg, uint8_t *bytes, uint32_t length
 	if (length == 0 || length > 60 || (length & 3) || (reg & 3) || !umi_i2c_bus_take()) {
 		return false;
 	}
+	umi_i2c_fault = false;
 	umi_i2c_start();
 	bool ack = umi_i2c_write_byte(address << 1);
 	for (int shift = 24; ack && shift >= 0; shift -= 8) {
@@ -1394,7 +1452,7 @@ umi_cs35l41_bytes(uint8_t address, uint32_t reg, uint8_t *bytes, uint32_t length
 	}
 	umi_i2c_stop();
 	umi_i2c_bus_give();
-	return ack;
+	return ack && !umi_i2c_fault;
 }
 
 static bool
@@ -1406,6 +1464,10 @@ umi_cs35l41_write(uint8_t address, uint32_t reg, uint32_t value)
 	return ok;
 }
 
+/* a set-up given up at once (umi_speaker_abort(): the sound is being taken down); chunks written again in this one */
+static volatile bool umi_setup_abort;
+static unsigned umi_chunks_again;
+
 static bool
 umi_cs35l41_memory(uint8_t address, uint32_t reg, const uint8_t *data, uint32_t length)
 {
@@ -1414,9 +1476,34 @@ umi_cs35l41_memory(uint8_t address, uint32_t reg, const uint8_t *data, uint32_t 
 		uint32_t n = length - done;
 		if (n > sizeof(chunk)) n = sizeof(chunk);
 		memcpy(chunk, data + done, n);
-		if (!umi_cs35l41_bytes(address, reg + done, chunk, n, true) ||
-		    !umi_cs35l41_bytes(address, reg + done, readback, n, false) || memcmp(chunk, readback, n)) {
-			say("umi-audio: amp %#x memory verification failed at %#x\n", address, reg + done);
+		/* (a chunk that does not read back as written is written again, twice at most) */
+		for (unsigned attempt = 0;; attempt++) {
+			bool wrote, read;
+			uint32_t at = 0;
+
+			if (umi_setup_abort) {
+				say("umi-audio: amp %#x: the set-up is given up: the sound is being taken down\n", address);
+				return false;
+			}
+			wrote = umi_cs35l41_bytes(address, reg + done, chunk, n, true);
+			read = wrote && umi_cs35l41_bytes(address, reg + done, readback, n, false);
+			if (read && memcmp(chunk, readback, n) == 0) {
+				break;
+			}
+			if (umi_i2c_careful && attempt < 2) {
+				umi_chunks_again++;
+				continue;
+			}
+			while (read && at < n && chunk[at] == readback[at]) {
+				at++;
+			}
+			if (!wrote || !read) {
+				say("umi-audio: amp %#x memory verification failed at %#x: the %s was not answered\n", address,
+				    reg + done, wrote ? "read back" : "write");
+			} else {
+				say("umi-audio: amp %#x memory verification failed at %#x: byte %u read back %#x, written %#x\n",
+				    address, reg + done, at, readback[at], chunk[at]);
+			}
 			return false;
 		}
 		done += n;
@@ -1570,14 +1657,20 @@ umi_cs35l41_preload(uint8_t address)
 	return true;
 }
 
+/*
+ * A register's other bits are written back as read -- read twice, and the same both times (sound_i2c_fix=1): with the
+ * bus's old timing a read could come back all ones, and every bit outside the mask was then set.
+ */
 static bool
 umi_cs35l41_update(uint8_t a, uint32_t reg, uint32_t mask, uint32_t value)
 {
-	uint32_t old = 0, check = 0;
-	bool ok = umi_cs35l41_read(a, reg, &old) && umi_cs35l41_write(a, reg, (old & ~mask) | (value & mask)) &&
+	uint32_t old = 0, again = 0, check = 0;
+	bool read = umi_cs35l41_read(a, reg, &old);
+	bool same = read && (!umi_i2c_careful || (umi_cs35l41_read(a, reg, &again) && again == old));
+	bool ok = same && umi_cs35l41_write(a, reg, (old & ~mask) | (value & mask)) &&
 	    umi_cs35l41_read(a, reg, &check) && (check & mask) == (value & mask);
-	if (!ok) say("umi-audio: amp %#x register update failed at %#x: old %#x, readback %#x, mask %#x, wanted %#x\n",
-	    a, reg, old, check, mask, value);
+	if (!ok) say("umi-audio: amp %#x register update failed at %#x: old %#x%s, readback %#x, mask %#x, wanted %#x\n",
+	    a, reg, old, read && !same ? " (read again: not the same, nothing written)" : "", check, mask, value);
 	return ok;
 }
 
@@ -1816,16 +1909,16 @@ umi_cs35l41_health_read(uint8_t a, uint32_t reg, uint32_t *value)
 }
 
 /*
- * A word of all ones is what a read gives that the chip never drove (a bit-banged transfer preempted mid-byte, SDA
- * left high), not what the chip holds: 2026-11-02 04:35:08 the speaker amp's protection DSP error word read
- * 0xffffffff, IRQ1_STATUS1 had no fault bit, and the speaker stayed silent for the rest of the run (Minecraft). Such a
- * word is read again, with the chip's ID as a check of the transfer, before it counts.
+ * A word of all ones is what a read gives that the chip never drove, not what the chip holds: 2026-11-02 04:35:08
+ * the speaker amp's protection DSP error word read 0xffffffff, IRQ1_STATUS1 had no fault bit, and the speaker stayed
+ * silent for the rest of the run (Minecraft). Such a word -- or a DSP word of 24 ones -- is read again, with the
+ * chip's ID as a check of the transfer, before it counts. (The cause was the bus's timing: umi_i2c_careful.)
  */
 static bool
 umi_cs35l41_health_word(uint8_t a, uint32_t reg, uint32_t *value)
 {
 	if (!umi_cs35l41_health_read(a, reg, value)) return false;
-	for (unsigned again = 0; *value == 0xffffffffu && again < 3; again++) {
+	for (unsigned again = 0; (*value == 0xffffffffu || *value == 0x00ffffffu) && again < 3; again++) {
 		uint32_t id = 0;
 
 		wait_ms(2);
@@ -1989,8 +2082,21 @@ umi_speaker_volume(uint32_t below, uint32_t step_ms)
 static bool
 umi_speaker_begin(bool keep)
 {
+	static bool args;
+
+	if (!args) {
+		uint32_t fix = 1;
+
+		args = true;
+		if (PE_parse_boot_argn("sound_i2c_fix", &fix, sizeof(fix)) && fix == 0) {
+			umi_i2c_careful = false;
+			say("umi-audio: sound_i2c_fix=0: the bus's timing as it was before 2026-11-03\n");
+		}
+	}
+	if (umi_setup_abort) return false;
 	if (tlmm == 0) tlmm = ml_io_map(UMI_TLMM_NORTH_PHYS, TLMM_SIZE);
 	if (tlmm == 0) return false;
+	umi_chunks_again = 0;
 	uint32_t cfg = rd(GPIO_CFG(UMI_AMP_RESET)), io = rd(GPIO_IO(UMI_AMP_RESET));
 	umi_runtime_preparing = keep;
 	wr(GPIO_IO(UMI_AMP_RESET), 0);
@@ -2009,6 +2115,10 @@ umi_speaker_begin(bool keep)
 			ok = false;
 			break;
 		}
+	}
+	if (umi_chunks_again != 0) {
+		say("umi-audio: %u chunks of DSP memory were written again: they had not read back as written\n",
+		    umi_chunks_again);
 	}
 	if (keep && ok) {
 		static bool saved;
@@ -2042,6 +2152,45 @@ umi_speaker_begin(bool keep)
 
 bool umi_speaker_dsp_test(void) { return umi_speaker_begin(false); }
 bool umi_speaker_prepare(void) { return umi_speaker_begin(true); }
+
+/* The sound is being taken down: a set-up on the way gives up at its next chunk, and none begins. */
+void
+umi_speaker_abort(void)
+{
+	umi_setup_abort = true;
+}
+
+/*
+ * boot-arg sound_i2c_test=N: the chip's ID read N times from each amplifier, and what came back counted -- the bus's
+ * timing tried (with sound_i2c_fix=0 the old one). A misframed read of it writes into a register that cannot be
+ * written, so the test does no harm. On the sound's thread, the amplifiers set up and not playing.
+ */
+void
+umi_speaker_i2c_test(uint32_t reads)
+{
+	if (!umi_output_ready || umi_reset_asserted || umi_output_on) return;
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t a = i ? UMI_AMP_RCV_ADDR : UMI_AMP_SPK_ADDR;
+		uint32_t wrong = 0, unanswered = 0, ones = 0, last_wrong = 0;
+		uint64_t began = mach_absolute_time(), took;
+
+		for (uint32_t n = 0; n < reads; n++) {
+			uint32_t id = 0;
+
+			if (!umi_cs35l41_read(a, UMI_CS35L41_DEVID, &id)) {
+				unanswered++;
+			} else if (id != UMI_CS35L41_CHIP_ID) {
+				wrong++;
+				ones += id == 0xffffffffu;
+				last_wrong = id;
+			}
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &took);
+		say("umi-audio: sound_i2c_test: amp %#x, %u reads of the chip ID in %llu ms (%s timing): %u wrong (%u all ones, "
+		    "the last %#x), %u not answered\n", a, reads, took / 1000000, umi_i2c_careful ? "the careful" : "the old",
+		    wrong, ones, last_wrong, unanswered);
+	}
+}
 bool umi_speaker_calibrated(void) { return umi_output_ready && umi_unit_calibrated[0] && umi_unit_calibrated[1]; }
 
 static void

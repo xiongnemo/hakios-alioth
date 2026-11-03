@@ -207,11 +207,22 @@ half_bit(void)
 	spin_us(5);                     /* 100 kHz at most */
 }
 
+/*
+ * The bus's timing as hakios.speaker.c's (umi_i2c_careful; haptic_i2c_fix=0: as it was before 2026-11-03): a change
+ * of a line read back before its delay counts, the clock low a whole low time before a repeated START (it went up
+ * within a microsecond of the ACK's clock, and a chip may then miss the START and take the read for a write), the
+ * data line seen high before the clock goes up.
+ */
+static bool careful = true;
+
 static void
 line(unsigned pin, bool high)
 {
 	wr(GPIO_IO(pin), 0);
 	wr(GPIO_CFG(pin), CFG_PULL_UP | (high ? 0 : CFG_OUTPUT));
+	if (careful) {
+		(void) rd(GPIO_CFG(pin));       /* (the write has reached the pin once this read is back) */
+	}
 }
 
 static bool
@@ -221,10 +232,29 @@ level_of(unsigned pin)
 }
 
 static void
+clock_up(void)
+{
+	line(clock_gpio(), true);
+	for (unsigned stretched = 0; !level_of(clock_gpio()) && stretched < 100; stretched++) {
+		half_bit();
+	}
+}
+
+static void
 i2c_start(void)
 {
-	line(data_gpio(), true);
-	line(clock_gpio(), true);
+	if (careful) {
+		half_bit();                     /* (the clock low a whole low time: an ACK before is let go of) */
+		line(data_gpio(), true);
+		for (unsigned waited = 0; !level_of(data_gpio()) && waited < 20; waited++) {
+			half_bit();
+		}
+		spin_us(1);
+		clock_up();
+	} else {
+		line(data_gpio(), true);
+		line(clock_gpio(), true);
+	}
 	half_bit();
 	line(data_gpio(), false);
 	half_bit();
@@ -237,7 +267,11 @@ i2c_stop(void)
 {
 	line(data_gpio(), false);
 	half_bit();
-	line(clock_gpio(), true);
+	if (careful) {
+		clock_up();
+	} else {
+		line(clock_gpio(), true);
+	}
 	half_bit();
 	line(data_gpio(), true);
 	half_bit();
@@ -250,13 +284,13 @@ i2c_bit(bool out)
 
 	line(data_gpio(), out);
 	half_bit();
-	line(clock_gpio(), true);
-	for (unsigned stretched = 0; !level_of(clock_gpio()) && stretched < 100; stretched++) {
-		half_bit();
-	}
+	clock_up();
 	half_bit();
 	in = level_of(data_gpio());
 	line(clock_gpio(), false);
+	if (careful) {
+		spin_us(1);                     /* (the data line held past the clock's fall before it changes) */
+	}
 	return in;
 }
 
@@ -1385,6 +1419,11 @@ hakios_haptic_init(void)
 	}
 	if (level > 5) {
 		level = 5;
+	}
+	uint32_t fix = 1;
+	if (PE_parse_boot_argn("haptic_i2c_fix", &fix, sizeof(fix)) && fix == 0) {
+		careful = false;
+		say("haptic: haptic_i2c_fix=0: the bus's timing as it was before 2026-11-03\n");
 	}
 	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

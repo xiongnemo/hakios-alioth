@@ -50,6 +50,8 @@ bool umi_speaker_healthy(void);
 void umi_speaker_stop(void);
 void umi_speaker_shutdown(void);
 void umi_speaker_quiesce(void);
+void umi_speaker_abort(void);
+void umi_speaker_i2c_test(uint32_t reads);
 
 
 
