@@ -1196,17 +1196,96 @@ location_services_available(id self, SEL c)
 	return ((id (*)(Class, SEL, BOOL))objc_msgSend)(objc_getClass("NSNumber"), sel_registerName("numberWithBool:"), true);
 }
 
+/*
+ * A third-party application's request to send notifications, answered "not allowed" here without the system's
+ * question (boot-arg notify_ask=1: asked as before). The data volume is in memory, so the answer given was gone at
+ * the next boot and the games asked again at every start (owner, 2026-11-02; work/TODO.md Q1). The application hears
+ * what a "Don't Allow" gives: its completion called on a queue of the system's -- or, by UIKit's older
+ * -registerUserNotificationSettings:, its delegate told that it was given no types. The image's own programs
+ * (/Applications, /System, /usr) are left alone.
+ */
+static bool
+third_party(void)
+{
+	static int known = -1;
+
+	if (known < 0) {
+		char path[1024];
+		uint32_t size = sizeof(path);
+
+		known = _NSGetExecutablePath(path, &size) == 0 && strstr(path, ".app/") != NULL &&
+		    strncmp(path, "/Applications/", 14) != 0 && strncmp(path, "/System/", 8) != 0 && strncmp(path, "/usr/", 5) != 0;
+	}
+	return known == 1;
+}
+
+static void
+notify_request(id self, SEL c, unsigned long options, id handler)
+{
+	void (^done)(bool, id) = (void (^)(bool, id))handler;
+
+	(void)self;
+	(void)c;
+	(void)options;
+	if (done != NULL) {
+		dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+			done(false, nil);
+		});
+	}
+}
+
+static void
+notify_register(id self, SEL c, id settings)
+{
+	id delegate = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("delegate"));
+	SEL told = sel_registerName("application:didRegisterUserNotificationSettings:");
+	Class kind = objc_getClass("UIUserNotificationSettings");
+	id none;
+
+	(void)c;
+	(void)settings;
+	if (delegate == nil || kind == Nil ||
+	    !((bool (*)(id, SEL, SEL))objc_msgSend)(delegate, sel_registerName("respondsToSelector:"), told)) {
+		return;
+	}
+	none = ((id (*)(Class, SEL, unsigned long, id))objc_msgSend)(kind, sel_registerName("settingsForTypes:categories:"), 0, nil);
+	((id (*)(id, SEL))objc_msgSend)(none, sel_registerName("retain"));     /* (no ARC here: kept for the block) */
+	dispatch_async(dispatch_get_main_queue(), ^{
+		((void (*)(id, SEL, id, id))objc_msgSend)(delegate, told, self, none);
+		((void (*)(id, SEL))objc_msgSend)(none, sel_registerName("release"));
+	});
+}
+
 /* CLLocationManager's heading and CMMotionManager's device motion answered here (once each, in the first image
  * that has the class: CoreLocation's, CoreMotion's); Settings' privacy pane's question about location too */
 static void
 compass_hooks(const struct mach_header *header, intptr_t image_slide)
 {
-	static bool done, motion_done, privacy_done;
-	Class manager, motion, privacy;
+	static bool done, motion_done, privacy_done, notify_center_done, notify_app_done, notify_checked;
+	Class manager, motion, privacy, center, application;
 	Method m;
 
 	(void)header;
 	(void)image_slide;
+	if (!notify_checked) {
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		notify_checked = true;
+		if (!third_party() || (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "notify_ask=1") != NULL)) {
+			notify_center_done = notify_app_done = true;
+		}
+	}
+	if (!notify_center_done && (center = objc_getClass("UNUserNotificationCenter")) != Nil) {
+		notify_center_done = true;
+		hook(center, false, "requestAuthorizationWithOptions:completionHandler:", (IMP)notify_request);
+		say("notifications: %s asks no question (its requests answered \"not allowed\"; notify_ask=1: asked)\n",
+		    getprogname());
+	}
+	if (!notify_app_done && (application = objc_getClass("UIApplication")) != Nil) {
+		notify_app_done = true;
+		hook(application, false, "registerUserNotificationSettings:", (IMP)notify_register);
+	}
 	if (!privacy_done && (privacy = objc_getClass("PUIPrivacyController")) != Nil) {
 		privacy_done = true;
 		hook(privacy, false, "_cachedLocationServicesAvailableValue", (IMP)location_services_available);
