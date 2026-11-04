@@ -454,13 +454,13 @@ download(NSString *url_string)
 }
 
 static BOOL
-install_ipa(NSString *ipa)
+install_ipa_once(NSString *ipa)
 {
 	NSFileManager *fm = NSFileManager.defaultManager;
 
 	if ([ipa hasPrefix:@"https://"] || [ipa hasPrefix:@"http://"]) {
 		NSString *file = download(ipa);
-		BOOL ok = file != nil && install_ipa(file);
+		BOOL ok = file != nil && install_ipa_once(file);
 
 		if (file != nil) {
 			[fm removeItemAtPath:file error:NULL];
@@ -489,6 +489,26 @@ install_ipa(NSString *ipa)
 		say("ipainstall: the earlier copy removed\n");
 	}
 	return YES;
+}
+
+/*
+ * An install that fails is tried once more, 5 s later (a download with it): The Sims failed twice at boot on a short
+ * write ("inflate -1", 2026-11-01 20:29 and 20:39 -- the data volume briefly out of pages while everything else
+ * started), then installed at the next three boots. A file that is not an IPA at all fails twice, said twice.
+ */
+static BOOL
+install_ipa(NSString *ipa)
+{
+	if (install_ipa_once(ipa)) {
+		return YES;
+	}
+	say("ipainstall: %s did not install: once more in 5 s\n", ipa.lastPathComponent.UTF8String);
+	sleep(5);
+	if (install_ipa_once(ipa)) {
+		say("ipainstall: %s installed at the second try\n", ipa.lastPathComponent.UTF8String);
+		return YES;
+	}
+	return NO;
 }
 
 static BOOL
