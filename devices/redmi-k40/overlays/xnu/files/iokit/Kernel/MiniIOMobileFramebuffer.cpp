@@ -339,6 +339,7 @@ public:
 	uint32_t        fStatDirect;
 	uint32_t        fEarlyPrev[2];          /* (fb_swap_early) the surfaces of the two direct frames before this one */
 	uint32_t        fEarlyShown;            /* ... the surface on the panel when the last swap was over early */
+	uint32_t        fDirectHeldID;          /* the swap fDirectHeld came in (fb_swap_wait: done when it is let go) */
 	uint32_t        fStatEarly, fStatEarlyRisk;     /* swaps over early; frames that came in fEarlyShown */
 	bool swapEarly(uint32_t sid);
 	IOMemoryMap *   fMoreMap;               /* (fb_slots=3/4) the slots the loader took from the firmware's memory */
@@ -841,6 +842,39 @@ IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfac
  * many frames still came in the surface that was on the panel as the swap before was over ("fEarlyShown").
  */
 static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 2);
+
+/*
+ * fb_swap_wait=1 (2026-11-07; 0 the default until measured): SwapWait (selector 6) tells the truth. CoreAnimation asks it
+ * of every swap it means to draw into again -- QuartzCore's swap_wait_timeout() calls IOMobileFramebufferSwapWait, and
+ * while that is not 0 sleeps 100 us and asks again, within a time of its own -- and IOMFBDisplay::can_update() keeps a
+ * second swap in flight ("triple_buffered", its third framebuffer: AppleDisplay makes three) only while one is still
+ * pending. Answered "done" at once, as before, it never was: two surfaces in turn, and with fb_swap_early it drew into
+ * the one on the panel. A swap is done once its surfaces are read no more: scanned out, when the next flip is taken
+ * (the surface held until then, fDirectHeld); drawn here, when that is over. Only one of the last 8 swaps made and not
+ * done is answered busy (kIOReturnBusy): anything else is done, so that a count gone wrong cannot hold CoreAnimation.
+ */
+static TUNABLE(uint32_t, gSwapWaitTruth, "fb_swap_wait", 0);
+static uint32_t gSwapDoneID, gSwapMadeID;      /* the newest swap done, the newest made (SwapEnd) */
+static uint32_t gStatSwapWaitBusy, gStatSwapWaitAsked;
+
+static void
+swapDone(uint32_t id)
+{
+	uint32_t was = __atomic_load_n(&gSwapDoneID, __ATOMIC_RELAXED);
+
+	if (id != 0 && (was == 0 || (int32_t) (id - was) > 0)) {
+		__atomic_store_n(&gSwapDoneID, id, __ATOMIC_RELEASE);
+	}
+}
+
+static bool
+swapPending(uint32_t id)
+{
+	uint32_t done = __atomic_load_n(&gSwapDoneID, __ATOMIC_ACQUIRE), made = __atomic_load_n(&gSwapMadeID, __ATOMIC_ACQUIRE);
+
+	return gSwapWaitTruth != 0 && id != 0 && done != 0 && (int32_t) (id - done) > 0 && (int32_t) (id - done) <= 8 &&
+	       (int32_t) (made - id) >= 0;
+}
 
 bool
 IOMobileFramebuffer::swapEarly(uint32_t sid)
@@ -1475,6 +1509,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		hakios_tl("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
 	}
 	alioth_refresh_activity();
+	__atomic_store_n(&gSwapMadeID, swapWord(swap, SWAP_ID), __ATOMIC_RELEASE);
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
 	fSwapTime = now;
@@ -1484,6 +1519,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		    fSwapsWaiting >= swapQueue()) {
 			fStatLost++;                    /* (the GPU has stopped answering: the frame before is waiting for it) */
 			IOLockUnlock(fSwapLock);
+			swapDone(swapWord(swap, SWAP_ID));      /* (never shown: nothing of it is read, fb_swap_wait) */
 			return;
 		}
 	}
@@ -1699,8 +1735,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		if (fDirectHeld != NULL) {
 			MiniIOSurfaceUse(fDirectHeld, -1);
 			MiniIOSurfaceDrop(fDirectHeld);
+			swapDone(fDirectHeldID);        /* (its surface read no more: the flip after it is taken) */
 		}
 		fDirectHeld = held;
+		fDirectHeldID = swapWord(swap, SWAP_ID);
+		/* the frames' surfaces, here too: how many CoreAnimation turns (fb_swap_wait) */
+		for (unsigned i = 0; i < 8; i++) {
+			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == direct->sid) {
+				fStatSurfaces[i] = direct->sid;
+				break;
+			}
+		}
 		if (!early) {
 			completeSwap();
 			stagedReleased = true;
@@ -1804,6 +1849,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				if (fDirectHeld != NULL) {
 					MiniIOSurfaceUse(fDirectHeld, -1);
 					MiniIOSurfaceDrop(fDirectHeld);
+					swapDone(fDirectHeldID);
 					fDirectHeld = NULL;
 				}
 				fFlipPending = false;
@@ -1877,10 +1923,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatHeld, fStatLost, fStatSwapsLate, fStatDirect);
 		fStatSwapsLate = 0;
 		fStatDirect = 0;
-		if (fStatEarly != 0 || fStatEarlyRisk != 0) {
+		if (fStatEarly != 0 || fStatEarlyRisk != 0 || gSwapWaitTruth != 0) {
+			uint32_t asked = __atomic_exchange_n(&gStatSwapWaitAsked, 0, __ATOMIC_RELAXED);
+			uint32_t busy = __atomic_exchange_n(&gStatSwapWaitBusy, 0, __ATOMIC_RELAXED);
+
 			hakios_tl("display: %u swaps over as their flip was issued (fb_swap_early=%u); %u frames came in the surface that "
-			    "was on the panel then; surfaces %u %u %u %u %u\n", fStatEarly, gSwapEarly, fStatEarlyRisk, fStatSurfaces[0],
-			    fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3], fStatSurfaces[4]);
+			    "was on the panel then; SwapWait asked %u times, %u busy (fb_swap_wait=%u); surfaces %u %u %u %u %u\n",
+			    fStatEarly, gSwapEarly, fStatEarlyRisk, asked, busy, gSwapWaitTruth, fStatSurfaces[0], fStatSurfaces[1],
+			    fStatSurfaces[2], fStatSurfaces[3], fStatSurfaces[4]);
 			fStatEarly = fStatEarlyRisk = 0;
 		}
 		if (fStatScanWaits != 0) {
@@ -1919,6 +1969,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	IOLockUnlock(fLock);
 	if (fComposeBase != NULL && !stagedReleased) completeSwap();
+	if (direct == NULL) {
+		swapDone(swapWord(swap, SWAP_ID));      /* (drawn here: its surfaces are read no more, fb_swap_wait) */
+	}
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -2607,12 +2660,22 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		fOwner->present((const uint8_t *) args->structureInput);
 		return kIOReturnSuccess;
 
-	case kFBMethodSwapWait:                         /* a swap is on the screen as soon as it is made */
+	case kFBMethodSwapWait:                         /* {swap, flags, timeout}: is that swap done? (fb_swap_wait; else: yes, at once) */
+	{
+		bool busy = args->scalarInputCount > 0 && swapPending((uint32_t) in[0]);
+
 		if (gTouchLat) {
-			hakios_tl("tl: w %llu %#llx %#llx at %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
-			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
+			hakios_tl("tl: w %llu %#llx %#llx at %llu%s\n", args->scalarInputCount > 0 ? in[0] : 0,
+			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()),
+			    busy ? " busy" : "");
+		}
+		__atomic_add_fetch(&gStatSwapWaitAsked, 1, __ATOMIC_RELAXED);
+		if (busy) {
+			__atomic_add_fetch(&gStatSwapWaitBusy, 1, __ATOMIC_RELAXED);
+			return kIOReturnBusy;
 		}
 		return kIOReturnSuccess;
+	}
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
