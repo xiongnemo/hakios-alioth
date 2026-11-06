@@ -5192,6 +5192,13 @@ fb_command(char *cmd)
 					staged_data = (const char *)(uintptr_t)scanned;
 					if (scanned != SCREEN.base && surface > staged_len && scanned + surface <= 0x9E300000ULL)
 						staged_len = surface;
+				} else if (scan_slots_n != 0 && scanned >= scan_slots_pa &&
+				    scanned + surface <= scan_slots_pa + scan_slots_n * SCAN_SLOT_BYTES) {
+					/* one of the slots taken from the firmware for the kernel (scan_slots_take): this loader's memory,
+					 * written by the GPU and the kernel's write-combined mapping (no stale lines of ours read back) */
+					staged_data = (const char *)(uintptr_t)scanned;
+					staged_len = surface;
+					flush_dcache(scanned, scanned + surface);
 				}
 				/*
 				 * The address VIG0 scans, in the reply: once (2026-11-01, a game on the screen) the copy was the
