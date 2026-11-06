@@ -748,3 +748,23 @@ hv_wdt_pet_init(void)
 	hv_wdt_pet(NULL, NULL);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hv_wdt_pet_init);
+
+/*
+ * The kernel's log, what the loader (and usbsh "dmesg") hands back, kept for what it is for: a DEVELOPMENT kernel logs
+ * every TCP connection (bsd/netinet/tcp_log.c, TCP_LOG_ENABLE_DEFAULT: "so_gencnt ... tcp connected"), and with Wi-Fi
+ * up that filled the 128 KB buffer in 17 s -- a run's boot was gone before anybody could read it (2026-11-06,
+ * logs/223152-play.kernel.log: 120-137 s of a 240 s run). Off unless boot-arg tcp_log=FLAGS asks (those of the sysctl
+ * net.inet.tcp.log.enable, which still works).
+ */
+extern uint32_t tcp_log_enable_flags;
+
+__startup_func
+static void
+tcp_log_quiet_init(void)
+{
+	uint32_t flags = 0;
+
+	PE_parse_boot_argn("tcp_log", &flags, sizeof(flags));
+	tcp_log_enable_flags = flags;
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, tcp_log_quiet_init);
