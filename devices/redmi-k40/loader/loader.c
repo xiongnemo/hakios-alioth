@@ -2832,6 +2832,62 @@ stage_away(void)
 	SAY("stage: downloads at %x (%d MB); %x is free for the kernel\n", payload_at, PAYLOAD_MAX_SIZE >> 20, PAYLOAD_BASE);
 }
 
+#if defined(LOADER_ALIOTH)
+/*
+ * More scan-out slots for the display (the kernel's fb_slots, MiniIOMobileFramebuffer.cpp aliothMoreSlots). CoreAnimation
+ * draws into three or four surfaces of the display's size; the display memory the bootloader keeps (cont_splash, 35 MB)
+ * holds the composed frame and two of them, and a surface outside a slot is scaled by the processors at every frame it
+ * is shown. The engine reads only below 4 GB (32-bit source addresses), and the kernel's window there is its image and
+ * the system image's. The firmware has memory below 0xc0000000: SCAN_SLOTS of SCAN_SLOT_BYTES are taken from it once a
+ * session (the highest it has, like stage_away), kept for every run, and the kernel is told where (fb_slots_pa=,
+ * fb_slots_more=). Only while 48 MB of the firmware's stay free below 0xc0000000 besides; otherwise one, or none.
+ */
+#define SCAN_SLOT_BYTES 0xc80000ULL           /* = kSlotBytes in MiniIOMobileFramebuffer.cpp */
+#define SCAN_SLOTS      2
+#define SCAN_ALIGN      0x10000ULL            /* (the kernel's pages are 16 KB) */
+static uint64_t scan_slots_pa;
+static unsigned scan_slots_n;
+
+static void
+scan_slots_take(void)
+{
+	static uint8_t map_buf[65536];
+	static int tried;
+	uint64_t map_size = sizeof(map_buf), map_key, desc_size, spare = 0;
+	uint32_t desc_ver;
+
+	if (tried) {
+		return;
+	}
+	tried = 1;
+	if (EFI_ERROR(BS->get_memory_map(&map_size, map_buf, &map_key, &desc_size, &desc_ver))) {
+		return;
+	}
+	for (uint64_t off = 0; off < map_size; off += desc_size) {
+		efi_memory_descriptor *d = (efi_memory_descriptor *)(map_buf + off);
+		uint64_t lo = d->phys_start, hi = d->phys_start + (d->pages << 12);
+
+		if (d->type == EfiConventionalMemory && lo < 0xc0000000ULL) {
+			spare += (hi < 0xc0000000ULL ? hi : 0xc0000000ULL) - lo;
+		}
+	}
+	for (unsigned want = SCAN_SLOTS; want > 0; want--) {
+		uint64_t bytes = want * SCAN_SLOT_BYTES + SCAN_ALIGN, at = 0xc0000000ULL - 1;
+
+		if (spare < bytes + (48ULL << 20) ||
+		    EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, bytes >> 12, &at))) {
+			continue;
+		}
+		scan_slots_pa = (at + SCAN_ALIGN - 1) & ~(SCAN_ALIGN - 1);
+		scan_slots_n = want;
+		SAY("display: %d more scan-out slot%s at %x (%d MB of the firmware's below c0000000 left)\n", (uint64_t)want,
+		    want == 1 ? "" : "s", scan_slots_pa, (spare - bytes) >> 20);
+		return;
+	}
+	SAY("display: no room for more scan-out slots below c0000000 (%d MB free): the kernel keeps two\n", spare >> 20);
+}
+#endif
+
 static int
 parse_payload(struct payload_info *pi, int verbose)
 {
@@ -3599,6 +3655,29 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ba->commandLine[n++] = *c;
 		}
 	}
+#if defined(LOADER_ALIOTH)
+	/* the display's scan-out slots in the firmware's memory (scan_slots_take), unless the payload names its own */
+	int own_slots = 0;
+	for (const char *c = pi.cmdline; *c; c++) {
+		own_slots |= starts_with(c, "fb_slots_pa=");
+	}
+	scan_slots_take();
+	if (scan_slots_n != 0 && !own_slots) {
+		static const char hex[] = "0123456789abcdef";
+
+		for (const char *c = "fb_slots_more="; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = (char)('0' + scan_slots_n);
+		for (const char *c = " fb_slots_pa=0x"; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
+			ba->commandLine[n++] = hex[(scan_slots_pa >> shift) & 0xf];
+		}
+		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+	}
+#endif
 	if (block_enabled) {
 		static const char prefix[] = "ufs_shared_pa=0x";
 		static const char hex[] = "0123456789abcdef";
@@ -3639,8 +3718,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
 	}
-	for (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-		ba->commandLine[n++] = *c;
+	const char *cut = pi.cmdline;
+	for (; *cut && n < BOOT_LINE_LENGTH - 1; cut++) {
+		ba->commandLine[n++] = *cut;
+	}
+	if (*cut) {
+		/* (the payload's own come last: what does not fit is lost, and said) */
+		SAY("run: THE KERNEL'S ARGUMENTS ARE LONGER THAN %d CHARACTERS: cut before \"%s\"\n", (uint64_t)(BOOT_LINE_LENGTH - 1), cut);
 	}
 
 	/* --- device tree ---------------------------------------------------- */
