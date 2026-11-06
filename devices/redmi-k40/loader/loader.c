@@ -5187,7 +5187,16 @@ fb_command(char *cmd)
 				 * where it fits; tools/k40.py keeps the rows beyond the panel's, tools/fixshot.py cuts them again.
 				 */
 				uint64_t scanned = *(volatile uint32_t *)(uintptr_t)0x0ae05014ULL, surface = 4608ULL * 2436;
-				char where[24];
+				/* (VIG0's source as the engine reads it: SRC_SIZE h << 16 | w, SRC_YSTRIDE0 -- the surfaces' rows differ:
+				 * the home screen's 4608 bytes, a game's other, 2026-11-06; said in the reply for tools/k40.py) */
+				uint32_t src_size = *(volatile uint32_t *)(uintptr_t)0x0ae05000ULL;
+				uint32_t src_w = src_size & 0xffff, src_h = src_size >> 16;
+				uint32_t src_stride = *(volatile uint32_t *)(uintptr_t)0x0ae05024ULL & 0xffff;
+				char where[48];
+				if (src_w >= 64 && src_w <= 2048 && src_h >= 64 && src_h <= 3072 && src_stride >= src_w * 4 &&
+				    (uint64_t)src_stride * src_h <= SCAN_SLOT_BYTES) {
+					surface = (uint64_t)src_stride * src_h;
+				}
 				if (scanned >= 0x9C000000ULL && scanned + staged_len <= 0x9E300000ULL) {
 					staged_data = (const char *)(uintptr_t)scanned;
 					if (scanned != SCREEN.base && surface > staged_len && scanned + surface <= 0x9E300000ULL)
@@ -5210,7 +5219,27 @@ fb_command(char *cmd)
 				where[1] = 'x';
 				for (int i = 0; i < 8; i++)
 					where[2 + i] = hex[(scanned >> (28 - 4 * i)) & 15];
-				where[10] = 0;
+				/* then " W H STRIDE" of the source (decimal) */
+				{
+					uint32_t vals[3] = { src_w, src_h, src_stride };
+					int at = 10;
+
+					for (int v = 0; v < 3; v++) {
+						char digits[8];
+						int nd = 0;
+						uint32_t x = vals[v];
+
+						where[at++] = ' ';
+						do {
+							digits[nd++] = (char)('0' + x % 10);
+							x /= 10;
+						} while (x != 0 && nd < 7);
+						while (nd > 0) {
+							where[at++] = digits[--nd];
+						}
+					}
+					where[at] = 0;
+				}
 				fb_reply("OKAY", where);
 			}
 #else
