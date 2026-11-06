@@ -41,6 +41,7 @@ struct dwc3 {
     uint8_t zlp_pending, running, initialized, full_speed, usb31;
     int failed;
     uint32_t events, commands, last_event;
+    uint32_t events_dropped;    /* hakios: events left in a ring at a stop and acknowledged unread (wait_halted) */
     uint64_t dropped;
     uint8_t device_descriptor[18], manufacturer[130], product[130], serial[130];
     uint8_t mux;                /* hakios: the iPhone's usbmux interface, packets (see dwc3_identity) */
@@ -182,6 +183,30 @@ static int wait_mask(struct dwc3 *d, uint32_t reg, uint32_t mask, uint32_t want)
         d->io.delay_us(d->io.cookie, 1);
     }
     trace(d, DWC3_TRACE_TIMEOUT, reg, rd(d, reg));
+    return -3;
+}
+/* hakios: the device controller halts only once no event waits for its driver (the DWC_usb3 databook; Linux's
+ * dwc3_gadget_soft_disconnect lets its interrupt handler take them while it polls DSTS.DEVCTRLHLT). A stop that left
+ * events in a ring waited in vain: the loader lent the controller with 8 bytes pending, and the kernel's usb=3 said
+ * "TIMEOUT waiting on register 0xc70c" and "could not be made ours (-3)", and the loader's own link did not come back
+ * after the run (2026-11-06). So while waiting, whatever waits in any interrupter's ring is acknowledged -- dropped:
+ * whoever stops the controller does not want it. Ring 0's bytes, if it is this driver's (`own`), are stepped over. */
+static int wait_halted(struct dwc3 *d, int own)
+{
+    unsigned i, ep, interrupters = (rd(d, DWC3_GHWPARAMS1) >> 15) & 63u;
+    if (interrupters > 32) interrupters = 32;
+    for (i = 0; i < COMMAND_POLLS; i++) {
+        if (rd(d, DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) return 0;
+        for (ep = 0; ep < interrupters; ep++) {
+            uint32_t n = rd(d, DWC3_GEVNTCOUNT(ep)) & DWC3_GEVNTCOUNT_MASK;
+            if (!n) continue;
+            wr(d, DWC3_GEVNTCOUNT(ep), n);
+            if (ep == 0 && own) d->event_offset = (d->event_offset + n) % EVENT_BYTES;
+            d->events_dropped += n / 4;
+        }
+        d->io.delay_us(d->io.cookie, 1);
+    }
+    trace(d, DWC3_TRACE_TIMEOUT, DWC3_DSTS, rd(d, DWC3_DSTS));
     return -3;
 }
 static int ep_command(struct dwc3 *d, unsigned ep, uint32_t cmd,
@@ -692,7 +717,7 @@ int dwc3_init(void *context, size_t context_bytes,
     interrupts = (rd(d, DWC3_GHWPARAMS1) >> 15) & 63u;
     if (!interrupts || interrupts > 32) return -2;
     wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP);
-    if (wait_mask(d, DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, DWC3_DSTS_DEVCTRLHLT)) return -3;
+    if (wait_halted(d, 0)) return -3;  /* (the rings are the previous owner's) */
     wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) | DWC3_DCTL_CSFTRST);
     if (wait_mask(d, DWC3_DCTL, DWC3_DCTL_CSFTRST, 0)) return -3;
     wr(d, DWC3_DEVTEN, 0); wr(d, DWC3_DALEPENA, 0);
@@ -919,6 +944,6 @@ int dwc3_stop(struct dwc3 *d)
     }
     wr(d, DWC3_DEVTEN, 0); wr(d, DWC3_DALEPENA, 0);
     wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP);
-    if (wait_mask(d, DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, DWC3_DSTS_DEVCTRLHLT)) return -3;
+    if (wait_halted(d, 1)) return -3;
     d->running = 0; return 0;
 }
