@@ -1875,8 +1875,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatSwapsLate = 0;
 		fStatDirect = 0;
 		if (fStatEarly != 0 || fStatEarlyRisk != 0) {
-			IOLog("MiniIOMobileFramebuffer: %u swaps over as their flip was issued (fb_swap_early=%u); %u frames came in the "
-			    "surface that was on the panel then\n", fStatEarly, gSwapEarly, fStatEarlyRisk);
+			hakios_tl("display: %u swaps over as their flip was issued (fb_swap_early=%u); %u frames came in the surface that "
+			    "was on the panel then; surfaces %u %u %u %u %u\n", fStatEarly, gSwapEarly, fStatEarlyRisk, fStatSurfaces[0],
+			    fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3], fStatSurfaces[4]);
 			fStatEarly = fStatEarlyRisk = 0;
 		}
 		if (fStatScanWaits != 0) {

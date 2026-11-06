@@ -366,11 +366,20 @@ loader_log_append_msgbuf(void)
 		return;
 	}
 	loader_log_puts("\n--- kernel message buffer ---\n");
-	/* oldest data first: [bufx, size) is only meaningful once the buffer has wrapped */
+	/*
+	 * Oldest data first: [bufx, size) is only meaningful once the buffer has wrapped. At most its newest 256 KB: a 1 MB
+	 * buffer (boot-arg msgbuf=, for usbsh "dmesg") went round the loader's 1 MB ring by itself, and the run's own log
+	 * and the buffer's newest lines were lost (2026-11-06, logs/231152-fpsq2e2.log).
+	 */
+	int skip = mb->msg_size > 256 * 1024 ? mb->msg_size - 256 * 1024 : 0;
 	for (int pass = 0; pass < 2; pass++) {
 		int from = pass == 0 ? mb->msg_bufx : 0;
 		int to = pass == 0 ? mb->msg_size : mb->msg_bufx;
 		for (int i = from; i < to; i++) {
+			if (skip > 0) {
+				skip--;
+				continue;
+			}
 			if (mb->msg_bufc[i] != 0) {
 				loader_log_putc(mb->msg_bufc[i]);
 			}
