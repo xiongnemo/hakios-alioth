@@ -828,7 +828,10 @@ IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfac
 }
 
 /*
- * fb_swap_early (default 1): the swap of a frame scanned out of its surface is over -- CoreAnimation back from SwapEnd
+ * fb_swap_early (default 2 since 2026-11-07: measured, CoreAnimation does draw the next frame into the surface shown
+ * until the TE -- every frame came in it, logs/231648-fpsq2e2b.log -- but the owner, scrolling and flicking pages, saw no
+ * tearing, and frames that missed their TE went from 18% to 2%; 1 or 0 to go back):
+ * the swap of a frame scanned out of its surface is over -- CoreAnimation back from SwapEnd
  * -- once the flip to it is issued, not once the engine has taken it at the next TE. Waiting held CoreAnimation up to a
  * refresh at every frame, its next one begun only after it: 231 of 379 swaps came a refresh late in a scroll
  * (logs/release-1104.log). Over early, the surface on the panel until that TE might be the one it draws into next. So,
@@ -837,7 +840,7 @@ IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfac
  * in use, MiniIOSurfaceUse(), to a drawer that asks IOSurfaceIsInUse()); 0: never, as before. The statistics say how
  * many frames still came in the surface that was on the panel as the swap before was over ("fEarlyShown").
  */
-static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 1);
+static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 2);
 
 bool
 IOMobileFramebuffer::swapEarly(uint32_t sid)
