@@ -337,6 +337,10 @@ public:
 	uint32_t        fDirectStride, fDirectWidth, fDirectHeight;     /* the source geometry VIG0 has now */
 	uint32_t        fPendingSwapID;         /* the swap whose (drawn) frame the pending flip shows */
 	uint32_t        fStatDirect;
+	uint32_t        fEarlyPrev[2];          /* (fb_swap_early) the surfaces of the two direct frames before this one */
+	uint32_t        fEarlyShown;            /* ... the surface on the panel when the last swap was over early */
+	uint32_t        fStatEarly, fStatEarlyRisk;     /* swaps over early; frames that came in fEarlyShown */
+	bool swapEarly(uint32_t sid);
 	IOMemoryMap *   fMoreMap;               /* (fb_slots=3/4) the slots the loader took from the firmware's memory */
 	bool aliothDirectTest(void);
 	void aliothMoreSlots(void);
@@ -821,6 +825,28 @@ IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfac
 		return NULL;
 	}
 	return s;
+}
+
+/*
+ * fb_swap_early (default 1): the swap of a frame scanned out of its surface is over -- CoreAnimation back from SwapEnd
+ * -- once the flip to it is issued, not once the engine has taken it at the next TE. Waiting held CoreAnimation up to a
+ * refresh at every frame, its next one begun only after it: 231 of 379 swaps came a refresh late in a scroll
+ * (logs/release-1104.log). Over early, the surface on the panel until that TE might be the one it draws into next. So,
+ * with 1, only when its last three frames came in three different surfaces: it draws into them in turn, and the next
+ * is then the one shown two frames ago, which the engine no longer reads. 2: always (the surfaces on the panel read as
+ * in use, MiniIOSurfaceUse(), to a drawer that asks IOSurfaceIsInUse()); 0: never, as before. The statistics say how
+ * many frames still came in the surface that was on the panel as the swap before was over ("fEarlyShown").
+ */
+static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 1);
+
+bool
+IOMobileFramebuffer::swapEarly(uint32_t sid)
+{
+	bool turn = sid != fEarlyPrev[0] && sid != fEarlyPrev[1] && fEarlyPrev[0] != fEarlyPrev[1] && fEarlyPrev[1] != 0;
+
+	fEarlyPrev[1] = fEarlyPrev[0];
+	fEarlyPrev[0] = sid;
+	return gSwapEarly >= 2 || (gSwapEarly == 1 && turn);
 }
 
 void
@@ -1641,6 +1667,19 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		} else {
 			alioth_flip_issue(direct->scanPhys);
 		}
+		/* (in use from now: the engine reads it from the next TE until the flip after this one is taken; held from before
+		 * the swap may be over, its maker free to let go of it then) */
+		MiniIOSurfaceUse(direct, 1);
+		MiniIOSurface * held = MiniIOSurfaceCopy(direct->sid);
+		fStatEarlyRisk += fEarlyShown != 0 && direct->sid == fEarlyShown;
+		fEarlyShown = 0;
+		bool early = swapEarly(direct->sid);
+		if (early) {
+			fEarlyShown = fDirectHeld != NULL ? fDirectHeld->sid : 0;
+			completeSwap();
+			stagedReleased = true;
+			fStatEarly++;
+		}
 		shown = mach_absolute_time();
 		if (alioth_flip_wait(40000)) {
 			uint64_t taken = mach_absolute_time();
@@ -1655,11 +1694,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			fStatScanMissed++;
 		}
 		if (fDirectHeld != NULL) {
+			MiniIOSurfaceUse(fDirectHeld, -1);
 			MiniIOSurfaceDrop(fDirectHeld);
 		}
-		fDirectHeld = MiniIOSurfaceCopy(direct->sid);
-		completeSwap();
-		stagedReleased = true;
+		fDirectHeld = held;
+		if (!early) {
+			completeSwap();
+			stagedReleased = true;
+		}
 		fStatDirect++;
 		bzero(fJobChunks, sizeof(fJobChunks));
 		bzero(fJobStartUs, sizeof(fJobStartUs));
@@ -1755,7 +1797,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				alioth_scan_source(fFlipPhys[back], 0, 0, 0);
 				fDirectOn = false;
 				(void) alioth_flip_wait(40000);
+				fEarlyPrev[0] = fEarlyPrev[1] = fEarlyShown = 0;
 				if (fDirectHeld != NULL) {
+					MiniIOSurfaceUse(fDirectHeld, -1);
 					MiniIOSurfaceDrop(fDirectHeld);
 					fDirectHeld = NULL;
 				}
@@ -1830,6 +1874,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatHeld, fStatLost, fStatSwapsLate, fStatDirect);
 		fStatSwapsLate = 0;
 		fStatDirect = 0;
+		if (fStatEarly != 0 || fStatEarlyRisk != 0) {
+			IOLog("MiniIOMobileFramebuffer: %u swaps over as their flip was issued (fb_swap_early=%u); %u frames came in the "
+			    "surface that was on the panel then\n", fStatEarly, gSwapEarly, fStatEarlyRisk);
+			fStatEarly = fStatEarlyRisk = 0;
+		}
 		if (fStatScanWaits != 0) {
 			IOLog("MiniIOMobileFramebuffer: the scan (fb_scan): %u frames started where it let them land whole, %u did not "
 			    "get there in time; %llu us to put a frame into the panel's memory\n", fStatScanWaits - fStatScanMissed,

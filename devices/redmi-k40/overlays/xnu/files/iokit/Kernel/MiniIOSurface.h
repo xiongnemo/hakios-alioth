@@ -180,6 +180,8 @@ void            MiniIOSurfaceSetScanout(uint32_t width, uint32_t height, uint64_
 /* one slot more, of the same size, elsewhere (below 4 GB, one piece), before the first surface */
 void            MiniIOSurfaceAddScanoutSlot(uint64_t phys);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
+/* The display's own use of a surface (+1 while it is on the panel or about to be, -1 after): what IOSurfaceIsInUse() reads. */
+void            MiniIOSurfaceUse(MiniIOSurface * surface, int delta);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
 

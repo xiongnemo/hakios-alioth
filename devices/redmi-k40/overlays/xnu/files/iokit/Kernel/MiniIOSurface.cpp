@@ -891,6 +891,25 @@ MiniIOSurfaceDrop(MiniIOSurface * s)
 	IOLockUnlock(gSurfaceLock);
 }
 
+/*
+ * The display's use of a surface, in the first category with its users' (useCountCommon below): a surface the engine
+ * scans out reads as in use for as long as it does, as an iPhone's display says of its own -- so that whoever draws
+ * into surfaces in turn and asks IOSurfaceIsInUse() first takes another (MiniIOMobileFramebuffer.cpp, fb_swap_early).
+ */
+void
+MiniIOSurfaceUse(MiniIOSurface * s, int delta)
+{
+	if (s == NULL || gSurfaceLock == NULL) {
+		return;
+	}
+	IOLockLock(gSurfaceLock);
+	if (delta > 0 || s->useCount[0] >= (uint32_t) -delta) {
+		s->useCount[0] += delta;
+		s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
+	}
+	IOLockUnlock(gSurfaceLock);
+}
+
 MiniIOSurface *
 MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat)
 {
