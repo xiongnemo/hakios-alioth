@@ -5214,6 +5214,205 @@ watch_start(void)
 }
 
 /*
+ * glprof=1 (a test, backboardd): where CoreAnimation's render server spends its frames. At 120 Hz it misses 57-60% of
+ * the TEs it is made to draw for (CA_FORCE_120HZ=1), with the processors and the GPU held at their highest clocks too
+ * (2026-11-07, logs/043552-force120max.log): the time goes in its render thread, not in the display. A thread of ours
+ * looks at that thread about every millisecond -- running or waiting (thread_info), and its pc, read with it held, as
+ * watch_frames() does -- and every 10 s says where the samples fell, by function (dladdr() once it runs again) and by
+ * image. The thread is the one whose name has "render" in it; if none has, their names are said instead.
+ */
+#define PROF_SLOTS      8192
+#define PROF_TOP        24
+static struct prof_slot { uint64_t pc; uint32_t n, waiting; } prof_pc[PROF_SLOTS];
+static uint32_t prof_samples, prof_waiting, prof_misses;
+/*
+ * (glprof_thread=WORD: the thread whose name has WORD in it, default "render" -- the first try found
+ * com.apple.coreanimation.render-server 94-100% waiting in mach_msg2_trap, no GL in it: the drawing is elsewhere.
+ * Every thread's name and how much it ran is said once, 30 s in, for choosing.)
+ */
+static char prof_word[48] = "render";
+
+static mach_port_t
+prof_find(char *name, size_t size, bool list)
+{
+	thread_act_array_t threads;
+	mach_msg_type_number_t count;
+	mach_port_t found = MACH_PORT_NULL;
+
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return MACH_PORT_NULL;
+	}
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		pthread_t thread = pthread_from_mach_thread_np(threads[i]);
+		char n[64] = "";
+
+		thread_basic_info_data_t info;
+		mach_msg_type_number_t icount = THREAD_BASIC_INFO_COUNT;
+		double ran = 0;
+
+		if (thread != NULL) {
+			pthread_getname_np(thread, n, sizeof(n));
+		}
+		if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&info, &icount) == KERN_SUCCESS) {
+			ran = info.user_time.seconds + info.user_time.microseconds / 1e6 + info.system_time.seconds +
+			    info.system_time.microseconds / 1e6;
+		}
+		if (list) {
+			say("hakios-gl: %s: glprof:   thread %u [%s] %.1f s of processor time so far\n", getprogname(), i, n, ran);
+		}
+		if (found == MACH_PORT_NULL && n[0] != 0 && strstr(n, prof_word) != NULL) {
+			found = threads[i];
+			strlcpy(name, n, size);
+		} else {
+			mach_port_deallocate(mach_task_self(), threads[i]);
+		}
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(threads[0]));
+	if (list || found == MACH_PORT_NULL) say("hakios-gl: %s: glprof: %s \"%s\" among its %u threads%s\n", getprogname(),
+	    found != MACH_PORT_NULL ? "sampling the thread with" : "NO thread with", prof_word, count, list ? " (above)" : "");
+	return found;
+}
+
+static void
+prof_report(const char *name)
+{
+	/* (by function: one slot a function, its start as pc) */
+	static struct prof_slot by[PROF_SLOTS];
+	static const char *by_name[PROF_SLOTS], *by_image[PROF_SLOTS];
+	unsigned functions = 0, total = prof_samples ? prof_samples : 1;
+
+	for (unsigned i = 0; i < PROF_SLOTS; i++) {
+		Dl_info info;
+		uint64_t start;
+		const char *image = "?", *function = "?";
+		unsigned j;
+
+		if (prof_pc[i].n == 0) {
+			continue;
+		}
+		start = prof_pc[i].pc;
+		if (dladdr((const void *)(uintptr_t)prof_pc[i].pc, &info) != 0 && info.dli_fname != NULL) {
+			image = strrchr(info.dli_fname, '/') != NULL ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname;
+			if (info.dli_sname != NULL) {
+				function = info.dli_sname;
+				start = (uint64_t)(uintptr_t)info.dli_saddr;
+			} else {
+				start = (uint64_t)(uintptr_t)info.dli_fbase;
+			}
+		}
+		for (j = 0; j < functions && by[j].pc != start; j++) {
+		}
+		if (j == functions) {
+			if (functions == PROF_SLOTS) {
+				continue;
+			}
+			by[functions] = (struct prof_slot){ start, 0, 0 };
+			by_name[functions] = function;
+			by_image[functions] = image;
+			functions++;
+		}
+		by[j].n += prof_pc[i].n;
+		by[j].waiting += prof_pc[i].waiting;
+	}
+	/* (the first PROF_TOP by count, their names moved with them) */
+	for (unsigned i = 0; i < functions; i++) {
+		for (unsigned k = i + 1; k < functions; k++) {
+			if (by[k].n > by[i].n) {
+				struct prof_slot s = by[i];
+				const char *n = by_name[i], *m = by_image[i];
+
+				by[i] = by[k], by_name[i] = by_name[k], by_image[i] = by_image[k];
+				by[k] = s, by_name[k] = n, by_image[k] = m;
+			}
+		}
+		if (i >= PROF_TOP) {
+			break;
+		}
+	}
+	say("hakios-gl: %s: glprof: %s: %u samples in 10 s, %.1f%% of them waiting, %u missed; where:\n", getprogname(), name,
+	    prof_samples, 100.0 * prof_waiting / total, prof_misses);
+	for (unsigned i = 0; i < functions && i < PROF_TOP; i++) {
+		say("hakios-gl: %s: glprof:   %5.1f%% (%4.1f%% waiting) %s %s\n", getprogname(), 100.0 * by[i].n / total,
+		    100.0 * by[i].waiting / total, by_image[i], by_name[i]);
+	}
+	memset(prof_pc, 0, sizeof(prof_pc));
+	prof_samples = prof_waiting = prof_misses = 0;
+}
+
+static void *
+prof_main(void *argument)
+{
+	char name[64] = "";
+	mach_port_t port = MACH_PORT_NULL;
+	uint64_t reported = now_us();
+	unsigned reports = 0;
+
+	(void)argument;
+	pthread_setname_np("hakios-gl prof");
+	sleep(20);                                      /* (the render server up first) */
+	for (;;) {
+		thread_basic_info_data_t info;
+		mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+		arm_thread_state64_t state;
+		mach_msg_type_number_t scount = ARM_THREAD_STATE64_COUNT;
+		bool waiting;
+
+		if (port == MACH_PORT_NULL && (port = prof_find(name, sizeof(name), false)) == MACH_PORT_NULL) {
+			sleep(10);
+			continue;
+		}
+		waiting = thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &count) == KERN_SUCCESS &&
+		    info.run_state == TH_STATE_WAITING;
+		if (thread_suspend(port) != KERN_SUCCESS) {
+			mach_port_deallocate(mach_task_self(), port);
+			port = MACH_PORT_NULL;                  /* (gone: looked for again) */
+			continue;
+		}
+		if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&state, &scount) == KERN_SUCCESS) {
+			uint64_t pc = (uint64_t)arm_thread_state64_get_pc(state);
+			unsigned slot = (unsigned)((pc >> 2) * 2654435761u) % PROF_SLOTS, tries = 0;
+
+			while (prof_pc[slot].n != 0 && prof_pc[slot].pc != pc && tries++ < 64) {
+				slot = (slot + 1) % PROF_SLOTS;
+			}
+			if (prof_pc[slot].n == 0 || prof_pc[slot].pc == pc) {
+				prof_pc[slot].pc = pc;
+				prof_pc[slot].n++;
+				prof_pc[slot].waiting += waiting;
+				prof_samples++;
+				prof_waiting += waiting;
+			} else {
+				prof_misses++;
+			}
+		}
+		(void)thread_resume(port);
+		if (now_us() - reported >= 10000000) {
+			reported = now_us();
+			prof_report(name);
+			if (++reports <= 3) {
+				mach_port_t again = prof_find(name, sizeof(name), true);   /* (the threads said: where the log keeps it) */
+
+				if (again != MACH_PORT_NULL) {
+					mach_port_deallocate(mach_task_self(), again);
+				}
+			}
+		}
+		usleep(1000);
+	}
+	return NULL;
+}
+
+static void
+prof_start(void)
+{
+	pthread_t thread;
+
+	if (pthread_create(&thread, NULL, prof_main, NULL) == 0) {
+		pthread_detach(thread);
+	}
+}
+
+/*
  * -presentRenderbuffer: -- the frame copied by the GPU from the renderbuffer into the next of the layer's surfaces,
  * turned over on the way (OpenGL's rows go up, an IOSurface's down), waited for, and the surface made the layer's
  * contents. The render server (backboardd) then draws the layer with that surface, as any other.
@@ -5757,6 +5956,16 @@ install(void)
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
+		if (!app_role && strstr(arguments, "glprof=1") != NULL) {
+			if ((argument = strstr(arguments, "glprof_thread=")) != NULL) {
+				size_t n = strcspn(argument + 14, " ");
+
+				n = n < sizeof(prof_word) - 1 ? n : sizeof(prof_word) - 1;
+				memcpy(prof_word, argument + 14, n);
+				prof_word[n] = 0;
+			}
+			prof_start();           /* (where CoreAnimation's render server spends its frames: see prof_main) */
+		}
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
 			slow_calls_us = strtoull(argument + 7, NULL, 10);
