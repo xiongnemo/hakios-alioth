@@ -444,6 +444,7 @@ public:
 	uint64_t        fHelperGeneration;
 	unsigned        fHelpersBusy, fHelpersStarted;
 	uint32_t *      fHelperBlend[7];
+	int32_t         fHoleX0, fHoleY0, fHoleX1, fHoleY1;     /* this frame's layers drawn so far, on the panel (drawLayer()) */
 	void record(MiniIOSurface * s);
 };
 
@@ -1204,7 +1205,31 @@ struct RowJob {
 	uint32_t        stride;
 	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
 	bool            filter, unscaled;
+	int32_t         hx0, hy0, hx1, hy1;     /* where the layers below were drawn: this one goes over them there */
 };
+
+/*
+ * One premultiplied pixel over another (source over, as CoreAnimation means its layers). A layer above another --
+ * CoreAnimation's frame over an application's CAMetalLayer, which it hands the display as a layer of its own and leaves
+ * a transparent hole for (2026-11-08) -- was copied over it, and the hole showed black.
+ */
+static inline uint32_t
+pixel_over(uint32_t s, uint32_t d)
+{
+	uint32_t ia = 255 - (s >> 24), rb, ag;
+
+	if (ia == 0) {
+		return s;
+	}
+	if (ia == 255) {
+		return d;               /* (alpha 0: nothing of it) */
+	}
+	rb = (d & 0x00ff00ff) * ia;
+	ag = ((d >> 8) & 0x00ff00ff) * ia;
+	rb = ((rb + 0x00800080 + ((rb >> 8) & 0x00ff00ff)) >> 8) & 0x00ff00ff;
+	ag = (ag + 0x00800080 + ((ag >> 8) & 0x00ff00ff)) & 0xff00ff00;
+	return s + (rb | ag);
+}
 
 void
 IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow)
@@ -1218,6 +1243,9 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 	for (int32_t y = y0; y < y1; y++) {
 		const uint32_t * from;
 		uint32_t * to;
+		/* (over the layers below, where they are: [h0, h1) of this row; elsewhere copied, as always) */
+		int32_t h0 = job->hx0 > cx0 ? job->hx0 : cx0, h1 = job->hx1 < cx1 ? job->hx1 : cx1;
+		bool holed = y >= job->hy0 && y < job->hy1 && h1 > h0;
 
 		if (y < 0 || (uint32_t) y >= fPanelHeight) {
 			continue;
@@ -1225,7 +1253,17 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 		to = (uint32_t *) ((fComposeBase != NULL ? fComposeBase : fBase) + (size_t) y * fRowBytes);
 		if (job->unscaled) {
 			/* not scaled at all */
-			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
+			const uint32_t * row = (const uint32_t *) (pixels + (size_t) (sy + y - py0) * stride) + sx - px0;
+
+			if (!holed) {
+				memcpy(to + px0, row + px0, (size_t) sw * 4);
+				continue;
+			}
+			memcpy(to + px0, row + px0, (size_t) (h0 - px0) * 4);
+			for (int32_t x = h0; x < h1; x++) {
+				to[x] = pixel_over(row[x], to[x]);
+			}
+			memcpy(to + h1, row + h1, (size_t) (px1 - h1) * 4);
 			continue;
 		}
 		if (filter) {
@@ -1265,7 +1303,15 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 				}
 			}
 		}
-		if (filter) {
+		if (holed) {
+			/* a row over the layers below: the plain loops, with the stretch over them blended */
+			for (int32_t x = cx0; x < cx1; x++) {
+				uint32_t value = filter ? (fColumnWeight[x] == 0 || from[fColumn[x]] == from[fColumn[x] + 1] ?
+				    from[fColumn[x]] : blend(from[fColumn[x]], from[fColumn[x] + 1], fColumnWeight[x])) : from[fColumn[x]];
+
+				to[x] = x >= h0 && x < h1 ? pixel_over(value, to[x]) : value;
+			}
+		} else if (filter) {
 			const uint32_t * __restrict column = fColumn + cx0;
 			const uint16_t * __restrict weights = fColumnWeight + cx0;
 			uint32_t * __restrict out = to + cx0;
@@ -1432,6 +1478,19 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.cx1 = cx1;
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
+	/* over what the layers below this one drew in this frame (none for the bottom one: show() empties it) */
+	job.hx0 = fHoleX0;
+	job.hy0 = fHoleY0;
+	job.hx1 = fHoleX1;
+	job.hy1 = fHoleY1;
+	if (fHoleX1 <= fHoleX0) {
+		fHoleX0 = cx0, fHoleY0 = py0, fHoleX1 = cx1, fHoleY1 = py1;
+	} else {
+		fHoleX0 = cx0 < fHoleX0 ? cx0 : fHoleX0;
+		fHoleY0 = py0 < fHoleY0 ? py0 : fHoleY0;
+		fHoleX1 = cx1 > fHoleX1 ? cx1 : fHoleX1;
+		fHoleY1 = py1 > fHoleY1 ? py1 : fHoleY1;
+	}
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, py0, py1, fBlendRow);
 		return;
@@ -1769,12 +1828,23 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fLastFrame = began;
 	report = fSwapsShown < 8;
+	{
+		/* (and whenever the layers in use change: each layer's surface, its size and where it goes -- an application's
+		 * CAMetalLayer given a layer of its own, 2026-11-08, showed black there) */
+		uint32_t now = 0;
+
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			now |= swapWord(swap, SWAP_SURFACE(layer)) != 0 ? 1u << layer : 0;
+		}
+		report = report || (direct == NULL && now != fLayersShown && now > 1);
+	}
 	if (report) {
 		IOLog("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
 	layers = direct != NULL ? 1u : 0u;
+	fHoleX0 = fHoleY0 = fHoleX1 = fHoleY1 = 0;      /* (nothing below the first layer drawn) */
 	for (unsigned layer = 0; direct == NULL && layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
