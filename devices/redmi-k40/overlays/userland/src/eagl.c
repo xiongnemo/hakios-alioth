@@ -4416,6 +4416,230 @@ app_glResolveMultisampleFramebufferAPPLE(void *context)
 }
 
 /*
+ * APPLE_fence for an application. Mesa has none of it, and games call it without asking for the extension: Terraria
+ * polled glTestObjectAPPLE, which answered 0 for ever (CALLED AND NOT THERE). A fence is a sync object of the
+ * context's, made again by every glSetFenceAPPLE; testing one asks its sync without waiting (with a flush, so that it
+ * can come), finishing one waits for it. glTestObjectAPPLE / glFinishObjectAPPLE of anything but a fence -- a texture,
+ * a buffer -- ask a sync put in after everything so far: done when all that was submitted until now is done.
+ */
+#define GL_FENCE_APPLE                  0x8a0b
+#define GL_ALREADY_SIGNALED             0x911a
+#define GL_CONDITION_SATISFIED          0x911c
+#define APP_FENCE_WAIT_NS               5000000000ull   /* how long a finish waits at most */
+
+static struct app_fence {
+	struct eagl *e;                 /* whose (NULL: a free entry) */
+	GLuint name;
+	bool set;                       /* glSetFenceAPPLE was called: until then it is not a fence (glIsFenceAPPLE) */
+	GLsync sync;                    /* what it waits for; NULL: done */
+} app_fences[64];
+static GLuint app_fence_names;
+static pthread_mutex_t app_fence_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct app_fence *
+app_fence_of(struct eagl *e, GLuint name, bool make)
+{
+	struct app_fence *unused = NULL;
+
+	for (unsigned i = 0; name != 0 && i < sizeof(app_fences) / sizeof(app_fences[0]); i++) {
+		if (app_fences[i].e == e && app_fences[i].name == name) {
+			return &app_fences[i];
+		}
+		if (app_fences[i].e == NULL && unused == NULL) {
+			unused = &app_fences[i];
+		}
+	}
+	if (make && unused != NULL) {
+		unused->e = e;
+		unused->name = name;
+		unused->set = false;
+		unused->sync = NULL;
+		return unused;
+	}
+	return NULL;
+}
+
+/* Has the GPU done what came before the sync (waiting at most ns)? The sync is deleted once it has. */
+static bool
+app_sync_done(GLsync *sync, uint64_t ns)
+{
+	GLenum result;
+
+	if (*sync == NULL) {
+		return true;
+	}
+	result = glClientWaitSync(*sync, GL_SYNC_FLUSH_COMMANDS_BIT, ns);
+	if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED) {
+		return false;
+	}
+	glDeleteSync(*sync);
+	*sync = NULL;
+	return true;
+}
+
+/* (a context that goes: its fences with it -- it is current, my_dealloc()) */
+static void
+app_fences_forget(struct eagl *e)
+{
+	pthread_mutex_lock(&app_fence_lock);
+	for (unsigned i = 0; i < sizeof(app_fences) / sizeof(app_fences[0]); i++) {
+		if (app_fences[i].e == e) {
+			if (app_fences[i].sync != NULL) {
+				glDeleteSync(app_fences[i].sync);
+			}
+			memset(&app_fences[i], 0, sizeof(app_fences[i]));
+		}
+	}
+	pthread_mutex_unlock(&app_fence_lock);
+}
+
+static void
+app_glGenFencesAPPLE(void *context, GLsizei n, GLuint *fences)
+{
+	EAGL_ENTER(context, 0x0e80);
+	pthread_mutex_lock(&app_fence_lock);
+	for (GLsizei i = 0; fences != NULL && i < n; i++) {
+		fences[i] = ++app_fence_names;
+	}
+	pthread_mutex_unlock(&app_fence_lock);
+	EAGL_LEAVE(context, 0x0e80);
+}
+
+static void
+app_glDeleteFencesAPPLE(void *context, GLsizei n, const GLuint *fences)
+{
+	EAGL_ENTER(context, 0x0e88);
+	pthread_mutex_lock(&app_fence_lock);
+	for (GLsizei i = 0; fences != NULL && i < n; i++) {
+		struct app_fence *f = app_fence_of(context, fences[i], false);
+
+		if (f != NULL) {
+			if (f->sync != NULL) {
+				glDeleteSync(f->sync);
+			}
+			memset(f, 0, sizeof(*f));
+		}
+	}
+	pthread_mutex_unlock(&app_fence_lock);
+	EAGL_LEAVE(context, 0x0e88);
+}
+
+static void
+app_glSetFenceAPPLE(void *context, GLuint fence)
+{
+	struct app_fence *f;
+
+	EAGL_ENTER(context, 0x0e90);
+	pthread_mutex_lock(&app_fence_lock);
+	if ((f = app_fence_of(context, fence, true)) != NULL) {
+		if (f->sync != NULL) {
+			glDeleteSync(f->sync);
+		}
+		f->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+		f->set = true;
+	} else if (fence != 0) {
+		glFinish();             /* (no room for one more: done at once, then) */
+	}
+	pthread_mutex_unlock(&app_fence_lock);
+	EAGL_LEAVE(context, 0x0e90);
+}
+
+static GLboolean
+app_glIsFenceAPPLE(void *context, GLuint fence)
+{
+	struct app_fence *f;
+	GLboolean is;
+
+	EAGL_ENTER(context, 0x0e98);
+	pthread_mutex_lock(&app_fence_lock);
+	f = app_fence_of(context, fence, false);
+	is = f != NULL && f->set;
+	pthread_mutex_unlock(&app_fence_lock);
+	EAGL_LEAVE(context, 0x0e98);
+	return is;
+}
+
+static GLboolean
+app_glTestFenceAPPLE(void *context, GLuint fence)
+{
+	struct app_fence *f;
+	GLboolean done;
+
+	EAGL_ENTER(context, 0x0ea0);
+	pthread_mutex_lock(&app_fence_lock);
+	f = app_fence_of(context, fence, false);
+	done = f == NULL || app_sync_done(&f->sync, 0);
+	pthread_mutex_unlock(&app_fence_lock);
+	EAGL_LEAVE(context, 0x0ea0);
+	return done;
+}
+
+static void
+app_glFinishFenceAPPLE(void *context, GLuint fence)
+{
+	struct app_fence *f;
+
+	EAGL_ENTER(context, 0x0ea8);
+	pthread_mutex_lock(&app_fence_lock);
+	f = app_fence_of(context, fence, false);
+	if (f != NULL && !app_sync_done(&f->sync, APP_FENCE_WAIT_NS)) {
+		glFinish();
+	}
+	pthread_mutex_unlock(&app_fence_lock);
+	EAGL_LEAVE(context, 0x0ea8);
+}
+
+static GLboolean
+app_glTestObjectAPPLE(void *context, GLenum object, GLuint name)
+{
+	GLboolean done;
+
+	if (object == GL_FENCE_APPLE) {
+		return app_glTestFenceAPPLE(context, name);
+	}
+	EAGL_ENTER(context, 0x0eb0);
+	{
+		GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+		done = app_sync_done(&sync, 0);
+		if (sync != NULL) {
+			glDeleteSync(sync);
+		}
+	}
+	EAGL_LEAVE(context, 0x0eb0);
+	return done;
+}
+
+static void
+app_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
+{
+	if (object == GL_FENCE_APPLE) {
+		app_glFinishFenceAPPLE(context, (GLuint)name);
+		return;
+	}
+	EAGL_ENTER(context, 0x0eb8);
+	glFinish();
+	EAGL_LEAVE(context, 0x0eb8);
+}
+
+/* EXT_debug_marker for an application: nothing (Mesa's OpenGL ES has neither; SceneKit calls both every frame) */
+static void
+app_glPushGroupMarkerEXT(void *context, GLsizei length, const GLchar *marker)
+{
+	(void)length;
+	(void)marker;
+	EAGL_ENTER(context, 0x1990);
+	EAGL_LEAVE(context, 0x1990);
+}
+
+static void
+app_glPopGroupMarkerEXT(void *context)
+{
+	EAGL_ENTER(context, 0x1998);
+	EAGL_LEAVE(context, 0x1998);
+}
+
+/*
  * An application's glCheckFramebufferStatus: an answer other than complete is logged with what is attached (the
  * first 8 times) -- Terraria said "Failed to make complete framebuffer object 812, 375" and stopped.
  */
@@ -5145,7 +5369,7 @@ storage_now(id self, SEL selector, unsigned long target, id drawable)
  * and once more when it answers. A process the system suspended (in the background) is not counted as stuck.
  */
 static bool app_watch = true;
-static pthread_t app_main;                  /* (the constructor runs on the main thread) */
+static pthread_t app_main;                  /* the application's main thread (the constructor sets it) */
 static mach_port_t app_main_port;
 static uint64_t watch_asked_us;
 static int watch_pending;
@@ -5880,6 +6104,7 @@ my_dealloc(id self, SEL selector)
 				glDeleteFramebuffers(1, &e->app_read);
 				glDeleteFramebuffers(1, &e->app_draw);
 			}
+			app_fences_forget(e);
 			if (app_tsd()[30] == (void *)e->tls_head) {
 				app_tsd()[30] = NULL;
 			}
@@ -5965,10 +6190,19 @@ install(void)
 	if (app_role) {
 		check_errors = 0;               /* (glGetError after every call would take the application's errors from it) */
 		pthread_key_create(&app_held, app_held_end);
+		/*
+		 * (for watch_main(): the thread that has to answer. Loaded at the start, this is the main thread; loaded
+		 * later, by the first EAGLContext an engine's thread asks for (src/inject_ui.c, gl_lazy_*), it is not:
+		 * libpthread's pthread_main_thread_np then, looked up -- the SDK's stubs do not name it.)
+		 */
 		if (pthread_main_np()) {
-			app_main = pthread_self();      /* (for watch_main(): the thread that has to answer) */
-			app_main_port = pthread_mach_thread_np(app_main);
+			app_main = pthread_self();
+		} else {
+			pthread_t (*main_thread)(void) = (pthread_t (*)(void))dlsym(RTLD_DEFAULT, "pthread_main_thread_np");
+
+			app_main = main_thread != NULL ? main_thread() : NULL;
 		}
+		app_main_port = app_main != NULL ? pthread_mach_thread_np(app_main) : MACH_PORT_NULL;
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 			app_finish = strstr(arguments, "appgl_finish=1") != NULL;
 			app_seed = strstr(arguments, "appgl_seed=0") == NULL;

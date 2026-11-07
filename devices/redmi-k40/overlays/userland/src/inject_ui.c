@@ -331,6 +331,35 @@ main_links_opengles(void)
  * start drawing with it. Boot-arg appgl=0: none. (Until the GPU driver keeps processes apart, an application could
  * reach the others' GPU memory: the plan's B4.)
  */
+static void gl_lazy_hooks(void);
+static IMP fr_hook(Class cls, const char *name, IMP imp);
+static bool gl_lazy_wanted;             /* an EAGLContext asked for loads the library (gl_lazy_hooks()) */
+
+static void
+app_gl_load(const char *why)
+{
+	static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+
+	os_unfair_lock_lock(&lock);
+	if (!app_gl) {
+		if (dlopen(HAKIOS_GL, RTLD_NOW) == NULL) {
+			say("%s: %s\n", HAKIOS_GL, dlerror());
+		} else {
+			app_gl = true;
+			say("OpenGL ES of its own for %s (%s): %s (the GPU, as the window server's)\n",
+			    _dyld_get_image_name(main_image()), why, HAKIOS_GL);
+		}
+	}
+	os_unfair_lock_unlock(&lock);
+}
+
+/*
+ * B1 (2026-11-08): an application whose main program does not link OpenGLES gets it too, at the first EAGLContext it
+ * asks for -- an engine that is an embedded framework of its own (Unity's UnityFramework, loaded by the program at
+ * run time), or SpriteKit, SceneKit, GLKit and CoreImage drawing with OpenGL ES where there is no Metal. Before, such a
+ * context was Apple's, over a Metal there is not: nil, and nothing drawn. Boot-arg appgl_lazy=1 (off by default until
+ * measured): without it, the main program's own OpenGLES only, as before.
+ */
 static void
 app_opengl_es(void)
 {
@@ -339,23 +368,87 @@ app_opengl_es(void)
 	size_t size = sizeof(arguments) - 1;
 
 	if (path == NULL || strncmp(path, "/Applications/", 14) == 0 || strncmp(path, "/System/", 8) == 0 ||
-	    strncmp(path, "/private/var/staged_system_apps/", 32) == 0 || !main_links_opengles()) {
+	    strncmp(path, "/private/var/staged_system_apps/", 32) == 0) {
 		return;
 	}
-	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "appgl=0") != NULL) {
-		say("OpenGL ES of its own: not with appgl=0\n");
+	(void)sysctlbyname("kern.bootargs", arguments, &size, NULL, 0);
+	if (strstr(arguments, "appgl=0") != NULL) {
+		if (main_links_opengles()) {
+			say("OpenGL ES of its own: not with appgl=0\n");
+		}
 		return;
 	}
 	if (access(HAKIOS_GL, R_OK) != 0) {
 		return;                 /* (an image without the library) */
 	}
-	if (dlopen(HAKIOS_GL, RTLD_NOW) == NULL) {
-		say("%s: %s\n", HAKIOS_GL, dlerror());
+	app_ci_off = strstr(arguments, "appci=0") != NULL;
+	if (main_links_opengles()) {
+		app_gl_load("its program links OpenGLES");
+	} else if (strstr(arguments, "appgl_lazy=1") != NULL) {
+		gl_lazy_wanted = true;
+		gl_lazy_hooks();        /* (OpenGLES may be in already; else the image callback, compass_hooks(), comes back) */
+	}
+}
+
+/*
+ * EAGLContext's initialisers while the library is not loaded: the first one called loads it -- its constructor
+ * puts its own initialisers in their place -- and the call goes on to what EAGLContext has then (Apple's, if the
+ * library could not be loaded).
+ */
+static IMP gl_lazy_api_original, gl_lazy_share_original, gl_lazy_props_original;
+
+static IMP
+gl_lazy_now(id self, SEL selector, IMP lazy, IMP original)
+{
+	Method m;
+	IMP now;
+
+	app_gl_load("an EAGLContext asked for");
+	m = class_getInstanceMethod(object_getClass(self), selector);
+	now = m != NULL ? method_getImplementation(m) : NULL;
+	return now == NULL || now == lazy ? original : now;
+}
+
+static id
+gl_lazy_api(id self, SEL selector, unsigned long api)
+{
+	IMP now = gl_lazy_now(self, selector, (IMP)gl_lazy_api, gl_lazy_api_original);
+
+	return ((id (*)(id, SEL, unsigned long))now)(self, selector, api);
+}
+
+static id
+gl_lazy_share(id self, SEL selector, unsigned long api, id sharegroup)
+{
+	IMP now = gl_lazy_now(self, selector, (IMP)gl_lazy_share, gl_lazy_share_original);
+
+	return ((id (*)(id, SEL, unsigned long, id))now)(self, selector, api, sharegroup);
+}
+
+static id
+gl_lazy_props(id self, SEL selector, unsigned long api, id properties)
+{
+	IMP now = gl_lazy_now(self, selector, (IMP)gl_lazy_props, gl_lazy_props_original);
+
+	return ((id (*)(id, SEL, unsigned long, id))now)(self, selector, api, properties);
+}
+
+/* (once, when OpenGLES's EAGLContext is there and the library is wanted lazily) */
+static void
+gl_lazy_hooks(void)
+{
+	static int done;
+	Class context;
+
+	if (!gl_lazy_wanted || app_gl || __atomic_load_n(&done, __ATOMIC_ACQUIRE) ||
+	    (context = objc_getClass("EAGLContext")) == Nil || __atomic_exchange_n(&done, 1, __ATOMIC_ACQ_REL)) {
 		return;
 	}
-	app_gl = true;
-	app_ci_off = strstr(arguments, "appci=0") != NULL;
-	say("OpenGL ES of its own for %s: %s (the GPU, as the window server's)\n", path, HAKIOS_GL);
+	gl_lazy_api_original = fr_hook(context, "initWithAPI:", (IMP)gl_lazy_api);
+	gl_lazy_share_original = fr_hook(context, "initWithAPI:sharegroup:", (IMP)gl_lazy_share);
+	gl_lazy_props_original = fr_hook(context, "initWithAPI:properties:", (IMP)gl_lazy_props);
+	say("OpenGL ES of its own: at the first EAGLContext asked for (its program does not link OpenGLES)%s\n",
+	    gl_lazy_api_original != NULL && gl_lazy_share_original != NULL ? "" : " -- AN INITIALISER IS MISSING");
 }
 
 /* ---- the compass ------------------------------------------------------------------------------------------- */
@@ -1444,6 +1537,7 @@ compass_hooks(const struct mach_header *header, intptr_t image_slide)
 	(void)header;
 	(void)image_slide;
 	fr_hooks();
+	gl_lazy_hooks();
 	if (!notify_checked) {
 		char args[1024] = "";
 		size_t len = sizeof(args) - 1;
