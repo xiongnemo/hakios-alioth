@@ -536,6 +536,38 @@ context_of(id object)
 	return NULL;
 }
 
+/*
+ * An application's thread after one of the context's own methods (-initWithAPI:, -renderbufferStorage:fromDrawable:,
+ * -presentRenderbuffer:, -texImageIOSurface:...): Mesa's current context there given back to the one the thread holds
+ * (app_setCurrentContext()), none if it holds none -- as on an iPhone, where none of them changes the current
+ * context. Left current in Mesa on a thread that does not hold it, a context is freed under that thread when its last
+ * owner lets it go on another, and the thread's next make-current reads the freed one (_mesa_make_current flushes the
+ * context it replaces): SceneKit's display link faulted so in -[SCNRenderer _installContext] on a queue's thread
+ * (GPU Check scenekit.default, 2026-11-08, in 2 runs of 2 with fr_min=120).
+ */
+static void
+app_settle(const char *after)
+{
+	id held = pthread_getspecific(app_held);
+	struct eagl *own = held != nil ? context_of(held) : NULL;
+	static _Atomic unsigned told;
+
+	if (current == own) {
+		return;
+	}
+	if (told < 12) {
+		told++;
+		say("hakios-gl: %s: after %s on %s thread %p: %s\n", getprogname(), after, pthread_main_np() ? "the main" : "another",
+		    (void *)pthread_self(), own != NULL ? "the thread's own context made current again" : "no context current");
+	}
+	if (own != NULL && hakios_gl_make_current(own->gl)) {
+		current = own;
+		return;
+	}
+	hakios_gl_make_current(NULL);
+	current = NULL;
+}
+
 /* ---- what CoreAnimation asks for: kept for the summary ------------------------------------------- */
 
 struct format_use {
@@ -4541,6 +4573,9 @@ eagl_init(id self, unsigned long api, struct eagl *share)
 			say("hakios-gl: images: %s at %p, %s at %p\n", gl.dli_fname, gl.dli_fbase, own.dli_fname, own.dli_fbase);
 		}
 	}
+	if (app_role) {
+		app_settle("-initWithAPI:");
+	}
 	return self;
 }
 
@@ -4656,7 +4691,7 @@ my_getMacroContextPrivate(id self, SEL selector)
 
 /* (the types are the method's own: the last three arrive on the stack, where sizes matter) */
 static BOOL
-my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long target, unsigned long internal,
+tex_image_now(id self, SEL selector, IOSurfaceRef surface, unsigned long target, unsigned long internal,
     GLsizei width, GLsizei height, unsigned long format, unsigned long type, uint32_t plane, BOOL invert)
 {
 	static unsigned shown;
@@ -4703,9 +4738,21 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	return YES;
 }
 
+static BOOL
+my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long target, unsigned long internal,
+    GLsizei width, GLsizei height, unsigned long format, unsigned long type, uint32_t plane, BOOL invert)
+{
+	BOOL done = tex_image_now(self, selector, surface, target, internal, width, height, format, type, plane, invert);
+
+	if (app_role) {
+		app_settle("-texImageIOSurface:");
+	}
+	return done;
+}
+
 /* (the "image" is the target, GL_TEXTURE_2D, and means the texture bound to it) */
 static BOOL
-my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface, BOOL inverted)
+attach_image_now(id self, SEL selector, unsigned long target, IOSurfaceRef surface, BOOL inverted)
 {
 	struct eagl *e = context_of(self);
 	static unsigned attached;
@@ -4767,6 +4814,17 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	}
 	eagl_leave(e, 0x970);
 	return YES;
+}
+
+static BOOL
+my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface, BOOL inverted)
+{
+	BOOL done = attach_image_now(self, selector, target, surface, inverted);
+
+	if (app_role) {
+		app_settle("-attachImage:");
+	}
+	return done;
 }
 
 /* ---- an application's OpenGL ES: its current context, its CAEAGLLayer ---------------------------- */
@@ -5007,7 +5065,7 @@ app_say_geometry(id layer, const char *when)
  * shown in, each the memory of a texture where the GPU can draw into a surface (else a texture read back).
  */
 static BOOL
-app_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable)
+storage_now(id self, SEL selector, unsigned long target, id drawable)
 {
 	struct eagl *e = context_of(self);
 	struct app_drawable *d;
@@ -5418,7 +5476,7 @@ prof_start(void)
  * contents. The render server (backboardd) then draws the layer with that surface, as any other.
  */
 static BOOL
-app_present(id self, SEL selector, unsigned long target)
+present_now(id self, SEL selector, unsigned long target)
 {
 	struct eagl *e = context_of(self);
 	struct app_drawable *d;
@@ -5769,6 +5827,25 @@ handed:
 		d->due_us = now + app_period_us;
 	}
 	return YES;
+}
+
+/* (the context's methods that make it current: the thread's own one current again afterwards, app_settle()) */
+static BOOL
+app_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable)
+{
+	BOOL done = storage_now(self, selector, target, drawable);
+
+	app_settle("-renderbufferStorage:fromDrawable:");
+	return done;
+}
+
+static BOOL
+app_present(id self, SEL selector, unsigned long target)
+{
+	BOOL done = present_now(self, selector, target);
+
+	app_settle("-presentRenderbuffer:");
+	return done;
 }
 
 static BOOL

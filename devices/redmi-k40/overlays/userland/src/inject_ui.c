@@ -31,6 +31,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <math.h>
+#include <os/lock.h>
 #include <stdarg.h>
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
@@ -1256,6 +1257,181 @@ notify_register(id self, SEL c, id settings)
 	});
 }
 
+/*
+ * Frame-rate requests (boot-arg fr_log=1: said; fr_min=N: UIKit's raised to at least N, in every application;
+ * fr_min_all=1: the applications' own too). After a home-screen swipe the page settles at 30 Hz for 0.25-1.5 s (logs/040002-catriple.log:
+ * ~190 intervals of 32-35 ms) while finger-down scrolling is at 120 Hz -- and halving CoreAnimation's beat changed
+ * nothing (logs/030653-vrrR1.log): the 30 is asked for in frames per second, not in beats. Who asks it, and with what
+ * range, is said once per caller and range (again at the 10th, 100th, 1000th time). fr_min=N lifts a range whose
+ * maximum is under N to a maximum of N (a set preferred rate under N to N), its minimum left: with fr_min=120 the
+ * settling's 20-30 is 20-120 and 99% of the after-lift intervals are under 12 ms, none 30-36 ms
+ * (logs/033942-homeFR120.log). A game that asks for 30 on purpose (its timing may count on it) is left alone unless
+ * fr_min_all=1. Nothing is hooked without fr_log or fr_min.
+ */
+typedef struct { float minimum, maximum, preferred; } fr_range;
+static IMP fr_link_range_original, fr_link_fps_original, fr_link_interval_original, fr_animation_range_original;
+static unsigned fr_min;
+static bool fr_log;
+static os_unfair_lock fr_lock = OS_UNFAIR_LOCK_INIT;
+
+static void
+fr_say(const char *what, void *caller, double a, double b, double c)
+{
+	static struct { void *caller; float a, b, c; unsigned n; } seen[128];
+	Dl_info info;
+	const char *image = "?", *function = "?";
+	unsigned i, n = 0;
+
+	os_unfair_lock_lock(&fr_lock);
+	for (i = 0; i < 128 && seen[i].n != 0; i++) {
+		if (seen[i].caller == caller && seen[i].a == (float)a && seen[i].b == (float)b && seen[i].c == (float)c) {
+			break;
+		}
+	}
+	if (i < 128) {
+		if (seen[i].n == 0) {
+			seen[i].caller = caller;
+			seen[i].a = (float)a, seen[i].b = (float)b, seen[i].c = (float)c;
+		}
+		n = ++seen[i].n;
+	}
+	os_unfair_lock_unlock(&fr_lock);
+	if (n != 1 && n != 10 && n != 100 && n != 1000) {
+		return;
+	}
+	if (dladdr(caller, &info) != 0) {
+		image = info.dli_fname != NULL && strrchr(info.dli_fname, '/') != NULL ? strrchr(info.dli_fname, '/') + 1 : "?";
+		function = info.dli_sname != NULL ? info.dli_sname : "?";
+	}
+	say("framerate: %s: %s %g %g %g from %s %s (time %u)\n", getprogname(), what, a, b, c, image, function, n);
+}
+
+/*
+ * (What fr_log found, 2026-11-08 logs/031727-frlog.log: UIKit in SpringBoard sets its display link to 48-120 while the
+ * finger is down and to 20-30 -- a maximum of 30 -- for the settling, over a hundred times in a run of swipes. Only a
+ * range that stops below fr_min is changed: its maximum lifted to fr_min, a preferred rate under it too. Raising the
+ * minimum of the others as well (48-120 -> 60-120) cost finger-down frames: CoreAnimation then took 60 at times,
+ * logs/032137-frmin60.log. The default range, all zeros, is left as it is.)
+ */
+/*
+ * Whose request it is: UIKit's own (its scroll views' settling -- in every application, the same 20-30) is raised;
+ * an application's own display link or animation is not, unless fr_min_all=1: a game may run at 30 on purpose and
+ * count its time by frames. (The caller's image, by dladdr: a few hundred calls in a run of swipes.)
+ */
+static bool fr_all;
+
+static bool
+fr_from_uikit(void *caller)
+{
+	Dl_info info;
+
+	if (fr_all) {
+		return true;
+	}
+	return dladdr(caller, &info) != 0 && info.dli_fname != NULL && strstr(info.dli_fname, "/UIKitCore.framework/") != NULL;
+}
+
+static fr_range
+fr_raise(fr_range r, void *caller)
+{
+	if (fr_min != 0 && r.maximum > 0 && r.maximum < (float)fr_min && fr_from_uikit(caller)) {
+		r.maximum = (float)fr_min;
+		r.preferred = r.preferred != 0 && r.preferred < (float)fr_min ? (float)fr_min : r.preferred;
+	}
+	return r;
+}
+
+static void
+fr_link_range(id self, SEL c, fr_range r)
+{
+	void *caller = __builtin_return_address(0);
+
+	if (fr_log) {
+		fr_say("-[CADisplayLink setPreferredFrameRateRange:]", caller, r.minimum, r.maximum, r.preferred);
+	}
+	((void (*)(id, SEL, fr_range))fr_link_range_original)(self, c, fr_raise(r, caller));
+}
+
+static void
+fr_animation_range(id self, SEL c, fr_range r)
+{
+	void *caller = __builtin_return_address(0);
+
+	if (fr_log) {
+		fr_say("-[CAAnimation setPreferredFrameRateRange:]", caller, r.minimum, r.maximum, r.preferred);
+	}
+	((void (*)(id, SEL, fr_range))fr_animation_range_original)(self, c, fr_raise(r, caller));
+}
+
+static void
+fr_link_fps(id self, SEL c, long fps)
+{
+	void *caller = __builtin_return_address(0);
+
+	if (fr_log) {
+		fr_say("-[CADisplayLink setPreferredFramesPerSecond:]", caller, (double)fps, 0, 0);
+	}
+	if (fr_min != 0 && fps > 0 && fps < (long)fr_min && fr_from_uikit(caller)) {
+		fps = (long)fr_min;
+	}
+	((void (*)(id, SEL, long))fr_link_fps_original)(self, c, fps);
+}
+
+static void
+fr_link_interval(id self, SEL c, long interval)
+{
+	if (fr_log) {
+		fr_say("-[CADisplayLink setFrameInterval:]", __builtin_return_address(0), (double)interval, 0, 0);
+	}
+	((void (*)(id, SEL, long))fr_link_interval_original)(self, c, interval);
+}
+
+static IMP
+fr_hook(Class cls, const char *name, IMP imp)
+{
+	Method m = class_getInstanceMethod(cls, sel_registerName(name));
+
+	return m != NULL ? method_setImplementation(m, imp) : NULL;
+}
+
+/* (once, when QuartzCore's classes are there) */
+static void
+fr_hooks(void)
+{
+	static bool done, checked, wanted;
+	Class link = objc_getClass("CADisplayLink"), animation = objc_getClass("CAAnimation");
+
+	if (!checked) {
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+		const char *at;
+
+		checked = true;
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0) {
+			fr_log = strstr(args, "fr_log=1") != NULL;
+			fr_all = strstr(args, "fr_min_all=1") != NULL;
+			if ((at = strstr(args, "fr_min=")) != NULL) {
+				fr_min = (unsigned)strtoul(at + 7, NULL, 10);
+				fr_min = fr_min > 240 ? 240 : fr_min;
+			}
+		}
+		wanted = fr_log || fr_min != 0;
+	}
+	if (done || !wanted || link == Nil || animation == Nil) {
+		return;
+	}
+	done = true;
+	fr_link_range_original = fr_hook(link, "setPreferredFrameRateRange:", (IMP)fr_link_range);
+	fr_link_fps_original = fr_hook(link, "setPreferredFramesPerSecond:", (IMP)fr_link_fps);
+	fr_link_interval_original = fr_hook(link, "setFrameInterval:", (IMP)fr_link_interval);
+	fr_animation_range_original = fr_hook(animation, "setPreferredFrameRateRange:", (IMP)fr_animation_range);
+	say("framerate: %s: requests %s%s%s (display link range %s, fps %s, interval %s; animation range %s)\n", getprogname(),
+	    fr_log ? "said" : "not said", fr_min != 0 ? ", raised to at least fr_min" : "", fr_min != 0 ? (fr_all ?
+	    " (everybody's)" : " (UIKit's)") : "",
+	    fr_link_range_original ? "hooked" : "MISSING", fr_link_fps_original ? "hooked" : "MISSING",
+	    fr_link_interval_original ? "hooked" : "MISSING", fr_animation_range_original ? "hooked" : "MISSING");
+}
+
 /* CLLocationManager's heading and CMMotionManager's device motion answered here (once each, in the first image
  * that has the class: CoreLocation's, CoreMotion's); Settings' privacy pane's question about location too */
 static void
@@ -1267,6 +1443,7 @@ compass_hooks(const struct mach_header *header, intptr_t image_slide)
 
 	(void)header;
 	(void)image_slide;
+	fr_hooks();
 	if (!notify_checked) {
 		char args[1024] = "";
 		size_t len = sizeof(args) - 1;
