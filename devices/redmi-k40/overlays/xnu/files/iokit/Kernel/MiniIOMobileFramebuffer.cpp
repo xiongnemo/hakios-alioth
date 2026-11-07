@@ -1845,7 +1845,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	layers = direct != NULL ? 1u : 0u;
 	fHoleX0 = fHoleY0 = fHoleX1 = fHoleY1 = 0;      /* (nothing below the first layer drawn) */
-	for (unsigned layer = 0; direct == NULL && layer < SWAP_LAYERS; layer++) {
+	if (direct == NULL && (set & 1) && fGraphics) {
+		bool any = false;
+
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			any = any || swapWord(swap, SWAP_SURFACE(layer)) != 0;
+		}
+		if (!any) {
+			/* every layer taken away: nothing is shown, the screen is black */
+			for (uint32_t y = 0; y < fPanelHeight; y++) {
+				bzero((fComposeBase != NULL ? fComposeBase : fBase) + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+			}
+		}
+	}
+	/*
+	 * The layers bottom up: a layer of a higher number is UNDER one of a lower. CoreAnimation, giving an application's
+	 * CAMetalLayer a layer of its own, makes it layer 0 and moves its own frame -- with what is under the Metal layer
+	 * drawn into it, the view's black background included -- to layer 1 (logs/052440, 2026-11-08); drawn from layer 0
+	 * on, the frame covered the Metal layer and the square was black.
+	 */
+	for (int layer = SWAP_LAYERS - 1; direct == NULL && layer >= 0; layer--) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
 		MiniIOSurface * s;
@@ -1859,12 +1878,6 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 		if (sid == 0) {
-			/* the bottom layer taken away: nothing is shown, the screen is black */
-			if (layer == 0 && (set & 1) && fGraphics) {
-				for (uint32_t y = 0; y < fPanelHeight; y++) {
-					bzero((fComposeBase != NULL ? fComposeBase : fBase) + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
-				}
-			}
 			continue;
 		}
 		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
@@ -1872,7 +1885,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		s = surfaces[layer];
 		if (report) {
 			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
-			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
+			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), (unsigned) layer, sid,
 			    s ? "" : " MISSING", s ? s->info.width : 0, s ? s->info.height : 0,
 			    s ? (int) (s->info.pixelFormat >> 24 & 0xff) : '?', s ? (int) (s->info.pixelFormat >> 16 & 0xff) : '?',
 			    s ? (int) (s->info.pixelFormat >> 8 & 0xff) : '?', s ? (int) (s->info.pixelFormat & 0xff) : '?',
