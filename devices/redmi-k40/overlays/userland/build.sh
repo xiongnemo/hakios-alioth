@@ -325,6 +325,21 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# it, and it is copied in when it is there.
 			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		fi
+		if [ "${METAL:-}" = 1 ]; then
+			# The K40's Metal (plan M1): Mesa's side, libhakios.air.dylib (the rwa_* of air_metal.h; built in a
+			# tree of its own by tools/mk-mesa-metal.sh, OpenGL ES's untouched), and the driver over Metal's own
+			# private classes, libhakios.metal.dylib (src/alioth_metal.m, src/alioth_drawable.m: hackios-xnu-
+			# userland a79ff07's, MIT). No ARC and -lobjc, as there: it links _OBJC_CLASS_$__MTLDevice itself.
+			# An application registers its device (Metal Check); nothing in the system loads it.
+			MM=../xnu-deps/build/mesa-metal/out
+			[ "$(cat $MM/built-from 2>/dev/null)" = "$( (for p in ../tools/mesa/*.patch; do
+				[ "$(basename "$p")" = air-ir3.patch ] || cat "$p"; done; cat ../tools/mesa/metal/*.patch \
+				../tools/mesa/hakios-drm/* ../tools/mesa/metal/air/*) | sha256sum)" ] || ../tools/mk-mesa-metal.sh
+			cp $MM/libhakios.air.dylib $MM/air_metal_test obj/
+			$DYN -dynamiclib -install_name /redwood/lib/libhakios.metal.dylib -framework Foundation -framework IOKit \
+				-framework Metal -lobjc -Wno-deprecated-declarations -o obj/libhakios.metal.dylib \
+				src/alioth_metal.m src/alioth_drawable.m
+		fi
 	fi
 	if [ -n "$COMPILE_ONLY" ]; then
 		cp hello obj/hello
@@ -395,6 +410,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		if [ -f obj/u2f_test ]; then cp obj/u2f_test root/bin/; fi   # an "if": see the inject.conf loop below
 		[ -f obj/air_run ] && cp obj/air_run root/bin/
 		[ "$GL" = test ] || cp obj/libhakios.gl.dylib root/lib/
+	fi
+	if [ "${METAL:-}" = 1 ] && [ -f obj/libhakios.metal.dylib ]; then
+		cp obj/libhakios.air.dylib obj/libhakios.metal.dylib root/lib/
+		cp obj/air_metal_test root/bin/
 	fi
 	# a program is not started with a library that is not there: it would not start at all
 	echo "$INJECT" | while read -r library names; do
