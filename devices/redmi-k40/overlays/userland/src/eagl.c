@@ -388,7 +388,13 @@ static int trace_listed;                        /* the draw at hand is one of th
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
-static struct eagl *contexts[8];
+/*
+ * Every live context of the process. (The K40, 2026-11-09: 8 was too few for an application -- System Check's GPU tab
+ * leaves SceneKit's and SpriteKit's contexts alive in their caches, CoreImage makes three of its own per CIContext, and
+ * the ninth, CoreImage's for an SKTexture, was refused: CI went on with a nil EAGLContext, GetMacroContext failed and
+ * it called through an empty table, CI::GLTextureManager::purge_attached_surfaces, pc 0. iOS has no such limit.)
+ */
+static struct eagl *contexts[64];
 /*
  * Which program this library is in: backboardd, whose CoreAnimation render server it was written for (the
  * functions by hand, the frame's end at glFlush, the display's surfaces), or an application drawing OpenGL ES of
