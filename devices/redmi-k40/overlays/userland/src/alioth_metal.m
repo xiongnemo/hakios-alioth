@@ -722,6 +722,87 @@ alioth_stats_setup(void)
 	});
 }
 
+/*
+ * (the K40's) MTLSharedEventListener on this port. +alloc hands out an MTLSharedEventListenerInternal, whose
+ * -initWithDispatchQueue: and -init make an IOKit notification port, give it the queue, and then register the pair with
+ * a call that fails here -- and answer nil (20F66: 0x181b19ec0, the branch at +140; -init at +136). An engine that waits
+ * on a shared event through a listener then has nil, and this driver's events took a nil listener as an exception
+ * (System Check's metal.event). Those events never use that port -- they put the block on the listener's queue
+ * themselves (-[AliothMetalEvent notifyListener:atValue:block:]) -- so in a process this driver is loaded in, the two
+ * initialisers are replaced by ones that do the same less the registration: the port made and given the queue, both
+ * kept in the ivars Apple's own -dealloc lets go of.
+ */
+static Method
+alioth_own_method(Class cls, SEL selector)
+{
+	unsigned count = 0;
+	Method *methods = class_copyMethodList(cls, &count), found = NULL;
+
+	for (unsigned i = 0; i < count && found == NULL; i++) {
+		if (method_getName(methods[i]) == selector) {
+			found = methods[i];
+		}
+	}
+	free(methods);
+	return found;
+}
+
+static id
+alioth_listener_init_queue(id self, SEL selector, dispatch_queue_t queue)
+{
+	Class internal = objc_getClass("MTLSharedEventListenerInternal");
+	Ivar queue_ivar = class_getInstanceVariable(internal, "_dispatchQueue");
+	Ivar port_ivar = class_getInstanceVariable(internal, "_notificationPort");
+	struct objc_super above = { self, class_getSuperclass(internal) };
+	IONotificationPortRef port;
+
+	(void)selector;
+	self = ((id (*)(struct objc_super *, SEL))objc_msgSendSuper)(&above, sel_registerName("init"));
+	if (self == nil) {
+		return nil;
+	}
+	if (queue == NULL || (port = IONotificationPortCreate(MACH_PORT_NULL)) == NULL) {
+		[self release];
+		return nil;
+	}
+	*(IONotificationPortRef *)((char *)self + ivar_getOffset(port_ivar)) = port;
+	*(dispatch_queue_t *)((char *)self + ivar_getOffset(queue_ivar)) = (dispatch_queue_t)[(id)queue retain];
+	IONotificationPortSetDispatchQueue(port, queue);
+	return self;
+}
+
+static id
+alioth_listener_init(id self, SEL selector)
+{
+	dispatch_queue_t queue = dispatch_queue_create("MTLSharedEventListener", NULL);
+	id made = alioth_listener_init_queue(self, selector, queue);
+
+	[(id)queue release];
+	return made;
+}
+
+static void
+alioth_listener_fix(void)
+{
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		Class internal = objc_getClass("MTLSharedEventListenerInternal");
+		Method with_queue = internal != Nil ? alioth_own_method(internal, sel_registerName("initWithDispatchQueue:")) :
+		    NULL;
+		Method plain = internal != Nil ? alioth_own_method(internal, sel_registerName("init")) : NULL;
+
+		if (with_queue == NULL || plain == NULL || class_getInstanceVariable(internal, "_dispatchQueue") == NULL ||
+		    class_getInstanceVariable(internal, "_notificationPort") == NULL) {
+			rw_print("MTLSharedEventListenerInternal is not as 20F66 has it: its initialisers are left as they "
+			         "are, and answer nil here\n");
+			return;
+		}
+		method_setImplementation(with_queue, (IMP)alioth_listener_init_queue);
+		method_setImplementation(plain, (IMP)alioth_listener_init);
+	});
+}
+
 /* the library's lock; a wait for it, when another thread holds it, is counted (metal_stats=1) */
 static void
 alioth_gpu_lock(void)
@@ -1627,6 +1708,7 @@ enum {
 		}
 	}
 	alioth_stats_setup();
+	alioth_listener_fix();
 
 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
 	 * demand: the pointer is handed out without a lock, from whichever thread a renderer
@@ -7093,25 +7175,39 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	for (NSArray *w in due) {
 		void (^block)(id, uint64_t) = w[2];
 
-		dispatch_async([w[0] dispatchQueue], ^{ block(self, v); });
+		dispatch_async(w[0], ^{ block(self, v); });
 	}
+}
+
+/* (the K40's) the queue a listener's blocks run on: its own -- or, for a nil listener, a global queue rather than an
+ * exception (Metal's own MTLSharedEventListener initialisers answer nil on this port; alioth_listener_fix) */
+static dispatch_queue_t
+alioth_listener_queue(id listener)
+{
+	dispatch_queue_t queue = [listener respondsToSelector:@selector(dispatchQueue)] ? [listener dispatchQueue] : nil;
+
+	return queue != nil ? queue : dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
 }
 
 - (void)notifyListener:(id)listener atValue:(uint64_t)v block:(void (^)(id, uint64_t))block
 {
+	dispatch_queue_t queue = alioth_listener_queue(listener);
 	uint64_t now;
 
+	if (block == nil) {
+		return;
+	}
 	@synchronized (self) {
 		now = value;
 		if (now < v) {
 			id copied = [block copy];
 
-			[waiting addObject:@[ listener, @(v), copied ]];
+			[waiting addObject:@[ (id)queue, @(v), copied ]];
 			[copied release];
 			return;
 		}
 	}
-	dispatch_async([listener dispatchQueue], ^{ block(self, now); });
+	dispatch_async(queue, ^{ block(self, now); });
 }
 
 - (void)dealloc
