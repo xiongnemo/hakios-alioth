@@ -197,6 +197,12 @@ struct rwa_texture {
     */
    enum pipe_format view_format;
 
+   /* (the K40's) its render surface, made when it is first an attachment and kept: the same
+    * surface for every draw into it is what lets freedreno see one framebuffer and batch the
+    * draws into one pass (texture_surface)
+    */
+   struct pipe_surface *surface;
+
    /* what MTLTextureUsage allowed, which is checked at every dispatch: a kernel that
     * writes a texture the application declared read-only is an application's mistake,
     * and Metal itself catches it -- so this library has to as well, or it is the
@@ -1533,8 +1539,23 @@ rwa_texture_destroy(struct rwa_texture *texture)
     */
    if (texture->view)
       texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
+   /* (the K40's) the kept surface by reference: a framebuffer still bound holds one of its
+    * own, and the surface and its resource go when that is let go too
+    */
+   if (texture->surface)
+      pipe_surface_reference(&texture->surface, NULL);
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
+}
+
+/* (the K40's) A texture's render surface, made once and kept with it (struct rwa_texture). */
+static struct pipe_surface *
+texture_surface(struct rwa_device *device, struct rwa_texture *t)
+{
+   if (!t->surface)
+      t->surface = device->pipe->create_surface(device->pipe, t->res,
+                                                &(struct pipe_surface){ .format = t->view_format });
+   return t->surface;
 }
 
 /*
@@ -4011,13 +4032,13 @@ rwa_finish(struct rwa_device *device, char *why, size_t why_size)
  * command buffer's completed handlers can wait for the GPU while the next one is encoded.
  */
 void *
-rwa_flush(struct rwa_device *device)
+rwa_flush(struct rwa_device *device, unsigned want_fence)
 {
    struct pipe_fence_handle *fence = NULL;
 
    if (!device)
       return NULL;
-   device->pipe->flush(device->pipe, &fence, 0);
+   device->pipe->flush(device->pipe, want_fence ? &fence : NULL, 0);
    return fence;
 }
 
@@ -6855,26 +6876,24 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    struct pipe_framebuffer_state fb = { .width = w, .height = h,
                                         .nr_cbufs = draw->color_count,
                                         .samples = samples };
+   /* (the K40's) each attachment's KEPT surface (texture_surface), not one made for this draw:
+    * freedreno compares the framebuffer by its surfaces, and a new one every draw made every
+    * draw a pass of its own -- the whole attachment through the tiles and back each time
+    */
    for (unsigned i = 0; i < draw->color_count; i++) {
-      surf[i] = pipe->create_surface(pipe, draw->color[i]->res,
-         &(struct pipe_surface){ .format = draw->color[i]->view_format });
+      surf[i] = texture_surface(device, draw->color[i]);
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
-         for (unsigned j = 0; j < i; j++)
-            pipe->surface_destroy(pipe, surf[j]);
          return -1;
       }
       fb.cbufs[i] = surf[i];
    }
    if (draw->depth) {
-      zsurf = pipe->create_surface(pipe, draw->depth->res,
-         &(struct pipe_surface){ .format = draw->depth->view_format });
+      zsurf = texture_surface(device, draw->depth);
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
-         for (unsigned j = 0; j < draw->color_count; j++)
-            pipe->surface_destroy(pipe, surf[j]);
          return -1;
       }
       fb.zsbuf = zsurf;
@@ -6904,12 +6923,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       float vx = draw->viewport[0], vy = draw->viewport[1], vw = draw->viewport[2], vh = draw->viewport[3];
 
       if (!(fabsf(vw) > 0.0f) || !(fabsf(vh) > 0.0f)) {
+         /* (the surfaces are the textures' own and stay: nothing here to free) */
          say(why, why_size, "a viewport of %gx%g has nothing in it", vw, vh);
-         pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
-         for (unsigned j = 0; j < draw->color_count; j++)
-            pipe->surface_destroy(pipe, surf[j]);
-         if (zsurf)
-            pipe->surface_destroy(pipe, zsurf);
          return -1;
       }
       flipped = vh < 0.0f;
@@ -7139,24 +7154,25 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * must not read as a result, and this is the call that can say which draw did not
     * come back (docs/air.md section 5). A link error between the stages, which ir3 only
     * finds now, surfaces as this not finishing.
+    *
+    * (The K40's) unless the caller says it keeps the score itself (rwa_draw.keep_bound): a
+    * Metal command buffer's draws are one pass on the GPU and its fence says when they are
+    * done, and a wait here made every draw a submission of its own with the processor
+    * standing still for it -- SceneKit and SpriteKit at 40 frames a second.
     */
-   rc = finish_or_say_why(device, true, "draw", why, why_size);
+   rc = draw->keep_bound ? 0 : finish_or_say_why(device, true, "draw", why, why_size);
 
 unbind:
    unbind_stage(device, PIPE_SHADER_FRAGMENT, &fbound);
    if (!render->generated_vertex)
       unbind_stage(device, PIPE_SHADER_VERTEX, &vbound);
-   /* The framebuffer is released before the surfaces are destroyed, and both before the
-    * caller's next call, which may be rwa_texture_destroy on one of these attachments:
-    * a context still holding a surface of a freed resource is the same trap as a bound
-    * sampler state (rwa_sampler_destroy).
+   /* The framebuffer let go, unless the next draw is to find it as it is (keep_bound). The
+    * surfaces are the textures' own (texture_surface) and are let go with them, by
+    * reference: a framebuffer still holding one keeps it, and its resource, alive -- the
+    * trap a destroyed surface under a bound framebuffer was (rwa_sampler_destroy's kin).
     */
-   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
-   for (unsigned i = 0; i < draw->color_count; i++)
-      if (surf[i])
-         pipe->surface_destroy(pipe, surf[i]);
-   if (zsurf)
-      pipe->surface_destroy(pipe, zsurf);
+   if (!draw->keep_bound)
+      pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
    return rc;
 }
 
@@ -7495,6 +7511,7 @@ rwa_texture_view(struct rwa_texture *texture, const struct rwa_texture_shape *sh
    }
    *view = *texture;
    view->view = NULL;
+   view->surface = NULL;   /* (its own, in its own format) */
    view->res = NULL;
    pipe_resource_reference(&view->res, texture->res);
    view->shape.pixel_format = shape->pixel_format;

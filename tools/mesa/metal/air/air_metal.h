@@ -1314,6 +1314,11 @@ struct rwa_draw {
 	unsigned front_ccw;
 	const unsigned *scissor;
 	unsigned fill_lines;
+	/* (the K40's) 1: the draw is not waited for and its framebuffer stays bound for the next one, so that
+	 * the draws of a Metal command buffer into the same attachments are one pass on the GPU; the caller says
+	 * when they are done (rwa_flush and rwa_fence_wait, or rwa_finish). 0, the default, is the old way:
+	 * waited for, the framebuffer let go. */
+	unsigned keep_bound;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
@@ -1373,11 +1378,11 @@ struct rwa_argument {
 	const struct rwa_struct_member *members;
 };
 
-/* (the K40's) rwa_finish in two halves: the work submitted so far flushed and a fence for it
- * returned (NULL: nothing to wait for), and a wait on it that also releases it. The wait takes
- * no context, so another thread may make it while this device's context goes on being used
- * (under the caller's own lock: the context is not thread-safe). 0, or -1 and why. */
-void *rwa_flush(struct rwa_device *device);
+/* (the K40's) rwa_finish in two halves: the work submitted so far flushed and, when want_fence,
+ * a fence for it returned (NULL: nothing to wait for), and a wait on it that also releases it.
+ * The wait takes no context, so another thread may make it while this device's context goes on
+ * being used (under the caller's own lock: the context is not thread-safe). 0, or -1 and why. */
+void *rwa_flush(struct rwa_device *device, unsigned want_fence);
 int rwa_fence_wait(struct rwa_device *device, void *fence, char *why, size_t why_size);
 
 /* (the K40's) A texture view over the whole of `texture`: a second texture sharing its

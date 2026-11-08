@@ -323,6 +323,8 @@ struct rwa_draw {
 	unsigned front_ccw;
 	const unsigned *scissor;
 	unsigned fill_lines;
+	/* (the K40's) 1: not waited for, the framebuffer kept -- a command buffer's draws batched into one pass */
+	unsigned keep_bound;
 };
 /* (the K40's) Metal's pipeline reflection, air_metal.h's rwa_argument (rwa_render_arguments) */
 struct rwa_struct_member {
@@ -590,7 +592,7 @@ static struct {
 	struct rwa_texture *(*texture_view)(struct rwa_texture *, const struct rwa_texture_shape *, char *, size_t);
 	/* (the K40's) rwa_finish in two halves: the wait off the encoding thread (AliothMetalCommandBuffer
 	 * -aliothDeliverHandlers); looked up, not required */
-	void *(*flush)(struct rwa_device *);
+	void *(*flush)(struct rwa_device *, unsigned);
 	int (*fence_wait)(struct rwa_device *, void *, char *, size_t);
 } mesa;
 
@@ -675,7 +677,7 @@ GPU_LOCKED(int, texture_resolve, (struct rwa_device *d, struct rwa_texture *s, s
     size_t ws), (d, s, t, w, ws))
 GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const struct rwa_texture_shape *s, char *w,
     size_t ws), (t, s, w, ws))
-GPU_LOCKED(void *, flush, (struct rwa_device *d), (d))
+GPU_LOCKED(void *, flush, (struct rwa_device *d, unsigned f), (d, f))
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
  * no library worth loading, and the device object still has to exist. */
@@ -5053,6 +5055,9 @@ done:
 		.front_ccw = work->frontCCW,
 		.scissor = work->hasScissor ? work->scissor : NULL,
 		.fill_lines = work->fillLines,
+		/* (the K40's) the draws of this buffer batched into one pass; -commit's flush and fence, or
+		 * -waitUntilCompleted's finish, say when they are done (each draw was waited for, 40 frames a second) */
+		.keep_bound = 1,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
@@ -5184,6 +5189,21 @@ done:
 
 	_scheduled = nil;
 	_completed = nil;
+
+	/*
+	 * (the K40's) THE WORK SUBMITTED FIRST. The draws of a buffer are one batch now (rwa_draw.keep_bound) and
+	 * nothing waits for each of them, so nothing would hand them to the GPU unless this did -- before anyone is told
+	 * the buffer is scheduled: a present is one of those handlers, and the GPU's one ring in order is what puts this
+	 * frame before the window server's reading of it. With a fence when completed handlers will wait on it.
+	 */
+	struct rwa_device *device = [[_queue device] mesaDevice];
+	BOOL async = [completed count] > 0 && _status != RW_CB_ERROR && device != NULL && mesa.flush != NULL &&
+	    mesa.fence_wait != NULL;
+	void *fence = NULL;
+
+	if (device != NULL && mesa.flush != NULL && _status != RW_CB_ERROR) {
+		fence = mesa.flush(device, async ? 1 : 0);
+	}
 	for (id handler in scheduled) {
 		[self aliothDeliver:(void (^)(id))handler];
 	}
@@ -5198,11 +5218,7 @@ done:
 	 * the handlers (on the application's completion queue if it named one), in commit order; -waitUntilCompleted
 	 * waits for that. The wait touches no context (rwa_fence_wait), and everything that does is under alioth_gpu.
 	 */
-	struct rwa_device *device = [[_queue device] mesaDevice];
-
-	if ([completed count] > 0 && _status != RW_CB_ERROR && device != NULL && mesa.flush != NULL &&
-	    mesa.fence_wait != NULL) {
-		void *fence = mesa.flush(device);
+	if (async) {
 		dispatch_group_t done = dispatch_group_create();
 
 		_done = done;
