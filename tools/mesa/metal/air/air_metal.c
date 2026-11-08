@@ -5270,6 +5270,11 @@ struct rwa_render {
     */
    struct pipe_rasterizer_state rast_templ;
    void *rast_variant[32];
+   /* (the K40's) and -setDepthBias:slopeScale:clamp:'s, one a variant, made again when the
+    * numbers change (a shadow pass keeps its own)
+    */
+   void *bias_variant[32];
+   float bias_value[32][3];
    struct pipe_resource *vbuf;        /* the full-screen quad, for the generated stage */
 
    /* What the vertex descriptor was turned into, empty for a stage that fetches no
@@ -5523,13 +5528,10 @@ blend_operation_name(unsigned op)
 static const char *
 blend_factor_refusal(unsigned f)
 {
-   if (f >= 11 && f <= 14)
-      return "one of Metal's BLEND COLOUR factors, whose colour is ENCODER state "
-             "(-setBlendColorRed:green:blue:alpha:) and not pipeline state: this "
-             "contract has nowhere to carry it and the driver's own setter drops it, so "
-             "the blend would be against the zero a Gallium context starts with -- the "
-             "layer would vanish rather than fail. Serving it is one float[4] in "
-             "rwa_draw and one set_blend_color, on the day something asks";
+   /* (The K40's) Metal's BLEND COLOUR factors (11 to 14) are served now: the colour is
+    * encoder state, and it rides in rwa_draw.blend_color to one set_blend_color a draw --
+    * the one float[4] and one call this refusal said it would take.
+    */
    if (f >= 15 && f <= 18)
       /* Deliberately short: `why` is 512 bytes here and in the driver, and the prefix
        * naming the field takes some of it, so a longer sentence would arrive truncated
@@ -6530,6 +6532,8 @@ rwa_render_destroy(struct rwa_render *render)
    for (unsigned i = 0; i < ARRAY_SIZE(render->rast_variant); i++) {
       if (render->rast_variant[i])
          pipe->delete_rasterizer_state(pipe, render->rast_variant[i]);
+      if (render->bias_variant[i])
+         pipe->delete_rasterizer_state(pipe, render->bias_variant[i]);
    }
    if (render->velem) {
       /* Unbound before deleted, and the vertex buffer unbound with it: the context holds
@@ -6993,17 +6997,47 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    bool ccw = (draw->front_ccw != 0) != flipped;
    unsigned variant = cull | (ccw ? 4 : 0) | (draw->scissor ? 8 : 0) | (lines ? 16 : 0);
    void *rast = render->rast;
-   if (variant) {
-      if (!render->rast_variant[variant]) {
-         struct pipe_rasterizer_state rs = render->rast_templ;
-         rs.cull_face = cull == 1 ? PIPE_FACE_FRONT : cull == 2 ? PIPE_FACE_BACK : PIPE_FACE_NONE;
-         rs.front_ccw = ccw;
-         rs.scissor = draw->scissor != NULL;
-         rs.fill_front = rs.fill_back = lines ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
-         render->rast_variant[variant] = pipe->create_rasterizer_state(pipe, &rs);
+   void *stale = NULL;
+   bool bias = draw->depth_bias &&
+               (draw->depth_bias[0] != 0.0f || draw->depth_bias[1] != 0.0f);
+   struct pipe_rasterizer_state rs = render->rast_templ;
+   rs.cull_face = cull == 1 ? PIPE_FACE_FRONT : cull == 2 ? PIPE_FACE_BACK : PIPE_FACE_NONE;
+   rs.front_ccw = ccw;
+   rs.scissor = draw->scissor != NULL;
+   rs.fill_front = rs.fill_back = lines ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
+   if (bias) {
+      /* (the K40's) -setDepthBias:slopeScale:clamp:, Gallium's polygon offset number for
+       * number; one variant a key, the old one let go only once the new one is bound
+       */
+      if (!render->bias_variant[variant] ||
+          memcmp(render->bias_value[variant], draw->depth_bias, sizeof(render->bias_value[0]))) {
+         rs.offset_tri = rs.offset_line = rs.offset_point = 1;
+         rs.offset_units = draw->depth_bias[0];
+         rs.offset_scale = draw->depth_bias[1];
+         rs.offset_clamp = draw->depth_bias[2];
+         void *made = pipe->create_rasterizer_state(pipe, &rs);
+         if (made) {
+            stale = render->bias_variant[variant];
+            render->bias_variant[variant] = made;
+            memcpy(render->bias_value[variant], draw->depth_bias, sizeof(render->bias_value[0]));
+         }
       }
+      if (render->bias_variant[variant])
+         rast = render->bias_variant[variant];
+   } else if (variant) {
+      if (!render->rast_variant[variant])
+         render->rast_variant[variant] = pipe->create_rasterizer_state(pipe, &rs);
       if (render->rast_variant[variant])
          rast = render->rast_variant[variant];
+   }
+   /* (the K40's) the blend colour, which is encoder state in Metal: the given one or Metal's
+    * own default of zero, every draw, so no draw blends against the one before's
+    */
+   {
+      struct pipe_blend_color bc = { { 0 } };
+      if (draw->blend_color)
+         memcpy(bc.color, draw->blend_color, sizeof(bc.color));
+      pipe->set_blend_color(pipe, &bc);
    }
    if (draw->scissor) {
       unsigned x0 = MIN2(draw->scissor[0], fb.width), y0 = MIN2(draw->scissor[1], fb.height);
@@ -7013,6 +7047,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .maxy = MIN2(y0 + draw->scissor[3], fb.height) });
    }
    pipe->bind_rasterizer_state(pipe, rast);
+   if (stale)
+      pipe->delete_rasterizer_state(pipe, stale);   /* (unbound now: the batch keeps what it used) */
    pipe->bind_vs_state(pipe, render->vs_cso);
    pipe->bind_fs_state(pipe, render->fs_cso);
 

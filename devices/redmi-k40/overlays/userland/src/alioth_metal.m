@@ -325,6 +325,9 @@ struct rwa_draw {
 	unsigned fill_lines;
 	/* (the K40's) 1: not waited for, the framebuffer kept -- a command buffer's draws batched into one pass */
 	unsigned keep_bound;
+	/* (the K40's) the blend colour (NULL: zero) and the depth bias { bias, slope, clamp } (NULL: none) */
+	const float *blend_color;
+	const float *depth_bias;
 };
 /* (the K40's) Metal's pipeline reflection, air_metal.h's rwa_argument (rwa_render_arguments) */
 struct rwa_struct_member {
@@ -678,6 +681,8 @@ GPU_LOCKED(int, texture_resolve, (struct rwa_device *d, struct rwa_texture *s, s
 GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const struct rwa_texture_shape *s, char *w,
     size_t ws), (t, s, w, ws))
 GPU_LOCKED(void *, flush, (struct rwa_device *d, unsigned f), (d, f))
+
+static NSUInteger alioth_texel_bytes(NSUInteger format);     /* (with the blit encoder, below) */
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
  * no library worth loading, and the device object still has to exist. */
@@ -1230,6 +1235,20 @@ enum {
 }
 @end
 
+/*
+ * (the K40's) MTLHeap. Metal's heap is one allocation its resources are cut out of; this one gives each resource an
+ * allocation of its own through the device, which is the same thing to everything but the bookkeeping -- and an engine
+ * that sizes its heaps (-heapBufferSizeAndAlignWithLength:options:) and allocates from them gets an object instead of
+ * nil. The size is accounted, not enforced: a heap here never refuses for being full, and -usedSize only grows.
+ */
+@interface AliothMetalHeap : NSObject {
+@public
+	id device;                      /* not retained: the device outlives what it makes */
+	NSString *label;
+	NSUInteger size, used, storageMode, cpuCacheMode, hazardTrackingMode, type;
+}
+@end
+
 @interface AliothMetalRenderEncoder : _MTLCommandEncoder
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
 				  descriptor:(id)descriptor;
@@ -1306,6 +1325,10 @@ enum {
 	unsigned cullMode, frontCCW, fillLines; /* (the K40's) the encoder's rasterizer state (rwa_draw says how) */
 	unsigned scissor[4];                    /* ... and its MTLScissorRect, when hasScissor */
 	BOOL hasScissor;
+	float blendColor[4];                    /* (the K40's) -setBlendColorRed:..., zero by default */
+	float depthBias[3];                     /* (the K40's) -setDepthBias:slopeScale:clamp:, zeros: none */
+	id indirectBuffer;                      /* (the K40's) an indirect draw's arguments, read at -commit */
+	NSUInteger indirectOffset;
 	unsigned primitive, vertexStart, vertexCount;
 	/* the index buffer of an indexed draw and the three numbers that come with it in
 	 * the same Metal call; indexBuffer nil is -drawPrimitives:, and then vertexCount
@@ -2585,18 +2608,40 @@ enum {
 	return 16;   /* a placeholder: the real figure is per format and belongs to Mesa */
 }
 
-/* Heaps are suballocation of one big allocation, and nothing here suballocates yet. Metal's
- * contract allows nil and a zero size-and-align, so these decline rather than lie. */
-- (id)newHeapWithDescriptor:(id)descriptor { (void)descriptor; return nil; }
+/* Heaps are suballocation of one big allocation, and nothing here suballocates. (The K40, 2026-11-09:) a heap is
+ * served as separate allocations through this device (AliothMetalHeap), and the size-and-align questions are answered
+ * with what such an allocation takes, so an engine that sizes its heaps sizes them sensibly. */
+- (id)newHeapWithDescriptor:(MTLHeapDescriptor *)descriptor
+{
+	AliothMetalHeap *heap = [[AliothMetalHeap alloc] init];
+
+	heap->device = self;
+	heap->size = [descriptor size];
+	heap->storageMode = [descriptor storageMode];
+	heap->cpuCacheMode = [descriptor cpuCacheMode];
+	heap->hazardTrackingMode = [descriptor hazardTrackingMode];
+	heap->type = [descriptor type];
+	return heap;
+}
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(NSUInteger)options
 {
-	(void)length; (void)options;
-	return (MTLSizeAndAlign){ 0, 0 };
+	(void)options;
+	return (MTLSizeAndAlign){ (length + 255) & ~(NSUInteger)255, 256 };
 }
-- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(id)descriptor
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d
 {
-	(void)descriptor;
-	return (MTLSizeAndAlign){ 0, 0 };
+	NSUInteger texel = alioth_texel_bytes([d pixelFormat]);
+	NSUInteger faces = ([d textureType] == MTLTextureTypeCube || [d textureType] == MTLTextureTypeCubeArray) ? 6 : 1;
+	NSUInteger total = 0;
+
+	if (texel == 0) {
+		texel = 4;      /* (a compressed or unusual format: an estimate rather than nothing) */
+	}
+	for (NSUInteger level = 0; level < MAX([d mipmapLevelCount], 1); level++) {
+		total += MAX([d width] >> level, 1) * MAX([d height] >> level, 1) * MAX([d depth] >> level, 1) * texel;
+	}
+	total *= MAX([d arrayLength], 1) * faces * MAX([d sampleCount], 1);
+	return (MTLSizeAndAlign){ (total + 4095) & ~(NSUInteger)4095, 4096 };
 }
 
 /* (the K40's) fences and events: see AliothMetalFence */
@@ -4938,6 +4983,46 @@ done:
 		[self failWith:why];
 		return NO;
 	}
+	/* (the K40's) An indirect draw's arguments, read NOW: what came before it in this buffer finished on the GPU
+	 * first, so a count a kernel wrote is the count drawn (see -drawPrimitives:indirectBuffer:...). Then the same
+	 * road as any draw, with the numbers in the work. */
+	if (work->indirectBuffer != nil) {
+		BOOL indexed = work->indexBuffer != nil;
+		NSUInteger words = indexed ? 5 : 4;
+		struct rwa_device *device = [[_queue device] mesaDevice];
+		const char *base = [work->indirectBuffer respondsToSelector:@selector(contents)] ?
+		    (const char *)[work->indirectBuffer contents] : NULL;
+
+		if (base == NULL || work->indirectOffset % 4 != 0 ||
+		    work->indirectOffset + words * 4 > [work->indirectBuffer length]) {
+			snprintf(why, size, "an indirect draw whose arguments (%lu words at %lu) are not in its buffer",
+			         (unsigned long)words, (unsigned long)work->indirectOffset);
+			[self failWith:why];
+			return NO;
+		}
+		if (device != NULL && mesa.finish(device, why, size) != 0) {
+			[self failWith:why];
+			return NO;
+		}
+		const uint32_t *a = (const uint32_t *)(base + work->indirectOffset);
+
+		if (a[0] == 0 || a[1] == 0) {
+			return YES;     /* no vertices or no instances: Metal draws nothing, and so does this */
+		}
+		work->vertexCount = a[0];
+		work->instanceCount = a[1];
+		if (indexed) {
+			unsigned index_bytes = work->indexType == MTLIndexTypeUInt32 ? 4 : 2;
+
+			work->indexBufferOffset += (size_t)a[2] * index_bytes;
+			work->baseVertex = (int)a[3];
+			work->baseInstance = a[4];
+		} else {
+			work->vertexStart = a[2];
+			work->baseInstance = a[3];
+		}
+		work->indirectBuffer = nil;     /* (read once: a second -commit of this work is not Metal's) */
+	}
 	for (unsigned i = 0; i < work->colorCount; i++) {
 		color[i] = [work->color[i] mesaTexture];
 	}
@@ -5066,6 +5151,8 @@ done:
 		/* (the K40's) the draws of this buffer batched into one pass; -commit's flush and fence, or
 		 * -waitUntilCompleted's finish, say when they are done (each draw was waited for, 40 frames a second) */
 		.keep_bound = 1,
+		.blend_color = work->blendColor,
+		.depth_bias = work->depthBias,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
@@ -5317,6 +5404,10 @@ done:
 	unsigned _cullMode, _frontCCW, _fillLines;      /* (the K40's) -setCullMode: and its kin */
 	unsigned _scissor[4];
 	BOOL _hasScissor;
+	float _blendColor[4];                           /* (the K40's) blend colour, depth bias */
+	float _depthBias[3];
+	id _pendingIndirect;                            /* (the K40's) the indirect draw being recorded */
+	NSUInteger _pendingIndirectOffset;
 	id _vertexBuffers[RW_MAX_BUFFERS];
 	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
 	id _fragmentBuffers[RW_MAX_BUFFERS];
@@ -5588,9 +5679,13 @@ done:
 	}
 	_depthStencilState = state;
 }
+/* (the K40's) the blend colour, for the pipelines whose factors are BlendColor / BlendAlpha (rwa_draw.blend_color) */
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a
 {
-	(void)r; (void)g; (void)b; (void)a;
+	_blendColor[0] = r;
+	_blendColor[1] = g;
+	_blendColor[2] = b;
+	_blendColor[3] = a;
 }
 
 - (void)recordDraw:(NSUInteger)primitive
@@ -5666,6 +5761,12 @@ done:
 	work->cullMode = _cullMode;
 	work->frontCCW = _frontCCW;
 	work->fillLines = _fillLines;
+	memcpy(work->blendColor, _blendColor, sizeof(work->blendColor));
+	memcpy(work->depthBias, _depthBias, sizeof(work->depthBias));
+	/* (the K40's) an indirect draw's arguments: read at -commit, when what wrote them is done (-runDraw) */
+	work->indirectBuffer = _pendingIndirect;
+	work->indirectOffset = _pendingIndirectOffset;
+	_pendingIndirect = nil;
 	work->primitive = (unsigned)primitive;
 	work->vertexStart = (unsigned)start;
 	work->vertexCount = (unsigned)count;
@@ -5893,31 +5994,29 @@ done:
 }
 
 /*
- * The INDIRECT forms, which were absent from this class altogether until now -- and
- * absent is the one answer that aborts the application, with our class's name on the
- * selector (10.1). They are the fourth -drawIndexedPrimitives: overload and the second
- * -drawPrimitives:, and what they ask for is the draw's whole argument list out of a
- * buffer: MTLDrawPrimitivesIndirectArguments and MTLDrawIndexedPrimitivesIndirect-
- * Arguments, five 32-bit words at an offset.
+ * The INDIRECT forms: the draw's whole argument list out of a buffer, MTLDrawPrimitives-
+ * IndirectArguments (vertexCount, instanceCount, vertexStart, baseInstance) or MTLDraw-
+ * IndexedPrimitivesIndirectArguments (indexCount, instanceCount, indexStart, baseVertex,
+ * baseInstance), 32-bit words at an offset.
  *
- * They decline, and the reason is not that the words are hard to read -- the processor
- * can read them, this buffer is mapped. It is that the point of an indirect draw is a
- * count the GPU writes, and this library validates an indexed draw ON THE PROCESSOR
- * before it makes it: the index count against the buffer's length, the indices against
- * the quad. A count read here would be the count at encode time and not the one the GPU
- * will have written, so what came out would be a picture of the wrong number of
- * primitives -- and it would read as a result.
- *
- * Nothing in Metal makes this unreachable for an application, so this says so out loud
- * rather than drawing nothing silently.
+ * They declined, because the point of an indirect draw is a count the GPU writes and a count
+ * read at ENCODE time would be the wrong one. (The K40, 2026-11-09:) they are recorded with
+ * the buffer and read at -commit instead, when the work before them in the command buffer
+ * has been finished on the GPU (-runDraw), so a count a kernel wrote earlier is the count
+ * drawn; the draw then takes the same validated road as any other.
  */
 - (void)drawPrimitives:(NSUInteger)primitive
 	indirectBuffer:(id)indirectBuffer
   indirectBufferOffset:(NSUInteger)offset
 {
-	rw_print("an indirect draw is not implemented (the argument list would "
-	         "be read on the processor at encode time, and the GPU may not have written it "
-	         "yet), so this draw is refused rather than drawn from the wrong count\n");
+	if (indirectBuffer == nil) {
+		return;
+	}
+	_pendingIndirect = indirectBuffer;
+	_pendingIndirectOffset = offset;
+	[self recordDraw:primitive vertexStart:0 count:1 indexBuffer:nil indexType:0
+	     indexOffset:0 baseVertex:0 instanceCount:1 baseInstance:0];
+	_pendingIndirect = nil;
 }
 - (void)drawIndexedPrimitives:(NSUInteger)primitive
 		    indexType:(NSUInteger)type
@@ -5926,8 +6025,14 @@ done:
 	       indirectBuffer:(id)indirectBuffer
 	 indirectBufferOffset:(NSUInteger)indirectOffset
 {
-	[self drawPrimitives:primitive indirectBuffer:indirectBuffer
-	       indirectBufferOffset:indirectOffset];
+	if (indirectBuffer == nil || buffer == nil) {
+		return;
+	}
+	_pendingIndirect = indirectBuffer;
+	_pendingIndirectOffset = indirectOffset;
+	[self recordDraw:primitive vertexStart:0 count:1 indexBuffer:buffer indexType:type
+	     indexOffset:offset baseVertex:0 instanceCount:1 baseInstance:0];
+	_pendingIndirect = nil;
 }
 
 /* Raster state the contract does not carry yet. Collected here with one line each so that
@@ -5962,9 +6067,12 @@ done:
 		_complained = YES;
 	}
 }
+/* (the K40's) Gallium's polygon offset, number for number (rwa_draw.depth_bias): a shadow map's bias */
 - (void)setDepthBias:(float)bias slopeScale:(float)scale clamp:(float)clamp
 {
-	(void)bias; (void)scale; (void)clamp;
+	_depthBias[0] = bias;
+	_depthBias[1] = scale;
+	_depthBias[2] = clamp;
 }
 /* The stencil reference, which Metal keeps on the encoder and not in the state object, so
  * it is recorded with the draw like the clear colour. */
@@ -6820,6 +6928,79 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 - (void)dealloc
 {
 	[event release];
+	[super dealloc];
+}
+
+@end
+
+@implementation AliothMetalHeap
+
+- (id)device                       { return device; }
+- (NSString *)label                { return label; }
+- (void)setLabel:(NSString *)text  { [label release]; label = [text copy]; }
+- (NSUInteger)storageMode          { return storageMode; }
+- (NSUInteger)cpuCacheMode         { return cpuCacheMode; }
+- (NSUInteger)hazardTrackingMode   { return hazardTrackingMode; }
+- (NSUInteger)resourceOptions
+{
+	return (storageMode << MTLResourceStorageModeShift) | (cpuCacheMode << MTLResourceCPUCacheModeShift) |
+	    (hazardTrackingMode << MTLResourceHazardTrackingModeShift);
+}
+- (NSUInteger)size                 { return size; }
+- (NSUInteger)type                 { return type; }
+- (NSUInteger)usedSize             { return MIN(used, size); }
+- (NSUInteger)currentAllocatedSize { return size; }
+
+- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment
+{
+	(void)alignment;
+	return size > used ? size - used : 0;
+}
+
+- (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options
+{
+	id buffer = [device newBufferWithLength:length options:options];
+
+	if (buffer != nil) {
+		used += length;
+	}
+	return buffer;
+}
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+{
+	id texture = [device newTextureWithDescriptor:descriptor];
+
+	if (texture != nil) {
+		used += [device heapTextureSizeAndAlignWithDescriptor:descriptor].size;
+	}
+	return texture;
+}
+
+/* placement at an offset is the one thing a heap of separate allocations cannot do: nil, Metal's own failure */
+- (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options offset:(NSUInteger)offset
+{
+	(void)length; (void)options; (void)offset;
+	RW_ONCE("a resource placed at an offset of a heap; this driver's heaps are separate allocations: nil\n");
+	return nil;
+}
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
+{
+	(void)descriptor; (void)offset;
+	RW_ONCE("a resource placed at an offset of a heap; this driver's heaps are separate allocations: nil\n");
+	return nil;
+}
+
+- (NSUInteger)setPurgeableState:(NSUInteger)state
+{
+	(void)state;
+	return MTLPurgeableStateNonVolatile;    /* nothing here is volatile (-aliothPurgedNote) */
+}
+
+- (void)dealloc
+{
+	[label release];
 	[super dealloc];
 }
 

@@ -1319,6 +1319,11 @@ struct rwa_draw {
 	 * when they are done (rwa_flush and rwa_fence_wait, or rwa_finish). 0, the default, is the old way:
 	 * waited for, the framebuffer let go. */
 	unsigned keep_bound;
+	/* (the K40's) the encoder's blend colour (-setBlendColorRed:green:blue:alpha:), RGBA, for Metal's
+	 * BlendColor / BlendAlpha factors; NULL is Metal's default of zero. And -setDepthBias:slopeScale:clamp:,
+	 * { bias, slope scale, clamp }; NULL or zeros is none. Appended, as above. */
+	const float *blend_color;
+	const float *depth_bias;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
