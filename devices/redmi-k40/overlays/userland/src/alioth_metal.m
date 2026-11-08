@@ -625,6 +625,7 @@ enum { ST_ENCODE, ST_RUN, ST_DRAW, ST_FLUSH, ST_GPU, ST_FINISH, ST_WAIT, ST_LOCK
 	ST_BLIT_GPU, ST_N };
 static bool alioth_stats_on;
 static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_buffers, alioth_stats_since;
+static uint64_t alioth_blit_kinds[8];   /* the processor's blits by AliothMetalBlit kind (fill, b2b, b2t, t2b, t2t, mips) */
 static mach_timebase_info_data_t alioth_timebase;
 static id (*alioth_next_drawable_imp)(id, SEL);
 
@@ -673,6 +674,17 @@ alioth_stats_commit(void)
 	for (unsigned i = 0; i < ST_N; i++) {
 		t[i] = __atomic_exchange_n(&alioth_stats_t[i], 0, __ATOMIC_RELAXED);
 		n[i] = __atomic_exchange_n(&alioth_stats_n[i], 0, __ATOMIC_RELAXED);
+	}
+	uint64_t kinds[8];
+
+	for (unsigned i = 0; i < 8; i++) {
+		kinds[i] = __atomic_exchange_n(&alioth_blit_kinds[i], 0, __ATOMIC_RELAXED);
+	}
+	if (n[ST_BLIT] != 0) {
+		rw_print("stats: the processor's blits: %llu fill, %llu buffer to buffer, %llu buffer to texture, %llu texture "
+		         "to buffer, %llu texture to texture, %llu mipmaps\n", (unsigned long long)kinds[0],
+		         (unsigned long long)kinds[1], (unsigned long long)kinds[2], (unsigned long long)kinds[3],
+		         (unsigned long long)kinds[4], (unsigned long long)kinds[5]);
 	}
 	rw_print("stats: %.1f s, %llu buffers (%.0f/s); a buffer: encode %.2f ms, run %.2f ms (%.1f draws, %.2f ms of "
 	         "them in the library), flush %.2f ms, GPU %.2f ms after it (%llu fenced); finish %llu x %.2f ms (%llu "
@@ -5007,24 +5019,35 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 			return YES;
 		}
 	}
+	/*
+	 * (the K40's) A multisample resolve is the GPU's too (rwa_texture_resolve: pipe->blit, which freedreno orders after
+	 * the pass's draws by its resource tracking, and a flush without a wait), so nothing waits for it either: it waited
+	 * here with everything else, once a frame for a renderer that resolves (VectorKit: 312 blits by the processor in
+	 * 2 s with buffer copies and fills already off this road, logs/103919).
+	 */
+	if (b->kind == ALIOTH_BLIT_RESOLVE) {
+		if (mesa.texture_resolve == NULL) {
+			snprintf(why, size, "a multisample resolve, and this compiler library has no rwa_texture_resolve");
+			[self failWith:why];
+			return NO;
+		}
+		alioth_stat(ST_BLIT_GPU, mach_absolute_time());
+		if (mesa.texture_resolve(device, [b->source mesaTexture], [b->destination mesaTexture], why, size) != 0) {
+			[self failWith:why];
+			return NO;
+		}
+		return YES;
+	}
 	alioth_stat(ST_BLIT, mach_absolute_time());
+	if (alioth_stats_on && b->kind < 8) {
+		__atomic_fetch_add(&alioth_blit_kinds[b->kind], 1, __ATOMIC_RELAXED);
+	}
 	/* what came before it in this buffer, finished: the processor reads and writes here */
 	if (device != NULL && alioth_finish(device, why, size) != 0) {
 		[self failWith:why];
 		return NO;
 	}
 	switch (b->kind) {
-	case ALIOTH_BLIT_RESOLVE:
-		if (mesa.texture_resolve == NULL) {
-			snprintf(why, size, "a multisample resolve, and this compiler library has no rwa_texture_resolve");
-			[self failWith:why];
-			return NO;
-		}
-		if (mesa.texture_resolve(device, [b->source mesaTexture], [b->destination mesaTexture], why, size) != 0) {
-			[self failWith:why];
-			return NO;
-		}
-		return YES;
 	case ALIOTH_BLIT_FILL:
 		memset((char *)[(id<MTLBuffer>)b->destination contents] + b->destinationOffset, b->value, b->length);
 		return YES;
