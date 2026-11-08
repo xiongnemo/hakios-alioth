@@ -1034,6 +1034,40 @@ enum {
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer;
 @end
 
+/*
+ * (the K40's) Fences and events. The GPU has one ring and a command buffer's work runs in order at -commit, so a fence
+ * orders nothing that is not in order already -- but the OBJECT has to exist: -newFence answered nil, and an engine
+ * that makes its fences up front asserts on that. An event (MTLEvent, and MTLSharedEvent: the same object here) has a
+ * value: -encodeSignalEvent:value: is recorded in the command buffer's order, and at -commit, once the GPU has finished
+ * what came before it, the value is set and the listeners waiting for it are told. A wait is recorded too and checked
+ * there; it cannot hold the work back for a value the processor sets later (the work runs on the committing thread),
+ * and says so once.
+ */
+@interface AliothMetalFence : NSObject {
+@public
+	id device;                      /* not retained: the device outlives what it makes */
+	NSString *label;
+}
+@end
+
+@interface AliothMetalEvent : NSObject {
+@public
+	id device;
+	NSString *label;
+	uint64_t value;                 /* under @synchronized (self) */
+	NSMutableArray *waiting;        /* @[ listener, value, block ] each */
+}
+- (void)aliothSignal:(uint64_t)value;
+@end
+
+@interface AliothMetalSignal : NSObject {
+@public
+	AliothMetalEvent *event;        /* retained */
+	uint64_t value;
+	BOOL wait;                      /* -encodeWaitForEvent:value:, not a signal */
+}
+@end
+
 @interface AliothMetalRenderEncoder : _MTLCommandEncoder
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
 				  descriptor:(id)descriptor;
@@ -2353,10 +2387,33 @@ enum {
 	return (MTLSizeAndAlign){ 0, 0 };
 }
 
-/* Everything else the two protocols require and this driver has not built. Each returns the
- * API's own failure value, so a caller finds out by the rule Metal already has, rather than
- * by a selector that does not exist. */
-- (id)newFence                                      { return nil; }
+/* (the K40's) fences and events: see AliothMetalFence */
+- (id)newFence
+{
+	AliothMetalFence *fence = [[AliothMetalFence alloc] init];
+
+	fence->device = self;
+	return fence;
+}
+
+- (id)newEvent
+{
+	AliothMetalEvent *event = [[AliothMetalEvent alloc] init];
+
+	event->device = self;
+	event->waiting = [[NSMutableArray alloc] init];
+	return event;
+}
+
+- (id)newSharedEvent { return [self newEvent]; }
+
+- (id)newSharedEventWithHandle:(id)handle
+{
+	(void)handle;
+	RW_ONCE("a shared event from another process's handle; this driver's events live in one process, so there is none\n");
+	return nil;
+}
+
 /*
  * The one method -[CAMetalLayer nextDrawable] asks of a device (docs/metal.md 10.46):
  * allocate_drawable_texture builds an ordinary MTLTextureDescriptor, sets its private
@@ -3852,8 +3909,24 @@ enum {
 
 - (id)resourceStateCommandEncoder { return nil; }
 - (id)accelerationStructureCommandEncoder { return nil; }
-- (void)encodeSignalEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
-- (void)encodeWaitForEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
+/* (the K40's) an event's signal or wait, in the command buffer's order (see AliothMetalFence) */
+- (void)recordEvent:(id)event value:(uint64_t)value wait:(BOOL)wait
+{
+	if (![event isKindOfClass:[AliothMetalEvent class]]) {
+		RW_ONCE("a command buffer was given an event this driver did not make; it is not signalled or waited for\n");
+		return;
+	}
+	AliothMetalSignal *s = [[AliothMetalSignal alloc] init];
+
+	s->event = [event retain];
+	s->value = value;
+	s->wait = wait;
+	[_work addObject:s];
+	[s release];
+}
+
+- (void)encodeSignalEvent:(id)event value:(uint64_t)value  { [self recordEvent:event value:value wait:NO]; }
+- (void)encodeWaitForEvent:(id)event value:(uint64_t)value { [self recordEvent:event value:value wait:YES]; }
 
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)type
 {
@@ -4066,6 +4139,30 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 				rw_print("the blit failed: %s\n", why);
 				goto done;
 			}
+			continue;
+		}
+		if ([item isKindOfClass:[AliothMetalSignal class]]) {
+			AliothMetalSignal *s = item;
+			struct rwa_device *device = [[_queue device] mesaDevice];
+
+			if (s->wait) {
+				uint64_t now;
+
+				@synchronized (s->event) {
+					now = s->event->value;
+				}
+				if (now < s->value) {
+					RW_ONCE("a command buffer waits for an event value that is not signalled yet; this "
+						"driver runs a buffer's work at -commit and goes on without it\n");
+				}
+				continue;
+			}
+			/* what came before the signal, finished on the GPU: that is what the value says */
+			if (device != NULL && mesa.finish(device, why, sizeof(why)) != 0) {
+				[self failWith:why];
+				goto done;
+			}
+			[s->event aliothSignal:s->value];
 			continue;
 		}
 		if (work->render != nil) {
@@ -5889,6 +5986,93 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 {
 	[source release];
 	[destination release];
+	[super dealloc];
+}
+
+@end
+
+@implementation AliothMetalFence
+
+- (id)device                       { return device; }
+- (NSString *)label                { return label; }
+- (void)setLabel:(NSString *)text  { [label release]; label = [text copy]; }
+
+- (void)dealloc
+{
+	[label release];
+	[super dealloc];
+}
+
+@end
+
+@implementation AliothMetalEvent
+
+- (id)device                       { return device; }
+- (NSString *)label                { return label; }
+- (void)setLabel:(NSString *)text  { [label release]; label = [text copy]; }
+- (id)newSharedEventHandle         { return nil; }     /* one process: see -newSharedEventWithHandle: */
+
+- (uint64_t)signaledValue
+{
+	@synchronized (self) {
+		return value;
+	}
+}
+
+- (void)setSignaledValue:(uint64_t)v { [self aliothSignal:v]; }
+
+/* the value set, and every listener whose value it reached told on its own queue */
+- (void)aliothSignal:(uint64_t)v
+{
+	NSMutableArray *due = [NSMutableArray array];
+
+	@synchronized (self) {
+		value = v;
+		for (NSArray *w in waiting) {
+			if ([w[1] unsignedLongLongValue] <= v) {
+				[due addObject:w];
+			}
+		}
+		[waiting removeObjectsInArray:due];
+	}
+	for (NSArray *w in due) {
+		void (^block)(id, uint64_t) = w[2];
+
+		dispatch_async([w[0] dispatchQueue], ^{ block(self, v); });
+	}
+}
+
+- (void)notifyListener:(id)listener atValue:(uint64_t)v block:(void (^)(id, uint64_t))block
+{
+	uint64_t now;
+
+	@synchronized (self) {
+		now = value;
+		if (now < v) {
+			id copied = [block copy];
+
+			[waiting addObject:@[ listener, @(v), copied ]];
+			[copied release];
+			return;
+		}
+	}
+	dispatch_async([listener dispatchQueue], ^{ block(self, now); });
+}
+
+- (void)dealloc
+{
+	[label release];
+	[waiting release];
+	[super dealloc];
+}
+
+@end
+
+@implementation AliothMetalSignal
+
+- (void)dealloc
+{
+	[event release];
 	[super dealloc];
 }
 
