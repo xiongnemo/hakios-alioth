@@ -93,6 +93,12 @@ struct rwa_device {
     */
    bool deferred;
 
+   /* (the K40's) the blend colour last given to the context: set again only when a draw's
+    * differs, since freedreno builds a state object for every change (fd6 build_blend_color)
+    */
+   float blend_color[4];
+   bool blend_color_set;
+
    /* One sampler for the slots nothing was bound to, made when a dispatch first needs
     * it. See rwa_dispatch: a kernel's read() is a texture fetch and ignores the
     * sampler, but softpipe dereferences the state of every unit a shader touches.
@@ -7037,7 +7043,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       struct pipe_blend_color bc = { { 0 } };
       if (draw->blend_color)
          memcpy(bc.color, draw->blend_color, sizeof(bc.color));
-      pipe->set_blend_color(pipe, &bc);
+      if (!device->blend_color_set || memcmp(device->blend_color, bc.color, sizeof(bc.color))) {
+         pipe->set_blend_color(pipe, &bc);
+         memcpy(device->blend_color, bc.color, sizeof(bc.color));
+         device->blend_color_set = true;
+      }
    }
    if (draw->scissor) {
       unsigned x0 = MIN2(draw->scissor[0], fb.width), y0 = MIN2(draw->scissor[1], fb.height);
