@@ -23,6 +23,7 @@ taken from linux-apfs/apfsprogs' mkapfs (and checked with its apfsck, which has 
 image clean: tools/apfs/check-image.sh).  Hard links are not made: a name is a file.
 """
 import argparse
+import collections
 import concurrent.futures
 import hashlib
 import os
@@ -331,10 +332,10 @@ class Volume:
             node.size = os.path.getsize(node.source)
         forks = iter(())
         if self.compress:
-            # compressed by as many processes as there are processors, taken in the files' order
-            pool = concurrent.futures.ProcessPoolExecutor()
-            forks = pool.map(compressed_fork, [n.source for n in files if n.size > 0 and not self.is_plain(n)],
-                             chunksize=16)
+            # compressed by JOBS processes (default: as many as there are processors), taken in the files' order
+            pool = concurrent.futures.ProcessPoolExecutor(max_workers=JOBS)
+            forks = bounded_map(pool, compressed_fork,
+                                [n.source for n in files if n.size > 0 and not self.is_plain(n)], JOBS * 4)
         for node in files:
             if node.size == 0:
                 continue
@@ -480,6 +481,28 @@ class Volume:
             start, n = self.extents[sid]
             recs.append((jkey(start, J_EXTENT), struct.pack('<QQI', n | (KIND_NEW << 60), sid, 1)))
         return recs
+
+
+# how many processes compress (-j; MKAPFS_JOBS; else one per processor)
+JOBS = int(os.environ.get('MKAPFS_JOBS') or 0) or os.cpu_count() or 1
+
+
+def bounded_map(pool, fn, items, ahead):
+    """pool.map, in order, with at most `ahead` results waiting to be taken. (Executor.map hands out every file at
+    once, and the compressed forks piled up in memory faster than one process wrote them out: a 5 GB system image
+    took WSL to 40-odd GB until a worker was killed, 2026-11-09.)"""
+    pending = collections.deque()
+    items = iter(items)
+    for item in items:
+        pending.append(pool.submit(fn, item))
+        if len(pending) >= ahead:
+            break
+    while pending:
+        result = pending.popleft().result()
+        for item in items:
+            pending.append(pool.submit(fn, item))
+            break
+        yield result
 
 
 def compressed_fork(path):
@@ -907,8 +930,13 @@ def main():
     ap.add_argument('--plain', action='append', default=[], help='with -z: never compress what is under this directory')
     ap.add_argument('--time', type=int, default=1683900000, help='every timestamp, in seconds')
     ap.add_argument('--slack', type=int, default=256, help='free blocks to leave (at least)')
+    ap.add_argument('-j', '--jobs', type=int, default=0, help='with -z: processes that compress (default: '
+                    'MKAPFS_JOBS, else one per processor)')
     ap.add_argument('volumes', nargs='+', help='NAME=DIR[,manifest=FILE]')
     args = ap.parse_args()
+    global JOBS
+    if args.jobs > 0:
+        JOBS = args.jobs
     vols = []
     spool = open(args.output + '.spool', 'w+b') if args.compress else None
     for i, spec in enumerate(args.volumes):

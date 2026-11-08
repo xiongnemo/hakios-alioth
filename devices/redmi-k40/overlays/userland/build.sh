@@ -899,7 +899,14 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
 	# (fw/sdx55m, MODEM=1's, as it is: the kernel uses the modem's 84 MB image where it lies, hakios.image.c)
-	python3 ../tools/apfs/mkapfs.py -z --plain fw/sdx55m -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	# (MKAPFS_JOBS=N: that many compressing processes, at a low priority, for a computer that is in use; and a failure
+	# is one -- through "| tail -1" it went unnoticed, and the old image stayed, 2026-11-09)
+	nice -n 10 python3 ../tools/apfs/mkapfs.py -z --plain fw/sdx55m -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+		echo "build.sh: mkapfs.py failed: no system.apfs made" >&2
+		rm -f system.apfs system.apfs.spool
+		exit 1
+	fi
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$IOS/system.manifest
 	rm -rf sysroot
 fi

@@ -1,0 +1,75 @@
+# Every push to alioth: what the kit is (devices/redmi-k40/kit/build-kit.sh: the kernel with this phone's drivers,
+# without firmware, and our programs and libraries with Mesa's OpenGL ES), built here from public sources alone -- and
+# with the Metal driver too (METAL=1: libhakios.metal.dylib, libhakios.air.dylib, the AIR front end's Mesa tree). Kept
+# as the run's artifact for the computer that tests on the phone, so that it fetches rather than compiles
+# (work/tools/ci-fetch.ps1 there: the kernel as it is, the programs for build-userland.sh PREBUILT=1). Started by hand
+# too (Actions > dev > Run workflow). Nothing of iOS and no firmware is kept, as for the kit.
+name: dev
+on:
+  workflow_dispatch:
+  push:
+    branches: [alioth]
+    paths-ignore: ['**.md', 'docs/**']
+concurrency:
+  group: dev-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dev:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Room on the disk (the IPSW's files, the kernel's tree)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force > /dev/null || true
+          df -h /
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential clang lld llvm flex bison m4 perl python3 python3-venv autoconf \
+            automake libtool gawk git curl xz-utils lz4 meson ninja-build zip unzip cpio bc pkg-config python3-dev \
+            uuid-dev libbsd-dev libbz2-dev libcrypt-dev libexpat1-dev libffi-dev libfl-dev liblz4-dev libmd-dev \
+            libncurses-dev libplist-dev libssl-dev libxml2-dev libxxhash-dev zlib1g-dev > /dev/null
+          # (XNU's build wants GNU awk: mawk breaks its system call table)
+          sudo update-alternatives --set awk /usr/bin/gawk
+          # 7-Zip 23 or newer reads APFS
+          curl -fsSL https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz | sudo tar -xJ -C /usr/local/bin 7zz
+          sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
+      - name: theos (its Linux toolchain and the iOS 16.5 SDK)
+        run: |
+          T=$HOME/theos
+          mkdir -p $T/toolchain/linux/iphone $T/sdks /tmp/tc
+          curl -fsSL https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz | tar -xJ -C /tmp/tc
+          c=$(find /tmp/tc -path '*/bin/clang' \( -type f -o -type l \) | head -1)
+          [ -n "$c" ] || { echo "no bin/clang in the toolchain archive"; find /tmp/tc -maxdepth 3; exit 1; }
+          cp -a "$(dirname "$(dirname "$c")")"/. $T/toolchain/linux/iphone/
+          git clone -q --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks $T/sdks-git
+          git -C $T/sdks-git sparse-checkout set iPhoneOS16.5.sdk
+          ln -s ../sdks-git/iPhoneOS16.5.sdk $T/sdks/iPhoneOS16.5.sdk
+          echo "THEOS=$T" >> "$GITHUB_ENV"
+      - name: The kernel and the programs (METAL=1)
+        env:
+          METAL: '1'
+        run: |
+          bash devices/redmi-k40/kit/build-kit.sh "$RUNNER_TEMP/dev" "dev-${GITHUB_SHA::7}"
+          z=$(ls $RUNNER_TEMP/dev/alioth-kit-*.zip)
+          ls -l "$z"
+          unzip -l "$z" | grep -E 'kernel-k40.bin|libhakios.metal.dylib|libhakios.air.dylib' || { echo "no Metal driver in it"; exit 1; }
+          echo "DEV_ZIP=$z" >> "$GITHUB_ENV"
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-logs
+          path: |
+            ${{ runner.temp }}/dev*.log
+            xnu-deps/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alioth-dev
+          path: ${{ env.DEV_ZIP }}
+          retention-days: 14
