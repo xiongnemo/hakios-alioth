@@ -1307,6 +1307,13 @@ struct rwa_draw {
 	 * what every draw made before this field existed used. Appended, for the reason the tables above are. Clip
 	 * space is still clipped to [-1, 1], so nothing lands outside the rectangle. */
 	const float *viewport;
+	/* (the K40's) the encoder's rasterizer state, appended as above: MTLCullMode (0 none, 1 front, 2 back),
+	 * MTLWinding's CounterClockwise as 1, MTLScissorRect { x, y, width, height } or NULL for the whole
+	 * attachment, and MTLTriangleFillModeLines as 1. Zeros are Metal's defaults. */
+	unsigned cull_mode;
+	unsigned front_ccw;
+	const unsigned *scissor;
+	unsigned fill_lines;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,

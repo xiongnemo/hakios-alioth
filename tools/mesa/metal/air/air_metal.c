@@ -5177,6 +5177,13 @@ struct rwa_render {
     */
    void *vs_cso, *fs_cso;
    void *blend, *dsa, *rast, *velem;
+
+   /* (the K40's) the encoder's rasterizer state -- -setCullMode:, -setFrontFacingWinding:,
+    * -setScissorRect:, -setTriangleFillMode: -- as variants of `rast`, made on first use and
+    * kept: index = cull (2 bits) | ccw << 2 | scissor << 3 | lines << 4
+    */
+   struct pipe_rasterizer_state rast_templ;
+   void *rast_variant[32];
    struct pipe_resource *vbuf;        /* the full-screen quad, for the generated stage */
 
    /* What the vertex descriptor was turned into, empty for a stage that fetches no
@@ -6299,11 +6306,11 @@ rwa_render_create(struct rwa_device *device,
     * util_framebuffer_get_num_samples) and emits with emit_msaa. So this bit is the
     * honest state for a multisample pass and not the thing that turns multisampling on.
     */
-   render->rast = device->pipe->create_rasterizer_state(device->pipe,
-      &(struct pipe_rasterizer_state){
+   render->rast_templ = (struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .multisample = samples > 1 });
+         .multisample = samples > 1 };
+   render->rast = device->pipe->create_rasterizer_state(device->pipe, &render->rast_templ);
    if (!render->blend || !render->dsa || !render->rast) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
       goto fail;
@@ -6433,6 +6440,10 @@ rwa_render_destroy(struct rwa_render *render)
    if (render->rast) {
       pipe->bind_rasterizer_state(pipe, NULL);
       pipe->delete_rasterizer_state(pipe, render->rast);
+   }
+   for (unsigned i = 0; i < ARRAY_SIZE(render->rast_variant); i++) {
+      if (render->rast_variant[i])
+         pipe->delete_rasterizer_state(pipe, render->rast_variant[i]);
    }
    if (render->velem) {
       /* Unbound before deleted, and the vertex buffer unbound with it: the context holds
@@ -6878,7 +6889,37 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
                      (uint8_t)(draw->stencil_reference[1] & 0xff) } });
-   pipe->bind_rasterizer_state(pipe, render->rast);
+   /* (the K40's) The encoder's rasterizer state, as a variant of the pipeline's: Metal's cull
+    * mode is Gallium's cull_face number for number (none, front, back); its winding is the
+    * front face in Metal's own y-up sense, which is GL's, and this viewport is inverted the
+    * way st/mesa inverts it for a window -- so CounterClockwise is front_ccw unchanged, as st
+    * hands GL's through there. The scissor is the framebuffer's rows from the top, Metal's
+    * origin and Gallium's alike.
+    */
+   unsigned cull = draw->cull_mode <= 2 ? draw->cull_mode : 0;
+   bool lines = draw->fill_lines != 0;
+   unsigned variant = cull | (draw->front_ccw ? 4 : 0) | (draw->scissor ? 8 : 0) | (lines ? 16 : 0);
+   void *rast = render->rast;
+   if (variant) {
+      if (!render->rast_variant[variant]) {
+         struct pipe_rasterizer_state rs = render->rast_templ;
+         rs.cull_face = cull == 1 ? PIPE_FACE_FRONT : cull == 2 ? PIPE_FACE_BACK : PIPE_FACE_NONE;
+         rs.front_ccw = draw->front_ccw != 0;
+         rs.scissor = draw->scissor != NULL;
+         rs.fill_front = rs.fill_back = lines ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
+         render->rast_variant[variant] = pipe->create_rasterizer_state(pipe, &rs);
+      }
+      if (render->rast_variant[variant])
+         rast = render->rast_variant[variant];
+   }
+   if (draw->scissor) {
+      unsigned x0 = MIN2(draw->scissor[0], fb.width), y0 = MIN2(draw->scissor[1], fb.height);
+      pipe->set_scissor_states(pipe, 0, 1, &(struct pipe_scissor_state){
+         .minx = x0, .miny = y0,
+         .maxx = MIN2(x0 + draw->scissor[2], fb.width),
+         .maxy = MIN2(y0 + draw->scissor[3], fb.height) });
+   }
+   pipe->bind_rasterizer_state(pipe, rast);
    pipe->bind_vs_state(pipe, render->vs_cso);
    pipe->bind_fs_state(pipe, render->fs_cso);
 

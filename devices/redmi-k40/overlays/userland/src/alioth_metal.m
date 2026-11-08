@@ -317,6 +317,11 @@ struct rwa_draw {
 	/* (the K40's) MTLViewport's rectangle, { originX, originY, width, height }; NULL is the whole attachment.
 	 * Appended, as the tables were. */
 	const float *viewport;
+	/* (the K40's) the rasterizer state: MTLCullMode, CounterClockwise as 1, MTLScissorRect or NULL, Lines as 1 */
+	unsigned cull_mode;
+	unsigned front_ccw;
+	const unsigned *scissor;
+	unsigned fill_lines;
 };
 /* (the K40's) Metal's pipeline reflection, air_metal.h's rwa_argument (rwa_render_arguments) */
 struct rwa_struct_member {
@@ -1175,6 +1180,9 @@ enum {
 	float viewport[4];                      /* (the K40's) MTLViewport's rectangle, when hasViewport */
 	BOOL hasViewport;
 	unsigned threadgroupBytes;              /* (the K40's) a dispatch's -setThreadgroupMemoryLength: for index 0 */
+	unsigned cullMode, frontCCW, fillLines; /* (the K40's) the encoder's rasterizer state (rwa_draw says how) */
+	unsigned scissor[4];                    /* ... and its MTLScissorRect, when hasScissor */
+	BOOL hasScissor;
 	unsigned primitive, vertexStart, vertexCount;
 	/* the index buffer of an indexed draw and the three numbers that come with it in
 	 * the same Metal call; indexBuffer nil is -drawPrimitives:, and then vertexCount
@@ -4881,6 +4889,10 @@ done:
 		.fragment_buffer_table = fragment_table,
 		.fragment_buffer_table_count = work->count,
 		.viewport = work->hasViewport ? work->viewport : NULL,
+		.cull_mode = work->cullMode,
+		.front_ccw = work->frontCCW,
+		.scissor = work->hasScissor ? work->scissor : NULL,
+		.fill_lines = work->fillLines,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
@@ -5069,6 +5081,9 @@ done:
 	BOOL _hasDepthRange;
 	float _viewport[4];
 	BOOL _hasViewport;
+	unsigned _cullMode, _frontCCW, _fillLines;      /* (the K40's) -setCullMode: and its kin */
+	unsigned _scissor[4];
+	BOOL _hasScissor;
 	id _vertexBuffers[RW_MAX_BUFFERS];
 	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
 	id _fragmentBuffers[RW_MAX_BUFFERS];
@@ -5307,10 +5322,24 @@ done:
 	_depthRange[1] = (float)viewport.zfar;
 	_hasDepthRange = YES;
 }
-- (void)setScissorRect:(MTLScissorRect)rect           { (void)rect; }
-- (void)setCullMode:(NSUInteger)mode                  { (void)mode; }
-- (void)setFrontFacingWinding:(NSUInteger)winding     { (void)winding; }
-- (void)setTriangleFillMode:(NSUInteger)mode          { (void)mode; }
+/* (the K40's) The rasterizer state, recorded like everything else and drawn with (rwa_draw's cull_mode, front_ccw,
+ * scissor, fill_lines); they were ignored, and SceneKit and SpriteKit set all four. A scissor of the whole
+ * attachment is no scissor. */
+- (void)setScissorRect:(MTLScissorRect)rect
+{
+	id first = _colorCount != 0 ? _color[0] : _depth;
+	BOOL whole = first != nil && rect.x == 0 && rect.y == 0 && rect.width >= [first width] &&
+	    rect.height >= [first height];
+
+	_scissor[0] = (unsigned)rect.x;
+	_scissor[1] = (unsigned)rect.y;
+	_scissor[2] = (unsigned)MIN(rect.width, UINT32_MAX);
+	_scissor[3] = (unsigned)MIN(rect.height, UINT32_MAX);
+	_hasScissor = !whole;
+}
+- (void)setCullMode:(NSUInteger)mode                  { _cullMode = mode <= MTLCullModeBack ? (unsigned)mode : 0; }
+- (void)setFrontFacingWinding:(NSUInteger)winding     { _frontCCW = winding == MTLWindingCounterClockwise; }
+- (void)setTriangleFillMode:(NSUInteger)mode          { _fillLines = mode == MTLTriangleFillModeLines; }
 
 /* The depth/stencil state, recorded like the pipeline state: nothing runs at encode time,
  * so what a draw tests against is whatever was bound when that draw was encoded. A state
@@ -5398,7 +5427,12 @@ done:
 	work->hasViewport = _hasViewport;
 	for (unsigned i = 0; i < 4; i++) {
 		work->viewport[i] = _viewport[i];
+		work->scissor[i] = _scissor[i];
 	}
+	work->hasScissor = _hasScissor;
+	work->cullMode = _cullMode;
+	work->frontCCW = _frontCCW;
+	work->fillLines = _fillLines;
 	work->primitive = (unsigned)primitive;
 	work->vertexStart = (unsigned)start;
 	work->vertexCount = (unsigned)count;
@@ -5678,7 +5712,10 @@ done:
 }
 - (void)setScissorRects:(const MTLScissorRect *)rects count:(NSUInteger)count
 {
-	(void)rects; (void)count;
+	/* one viewport here, so the first rectangle (as -setViewports:count: takes the first viewport) */
+	if (rects != NULL && count != 0) {
+		[self setScissorRect:rects[0]];
+	}
 }
 /* MTLDepthClipModeClip is what the library's rasterizer state does (depth_clip_near and
  * _far are both on); MTLDepthClipModeClamp, which keeps a primitive outside the depth range
