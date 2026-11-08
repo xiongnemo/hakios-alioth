@@ -196,6 +196,30 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       return true;
    }
 
+   /* (the K40's) sincos: the sine returned, the cosine stored through the pointer that is the
+    * second argument -- `float @air.fast_sincos.f32(float, ptr writeonly)`, an alloca of the
+    * caller's. SceneKit has it in 15 modules, Core Image's stdlib in one. Before the operands
+    * below, which are all numbers and would refuse the pointer.
+    */
+   if ((!strcmp(op, "sincos") || !strcmp(op, "fast_sincos")) && argc == 2) {
+      nir_def *x = air_get_ssa(c, in->operands[1]);
+      struct air_val *pv = air_get(c, in->operands[2]);
+
+      if (!x || !pv)
+         return false;
+      if (pv->kind != AIR_VAL_PTR)
+         return air_error(c, "intrinsic: air.%s whose cosine pointer this cannot resolve", op);
+      bool exact = c->b.exact;
+      c->b.exact = false;
+      nir_def *sine = nir_fsin(&c->b, x), *cosine = nir_fcos(&c->b, x);
+      c->b.exact = exact;
+      if (!air_store_ptr(c, pv->ptr, cosine, 0))
+         return false;
+      air_set(c, &in->base, air_val_ssa(c, sine));
+      *handled = true;
+      return true;
+   }
+
    nir_def *a[4] = { 0 };
    for (unsigned i = 0; i < argc && i < 4; i++)
       if (!(a[i] = air_get_ssa(c, in->operands[1 + i])))
@@ -804,11 +828,13 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
 /* -- barriers ----------------------------------------------------------- */
 
 static bool
-barrier_op(struct air_ctx *c, const struct air_inst *in)
+barrier_op(struct air_ctx *c, const struct air_inst *in, mesa_scope scope)
 {
    /* air.wg.barrier(i32 flags, i32 scope): the flags say which memory is
     * ordered. 2 is threadgroup memory, 1 device, 4 texture; the corpus only
-    * ever passes 2 with scope 1 (the threadgroup).
+    * ever passes 2 with scope 1 (the threadgroup). (The K40's) air.simdgroup.barrier
+    * takes the same arguments and is the same barrier over the SIMD group
+    * (Core Image's stdlib: simdgroup.barrier(2, 1)).
     */
    uint64_t flags = 2;
    if (in->num_operands > 1)
@@ -824,8 +850,8 @@ barrier_op(struct air_ctx *c, const struct air_inst *in)
    if (!modes)
       modes = nir_var_mem_shared;
 
-   nir_barrier(&c->b, .execution_scope = SCOPE_WORKGROUP,
-               .memory_scope = SCOPE_WORKGROUP, .memory_semantics = NIR_MEMORY_ACQ_REL,
+   nir_barrier(&c->b, .execution_scope = scope,
+               .memory_scope = scope, .memory_semantics = NIR_MEMORY_ACQ_REL,
                .memory_modes = modes);
    return true;
 }
@@ -1987,7 +2013,9 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (!strcmp(n.part[0], "is_function_constant_defined"))
       return fc_defined_op(c, in);
    if (n.num >= 2 && !strcmp(n.part[0], "wg") && !strcmp(n.part[1], "barrier"))
-      return barrier_op(c, in);
+      return barrier_op(c, in, SCOPE_WORKGROUP);
+   if (n.num >= 2 && !strcmp(n.part[0], "simdgroup") && !strcmp(n.part[1], "barrier"))
+      return barrier_op(c, in, SCOPE_SUBGROUP);
    if (!strcmp(n.part[0], "atomic"))
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))
