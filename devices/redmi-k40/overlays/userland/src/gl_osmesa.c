@@ -8,10 +8,16 @@
  * thread's, a context taken away again, and a name for the log. A library with another way to
  * its contexts gets another file like this one.
  */
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "hakios.gl.h"
 
@@ -33,6 +39,10 @@ extern OSMesaContext OSMesaCreateContextAttribs(const int *attributes, OSMesaCon
 extern unsigned char OSMesaMakeCurrent(OSMesaContext context, void *buffer, unsigned type, int width, int height);
 extern void OSMesaDestroyContext(OSMesaContext context);
 extern void (*OSMesaGetProcAddress(const char *name))(void);
+/* Mesa's own per-thread current context, read and cleared without being looked into (forget_dead_current()) */
+extern void *_mesa_glapi_get_context(void);
+extern void _mesa_glapi_set_context(void *context);
+extern void _mesa_glapi_set_dispatch(void *dispatch);
 extern unsigned char OSMesaHakiosCopy(unsigned renderbuffer, unsigned texture, unsigned char flip)
     __attribute__((weak_import));      /* tools/mesa/osmesa-hakios-copy.patch */
 extern const unsigned char *glGetString(unsigned name);
@@ -46,8 +56,65 @@ extern unsigned glGetError(void);
 
 struct hakios_gl {
 	OSMesaContext context;
+	void *current;                  /* Mesa's context of it, as the thread's current one once made so */
 	unsigned char window[WINDOW * WINDOW * 4];
 };
+
+/*
+ * Every context alive, by Mesa's own pointer (what the thread's current one is). A thread whose current context is
+ * not among them has a freed one current: Mesa's next make-current there reads it to flush it, and faults --
+ * SceneKit's display link in -[SCNRenderer _installContext] -> -[EAGLContext dealloc] of the context it let go of
+ * (GPU Check scenekit.default, again on 2026-11-08 16:15, after app_settle() had closed the ways we knew of).
+ * Such a thread's current context is forgotten first, without Mesa looking into it.
+ */
+#define LIVE    64
+static struct hakios_gl *live[LIVE];
+static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned forgotten;
+
+/* a line on the console, where eagl.c's go too (an application's standard error goes nowhere) */
+static void
+gl_say(const char *format, ...)
+{
+	static int console = -2;
+	char line[256];
+	va_list ap;
+	int n;
+
+	if (console == -2) {
+		console = open("/dev/console", O_WRONLY);
+	}
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (n > 0) {
+		(void)write(console >= 0 ? console : 2, line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+	}
+}
+
+static void
+forget_dead_current(void)
+{
+	void *current = _mesa_glapi_get_context();
+	bool alive = current == NULL;
+
+	if (alive) {
+		return;
+	}
+	pthread_mutex_lock(&live_lock);
+	for (unsigned i = 0; i < LIVE && !alive; i++) {
+		alive = live[i] != NULL && live[i]->current == current;
+	}
+	pthread_mutex_unlock(&live_lock);
+	if (!alive) {
+		_mesa_glapi_set_context(NULL);
+		_mesa_glapi_set_dispatch(NULL);
+		if (forgotten++ < 8) {
+			gl_say("hakios-gl: %s: a freed context was this thread's current one (%p, thread %p): forgotten\n",
+			    getprogname(), current, (void *)pthread_self());
+		}
+	}
+}
 
 struct hakios_gl *
 hakios_gl_create_shared(int version, struct hakios_gl *share)
@@ -64,6 +131,16 @@ hakios_gl_create_shared(int version, struct hakios_gl *share)
 		free(gl);
 		gl = NULL;
 	}
+	if (gl != NULL) {
+		pthread_mutex_lock(&live_lock);
+		for (unsigned i = 0; i < LIVE; i++) {
+			if (live[i] == NULL) {
+				live[i] = gl;
+				break;
+			}
+		}
+		pthread_mutex_unlock(&live_lock);
+	}
 	return gl;
 }
 
@@ -76,15 +153,30 @@ hakios_gl_create(int version)
 int
 hakios_gl_make_current(struct hakios_gl *gl)
 {
+	int done;
+
+	forget_dead_current();
 	if (gl == NULL) {
 		return OSMesaMakeCurrent(NULL, NULL, 0, 0, 0);
 	}
-	return OSMesaMakeCurrent(gl->context, gl->window, GL_UNSIGNED_BYTE, WINDOW, WINDOW);
+	done = OSMesaMakeCurrent(gl->context, gl->window, GL_UNSIGNED_BYTE, WINDOW, WINDOW);
+	if (done) {
+		gl->current = _mesa_glapi_get_context();
+	}
+	return done;
 }
 
 void
 hakios_gl_destroy(struct hakios_gl *gl)
 {
+	pthread_mutex_lock(&live_lock);
+	for (unsigned i = 0; i < LIVE; i++) {
+		if (live[i] == gl) {
+			live[i] = NULL;
+		}
+	}
+	pthread_mutex_unlock(&live_lock);
+	forget_dead_current();          /* (Mesa makes the dying one current, then the thread's one before it again) */
 	OSMesaDestroyContext(gl->context);
 	free(gl);
 }
