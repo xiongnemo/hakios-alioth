@@ -334,7 +334,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			MM=../xnu-deps/build/mesa-metal/out
 			[ "$(cat $MM/built-from 2>/dev/null)" = "$( (for p in ../tools/mesa/*.patch; do
 				[ "$(basename "$p")" = air-ir3.patch ] || cat "$p"; done; cat ../tools/mesa/metal/*.patch \
-				../tools/mesa/hakios-drm/* ../tools/mesa/metal/air/*) | sha256sum)" ] || ../tools/mk-mesa-metal.sh
+				../tools/mesa/hakios-drm/* ../tools/mesa/metal/air/*) | sha256sum)" ] || bash ../tools/mk-mesa-metal.sh
 			cp $MM/libhakios.air.dylib $MM/air_metal_test obj/
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.metal.dylib -framework Foundation -framework IOKit \
 				-framework Metal -lobjc -Wno-deprecated-declarations -o obj/libhakios.metal.dylib \
