@@ -985,10 +985,41 @@ struct gem_close { uint32_t handle, pad; };
 @interface AliothMetalCommandBuffer : _MTLCommandBuffer
 - (instancetype)initWithAliothQueue:(AliothMetalCommandQueue *)queue;
 - (void)recordWork:(AliothMetalWork *)work;
+- (void)recordBlit:(id)blit;
 - (id)device;
 @end
 
 @interface AliothMetalComputeEncoder : _MTLCommandEncoder
+- (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer;
+@end
+
+/*
+ * (the K40's) The blit encoder. It answered nil, and SpriteKit, SceneKit and most engines upload their textures with
+ * one (a staging buffer copied into the texture) and make their mipmaps with one. Each copy, fill and mipmap chain is
+ * recorded in the command buffer's order and done by the processor at -commit, after the GPU has finished whatever
+ * came before it in that buffer (mesa.finish): every buffer of ours is memory the processor maps, and every texture is
+ * read and written through the compiler library's texture_read / texture_write, which know its layout. Slower than the
+ * GPU's own copy engine, and right; the GPU path can come later behind the same records.
+ */
+enum {
+	ALIOTH_BLIT_FILL, ALIOTH_BLIT_BUFFER_TO_BUFFER, ALIOTH_BLIT_BUFFER_TO_TEXTURE, ALIOTH_BLIT_TEXTURE_TO_BUFFER,
+	ALIOTH_BLIT_TEXTURE_TO_TEXTURE, ALIOTH_BLIT_MIPMAPS,
+};
+
+@interface AliothMetalBlit : NSObject {
+@public
+	int kind;
+	id source, destination;         /* retained */
+	NSUInteger sourceOffset, destinationOffset, length;
+	uint8_t value;
+	NSUInteger sourceBytesPerRow, sourceBytesPerImage, destinationBytesPerRow, destinationBytesPerImage;
+	NSUInteger sourceSlice, sourceLevel, destinationSlice, destinationLevel;
+	MTLOrigin sourceOrigin, destinationOrigin;
+	MTLSize size;
+}
+@end
+
+@interface AliothMetalBlitEncoder : _MTLCommandEncoder
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer;
 @end
 
@@ -3788,7 +3819,17 @@ enum {
 /* The rest of what MTLCommandBuffer requires of a driver. Each declines rather than being
  * absent, for the reason the device's own 44 were answered: a missing selector aborts the
  * caller, and these are the four that were still missing. */
-- (id)blitCommandEncoder          { return nil; }
+- (id)blitCommandEncoder
+{
+	return [[[AliothMetalBlitEncoder alloc] initWithAliothCommandBuffer:self] autorelease];
+}
+
+- (id)blitCommandEncoderWithDescriptor:(id)descriptor
+{
+	(void)descriptor;       /* (its sample buffer attachments: no counters here) */
+	return [self blitCommandEncoder];
+}
+
 - (id)resourceStateCommandEncoder { return nil; }
 - (id)accelerationStructureCommandEncoder { return nil; }
 - (void)encodeSignalEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
@@ -3805,6 +3846,179 @@ enum {
 	[_work addObject:work];
 }
 
+- (void)recordBlit:(id)blit
+{
+	[_work addObject:blit];
+}
+
+/* the bytes of one texel of the formats the blit path copies between textures; 0: not one of them */
+static NSUInteger
+alioth_texel_bytes(NSUInteger format)
+{
+	switch (format) {
+	case MTLPixelFormatA8Unorm: case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB:
+	case MTLPixelFormatR8Snorm: case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint:
+	case MTLPixelFormatStencil8:
+		return 1;
+	case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: case MTLPixelFormatRG8Snorm:
+	case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Float: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+	case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatA1BGR5Unorm: case MTLPixelFormatABGR4Unorm:
+	case MTLPixelFormatBGR5A1Unorm: case MTLPixelFormatDepth16Unorm:
+		return 2;
+	case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatRGBA8Snorm:
+	case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm:
+	case MTLPixelFormatBGRA8Unorm_sRGB: case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm:
+	case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float: case MTLPixelFormatR32Float:
+	case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatRG16Float: case MTLPixelFormatRG16Unorm:
+	case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatDepth32Float:
+		return 4;
+	case MTLPixelFormatRGBA16Float: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Uint:
+	case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRG32Float: case MTLPixelFormatRG32Uint:
+	case MTLPixelFormatRG32Sint:
+		return 8;
+	case MTLPixelFormatRGBA32Float: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
+		return 16;
+	default:
+		return 0;
+	}
+}
+
+/* a texture's region through the processor, slice by slice of a 3D region: what texture_read/write take is 2D */
+static void
+alioth_texture_out(id texture, void *bytes, NSUInteger stride, NSUInteger image, MTLOrigin origin, MTLSize size,
+    NSUInteger level, NSUInteger slice)
+{
+	for (NSUInteger z = 0; z < MAX(size.depth, 1); z++) {
+		[texture getBytes:(char *)bytes + z * image bytesPerRow:stride bytesPerImage:image
+		       fromRegion:MTLRegionMake3D(origin.x, origin.y, origin.z + z, size.width, size.height, 1)
+		      mipmapLevel:level slice:slice];
+	}
+}
+
+static void
+alioth_texture_in(id texture, const void *bytes, NSUInteger stride, NSUInteger image, MTLOrigin origin, MTLSize size,
+    NSUInteger level, NSUInteger slice)
+{
+	for (NSUInteger z = 0; z < MAX(size.depth, 1); z++) {
+		[texture replaceRegion:MTLRegionMake3D(origin.x, origin.y, origin.z + z, size.width, size.height, 1)
+			   mipmapLevel:level slice:slice withBytes:(const char *)bytes + z * image bytesPerRow:stride
+			 bytesPerImage:image];
+	}
+}
+
+/* the next level of a mipmap chain from the one above it, a 2x2 box of each channel byte (8-bit formats only) */
+static void
+alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *below, NSUInteger bw, NSUInteger bh,
+    NSUInteger bpp)
+{
+	for (NSUInteger y = 0; y < bh; y++) {
+		for (NSUInteger x = 0; x < bw; x++) {
+			NSUInteger x0 = MIN(2 * x, aw - 1), x1 = MIN(2 * x + 1, aw - 1);
+			NSUInteger y0 = MIN(2 * y, ah - 1), y1 = MIN(2 * y + 1, ah - 1);
+
+			for (NSUInteger c = 0; c < bpp; c++) {
+				unsigned sum = above[(y0 * aw + x0) * bpp + c] + above[(y0 * aw + x1) * bpp + c] +
+				    above[(y1 * aw + x0) * bpp + c] + above[(y1 * aw + x1) * bpp + c];
+
+				below[(y * bw + x) * bpp + c] = (uint8_t)((sum + 2) / 4);
+			}
+		}
+	}
+}
+
+/* One blit record, by the processor (see AliothMetalBlit). NO and the reason when it cannot be done. */
+- (BOOL)runBlit:(AliothMetalBlit *)b why:(char *)why size:(size_t)size
+{
+	struct rwa_device *device = [[_queue device] mesaDevice];
+
+	/* what came before it in this buffer, finished: the processor reads and writes here */
+	if (device != NULL && mesa.finish(device, why, size) != 0) {
+		[self failWith:why];
+		return NO;
+	}
+	switch (b->kind) {
+	case ALIOTH_BLIT_FILL:
+		memset((char *)[(id<MTLBuffer>)b->destination contents] + b->destinationOffset, b->value, b->length);
+		return YES;
+	case ALIOTH_BLIT_BUFFER_TO_BUFFER:
+		memmove((char *)[(id<MTLBuffer>)b->destination contents] + b->destinationOffset,
+			(const char *)[(id<MTLBuffer>)b->source contents] + b->sourceOffset, b->length);
+		return YES;
+	case ALIOTH_BLIT_BUFFER_TO_TEXTURE:
+		alioth_texture_in(b->destination, (const char *)[(id<MTLBuffer>)b->source contents] + b->sourceOffset,
+				  b->sourceBytesPerRow, b->sourceBytesPerImage, b->destinationOrigin, b->size,
+				  b->destinationLevel, b->destinationSlice);
+		return YES;
+	case ALIOTH_BLIT_TEXTURE_TO_BUFFER:
+		alioth_texture_out(b->source, (char *)[(id<MTLBuffer>)b->destination contents] + b->destinationOffset,
+				   b->destinationBytesPerRow, b->destinationBytesPerImage, b->sourceOrigin, b->size,
+				   b->sourceLevel, b->sourceSlice);
+		return YES;
+	case ALIOTH_BLIT_TEXTURE_TO_TEXTURE: {
+		NSUInteger bpp = alioth_texel_bytes([(id<MTLTexture>)b->source pixelFormat]);
+		NSUInteger stride = b->size.width * bpp, image = stride * b->size.height;
+		void *staging;
+
+		if (bpp == 0) {
+			snprintf(why, size, "a texture-to-texture copy of pixel format %lu, whose texels this driver "
+				 "does not know the size of", (unsigned long)[(id<MTLTexture>)b->source pixelFormat]);
+			[self failWith:why];
+			return NO;
+		}
+		if ((staging = malloc(image * MAX(b->size.depth, 1))) == NULL) {
+			snprintf(why, size, "no memory for a texture copy of %lu bytes",
+				 (unsigned long)(image * MAX(b->size.depth, 1)));
+			[self failWith:why];
+			return NO;
+		}
+		alioth_texture_out(b->source, staging, stride, image, b->sourceOrigin, b->size, b->sourceLevel,
+				   b->sourceSlice);
+		alioth_texture_in(b->destination, staging, stride, image, b->destinationOrigin, b->size,
+				  b->destinationLevel, b->destinationSlice);
+		free(staging);
+		return YES;
+	}
+	case ALIOTH_BLIT_MIPMAPS: {
+		id<MTLTexture> texture = b->destination;
+		NSUInteger bpp = alioth_texel_bytes([texture pixelFormat]), w = [texture width], h = [texture height];
+		NSUInteger levels = [texture mipmapLevelCount], format = [texture pixelFormat];
+		uint8_t *above, *below;
+
+		/* (a box of bytes is right for 8-bit channels only; sRGB is averaged as stored, a small error) */
+		if (bpp == 0 || format == MTLPixelFormatRGBA16Float || format == MTLPixelFormatR16Float ||
+		    format == MTLPixelFormatRG16Float || format == MTLPixelFormatR32Float || format == MTLPixelFormatRGBA32Float ||
+		    format == MTLPixelFormatRG32Float || format == MTLPixelFormatB5G6R5Unorm || format == MTLPixelFormatDepth32Float) {
+			RW_ONCE("mipmaps of pixel format %lu are not made: this driver averages 8-bit channels only\n",
+				(unsigned long)format);
+			return YES;
+		}
+		if ((above = malloc(w * h * bpp)) == NULL) {
+			snprintf(why, size, "no memory for a mipmap chain");
+			[self failWith:why];
+			return NO;
+		}
+		alioth_texture_out(texture, above, w * bpp, w * h * bpp, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), 0, 0);
+		for (NSUInteger level = 1; level < levels && (w > 1 || h > 1); level++) {
+			NSUInteger bw = MAX(w / 2, 1), bh = MAX(h / 2, 1);
+
+			if ((below = malloc(bw * bh * bpp)) == NULL) {
+				break;
+			}
+			alioth_half_texels(above, w, h, below, bw, bh, bpp);
+			alioth_texture_in(texture, below, bw * bpp, bw * bh * bpp, MTLOriginMake(0, 0, 0),
+					  MTLSizeMake(bw, bh, 1), level, 0);
+			free(above);
+			above = below;
+			w = bw;
+			h = bh;
+		}
+		free(above);
+		return YES;
+	}
+	}
+	return YES;
+}
+
 - (void)enqueue { }
 
 /* Metal's own rule, kept: the recorded dispatches run here and not when they were encoded. */
@@ -3813,7 +4027,16 @@ enum {
 	char why[512] = { 0 };
 
 	_status = RW_CB_COMMITTED;
-	for (AliothMetalWork *work in _work) {
+	for (id item in _work) {
+		AliothMetalWork *work = item;
+
+		if ([item isKindOfClass:[AliothMetalBlit class]]) {
+			if (![self runBlit:item why:why size:sizeof(why)]) {
+				rw_print("the blit failed: %s\n", why);
+				goto done;
+			}
+			continue;
+		}
 		if (work->render != nil) {
 			if (![self runDraw:work why:why size:sizeof(why)]) {
 				goto done;
@@ -5577,6 +5800,208 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		[work release];
 	}
 	_ended = YES;
+	[super endEncoding];
+}
+
+@end
+
+@implementation AliothMetalBlit
+
+- (void)dealloc
+{
+	[source release];
+	[destination release];
+	[super dealloc];
+}
+
+@end
+
+@implementation AliothMetalBlitEncoder {
+	AliothMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder's life */
+}
+
+- (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
+{
+	self = [super initWithCommandBuffer:commandBuffer];
+	if (self == nil) {
+		return nil;
+	}
+	_commandBuffer = commandBuffer;
+	return self;
+}
+
+- (id)device { return [_commandBuffer device]; }
+
+/* a record, handed to the command buffer (which keeps the order) */
+- (AliothMetalBlit *)record:(int)kind from:(id)source to:(id)destination
+{
+	AliothMetalBlit *b = [[AliothMetalBlit alloc] init];
+
+	b->kind = kind;
+	b->source = [source retain];
+	b->destination = [destination retain];
+	[_commandBuffer recordBlit:b];
+	[b release];
+	return b;       /* (the command buffer holds it) */
+}
+
+- (void)fillBuffer:(id)buffer range:(NSRange)range value:(uint8_t)value
+{
+	AliothMetalBlit *b = [self record:ALIOTH_BLIT_FILL from:nil to:buffer];
+
+	b->destinationOffset = range.location;
+	b->length = range.length;
+	b->value = value;
+}
+
+- (void)copyFromBuffer:(id)source sourceOffset:(NSUInteger)sourceOffset toBuffer:(id)destination
+     destinationOffset:(NSUInteger)destinationOffset size:(NSUInteger)size
+{
+	AliothMetalBlit *b = [self record:ALIOTH_BLIT_BUFFER_TO_BUFFER from:source to:destination];
+
+	b->sourceOffset = sourceOffset;
+	b->destinationOffset = destinationOffset;
+	b->length = size;
+}
+
+- (void)copyFromBuffer:(id)source sourceOffset:(NSUInteger)offset sourceBytesPerRow:(NSUInteger)stride
+   sourceBytesPerImage:(NSUInteger)image sourceSize:(MTLSize)size toTexture:(id)texture
+      destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin
+{
+	AliothMetalBlit *b = [self record:ALIOTH_BLIT_BUFFER_TO_TEXTURE from:source to:texture];
+
+	b->sourceOffset = offset;
+	b->sourceBytesPerRow = stride;
+	b->sourceBytesPerImage = image;
+	b->size = size;
+	b->destinationSlice = slice;
+	b->destinationLevel = level;
+	b->destinationOrigin = origin;
+}
+
+- (void)copyFromBuffer:(id)source sourceOffset:(NSUInteger)offset sourceBytesPerRow:(NSUInteger)stride
+   sourceBytesPerImage:(NSUInteger)image sourceSize:(MTLSize)size toTexture:(id)texture
+      destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin
+	       options:(NSUInteger)options
+{
+	(void)options;  /* (depth or stencil from a combined format: one aspect here) */
+	[self copyFromBuffer:source sourceOffset:offset sourceBytesPerRow:stride sourceBytesPerImage:image sourceSize:size
+		   toTexture:texture destinationSlice:slice destinationLevel:level destinationOrigin:origin];
+}
+
+- (void)copyFromTexture:(id)texture sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level
+	   sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size toBuffer:(id)buffer
+      destinationOffset:(NSUInteger)offset destinationBytesPerRow:(NSUInteger)stride
+destinationBytesPerImage:(NSUInteger)image
+{
+	AliothMetalBlit *b = [self record:ALIOTH_BLIT_TEXTURE_TO_BUFFER from:texture to:buffer];
+
+	b->sourceSlice = slice;
+	b->sourceLevel = level;
+	b->sourceOrigin = origin;
+	b->size = size;
+	b->destinationOffset = offset;
+	b->destinationBytesPerRow = stride;
+	b->destinationBytesPerImage = image;
+}
+
+- (void)copyFromTexture:(id)texture sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level
+	   sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size toBuffer:(id)buffer
+      destinationOffset:(NSUInteger)offset destinationBytesPerRow:(NSUInteger)stride
+destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
+{
+	(void)options;
+	[self copyFromTexture:texture sourceSlice:slice sourceLevel:level sourceOrigin:origin sourceSize:size
+		     toBuffer:buffer destinationOffset:offset destinationBytesPerRow:stride destinationBytesPerImage:image];
+}
+
+- (void)copyFromTexture:(id)source sourceSlice:(NSUInteger)sourceSlice sourceLevel:(NSUInteger)sourceLevel
+	   sourceOrigin:(MTLOrigin)sourceOrigin sourceSize:(MTLSize)size toTexture:(id)destination
+       destinationSlice:(NSUInteger)destinationSlice destinationLevel:(NSUInteger)destinationLevel
+      destinationOrigin:(MTLOrigin)destinationOrigin
+{
+	AliothMetalBlit *b = [self record:ALIOTH_BLIT_TEXTURE_TO_TEXTURE from:source to:destination];
+
+	b->sourceSlice = sourceSlice;
+	b->sourceLevel = sourceLevel;
+	b->sourceOrigin = sourceOrigin;
+	b->size = size;
+	b->destinationSlice = destinationSlice;
+	b->destinationLevel = destinationLevel;
+	b->destinationOrigin = destinationOrigin;
+}
+
+- (void)copyFromTexture:(id)source sourceSlice:(NSUInteger)sourceSlice sourceLevel:(NSUInteger)sourceLevel
+	      toTexture:(id)destination destinationSlice:(NSUInteger)destinationSlice
+       destinationLevel:(NSUInteger)destinationLevel sliceCount:(NSUInteger)slices levelCount:(NSUInteger)levels
+{
+	for (NSUInteger l = 0; l < levels; l++) {
+		NSUInteger w = MAX([(id<MTLTexture>)source width] >> (sourceLevel + l), 1),
+		    h = MAX([(id<MTLTexture>)source height] >> (sourceLevel + l), 1);
+
+		for (NSUInteger s = 0; s < slices; s++) {
+			[self copyFromTexture:source sourceSlice:sourceSlice + s sourceLevel:sourceLevel + l
+				 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toTexture:destination
+			     destinationSlice:destinationSlice + s destinationLevel:destinationLevel + l
+			    destinationOrigin:MTLOriginMake(0, 0, 0)];
+		}
+	}
+}
+
+- (void)copyFromTexture:(id)source toTexture:(id)destination
+{
+	[self copyFromTexture:source sourceSlice:0 sourceLevel:0 toTexture:destination destinationSlice:0
+	     destinationLevel:0 sliceCount:MAX([(id<MTLTexture>)source arrayLength], 1)
+	   levelCount:MIN([(id<MTLTexture>)source mipmapLevelCount], [(id<MTLTexture>)destination mipmapLevelCount])];
+}
+
+- (void)generateMipmapsForTexture:(id)texture
+{
+	[self record:ALIOTH_BLIT_MIPMAPS from:nil to:texture];
+}
+
+/* what a blit encoder may also be asked, with nothing to do on memory both sides see alike */
+- (void)synchronizeResource:(id)resource { (void)resource; }
+- (void)synchronizeTexture:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
+{
+	(void)texture; (void)slice; (void)level;
+}
+- (void)optimizeContentsForGPUAccess:(id)texture { (void)texture; }
+- (void)optimizeContentsForGPUAccess:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
+{
+	(void)texture; (void)slice; (void)level;
+}
+- (void)optimizeContentsForCPUAccess:(id)texture { (void)texture; }
+- (void)optimizeContentsForCPUAccess:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
+{
+	(void)texture; (void)slice; (void)level;
+}
+- (void)updateFence:(id)fence  { (void)fence; }
+- (void)waitForFence:(id)fence { (void)fence; }
+- (void)resetCommandsInBuffer:(id)buffer withRange:(NSRange)range
+{
+	(void)buffer; (void)range;
+	RW_ONCE("indirect command buffers are not implemented; a blit encoder's reset of one does nothing\n");
+}
+- (void)copyIndirectCommandBuffer:(id)source sourceRange:(NSRange)range destination:(id)destination
+		 destinationIndex:(NSUInteger)index
+{
+	(void)source; (void)range; (void)destination; (void)index;
+	RW_ONCE("indirect command buffers are not implemented; a blit encoder's copy of one does nothing\n");
+}
+- (void)optimizeIndirectCommandBuffer:(id)buffer withRange:(NSRange)range { (void)buffer; (void)range; }
+- (void)sampleCountersInBuffer:(id)buffer atSampleIndex:(NSUInteger)index withBarrier:(BOOL)barrier
+{
+	(void)buffer; (void)index; (void)barrier;
+}
+- (void)resolveCounters:(id)buffer inRange:(NSRange)range destinationBuffer:(id)destination
+      destinationOffset:(NSUInteger)offset
+{
+	(void)buffer; (void)range; (void)destination; (void)offset;
+}
+
+- (void)endEncoding
+{
 	[super endEncoding];
 }
 
