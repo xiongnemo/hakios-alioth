@@ -1723,6 +1723,7 @@ metal_for_allowed(void)
 
 	void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW);
 	void (*add)(id) = metal ? (void (*)(id))dlsym(metal, "MTLAddDevice") : NULL;
+	id (*system_default)(void) = metal ? (id (*)(void))dlsym(metal, "MTLCreateSystemDefaultDevice") : NULL;
 	void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
 	void *(*matching)(const char *) = iokit ? (void *(*)(const char *))dlsym(iokit, "IOServiceMatching") : NULL;
 	unsigned (*service_of)(unsigned, void *) = iokit ? (unsigned (*)(unsigned, void *))dlsym(iokit,
@@ -1731,9 +1732,21 @@ metal_for_allowed(void)
 	unsigned service;
 	id device;
 
-	if (add == NULL || matching == NULL || service_of == NULL) {
-		say("metal: %s is allowed and %s; nothing registered\n", bundle_id, add == NULL ? "Metal has no MTLAddDevice" :
-		    "IOKit's matching calls are missing");
+	if (add == NULL || system_default == NULL || matching == NULL || service_of == NULL) {
+		say("metal: %s is allowed and %s; nothing registered\n", bundle_id, add == NULL || system_default == NULL ?
+		    "Metal has no MTLAddDevice / MTLCreateSystemDefaultDevice" : "IOKit's matching calls are missing");
+		return;
+	}
+	/*
+	 * Metal's own discovery first, for two reasons. MTLAddDevice asserts "_deviceArray != NULL" (Metal,
+	 * MTLAddDevice+0x44) and that array is made by the discovery's dispatch_once -- unasked, it aborted every launch
+	 * of the first allowed application (2026-11-09; System Check's Metal tab always asked first). And a device Metal
+	 * found on its own is left alone: a second one is not added beside it.
+	 */
+	id found = system_default();
+	if (found != nil) {
+		((void (*)(id, SEL))objc_msgSend)(found, sel_registerName("release"));
+		say("metal: %s is allowed and Metal has a device of its own already; nothing added\n", bundle_id);
 		return;
 	}
 	if (dlopen(METAL_DRIVER, RTLD_NOW) == NULL || (device_class = objc_getClass("AliothMetalDevice")) == Nil) {
