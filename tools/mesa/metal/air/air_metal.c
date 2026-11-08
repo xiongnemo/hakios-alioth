@@ -1343,6 +1343,20 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       return NULL;
    }
 
+   /* (the K40's) Drawable into whatever its usage says, where the GPU can: on Apple's GPUs
+    * MTLTextureUsage is a hint outside the validation layer, and SpriteKit's own
+    * -textureFromNode: renders into an RGBA8 texture made without RenderTarget (System
+    * Check, 2026-11-09: "colour attachment 0 ... was made without MTLTextureUsageRenderTarget",
+    * the sprite's texture empty). So a format this GPU renders to, or tests depth in, is made
+    * so as well -- asked first, so a compressed format stays what it was. An import keeps
+    * exactly what it was asked for.
+    */
+   unsigned attach = depth_stencil ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET;
+   if (!import && !(bind & attach) &&
+       device->screen->is_format_supported(device->screen, fmt->pipe, target, query_samples,
+                                           query_samples, bind | attach))
+      bind |= attach;
+
    struct rwa_texture *texture = calloc(1, sizeof(*texture));
    if (!texture) {
       say(why, why_size, "out of memory making a texture");
