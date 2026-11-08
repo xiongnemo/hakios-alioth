@@ -2960,6 +2960,25 @@ enum {
 
 @end
 
+/*
+ * (the K40's) A texture object this driver did not make answers no compiler-library texture, and the draw that binds
+ * it is refused by name ("reads texture 0 and 0 textures were bound") instead of the process dying of an
+ * unrecognized selector. SpriteKit is how it happens: in a process whose SKViews began with OpenGL ES, an SKRenderer
+ * on this device was handed SpriteKit's GL-backed texture (System Check, 2026-11-09: -[EAGLContext mesaTexture]).
+ */
+@interface NSObject (AliothMetalForeign)
+- (struct rwa_texture *)mesaTexture;
+@end
+
+@implementation NSObject (AliothMetalForeign)
+- (struct rwa_texture *)mesaTexture
+{
+	RW_ONCE("a %s was bound where a texture of this driver belongs; it is taken as nothing bound\n",
+		object_getClassName(self));
+	return NULL;
+}
+@end
+
 @implementation AliothMetalTexture
 
 + (void)load

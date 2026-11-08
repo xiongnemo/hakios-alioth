@@ -6844,18 +6844,28 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    float znear = draw->depth_range ? draw->depth_range[0] : 0.0f;
    float zfar = draw->depth_range ? draw->depth_range[1] : 1.0f;
    /* (the K40's) MTLViewport's rectangle, where one was given: the same transform over it instead of over the
-    * whole attachment -- its centre for the translation, half its size for the scale, y still negative. */
+    * whole attachment -- its centre for the translation, half its size for the scale, y still negative.
+    *
+    * A NEGATIVE height is a viewport turned upside down, and SpriteKit's own: an SKView draws into its drawable
+    * through { 0, 2436, 1125, -2436 }. The transform needs nothing for it -- originY + height/2 is still the
+    * centre and -height/2 is now a positive scale -- so only an empty or NaN one is refused. And it is refused
+    * with the framebuffer UNBOUND first: these surfaces are in the context's framebuffer state already, and
+    * destroying them under it (what this did) freed what the next draw's set_framebuffer_state then released
+    * again -- SpriteKit's second such draw aborted the process (System Check, 2026-11-09). */
+   bool flipped = false;
    if (draw->viewport) {
       float vx = draw->viewport[0], vy = draw->viewport[1], vw = draw->viewport[2], vh = draw->viewport[3];
 
-      if (!(vw > 0.0f) || !(vh > 0.0f)) {
+      if (!(fabsf(vw) > 0.0f) || !(fabsf(vh) > 0.0f)) {
          say(why, why_size, "a viewport of %gx%g has nothing in it", vw, vh);
+         pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
          for (unsigned j = 0; j < draw->color_count; j++)
             pipe->surface_destroy(pipe, surf[j]);
          if (zsurf)
             pipe->surface_destroy(pipe, zsurf);
          return -1;
       }
+      flipped = vh < 0.0f;
       pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
          .scale = { vw / 2.0f, -(vh / 2.0f), zfar - znear },
          .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } });
@@ -6898,13 +6908,16 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    unsigned cull = draw->cull_mode <= 2 ? draw->cull_mode : 0;
    bool lines = draw->fill_lines != 0;
-   unsigned variant = cull | (draw->front_ccw ? 4 : 0) | (draw->scissor ? 8 : 0) | (lines ? 16 : 0);
+   /* an upside-down viewport (above) turns window-space winding over, and Metal's front face is
+    * decided before the viewport: so it turns front_ccw over too */
+   bool ccw = (draw->front_ccw != 0) != flipped;
+   unsigned variant = cull | (ccw ? 4 : 0) | (draw->scissor ? 8 : 0) | (lines ? 16 : 0);
    void *rast = render->rast;
    if (variant) {
       if (!render->rast_variant[variant]) {
          struct pipe_rasterizer_state rs = render->rast_templ;
          rs.cull_face = cull == 1 ? PIPE_FACE_FRONT : cull == 2 ? PIPE_FACE_BACK : PIPE_FACE_NONE;
-         rs.front_ccw = draw->front_ccw != 0;
+         rs.front_ccw = ccw;
          rs.scissor = draw->scissor != NULL;
          rs.fill_front = rs.fill_back = lines ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
          render->rast_variant[variant] = pipe->create_rasterizer_state(pipe, &rs);
