@@ -7127,3 +7127,35 @@ rwa_compute_set_threadgroup_bytes(struct rwa_compute *compute, unsigned bytes, c
    compute->dynamic_bytes = bytes;
    return 0;
 }
+
+/* (the K40's) A multisample attachment resolved into a one-sample texture of the same size and format: Metal's
+ * MTLStoreActionMultisampleResolve at the end of a pass, done by the GPU's own blit (Gallium averages the samples
+ * when the source has more than one). 0, or -1 and why. */
+int
+rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, struct rwa_texture *dst, char *why,
+                    size_t why_size)
+{
+   if (!device || !src || !dst) {
+      say(why, why_size, "a resolve needs a device and two textures");
+      return -1;
+   }
+   if (src->res->width0 != dst->res->width0 || src->res->height0 != dst->res->height0) {
+      say(why, why_size, "a resolve from %ux%u into %ux%u", src->res->width0, src->res->height0,
+          dst->res->width0, dst->res->height0);
+      return -1;
+   }
+   struct pipe_blit_info blit = { 0 };
+   blit.src.resource = src->res;
+   blit.src.format = src->res->format;
+   blit.src.box.width = src->res->width0;
+   blit.src.box.height = src->res->height0;
+   blit.src.box.depth = 1;
+   blit.dst.resource = dst->res;
+   blit.dst.format = dst->res->format;
+   blit.dst.box = blit.src.box;
+   blit.mask = util_format_is_depth_or_stencil(src->res->format) ? PIPE_MASK_ZS : PIPE_MASK_RGBA;
+   blit.filter = PIPE_TEX_FILTER_NEAREST;
+   device->pipe->blit(device->pipe, &blit);
+   device->pipe->flush(device->pipe, NULL, 0);
+   return 0;
+}

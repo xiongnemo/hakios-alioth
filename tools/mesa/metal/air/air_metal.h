@@ -1317,6 +1317,11 @@ int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
  * the pipeline until set again; 0 refuses a dispatch of a kernel that takes one. 0, or -1 and why. */
 int rwa_compute_set_threadgroup_bytes(struct rwa_compute *compute, unsigned bytes, char *why, size_t why_size);
 
+/* (the K40's) a multisample attachment resolved into a one-sample texture of its size and format (MTLStoreAction-
+ * MultisampleResolve), by the GPU. 0, or -1 and why. */
+int rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, struct rwa_texture *dst, char *why,
+			size_t why_size);
+
 /*
  * A pass that clears and draws nothing (the K40's addition): the colour attachments (NULL
  * entries kept as they are) cleared to clear_color if it is not NULL, the depth/stencil

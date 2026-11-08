@@ -85,8 +85,9 @@
  * `device` one the GPU cannot fetch from is refused by name, because the shader may write
  * it and a copy would lose the writes.
  *
- * What is NOT here, and is not pretended: heaps, blit encoders, events, multisample
- * resolve, and the rectangle half of a viewport -- the rest of docs/metal.md 10.8.
+ * What is NOT here, and is not pretended: heaps, events, fences and texture views -- the
+ * rest of docs/metal.md 10.8. (The K40, 2026-11-09: blit encoders, the viewport rectangle,
+ * [[threadgroup(0)]] memory and multisample resolve came off this list.)
  *
  * Every line this file writes carries the PROCESS it was written by
  * (`aliothmetal[progname pid]:`, see rw_print): a driver is a library, four or five
@@ -550,6 +551,8 @@ static struct {
 	int (*finish)(struct rwa_device *, char *, size_t);
 	/* (the K40's) a kernel's [[threadgroup(0)]] size for its next dispatch; looked up, not required */
 	int (*compute_threadgroup_bytes)(struct rwa_compute *, unsigned, char *, size_t);
+	/* (the K40's) a multisample attachment resolved by the GPU; looked up, not required */
+	int (*texture_resolve)(struct rwa_device *, struct rwa_texture *, struct rwa_texture *, char *, size_t);
 } mesa;
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
@@ -611,6 +614,7 @@ mesa_available(void)
 	*(void **)&mesa.depth_stencil_destroy = dlsym(mesa.handle, "rwa_depth_stencil_destroy");
 	*(void **)&mesa.finish = dlsym(mesa.handle, "rwa_finish");
 	*(void **)&mesa.compute_threadgroup_bytes = dlsym(mesa.handle, "rwa_compute_set_threadgroup_bytes");
+	*(void **)&mesa.texture_resolve = dlsym(mesa.handle, "rwa_texture_resolve");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -1010,6 +1014,7 @@ struct gem_close { uint32_t handle, pad; };
 enum {
 	ALIOTH_BLIT_FILL, ALIOTH_BLIT_BUFFER_TO_BUFFER, ALIOTH_BLIT_BUFFER_TO_TEXTURE, ALIOTH_BLIT_TEXTURE_TO_BUFFER,
 	ALIOTH_BLIT_TEXTURE_TO_TEXTURE, ALIOTH_BLIT_MIPMAPS,
+	ALIOTH_BLIT_RESOLVE,    /* a render pass's MultisampleResolve, recorded at its end; the GPU does this one */
 };
 
 @interface AliothMetalBlit : NSObject {
@@ -2292,13 +2297,19 @@ enum {
  * given none. So the yes waits for the resolve, and the measurement of the texture does
  * not wait for the yes: a test binds one without asking.
  *
+ * (The K40, 2026-11-09: the resolve is here -- -endEncoding records it and the GPU does it,
+ * rwa_texture_resolve -- so the answer is the Adreno's own, 1, 2 and 4.)
+ *
  * Note also that -supportsTextureSampleCount: is not a second answer to keep in step. It
  * is one instruction in _MTLDevice (0x181a17890) that tail-calls -supportsSampleCount:,
  * which _MTLDevice itself does not implement at all -- so this method is the whole of
  * both, and without it that forward would die on an unrecognized selector naming OUR
  * class (docs/metal.md 10.1's trap).
  */
-- (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1; }
+- (BOOL)supportsSampleCount:(NSUInteger)count
+{
+	return count == 1 || (mesa.texture_resolve != NULL && (count == 2 || count == 4));
+}
 - (MTLSize)sparseTileSizeWithTextureType:(NSUInteger)type
 			     pixelFormat:(NSUInteger)format
 			     sampleCount:(NSUInteger)samples
@@ -3946,6 +3957,17 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 		return NO;
 	}
 	switch (b->kind) {
+	case ALIOTH_BLIT_RESOLVE:
+		if (mesa.texture_resolve == NULL) {
+			snprintf(why, size, "a multisample resolve, and this compiler library has no rwa_texture_resolve");
+			[self failWith:why];
+			return NO;
+		}
+		if (mesa.texture_resolve(device, [b->source mesaTexture], [b->destination mesaTexture], why, size) != 0) {
+			[self failWith:why];
+			return NO;
+		}
+		return YES;
 	case ALIOTH_BLIT_FILL:
 		memset((char *)[(id<MTLBuffer>)b->destination contents] + b->destinationOffset, b->value, b->length);
 		return YES;
@@ -4458,10 +4480,12 @@ done:
 	AliothMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder */
 	AliothMetalRenderPipeline *_pipeline;
 	id _color[8];
+	id _resolve[8];         /* (the K40's) each colour attachment's resolveTexture, resolved at -endEncoding */
 	unsigned _colorCount;
 	float _clearColor[4];
 	BOOL _clears;
 	id _depth;
+	id _depthResolve;
 	id _depthStencilState;
 	float _clearDepth;
 	unsigned _clearStencil;
@@ -4505,27 +4529,25 @@ done:
 		_color[i] = texture;
 		_colorCount = i + 1;
 		/*
-		 * A resolve is the one thing a multisample pass asks for that this driver
-		 * cannot do, and it is said out loud rather than ignored. The compiler
-		 * library makes multisample attachments and renders into them
-		 * (docs/metal.md 10.34), but it stores what it has and resolves nothing --
-		 * so for an application the one-sample texture it means to READ is the
-		 * resolveTexture, and that one would come back holding whatever it held
-		 * before. Silence here would read as a pass that drew nothing. The same
-		 * goes for MTLStoreActionMultisampleResolve on the depth attachment, which
-		 * nothing has asked for yet.
+		 * A resolve. The compiler library makes multisample attachments and renders
+		 * into them (docs/metal.md 10.34), and the one-sample texture an application
+		 * means to READ is the resolveTexture. (The K40, 2026-11-09: this driver
+		 * resolved nothing and said so; now -endEncoding records the resolve after the
+		 * pass's work, and the GPU does it at -commit, rwa_texture_resolve.) A resolve
+		 * store action with no resolve texture is Metal's validation error; it is said
+		 * and the attachment is stored.
 		 */
 		NSUInteger store = [attachment storeAction];
 
 		if (store == MTLStoreActionMultisampleResolve ||
-		    store == MTLStoreActionStoreAndMultisampleResolve ||
-		    [attachment resolveTexture] != nil) {
-			rw_print("colour attachment %u asks for a multisample "
-			         "resolve (storeAction %lu%s) and this driver resolves nothing: "
-			         "the attachment itself is stored and the resolve texture is "
-			         "left as it was\n", i, (unsigned long)store,
-			         [attachment resolveTexture] != nil ? ", with a resolveTexture"
-								  : "");
+		    store == MTLStoreActionStoreAndMultisampleResolve) {
+			if ([attachment resolveTexture] != nil) {
+				_resolve[i] = [attachment resolveTexture];
+			} else {
+				rw_print("colour attachment %u asks for a multisample resolve "
+				         "(storeAction %lu) with no resolveTexture; the attachment is "
+				         "stored and nothing is resolved\n", i, (unsigned long)store);
+			}
 		}
 		if (i == 0 && [attachment loadAction] == MTLLoadActionClear) {
 			MTLClearColor c = [attachment clearColor];
@@ -4564,6 +4586,16 @@ done:
 		if (ztex != nil && [za loadAction] == MTLLoadActionClear) {
 			_clearDepth = (float)[za clearDepth];
 			_clearsDepth = YES;
+		}
+		/* a depth resolve takes sample 0 (Gallium's blit of depth); Min and Max are said */
+		if (ztex != nil && [za resolveTexture] != nil &&
+		    ([za storeAction] == MTLStoreActionMultisampleResolve ||
+		     [za storeAction] == MTLStoreActionStoreAndMultisampleResolve)) {
+			_depthResolve = [za resolveTexture];
+			if ([za depthResolveFilter] != MTLMultisampleDepthResolveFilterSample0) {
+				RW_ONCE("a depth resolve asks for the minimum or maximum of the samples; "
+					"this driver resolves depth to sample 0\n");
+			}
 		}
 		if (stex != nil && [sa loadAction] == MTLLoadActionClear) {
 			_clearStencil = (unsigned)[sa clearStencil];
@@ -5828,6 +5860,22 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		work->clearsStencil = _clearsStencil;
 		[_commandBuffer recordWork:work];
 		[work release];
+	}
+	/* (the K40's) the pass's resolves, after its work in the command buffer's order */
+	for (unsigned i = 0; !_ended && i <= _colorCount; i++) {
+		id from = i < _colorCount ? _color[i] : _depth;
+		id to = i < _colorCount ? _resolve[i] : _depthResolve;
+
+		if (from == nil || to == nil) {
+			continue;
+		}
+		AliothMetalBlit *b = [[AliothMetalBlit alloc] init];
+
+		b->kind = ALIOTH_BLIT_RESOLVE;
+		b->source = [from retain];
+		b->destination = [to retain];
+		[_commandBuffer recordBlit:b];
+		[b release];
 	}
 	_ended = YES;
 	[super endEncoding];
