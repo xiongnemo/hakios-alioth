@@ -191,6 +191,12 @@ struct rwa_texture {
    const char *format_name;         /* the MTLPixelFormat, spelled out */
    unsigned layers;                 /* array slices, or the six faces of a cube */
 
+   /* (the K40's) the format its sampler views, image views and render surfaces are made
+    * in: the resource's own, or a texture view's (rwa_texture_view: an sRGB twin, a cast
+    * between formats of one texel size) over the same resource
+    */
+   enum pipe_format view_format;
+
    /* what MTLTextureUsage allowed, which is checked at every dispatch: a kernel that
     * writes a texture the application declared read-only is an application's mistake,
     * and Metal itself catches it -- so this library has to as well, or it is the
@@ -1452,6 +1458,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          free(texture);
          return NULL;
       }
+      texture->view_format = texture->res->format;
       return texture;
    }
 
@@ -1464,6 +1471,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       free(texture);
       return NULL;
    }
+   texture->view_format = texture->res->format;
    return texture;
 }
 
@@ -3311,8 +3319,9 @@ texture_fits(const struct rwa_texture *t, const struct rwa_slot *s, const char *
     * slot_element's -- shared with the query so that what a caller is told to bind and
     * what it is refused for cannot be two different things.
     */
-   nir_alu_type want = util_format_is_pure_uint(t->res->format) ? nir_type_uint
-                     : util_format_is_pure_sint(t->res->format) ? nir_type_int
+   /* (the format the shader sees: a texture view's own, rwa_texture_view) */
+   nir_alu_type want = util_format_is_pure_uint(t->view_format) ? nir_type_uint
+                     : util_format_is_pure_sint(t->view_format) ? nir_type_int
                                                                 : nir_type_float;
    nir_alu_type have;
    const char *have_word;
@@ -3719,7 +3728,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
           */
          if (!t->view) {
             struct pipe_sampler_view tmpl = { 0 };
-            u_sampler_view_default_template(&tmpl, t->res, t->res->format);
+            u_sampler_view_default_template(&tmpl, t->res, t->view_format);
             t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
             if (!t->view) {
                say(why, why_size, "%s would not make a sampler view of the %s bound at "
@@ -3735,7 +3744,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
       case AIR_RESOURCE_IMAGE:
          images[r->index] = (struct pipe_image_view){
             .resource = t->res,
-            .format = t->res->format,
+            .format = t->view_format,
             /* what the shader does with it, from the metadata rather than assumed: a
              * read-write image told it is write-only reads zeros on some drivers.
              */
@@ -6790,7 +6799,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                                         .samples = samples };
    for (unsigned i = 0; i < draw->color_count; i++) {
       surf[i] = pipe->create_surface(pipe, draw->color[i]->res,
-         &(struct pipe_surface){ .format = draw->color[i]->res->format });
+         &(struct pipe_surface){ .format = draw->color[i]->view_format });
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
@@ -6802,7 +6811,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
    if (draw->depth) {
       zsurf = pipe->create_surface(pipe, draw->depth->res,
-         &(struct pipe_surface){ .format = draw->depth->res->format });
+         &(struct pipe_surface){ .format = draw->depth->view_format });
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
@@ -7092,7 +7101,7 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
       fb.width = MIN2(fb.width, color[i]->res->width0);
       fb.height = MIN2(fb.height, color[i]->res->height0);
       surf[i] = pipe->create_surface(pipe, color[i]->res,
-         &(struct pipe_surface){ .format = color[i]->res->format });
+         &(struct pipe_surface){ .format = color[i]->view_format });
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
@@ -7104,7 +7113,7 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
    }
    if (depth) {
       zsurf = pipe->create_surface(pipe, depth->res,
-         &(struct pipe_surface){ .format = depth->res->format });
+         &(struct pipe_surface){ .format = depth->view_format });
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
@@ -7335,6 +7344,63 @@ rwa_render_arguments(struct rwa_render *render, unsigned stage, struct rwa_argum
       return render->generated_vertex ? 0 : reflect_arguments(&render->vinfo, render->mem_ctx,
                                                               out, max, count, why, why_size);
    return reflect_arguments(&render->finfo, render->mem_ctx, out, max, count, why, why_size);
+}
+
+/*
+ * (the K40's) A texture view: a second texture over the same memory, Metal's
+ * -newTextureViewWithPixelFormat: and the textureType:levels:slices: form over the whole of
+ * the texture. The format may change to one of the same texel size and kind -- the sRGB and
+ * linear twins SceneKit and CoreAnimation reach for, or a cast between same-size colour
+ * formats -- and the type between the same-dimensioned ones (2D and a one-slice 2D array).
+ * The resource is shared by reference; what changes is the format and target every view and
+ * surface of it is made in (view_format, and the shape Metal is answered from).
+ */
+struct rwa_texture *
+rwa_texture_view(struct rwa_texture *texture, const struct rwa_texture_shape *shape, char *why,
+                 size_t why_size)
+{
+   if (!texture || !shape) {
+      say(why, why_size, "a view needs a texture and the shape it is to have");
+      return NULL;
+   }
+   const struct rwa_pixel_format *fmt = pixel_format(shape->pixel_format);
+   if (!fmt) {
+      say(why, why_size, "a view as MTLPixelFormat %u, which has no translation here",
+          shape->pixel_format);
+      return NULL;
+   }
+   enum pipe_format from = texture->res->format;
+   if (util_format_get_blocksize(fmt->pipe) != util_format_get_blocksize(from) ||
+       util_format_get_blockwidth(fmt->pipe) != util_format_get_blockwidth(from) ||
+       util_format_get_blockheight(fmt->pipe) != util_format_get_blockheight(from) ||
+       util_format_is_depth_or_stencil(fmt->pipe) != util_format_is_depth_or_stencil(from)) {
+      say(why, why_size, "a view of %s as %s: Metal views a texture only as a format of the "
+                         "same texel size and kind", texture->format_name, fmt->name);
+      return NULL;
+   }
+   unsigned have = texture->shape.type, want = shape->type;
+   bool flat = (have == RWA_TYPE_2D || have == RWA_TYPE_2D_ARRAY) &&
+               (want == RWA_TYPE_2D || want == RWA_TYPE_2D_ARRAY) && texture->layers == 1;
+   if (have != want && !flat) {
+      say(why, why_size, "a view of a %s as a %s: only the same type, or a 2D texture and a "
+                         "one-slice 2D array, are viewed here", texture_type_name(have),
+          texture_type_name(want) ? texture_type_name(want) : "type nobody has");
+      return NULL;
+   }
+   struct rwa_texture *view = calloc(1, sizeof(*view));
+   if (!view) {
+      say(why, why_size, "out of memory making a texture view");
+      return NULL;
+   }
+   *view = *texture;
+   view->view = NULL;
+   view->res = NULL;
+   pipe_resource_reference(&view->res, texture->res);
+   view->shape.pixel_format = shape->pixel_format;
+   view->shape.type = want;
+   view->format_name = fmt->name;
+   view->view_format = fmt->pipe;
+   return view;
 }
 
 int

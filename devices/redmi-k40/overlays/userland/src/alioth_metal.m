@@ -580,6 +580,8 @@ static struct {
 	int (*render_arguments)(struct rwa_render *, unsigned, struct rwa_argument *, unsigned, unsigned *, char *,
 	    size_t);
 	int (*compute_arguments)(struct rwa_compute *, struct rwa_argument *, unsigned, unsigned *, char *, size_t);
+	/* (the K40's) a texture view over the same memory; looked up, not required */
+	struct rwa_texture *(*texture_view)(struct rwa_texture *, const struct rwa_texture_shape *, char *, size_t);
 } mesa;
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
@@ -644,6 +646,7 @@ mesa_available(void)
 	*(void **)&mesa.texture_resolve = dlsym(mesa.handle, "rwa_texture_resolve");
 	*(void **)&mesa.render_arguments = dlsym(mesa.handle, "rwa_render_arguments");
 	*(void **)&mesa.compute_arguments = dlsym(mesa.handle, "rwa_compute_arguments");
+	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -1203,6 +1206,7 @@ enum {
 	struct rwa_texture *_texture;
 	struct rwa_texture_shape _shape;
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
+	id _parent;                /* (the K40's) a view's texture, retained: -parentTexture */
 }
 @property (readonly) struct rwa_texture *mesaTexture;
 /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
@@ -2992,6 +2996,7 @@ enum {
 	if (_texture != NULL) {
 		mesa.texture_destroy(_texture);
 	}
+	[_parent release];
 	[super dealloc];
 }
 
@@ -3009,7 +3014,7 @@ enum {
 - (NSUInteger)usage                { return _shape.usage; }
 - (BOOL)isFramebufferOnly          { return NO; }
 - (BOOL)allowGPUOptimizedContents  { return NO; }
-- (id)parentTexture                { return nil; }
+- (id)parentTexture                { return _parent; }
 - (NSUInteger)parentRelativeLevel  { return 0; }
 - (NSUInteger)parentRelativeSlice  { return 0; }
 - (id)buffer                       { return nil; }
@@ -3123,29 +3128,64 @@ enum {
 	return YES;
 }
 
-/* A view of a texture is another texture over the same memory, and the compiler library has
- * no call for that yet; nil is the honest answer, and it is better than a view that aliases
- * nothing. */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format { (void)format; return nil; }
+/* A view of a texture is another texture over the same memory. (The K40, 2026-11-09: nil until
+ * the compiler library had rwa_texture_view; SceneKit asks for both forms.) */
+- (id)newTextureViewWithPixelFormat:(NSUInteger)format
+{
+	return [self newTextureViewWithPixelFormat:format textureType:_shape.type
+					    levels:NSMakeRange(0, MAX(_shape.mip_levels, 1))
+					    slices:NSMakeRange(0, [self aliothSlices])];
+}
+
+/* the slices a view of the whole texture spans: Metal counts a cube's faces as slices */
+- (NSUInteger)aliothSlices
+{
+	return MAX(_shape.array_length, 1) * ((_shape.type == 5 || _shape.type == 6) ? 6 : 1);
+}
 
 /*
  * THE REST OF WHAT <MTLTexture>, <MTLTextureSPI>, <MTLResource> AND <MTLResourceSPI>
  * REQUIRE: 27 methods with no answer anywhere in this chain before this section. The same
  * three kinds as everywhere else -- served, true by construction, or refused out loud.
  *
- * The two view calls are the only ones here that hand nothing back, and they say so: a view
- * is a second texture over the first one's memory, and rwa has no call that makes one. A
- * view that aliased nothing would be found much later, by a picture that did not change.
+ * A view is the whole of the texture in another format of its texel size or another type of
+ * its dimensions (rwa_texture_view); a range of its levels or slices is refused out loud, nil,
+ * because a view that aliased the wrong part would be found much later, by a picture that did
+ * not change.
  */
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
 			     levels:(NSRange)levels
 			     slices:(NSRange)slices
 {
-	(void)format; (void)type; (void)levels; (void)slices;
-	RW_ONCE("a texture view is not implemented (the compiler library has no "
-		"call that makes a second texture over the same memory); nil\n");
-	return nil;
+	char why[512] = { 0 };
+	struct rwa_texture_shape shape = _shape;
+	struct rwa_texture *view;
+
+	if (mesa.texture_view == NULL) {
+		RW_ONCE("a texture view, and this compiler library has no rwa_texture_view; nil\n");
+		return nil;
+	}
+	if (levels.location != 0 || levels.length != MAX(_shape.mip_levels, 1) || slices.location != 0 ||
+	    slices.length != [self aliothSlices]) {
+		RW_AGAIN("a texture view of levels %lu+%lu and slices %lu+%lu: only a view of the whole texture is "
+			 "made here; nil\n", (unsigned long)levels.location, (unsigned long)levels.length,
+			 (unsigned long)slices.location, (unsigned long)slices.length);
+		return nil;
+	}
+	shape.pixel_format = (unsigned)format;
+	shape.type = (unsigned)type;
+	if ((view = mesa.texture_view(_texture, &shape, why, sizeof(why))) == NULL) {
+		RW_AGAIN("a texture view: %s; nil\n", why);
+		return nil;
+	}
+	AliothMetalTexture *texture = [[AliothMetalTexture alloc] initWithAliothDevice:_owner texture:view
+										 shape:&shape];
+
+	if (texture != nil) {
+		texture->_parent = [self retain];
+	}
+	return texture;
 }
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
@@ -3160,11 +3200,12 @@ enum {
 - (id)newSharedTextureHandle { return nil; }   /* nothing here is shared between processes */
 
 /* Served out of the shape this texture was made with, which is the only place that
- * knowledge exists: a cube is six faces (MTLTextureTypeCube is 3, CubeArray is 4),
- * everything else is one. */
+ * knowledge exists: a cube is six faces, everything else is one. (The K40, 2026-11-09:
+ * MTLTextureTypeCube is 5 and CubeArray 6 in the iOS 16.5 SDK's MTLTexture.h; this said 3
+ * and 4, which are 2DArray and 2DMultisample, and answered six faces for those.) */
 - (NSUInteger)numFaces
 {
-	return (_shape.type == 3 || _shape.type == 4) ? 6 : 1;
+	return (_shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray) ? 6 : 1;
 }
 /* The identity swizzle, and it is the truth rather than a default: a texture of this driver
  * is made from a descriptor's format alone and nothing reorders its channels, so red reads

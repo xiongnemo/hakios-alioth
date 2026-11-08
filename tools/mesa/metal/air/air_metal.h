@@ -1366,6 +1366,14 @@ struct rwa_argument {
 	const struct rwa_struct_member *members;
 };
 
+/* (the K40's) A texture view over the whole of `texture`: a second texture sharing its
+ * memory, in shape->pixel_format (one of the same texel size and kind) and shape->type (the
+ * same, or 2D and a one-slice 2D array); the rest of `shape` is ignored. Destroyed with
+ * rwa_texture_destroy, in either order with the texture. NULL and why. */
+struct rwa_texture *rwa_texture_view(struct rwa_texture *texture,
+				     const struct rwa_texture_shape *shape, char *why,
+				     size_t why_size);
+
 /* stage 0 the vertex function (nothing for a generated vertex stage), 1 the fragment one.
  * 0, or -1 and why -- including when there are more than `max`. */
 int rwa_render_arguments(struct rwa_render *render, unsigned stage, struct rwa_argument *out,
