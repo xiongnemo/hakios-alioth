@@ -110,6 +110,17 @@ struct air_sampler_state {
    unsigned reduction;            /* AGX does not read this field */
 };
 
+/* (the K40's) One member of a plain buffer argument's struct, as `air.struct_type_info`
+ * lists it: five fields each -- byte offset, size, a flag, the type name, the member
+ * name. Metal's pipeline reflection (MTLStructType) is made of these.
+ */
+struct air_struct_member {
+   const char *name;
+   const char *type_name;
+   unsigned offset, size;
+   bool is_struct;    /* the member is a struct of its own (its members are not kept) */
+};
+
 struct air_resource {
    enum air_resource_kind kind;
    unsigned index;   /* Metal's [[buffer(n)]], [[texture(n)]], [[sampler(n)]] --
@@ -120,6 +131,20 @@ struct air_resource {
    unsigned param;   /* the entry point's parameter; ~0u for an inline sampler */
    const char *name; /* air.arg_name */
    const char *type_name;
+
+   /* (the K40's) What Metal's pipeline reflection reports about an argument, which
+    * SpriteKit and SceneKit bind by: they look each argument up BY NAME in
+    * -fragmentArguments / -vertexArguments and bind at the index it reports.
+    *
+    * `unused` is Apple's `air.arg_unused`: the function reads nothing through it, and
+    * Metal does not want it bound (MTLArgument.isActive is NO). SceneKit's
+    * commonprofile_frag declares three such buffers and binds none of them.
+    */
+   bool unused;
+   unsigned array_length;            /* air.location_index's span: 1 for one argument */
+   unsigned type_size, type_align;   /* air.arg_type_size / _align_size; 0 when not given */
+   unsigned num_members;             /* a plain buffer's air.struct_type_info */
+   struct air_struct_member *members;
 
    /* A sampler the shader declares itself (Metal's constexpr sampler) rather
     * than one the API binds: the runtime has to create it from this state

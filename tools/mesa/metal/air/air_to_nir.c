@@ -920,6 +920,42 @@ add_resource(struct air_ctx *c, enum air_resource_kind kind, unsigned index, uns
                index, name ? name : "unnamed");
    }
 
+   /* (the K40's) what Metal's pipeline reflection reports, struct air_resource says why */
+   uint64_t span = 1, type_size = 0, type_align = 0;
+   int li = md_key(node, "air.location_index");
+   if (li >= 0 && (!md_int(node, li + 2, &span) || span == 0))
+      span = 1;
+   md_key_int(node, "air.arg_type_size", &type_size);
+   md_key_int(node, "air.arg_type_align_size", &type_align);
+
+   struct air_struct_member *members = NULL;
+   unsigned num_members = 0;
+   const struct air_md *sti = (kind == AIR_RESOURCE_CONSTANT_BUFFER ||
+                               kind == AIR_RESOURCE_DEVICE_BUFFER)
+                                 ? md_key_node(node, "air.struct_type_info") : NULL;
+   for (unsigned i = 0; sti && i < sti->num_ops;) {
+      /* a member that is a struct itself comes key first: the key, its own table,
+       * then the five fields (argbuf_members says the same of a set's members)
+       */
+      bool nested = false;
+      const char *key = md_str(sti, i);
+      if (key && !strcmp(key, "air.struct_type_info")) {
+         nested = true;
+         i += 2;
+      }
+      uint64_t off = 0, msize = 0, flag = 0;
+      const char *mtype = md_str(sti, i + 3), *mname = md_str(sti, i + 4);
+      if (!md_int(sti, i, &off) || !md_int(sti, i + 1, &msize) ||
+          !md_int(sti, i + 2, &flag) || !mtype || !mname)
+         break;   /* a shape not read yet: the members so far are what is reported */
+      members = reralloc(c->mem_ctx, members, struct air_struct_member, num_members + 1);
+      members[num_members++] = (struct air_struct_member) {
+         .name = mname, .type_name = mtype, .offset = (unsigned)off,
+         .size = (unsigned)msize, .is_struct = nested,
+      };
+      i += 5;
+   }
+
    info->resources[info->num_resources] = (struct air_resource) {
       .kind = kind, .index = index, .size = size, .read = read, .write = write,
       .param = param,
@@ -928,6 +964,10 @@ add_resource(struct air_ctx *c, enum air_resource_kind kind, unsigned index, uns
       .raster_order_group = has_group ? (int)group : -1,
       /* a direct argument: Metal names it by .index and there is no set */
       .argbuf_set = ~0u, .argbuf_id = ~0u,
+      .unused = md_key(node, "air.arg_unused") >= 0,
+      .array_length = (unsigned)span,
+      .type_size = (unsigned)type_size, .type_align = (unsigned)type_align,
+      .num_members = num_members, .members = members,
    };
    return &info->resources[info->num_resources++];
 }
@@ -4049,9 +4089,20 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
          info->resources = ralloc_memdup(mem_ctx, info->resources,
                                          info->num_resources * sizeof(*info->resources));
          for (unsigned i = 0; i < info->num_resources; i++) {
-            info->resources[i].name = ralloc_strdup(mem_ctx, info->resources[i].name);
-            info->resources[i].type_name =
-               ralloc_strdup(mem_ctx, info->resources[i].type_name);
+            struct air_resource *r = &info->resources[i];
+            r->name = ralloc_strdup(mem_ctx, r->name);
+            r->type_name = ralloc_strdup(mem_ctx, r->type_name);
+            /* (the K40's) the struct members, for reflection: out of ctx too */
+            if (r->num_members) {
+               r->members = ralloc_memdup(mem_ctx, r->members,
+                                          r->num_members * sizeof(*r->members));
+               for (unsigned m = 0; m < r->num_members; m++) {
+                  r->members[m].name = ralloc_strdup(mem_ctx, r->members[m].name);
+                  r->members[m].type_name = ralloc_strdup(mem_ctx, r->members[m].type_name);
+               }
+            } else {
+               r->members = NULL;
+            }
          }
       }
       if (info->num_varyings) {

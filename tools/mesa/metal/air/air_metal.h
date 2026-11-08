@@ -1323,6 +1323,57 @@ int rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, stru
 			size_t why_size);
 
 /*
+ * (the K40's) Metal's pipeline reflection: one entry per argument a stage declares, as
+ * -[MTLRenderPipelineReflection vertexArguments / fragmentArguments] and a compute
+ * pipeline's -arguments report them. SpriteKit's renderer and SceneKit bind BY NAME
+ * through this -- each looks an argument up and binds at the index it reports -- so a
+ * pipeline without it is one they bind nothing to.
+ *
+ * Off Apple's own metadata: air.arg_name, air.arg_type_name, air.arg_unused (`active` 0),
+ * air.arg_type_size / _align_size, air.location_index's span, and a buffer's
+ * air.struct_type_info. The strings and the member arrays belong to the pipeline and live
+ * as long as it does. A member of an argument buffer is not an argument of its own and is
+ * not listed; neither is a constexpr sampler.
+ */
+enum rwa_argument_kind {
+	RWA_ARGUMENT_BUFFER = 0,          /* MTLArgumentType's own numbers */
+	RWA_ARGUMENT_THREADGROUP = 1,
+	RWA_ARGUMENT_TEXTURE = 2,
+	RWA_ARGUMENT_SAMPLER = 3,
+};
+
+struct rwa_struct_member {
+	const char *name;
+	const char *type_name;            /* e.g. "float4x4"; MTLDataType is the caller's to map */
+	unsigned offset, size;
+	unsigned is_struct;               /* a struct of its own, whose members are not listed */
+};
+
+struct rwa_argument {
+	unsigned kind;                    /* enum rwa_argument_kind */
+	unsigned index;                   /* [[buffer(n)]], [[texture(n)]], [[sampler(n)]] */
+	unsigned active;                  /* 0: air.arg_unused, nothing need be bound */
+	unsigned access;                  /* MTLArgumentAccess: 0 read, 1 read-write, 2 write */
+	unsigned size, align;             /* a buffer's sizeof(T) and alignment; 0 unknown */
+	unsigned array_length;            /* 1 for one */
+	unsigned texture_type;            /* MTLTextureType, when type_known */
+	unsigned type_known;
+	unsigned element, element_bits;   /* enum rwa_element of a texture */
+	unsigned is_depth;                /* depth2d and its kin */
+	const char *name;
+	const char *type_name;            /* air.arg_type_name */
+	unsigned member_count;            /* a buffer's struct, air.struct_type_info */
+	const struct rwa_struct_member *members;
+};
+
+/* stage 0 the vertex function (nothing for a generated vertex stage), 1 the fragment one.
+ * 0, or -1 and why -- including when there are more than `max`. */
+int rwa_render_arguments(struct rwa_render *render, unsigned stage, struct rwa_argument *out,
+			 unsigned max, unsigned *count, char *why, size_t why_size);
+int rwa_compute_arguments(struct rwa_compute *compute, struct rwa_argument *out, unsigned max,
+			  unsigned *count, char *why, size_t why_size);
+
+/*
  * A pass that clears and draws nothing (the K40's addition): the colour attachments (NULL
  * entries kept as they are) cleared to clear_color if it is not NULL, the depth/stencil
  * attachment to *clear_depth / *clear_stencil where those are given and the format has the

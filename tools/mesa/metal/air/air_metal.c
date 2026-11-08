@@ -1349,10 +1349,16 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
    texture->shader_read = read;
    texture->shader_write = write;
 
+   /* (the K40's) nr_storage_samples as well as nr_samples, as st/mesa sets them: fd6's
+    * is_format_supported refuses a resource whose two counts differ, and u_blitter asks
+    * it before a resolve -- with 0 here every MSAA resolve was dropped without a word
+    * (fd_blit: "blit unsupported"), the resolve texture left as it was.
+    */
    struct pipe_resource templ = {
       .target = target, .format = fmt->pipe,
       .width0 = width, .height0 = height, .depth0 = depth,
       .array_size = array_size, .last_level = mips - 1, .nr_samples = query_samples,
+      .nr_storage_samples = query_samples,
       .bind = bind, .usage = PIPE_USAGE_DEFAULT };
 
    if (import) {
@@ -2872,6 +2878,9 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
     */
    for (unsigned i = 0; i < compute->info.num_resources; i++) {
       const struct air_resource *r = &compute->info.resources[i];
+      /* (the K40's) an argument nothing reads is not counted: check_bindings */
+      if (r->unused && r->argbuf_set == ~0u && r->kind != AIR_RESOURCE_THREADGROUP_BUFFER)
+         continue;
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
       case AIR_RESOURCE_DEVICE_BUFFER:
@@ -3404,6 +3413,14 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
 
+      /* (the K40's) Apple's air.arg_unused: the function reads nothing through it, so
+       * nothing need be bound there -- Metal reports it inactive and SceneKit binds none
+       * of commonprofile_frag's three such buffers. Refusing the draw for it was this
+       * library being stricter than the API.
+       */
+      if (r->unused && r->argbuf_set == ~0u)
+         continue;
+
       /*
        * A MEMBER OF AN ARGUMENT BUFFER comes from the encoder's record and not from the
        * caller's arrays, and everything below this point is the same for both: the
@@ -3591,6 +3608,12 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
       struct rwa_texture *t = NULL;
       struct rwa_sampler *sm = NULL;
       size_t boffset = 0;
+
+      /* (the K40's) an argument nothing reads (air.arg_unused) is bound by nobody, and
+       * Metal does not want it bound: check_bindings skips it too
+       */
+      if (r->unused && r->argbuf_set == ~0u)
+         continue;
 
       /* A member of an argument buffer comes from the encoder's record; everything
        * below binds it exactly as a direct argument, at the index the frontend gave it.
@@ -4137,6 +4160,8 @@ count_resources(const struct air_shader_info *info, struct rwa_slot slots[RWA_MA
 {
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
+      if (r->unused && r->argbuf_set == ~0u)
+         continue;   /* (the K40's) nothing to bind: check_bindings */
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
       case AIR_RESOURCE_DEVICE_BUFFER:
@@ -7144,6 +7169,22 @@ rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, struct r
           dst->res->width0, dst->res->height0);
       return -1;
    }
+   /* pipe->blit says nothing when it does nothing, so what freedreno's fallback asks
+    * (u_blitter, is_blit_generic_supported) is asked here first, and a no is a sentence
+    */
+   struct pipe_screen *screen = device->screen;
+   bool zs = util_format_is_depth_or_stencil(dst->res->format);
+   if (!screen->is_format_supported(screen, src->res->format, src->res->target,
+                                    src->res->nr_samples, src->res->nr_storage_samples,
+                                    PIPE_BIND_SAMPLER_VIEW) ||
+       !screen->is_format_supported(screen, dst->res->format, dst->res->target,
+                                    dst->res->nr_samples, dst->res->nr_storage_samples,
+                                    zs ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET)) {
+      say(why, why_size, "%s cannot resolve %s of %u samples into %s: the GPU's blit "
+                         "takes neither", rwa_device_name(device), src->format_name,
+          src->res->nr_samples, dst->format_name);
+      return -1;
+   }
    struct pipe_blit_info blit = { 0 };
    blit.src.resource = src->res;
    blit.src.format = src->res->format;
@@ -7158,4 +7199,153 @@ rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, struct r
    device->pipe->blit(device->pipe, &blit);
    device->pipe->flush(device->pipe, NULL, 0);
    return 0;
+}
+
+/*
+ * (the K40's) Metal's pipeline reflection (air_metal.h, struct rwa_argument), off the
+ * arguments the frontend read -- names, indices, Apple's air.arg_unused, sizes and the
+ * members of a buffer's struct. SpriteKit's renderer (Jet) and SceneKit look every
+ * argument up BY NAME in -vertexArguments / -fragmentArguments and bind at the index it
+ * reports; a pipeline with no reflection is one they bind nothing to, which is how
+ * SpriteKit's FastSingle_FragFunc came to "read texture 0 and 0 textures were bound".
+ */
+
+/* what a texture argument's own declaration says (air.arg_type_name, e.g. "texture2d<float,
+ * sample>" or "depth2d<float>"): MTLTextureType, enum rwa_element, its width, depth or not
+ */
+static bool
+reflect_texture_name(const char *tn, unsigned *type, unsigned *element, unsigned *bits,
+                     unsigned *depth)
+{
+   static const struct { const char *prefix; unsigned type; } kinds[] = {
+      /* longest first: "texture2d" is a prefix of four of them */
+      { "texture2d_ms_array", 8 }, { "texture2d_ms", 4 }, { "texture2d_array", 3 },
+      { "texture2d", 2 }, { "texture1d_array", 1 }, { "texture1d", 0 },
+      { "texturecube_array", 6 }, { "texturecube", 5 }, { "texture3d", 7 },
+      { "texture_buffer", 9 }, { "depth2d_ms_array", 8 }, { "depth2d_ms", 4 },
+      { "depth2d_array", 3 }, { "depth2d", 2 }, { "depthcube_array", 6 },
+      { "depthcube", 5 },
+   };
+   if (!tn)
+      return false;
+   for (unsigned i = 0; i < ARRAY_SIZE(kinds); i++) {
+      size_t n = strlen(kinds[i].prefix);
+      if (strncmp(tn, kinds[i].prefix, n) || (tn[n] != '<' && tn[n] != '\0'))
+         continue;
+      *type = kinds[i].type;
+      *depth = !strncmp(tn, "depth", 5);
+      const char *e = tn[n] == '<' ? tn + n + 1 : "";
+      *element = RWA_ELEMENT_UNKNOWN;
+      *bits = 0;
+      if (!strncmp(e, "float", 5)) { *element = RWA_ELEMENT_FLOAT; *bits = 32; }
+      else if (!strncmp(e, "half", 4)) { *element = RWA_ELEMENT_FLOAT; *bits = 16; }
+      else if (!strncmp(e, "uint", 4)) { *element = RWA_ELEMENT_UINT; *bits = 32; }
+      else if (!strncmp(e, "ushort", 6)) { *element = RWA_ELEMENT_UINT; *bits = 16; }
+      else if (!strncmp(e, "int", 3)) { *element = RWA_ELEMENT_INT; *bits = 32; }
+      else if (!strncmp(e, "short", 5)) { *element = RWA_ELEMENT_INT; *bits = 16; }
+      return true;
+   }
+   return false;
+}
+
+static int
+reflect_arguments(const struct air_shader_info *info, void *mem_ctx, struct rwa_argument *out,
+                  unsigned max, unsigned *count, char *why, size_t why_size)
+{
+   const char *fname = info->entry_point ? info->entry_point : "the function";
+   unsigned n = 0;
+
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      const struct air_resource *r = &info->resources[i];
+
+      /* a member of an argument buffer is not an argument of its own, and a constexpr
+       * sampler is nothing the API binds
+       */
+      if (r->argbuf_set != ~0u || r->inline_sampler)
+         continue;
+      if (n >= max) {
+         say(why, why_size, "%s has more than %u arguments to reflect", fname, max);
+         return -1;
+      }
+      struct rwa_argument *a = &out[n++];
+      memset(a, 0, sizeof(*a));
+      a->index = r->index;
+      a->active = !r->unused;
+      a->name = r->name ? r->name : "";
+      a->type_name = r->type_name ? r->type_name : "";
+      a->array_length = r->array_length ? r->array_length : 1;
+
+      switch (r->kind) {
+      case AIR_RESOURCE_CONSTANT_BUFFER:
+      case AIR_RESOURCE_DEVICE_BUFFER:
+         a->kind = RWA_ARGUMENT_BUFFER;
+         a->access = r->write ? (r->read ? 1 : 2) : 0;
+         a->size = r->type_size ? r->type_size : r->size;
+         a->align = r->type_align;
+         if (r->num_members) {
+            struct rwa_struct_member *m =
+               ralloc_array(mem_ctx, struct rwa_struct_member, r->num_members);
+            if (!m) {
+               say(why, why_size, "out of memory reflecting %s", fname);
+               return -1;
+            }
+            for (unsigned k = 0; k < r->num_members; k++)
+               m[k] = (struct rwa_struct_member) {
+                  .name = r->members[k].name, .type_name = r->members[k].type_name,
+                  .offset = r->members[k].offset, .size = r->members[k].size,
+                  .is_struct = r->members[k].is_struct,
+               };
+            a->members = m;
+            a->member_count = r->num_members;
+         }
+         break;
+      case AIR_RESOURCE_THREADGROUP_BUFFER:
+         a->kind = RWA_ARGUMENT_THREADGROUP;
+         a->access = 1;
+         a->size = r->type_size;
+         a->align = r->type_align;
+         break;
+      case AIR_RESOURCE_TEXTURE:
+      case AIR_RESOURCE_IMAGE:
+         a->kind = RWA_ARGUMENT_TEXTURE;
+         a->access = r->kind == AIR_RESOURCE_IMAGE ? (r->read ? 1 : 2) : 0;
+         a->type_known = reflect_texture_name(r->type_name, &a->texture_type, &a->element,
+                                              &a->element_bits, &a->is_depth);
+         break;
+      case AIR_RESOURCE_SAMPLER:
+         a->kind = RWA_ARGUMENT_SAMPLER;
+         break;
+      }
+   }
+   *count = n;
+   return 0;
+}
+
+int
+rwa_render_arguments(struct rwa_render *render, unsigned stage, struct rwa_argument *out,
+                     unsigned max, unsigned *count, char *why, size_t why_size)
+{
+   if (count)
+      *count = 0;
+   if (!render || !count || (!out && max)) {
+      say(why, why_size, "reflection needs a pipeline and somewhere to put it");
+      return -1;
+   }
+   if (stage == 0)   /* the vertex stage; the generated one takes no arguments */
+      return render->generated_vertex ? 0 : reflect_arguments(&render->vinfo, render->mem_ctx,
+                                                              out, max, count, why, why_size);
+   return reflect_arguments(&render->finfo, render->mem_ctx, out, max, count, why, why_size);
+}
+
+int
+rwa_compute_arguments(struct rwa_compute *compute, struct rwa_argument *out, unsigned max,
+                      unsigned *count, char *why, size_t why_size)
+{
+   if (count)
+      *count = 0;
+   if (!compute || !count || (!out && max)) {
+      say(why, why_size, "reflection needs a pipeline and somewhere to put it");
+      return -1;
+   }
+   return reflect_arguments(&compute->info, compute->mem_ctx, out, max, count, why, why_size);
 }

@@ -318,6 +318,29 @@ struct rwa_draw {
 	 * Appended, as the tables were. */
 	const float *viewport;
 };
+/* (the K40's) Metal's pipeline reflection, air_metal.h's rwa_argument (rwa_render_arguments) */
+struct rwa_struct_member {
+	const char *name;
+	const char *type_name;
+	unsigned offset, size;
+	unsigned is_struct;
+};
+struct rwa_argument {
+	unsigned kind;                    /* MTLArgumentType's own numbers */
+	unsigned index;
+	unsigned active;
+	unsigned access;                  /* MTLArgumentAccess */
+	unsigned size, align;
+	unsigned array_length;
+	unsigned texture_type;
+	unsigned type_known;
+	unsigned element, element_bits;   /* 1 float, 2 int, 3 uint (enum rwa_element) */
+	unsigned is_depth;
+	const char *name;
+	const char *type_name;
+	unsigned member_count;
+	const struct rwa_struct_member *members;
+};
 
 /*
  * The library's MTLVertexFormat table, checked against Apple's own header HERE, where the
@@ -553,6 +576,10 @@ static struct {
 	int (*compute_threadgroup_bytes)(struct rwa_compute *, unsigned, char *, size_t);
 	/* (the K40's) a multisample attachment resolved by the GPU; looked up, not required */
 	int (*texture_resolve)(struct rwa_device *, struct rwa_texture *, struct rwa_texture *, char *, size_t);
+	/* (the K40's) pipeline reflection, by stage; looked up, not required */
+	int (*render_arguments)(struct rwa_render *, unsigned, struct rwa_argument *, unsigned, unsigned *, char *,
+	    size_t);
+	int (*compute_arguments)(struct rwa_compute *, struct rwa_argument *, unsigned, unsigned *, char *, size_t);
 } mesa;
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
@@ -615,6 +642,8 @@ mesa_available(void)
 	*(void **)&mesa.finish = dlsym(mesa.handle, "rwa_finish");
 	*(void **)&mesa.compute_threadgroup_bytes = dlsym(mesa.handle, "rwa_compute_set_threadgroup_bytes");
 	*(void **)&mesa.texture_resolve = dlsym(mesa.handle, "rwa_texture_resolve");
+	*(void **)&mesa.render_arguments = dlsym(mesa.handle, "rwa_render_arguments");
+	*(void **)&mesa.compute_arguments = dlsym(mesa.handle, "rwa_compute_arguments");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -986,6 +1015,8 @@ struct gem_close { uint32_t handle, pad; };
 				info:(const struct rwa_compute_info *)info
 			  descriptor:(id)descriptor;
 - (struct rwa_compute *)compute;
+/* (the K40's) Metal's pipeline reflection of it, autoreleased; nil when the library has none */
+- (id)aliothReflection;
 @end
 
 @interface AliothMetalCommandQueue : _MTLCommandQueue
@@ -1091,6 +1122,8 @@ enum {
 	struct rwa_render_info _info;
 }
 - (struct rwa_render *)render;
+/* (the K40's) Metal's pipeline reflection of it, autoreleased; nil when the library has none */
+- (id)aliothReflection;
 /* Not part of any Metal protocol: whether this pipeline's fragment shader stores to
  * [[depth]], which only whoever read the shader knows. A pass without a depth attachment
  * drops those writes -- Metal's own behaviour -- and a draw that says so is the difference
@@ -1619,16 +1652,20 @@ enum {
 							     descriptor:descriptor];
 }
 
+/* (the K40's) with Metal's reflection of what was built, which SpriteKit and SceneKit bind by:
+ * AliothMetalArgument says how */
 - (id)newRenderPipelineStateWithDescriptor:(id)descriptor
 				   options:(NSUInteger)options
 				reflection:(id *)reflection
 				     error:(NSError **)error
 {
 	(void)options;
+	id state = [self newRenderPipelineStateWithDescriptor:descriptor error:error];
+
 	if (reflection != NULL) {
-		*reflection = nil;   /* reflection is Metal's compiler's, and ours is nil */
+		*reflection = state != nil ? [state aliothReflection] : nil;
 	}
-	return [self newRenderPipelineStateWithDescriptor:descriptor error:error];
+	return state;
 }
 
 /*
@@ -2133,11 +2170,27 @@ enum {
 				      error:(NSError **)error
 {
 	(void)options;
+	id state = [self pipelineForFunction:[descriptor computeFunction] descriptor:descriptor error:error];
+
+	/* (the K40's) Metal's reflection of it, which was nil: AliothMetalArgument */
 	if (reflection != NULL) {
-		*reflection = nil;   /* reflection needs Metal's compiler; saying nil is honest */
+		*reflection = state != nil ? [state aliothReflection] : nil;
 	}
-	return [self pipelineForFunction:[descriptor computeFunction] descriptor:descriptor
-				  error:error];
+	return state;
+}
+
+- (id)newComputePipelineStateWithFunction:(id)function
+				  options:(NSUInteger)options
+			       reflection:(id *)reflection
+				    error:(NSError **)error
+{
+	(void)options;
+	id state = [self newComputePipelineStateWithFunction:function error:error];
+
+	if (reflection != NULL) {
+		*reflection = state != nil ? [state aliothReflection] : nil;
+	}
+	return state;
 }
 
 - (id)newComputePipelineStateWithDescriptor:(id)descriptor error:(NSError **)error
@@ -2173,6 +2226,22 @@ enum {
 						      options:options
 						   reflection:&reflection
 							error:&error];
+
+	if (handler != NULL) {
+		handler(state, reflection, error);
+	}
+	[state release];
+}
+
+/* (the K40's) and the function form of it, which Metal's own sends to the nil compiler as well */
+- (void)newComputePipelineStateWithFunction:(id)function
+				    options:(NSUInteger)options
+			  completionHandler:(void (^)(id, id, NSError *))handler
+{
+	NSError *error = nil;
+	id reflection = nil;
+	id state = [self newComputePipelineStateWithFunction:function options:options reflection:&reflection
+						       error:&error];
 
 	if (handler != NULL) {
 		handler(state, reflection, error);
@@ -3275,6 +3344,310 @@ enum {
 
 @end
 
+/*
+ * (the K40's) Metal's pipeline reflection, made of what the compiler library read out of Apple's metadata
+ * (rwa_render_arguments, rwa_compute_arguments): MTLArgument and the iOS 16 MTLBinding in one object, MTLStructType,
+ * MTLStructMember, MTLArrayType, and MTLRenderPipelineReflection / MTLComputePipelineReflection. Metal's own classes
+ * are made by its compiler, which is nil here, so it was reflection that was nil -- and SpriteKit's renderer (Jet)
+ * and SceneKit look every argument up BY NAME in -vertexArguments / -fragmentArguments and bind at the index it
+ * reports (SceneKit also finds a buffer's members by name). With nil they bound nothing: "FastSingle_FragFunc reads
+ * texture 0 and 0 textures were bound". These answer by the protocols' selectors; nothing checks their class.
+ */
+
+/* MTLDataType from a type name as Apple's metadata writes it ("float4x4", "half3", "packed_float3", "uint") */
+static NSUInteger
+alioth_data_type(const char *type)
+{
+	static const struct {
+		const char *name;
+		NSUInteger scalar;
+	} bases[] = {
+		{ "float", MTLDataTypeFloat }, { "half", MTLDataTypeHalf }, { "int", MTLDataTypeInt },
+		{ "uint", MTLDataTypeUInt }, { "short", MTLDataTypeShort }, { "ushort", MTLDataTypeUShort },
+		{ "char", MTLDataTypeChar }, { "uchar", MTLDataTypeUChar }, { "bool", MTLDataTypeBool },
+	};
+
+	if (type == NULL) {
+		return MTLDataTypeNone;
+	}
+	if (strncmp(type, "packed_", 7) == 0) {
+		type += 7;
+	}
+	for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
+		size_t n = strlen(bases[i].name);
+		const char *rest = type + n;
+
+		if (strncmp(type, bases[i].name, n) != 0) {
+			continue;
+		}
+		if (*rest == '\0') {
+			return bases[i].scalar;
+		}
+		if (rest[0] >= '2' && rest[0] <= '4') {
+			unsigned columns = (unsigned)(rest[0] - '0');
+
+			if (rest[1] == '\0') {
+				return bases[i].scalar + (columns - 1);         /* Float2 = Float + 1, ... */
+			}
+			if (rest[1] == 'x' && rest[2] >= '2' && rest[2] <= '4' && rest[3] == '\0') {
+				unsigned rows = (unsigned)(rest[2] - '0');
+
+				if (bases[i].scalar == MTLDataTypeFloat) {
+					return MTLDataTypeFloat2x2 + (columns - 2) * 3 + (rows - 2);
+				}
+				if (bases[i].scalar == MTLDataTypeHalf) {
+					return MTLDataTypeHalf2x2 + (columns - 2) * 3 + (rows - 2);
+				}
+			}
+		}
+	}
+	return MTLDataTypeNone;
+}
+
+@interface AliothMetalArrayType : NSObject {
+@public
+	NSUInteger elementType, arrayLength, stride;
+}
+@end
+
+@implementation AliothMetalArrayType
+- (NSUInteger)dataType                  { return MTLDataTypeArray; }
+- (NSUInteger)elementType               { return elementType; }
+- (NSUInteger)arrayLength               { return arrayLength; }
+- (NSUInteger)stride                    { return stride; }
+- (NSUInteger)argumentIndexStride       { return 0; }
+- (id)elementStructType                 { return nil; }
+- (id)elementArrayType                  { return nil; }
+- (id)elementTextureReferenceType       { return nil; }
+- (id)elementPointerType                { return nil; }
+@end
+
+@interface AliothMetalStructType : NSObject {
+@public
+	NSArray *members;                       /* AliothMetalStructMember each */
+}
+@end
+
+@interface AliothMetalStructMember : NSObject {
+@public
+	NSString *name;
+	NSUInteger offset, dataType;
+	AliothMetalStructType *structType;      /* a struct member: empty, its members are not kept */
+	AliothMetalArrayType *arrayType;        /* "T[n]" */
+}
+@end
+
+@implementation AliothMetalStructMember
+- (NSString *)name                      { return name; }
+- (NSUInteger)offset                    { return offset; }
+- (NSUInteger)dataType                  { return dataType; }
+- (id)structType                        { return structType; }
+- (id)arrayType                         { return arrayType; }
+- (id)textureReferenceType              { return nil; }
+- (id)pointerType                       { return nil; }
+- (NSUInteger)argumentIndex             { return 0; }
+
+- (void)dealloc
+{
+	[name release];
+	[structType release];
+	[arrayType release];
+	[super dealloc];
+}
+@end
+
+@implementation AliothMetalStructType
+- (NSUInteger)dataType                  { return MTLDataTypeStruct; }
+- (NSArray *)members                    { return members; }
+
+- (id)memberByName:(NSString *)name
+{
+	for (AliothMetalStructMember *m in members) {
+		if ([m->name isEqualToString:name]) {
+			return m;
+		}
+	}
+	return nil;
+}
+
+- (void)dealloc
+{
+	[members release];
+	[super dealloc];
+}
+@end
+
+/* a buffer's struct, from air.struct_type_info's members */
+static AliothMetalStructType *
+alioth_struct_type(const struct rwa_struct_member *members, unsigned count)
+{
+	AliothMetalStructType *type = [[AliothMetalStructType alloc] init];
+	NSMutableArray *list = [[NSMutableArray alloc] initWithCapacity:count];
+
+	for (unsigned i = 0; i < count; i++) {
+		AliothMetalStructMember *m = [[AliothMetalStructMember alloc] init];
+		const char *tn = members[i].type_name ? members[i].type_name : "";
+		const char *bracket = strchr(tn, '[');
+
+		m->name = [[NSString alloc] initWithUTF8String:members[i].name ? members[i].name : ""];
+		m->offset = members[i].offset;
+		if (members[i].is_struct) {
+			m->dataType = MTLDataTypeStruct;
+			m->structType = [[AliothMetalStructType alloc] init];
+		} else if (bracket != NULL) {
+			char element[64];
+			size_t n = MIN((size_t)(bracket - tn), sizeof(element) - 1);
+			unsigned long length = strtoul(bracket + 1, NULL, 10);
+
+			memcpy(element, tn, n);
+			element[n] = '\0';
+			m->dataType = MTLDataTypeArray;
+			m->arrayType = [[AliothMetalArrayType alloc] init];
+			m->arrayType->elementType = alioth_data_type(element);
+			m->arrayType->arrayLength = length;
+			m->arrayType->stride = length != 0 ? members[i].size / length : 0;
+		} else {
+			m->dataType = alioth_data_type(tn);
+		}
+		[list addObject:m];
+		[m release];
+	}
+	type->members = list;
+	return [type autorelease];
+}
+
+@interface AliothMetalArgument : NSObject {
+@public
+	NSString *name;
+	NSUInteger type, access, index, size, align, dataType, textureType, textureDataType, arrayLength;
+	BOOL active, depth;
+	AliothMetalStructType *structType;
+}
+@end
+
+@implementation AliothMetalArgument
+/* MTLArgument */
+- (NSString *)name                      { return name; }
+- (NSUInteger)type                      { return type; }     /* MTLArgumentType and MTLBindingType agree */
+- (NSUInteger)access                    { return access; }
+- (NSUInteger)index                     { return index; }
+- (BOOL)isActive                        { return active; }
+- (NSUInteger)bufferAlignment           { return align; }
+- (NSUInteger)bufferDataSize            { return size; }
+- (NSUInteger)bufferDataType            { return dataType; }
+- (id)bufferStructType                  { return structType; }
+- (id)bufferPointerType                 { return nil; }
+- (NSUInteger)threadgroupMemoryAlignment { return align; }
+- (NSUInteger)threadgroupMemoryDataSize { return size; }
+- (NSUInteger)textureType               { return textureType; }
+- (NSUInteger)textureDataType           { return textureDataType; }
+- (BOOL)isDepthTexture                  { return depth; }
+- (NSUInteger)arrayLength               { return arrayLength; }
+/* MTLBinding and its kin, iOS 16 */
+- (BOOL)isUsed                          { return active; }
+- (BOOL)isArgument                      { return NO; }
+- (NSUInteger)objectPayloadAlignment    { return 0; }
+- (NSUInteger)objectPayloadDataSize     { return 0; }
+
+- (NSString *)description
+{
+	return [NSString stringWithFormat:@"<AliothMetalArgument %@: type %lu index %lu%s>", name, (unsigned long)type,
+	    (unsigned long)index, active ? "" : ", inactive"];
+}
+
+- (void)dealloc
+{
+	[name release];
+	[structType release];
+	[super dealloc];
+}
+@end
+
+static NSArray *
+alioth_arguments(const struct rwa_argument *args, unsigned count)
+{
+	NSMutableArray *list = [NSMutableArray arrayWithCapacity:count];
+
+	for (unsigned i = 0; i < count; i++) {
+		const struct rwa_argument *a = &args[i];
+		AliothMetalArgument *m = [[AliothMetalArgument alloc] init];
+		BOOL half = a->element_bits == 16;
+
+		m->name = [[NSString alloc] initWithUTF8String:a->name ? a->name : ""];
+		m->type = a->kind;
+		m->access = a->access;
+		m->index = a->index;
+		m->active = a->active != 0;
+		m->size = a->size;
+		m->align = a->align;
+		m->arrayLength = a->array_length != 0 ? a->array_length : 1;
+		m->textureType = a->type_known ? a->texture_type : MTLTextureType2D;
+		m->textureDataType = a->element == 1 ? (half ? MTLDataTypeHalf : MTLDataTypeFloat) :
+		    a->element == 2 ? (half ? MTLDataTypeShort : MTLDataTypeInt) :
+		    a->element == 3 ? (half ? MTLDataTypeUShort : MTLDataTypeUInt) : MTLDataTypeNone;
+		m->depth = a->is_depth != 0;
+		if (a->kind == MTLArgumentTypeBuffer) {
+			m->dataType = alioth_data_type(a->type_name);
+			/* a struct: its members when the metadata lists them, an empty struct when it does not */
+			if (a->member_count != 0 || (m->dataType == MTLDataTypeNone && a->type_name && a->type_name[0])) {
+				m->dataType = MTLDataTypeStruct;
+				m->structType = [alioth_struct_type(a->members, a->member_count) retain];
+			}
+		}
+		[list addObject:m];
+		[m release];
+	}
+	return list;
+}
+
+@interface AliothMetalReflection : NSObject {
+@public
+	NSArray *vertex, *fragment;             /* a compute pipeline's arguments are `vertex` */
+}
+@end
+
+@implementation AliothMetalReflection
+- (NSArray *)vertexArguments            { return vertex; }
+- (NSArray *)fragmentArguments          { return fragment; }
+- (NSArray *)tileArguments              { return @[]; }
+- (NSArray *)vertexBindings             { return vertex; }
+- (NSArray *)fragmentBindings           { return fragment; }
+- (NSArray *)tileBindings               { return @[]; }
+- (NSArray *)objectBindings             { return @[]; }
+- (NSArray *)meshBindings               { return @[]; }
+- (NSArray *)arguments                  { return vertex; }
+- (NSArray *)bindings                   { return vertex; }
+
+- (void)dealloc
+{
+	[vertex release];
+	[fragment release];
+	[super dealloc];
+}
+@end
+
+/* The first few reflections of a process written down: what a framework is told it may bind, by name */
+static void
+alioth_reflection_note(const char *what, const struct rwa_argument *args, unsigned count)
+{
+	static _Atomic unsigned told;
+	char line[640];
+	size_t k;
+
+	if (told >= 12) {
+		return;
+	}
+	told++;
+	k = (size_t)snprintf(line, sizeof(line), "reflection of %s:", what);
+	for (unsigned i = 0; i < count && k < sizeof(line) - 1; i++) {
+		static const char *const kinds[] = { "buffer", "threadgroup", "texture", "sampler" };
+
+		k += (size_t)snprintf(line + k, sizeof(line) - k, " %s=%s %u%s", args[i].name ? args[i].name : "?",
+		    args[i].kind < 4 ? kinds[args[i].kind] : "?", args[i].index, args[i].active ? "" : " (unused)");
+	}
+	rw_print("%s\n", line);
+}
+
 @implementation AliothMetalComputePipeline
 
 - (instancetype)initWithAliothDevice:(AliothMetalDevice *)device
@@ -3314,6 +3687,34 @@ enum {
 - (struct rwa_compute *)compute
 {
 	return _compute;
+}
+
+- (id)aliothReflection
+{
+	enum { MAX_ARGS = 128 };
+	struct rwa_argument *args;
+	unsigned count = 0;
+	char why[512] = { 0 };
+
+	if (mesa.compute_arguments == NULL) {
+		RW_ONCE("pipeline reflection was asked for and this compiler library has no rwa_compute_arguments: nil\n");
+		return nil;
+	}
+	if ((args = calloc(MAX_ARGS, sizeof(*args))) == NULL) {
+		return nil;
+	}
+	if (mesa.compute_arguments(_compute, args, MAX_ARGS, &count, why, sizeof(why)) != 0) {
+		rw_print("pipeline reflection: %s\n", why);
+		free(args);
+		return nil;
+	}
+	alioth_reflection_note("a kernel", args, count);
+	AliothMetalReflection *reflection = [[AliothMetalReflection alloc] init];
+
+	reflection->vertex = [alioth_arguments(args, count) retain];
+	reflection->fragment = [[NSArray alloc] init];
+	free(args);
+	return [reflection autorelease];
 }
 
 /* The three the base class answers with nothing at all (docs/metal.md 10.8), so they can
@@ -3371,6 +3772,41 @@ enum {
 }
 
 - (struct rwa_render *)render { return _render; }
+
+- (id)aliothReflection
+{
+	enum { MAX_ARGS = 128 };
+	struct rwa_argument *args[2];
+	unsigned count[2] = { 0, 0 };
+	char why[512] = { 0 };
+	AliothMetalReflection *reflection = nil;
+
+	if (mesa.render_arguments == NULL) {
+		RW_ONCE("pipeline reflection was asked for and this compiler library has no rwa_render_arguments: nil\n");
+		return nil;
+	}
+	args[0] = calloc(MAX_ARGS, sizeof(struct rwa_argument));
+	args[1] = calloc(MAX_ARGS, sizeof(struct rwa_argument));
+	if (args[0] == NULL || args[1] == NULL) {
+		goto out;
+	}
+	for (unsigned stage = 0; stage < 2; stage++) {
+		if (mesa.render_arguments(_render, stage, args[stage], MAX_ARGS, &count[stage], why, sizeof(why)) != 0) {
+			rw_print("pipeline reflection: %s\n", why);
+			goto out;
+		}
+	}
+	alioth_reflection_note("a vertex function", args[0], count[0]);
+	alioth_reflection_note("a fragment function", args[1], count[1]);
+	reflection = [[[AliothMetalReflection alloc] init] autorelease];
+	reflection->vertex = [alioth_arguments(args[0], count[0]) retain];
+	reflection->fragment = [alioth_arguments(args[1], count[1]) retain];
+out:
+	free(args[0]);
+	free(args[1]);
+	return reflection;
+}
+
 - (BOOL)writesDepth           { return _info.fragment_writes_depth != 0; }
 - (unsigned)vertexStreamMask  { return _info.vertex_stream_mask; }
 - (unsigned)vertexStreamCount { return _info.vertex_streams; }
