@@ -373,6 +373,7 @@ public:
 	 */
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
+	uint8_t         fLastSwap[SWAP_SIZE];           /* the last swap as it stands, its layers kept from before included */
 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
 	unsigned        fSwapFirst, fSwapsWaiting;
 	uint64_t        fNextTicket, fCompletedTicket;
@@ -1597,8 +1598,36 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	unsigned slot = (fSwapFirst + fSwapsWaiting) % SWAP_QUEUE;
 
 	memcpy(fSwap[slot], swap, SWAP_SIZE);
+	{
+		/*
+		 * A layer a swap does not name is kept as the swap before had it: only the layers of SWAP_LAYERS_SET change,
+		 * those of SWAP_LAYERS_CLEARED go. CoreAnimation, an application's CAMetalLayer on layer 0 and its frame on
+		 * layer 1, then sends swaps of its frame alone (layers set 0x2, cleared 0) -- and layer 0 was taken for
+		 * empty here: the Metal square went black at the next frame (logs/164455, 2026-11-08).
+		 */
+		uint8_t * now_swap = fSwap[slot];
+		uint32_t set = swapWord(swap, SWAP_LAYERS_SET), cleared = swapWord(swap, SWAP_LAYERS_CLEARED), kept = 0;
+
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			uint32_t bit = 1u << layer;
+
+			if ((set & bit) || (cleared & bit) || swapWord(fLastSwap, SWAP_SURFACE(layer)) == 0) {
+				continue;
+			}
+			memcpy(now_swap + SWAP_SURFACE(layer), fLastSwap + SWAP_SURFACE(layer), 4);
+			memcpy(now_swap + SWAP_SOURCE(layer), fLastSwap + SWAP_SOURCE(layer), 16);
+			memcpy(now_swap + SWAP_ENABLED(layer), fLastSwap + SWAP_ENABLED(layer), 4);
+			memcpy(now_swap + SWAP_DEST(layer), fLastSwap + SWAP_DEST(layer), 16);
+			kept |= bit;
+		}
+		if (kept != 0) {
+			set |= kept;
+			memcpy(now_swap + SWAP_LAYERS_SET, &set, 4);
+		}
+		memcpy(fLastSwap, now_swap, SWAP_SIZE);
+	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+		uint32_t sid = swapWord(fSwap[slot], SWAP_SURFACE(layer));
 
 		fSwapSurfaces[slot][layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
 	}
