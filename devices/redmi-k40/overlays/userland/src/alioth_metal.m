@@ -593,6 +593,9 @@ static struct {
 	int (*compute_arguments)(struct rwa_compute *, struct rwa_argument *, unsigned, unsigned *, char *, size_t);
 	/* (the K40's) a texture view over the same memory; looked up, not required */
 	struct rwa_texture *(*texture_view)(struct rwa_texture *, const struct rwa_texture_shape *, char *, size_t);
+	/* (the K40's) a blit encoder's buffer copy and fill, by the GPU (air_metal.h rwa_buffer_copy) */
+	int (*buffer_copy)(struct rwa_buffer *, size_t, struct rwa_buffer *, size_t, size_t, char *, size_t);
+	int (*buffer_fill)(struct rwa_buffer *, size_t, size_t, unsigned char, char *, size_t);
 	/* (the K40's) rwa_finish in two halves: the wait off the encoding thread (AliothMetalCommandBuffer
 	 * -aliothDeliverHandlers); looked up, not required */
 	void *(*flush)(struct rwa_device *, unsigned);
@@ -618,7 +621,8 @@ static pthread_mutex_t alioth_gpu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
  */
 #include <mach/mach_time.h>
 
-enum { ST_ENCODE, ST_RUN, ST_DRAW, ST_FLUSH, ST_GPU, ST_FINISH, ST_WAIT, ST_LOCK, ST_DRAWABLE, ST_SIGNAL, ST_BLIT, ST_N };
+enum { ST_ENCODE, ST_RUN, ST_DRAW, ST_FLUSH, ST_GPU, ST_FINISH, ST_WAIT, ST_LOCK, ST_DRAWABLE, ST_SIGNAL, ST_BLIT,
+	ST_BLIT_GPU, ST_N };
 static bool alioth_stats_on;
 static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_buffers, alioth_stats_since;
 static mach_timebase_info_data_t alioth_timebase;
@@ -672,14 +676,15 @@ alioth_stats_commit(void)
 	}
 	rw_print("stats: %.1f s, %llu buffers (%.0f/s); a buffer: encode %.2f ms, run %.2f ms (%.1f draws, %.2f ms of "
 	         "them in the library), flush %.2f ms, GPU %.2f ms after it (%llu fenced); finish %llu x %.2f ms (%llu "
-	         "blits, %llu signals set after the fence), "
+	         "blits by the processor, %llu by the GPU without a wait, %llu signals set after the fence), "
 	         "waitUntilCompleted %llu x %.2f ms, lock held elsewhere %llu x %.2f ms, nextDrawable %llu x %.2f ms\n",
 	         alioth_ms(now - since) / 1000.0, (unsigned long long)buffers,
 	         (double)buffers * 1000.0 / alioth_ms(now - since), alioth_stat_avg(t, n, ST_ENCODE),
 	         alioth_stat_avg(t, n, ST_RUN), buffers != 0 ? (double)n[ST_DRAW] / (double)buffers : 0.0,
 	         buffers != 0 ? alioth_ms(t[ST_DRAW]) / (double)buffers : 0.0, alioth_stat_avg(t, n, ST_FLUSH),
 	         alioth_stat_avg(t, n, ST_GPU), (unsigned long long)n[ST_GPU], (unsigned long long)n[ST_FINISH],
-	         alioth_stat_avg(t, n, ST_FINISH), (unsigned long long)n[ST_BLIT], (unsigned long long)n[ST_SIGNAL],
+	         alioth_stat_avg(t, n, ST_FINISH), (unsigned long long)n[ST_BLIT], (unsigned long long)n[ST_BLIT_GPU],
+	         (unsigned long long)n[ST_SIGNAL],
 	         (unsigned long long)n[ST_WAIT], alioth_stat_avg(t, n, ST_WAIT),
 	         (unsigned long long)n[ST_LOCK], alioth_stat_avg(t, n, ST_LOCK), (unsigned long long)n[ST_DRAWABLE],
 	         alioth_stat_avg(t, n, ST_DRAWABLE));
@@ -887,6 +892,10 @@ GPU_LOCKED(int, texture_resolve, (struct rwa_device *d, struct rwa_texture *s, s
 GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const struct rwa_texture_shape *s, char *w,
     size_t ws), (t, s, w, ws))
 GPU_LOCKED(void *, flush, (struct rwa_device *d, unsigned f), (d, f))
+GPU_LOCKED(int, buffer_copy, (struct rwa_buffer *d, size_t do_, struct rwa_buffer *s, size_t so, size_t n, char *w,
+    size_t ws), (d, do_, s, so, n, w, ws))
+GPU_LOCKED(int, buffer_fill, (struct rwa_buffer *b, size_t o, size_t n, unsigned char v, char *w, size_t ws),
+    (b, o, n, v, w, ws))
 
 /*
  * (the K40's) rwa_finish in its two halves: flushed with a fence under the library's lock, the fence waited for
@@ -979,6 +988,8 @@ mesa_available(void)
 	*(void **)&mesa.render_arguments = dlsym(mesa.handle, "rwa_render_arguments");
 	*(void **)&mesa.compute_arguments = dlsym(mesa.handle, "rwa_compute_arguments");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
+	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
+	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
 	*(void **)&mesa.flush = dlsym(mesa.handle, "rwa_flush");
 	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
@@ -1022,6 +1033,8 @@ mesa_available(void)
 	GPU_LOCK_WRAP(compute_threadgroup_bytes);
 	GPU_LOCK_WRAP(texture_resolve);
 	GPU_LOCK_WRAP(texture_view);
+	GPU_LOCK_WRAP(buffer_copy);
+	GPU_LOCK_WRAP(buffer_fill);
 	GPU_LOCK_WRAP(flush);
 	return true;
 }
@@ -4962,6 +4975,38 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 {
 	struct rwa_device *device = [[_queue device] mesaDevice];
 
+	/*
+	 * (the K40's) A buffer copy or fill between buffers of the library's: done by the GPU in the work's own order
+	 * (rwa_buffer_copy, rwa_buffer_fill), so nothing waits for what came before it. VectorKit's command buffers
+	 * carry six or seven blits each and every one of them waited (metal_stats=1: 1242 in 2.1 s, logs/101521).
+	 */
+	if (b->kind == ALIOTH_BLIT_BUFFER_TO_BUFFER && mesa.buffer_copy != NULL) {
+		struct rwa_buffer *src = [b->source respondsToSelector:@selector(mesaBuffer)] ? [b->source mesaBuffer] : NULL;
+		struct rwa_buffer *dst = [b->destination respondsToSelector:@selector(mesaBuffer)] ?
+		    [b->destination mesaBuffer] : NULL;
+
+		if (src != NULL && dst != NULL) {
+			alioth_stat(ST_BLIT_GPU, mach_absolute_time());
+			if (mesa.buffer_copy(dst, b->destinationOffset, src, b->sourceOffset, b->length, why, size) != 0) {
+				[self failWith:why];
+				return NO;
+			}
+			return YES;
+		}
+	}
+	if (b->kind == ALIOTH_BLIT_FILL && mesa.buffer_fill != NULL) {
+		struct rwa_buffer *dst = [b->destination respondsToSelector:@selector(mesaBuffer)] ?
+		    [b->destination mesaBuffer] : NULL;
+
+		if (dst != NULL) {
+			alioth_stat(ST_BLIT_GPU, mach_absolute_time());
+			if (mesa.buffer_fill(dst, b->destinationOffset, b->length, (unsigned char)b->value, why, size) != 0) {
+				[self failWith:why];
+				return NO;
+			}
+			return YES;
+		}
+	}
 	alioth_stat(ST_BLIT, mach_absolute_time());
 	/* what came before it in this buffer, finished: the processor reads and writes here */
 	if (device != NULL && alioth_finish(device, why, size) != 0) {

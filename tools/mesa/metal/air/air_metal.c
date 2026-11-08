@@ -690,6 +690,59 @@ rwa_buffer_map(struct rwa_buffer *buffer)
    return buffer->map;
 }
 
+/*
+ * (the K40's) A blit encoder's buffer copy and fill by the GPU. The driver did both by the
+ * processor, after waiting for everything before them on the GPU -- and VectorKit's command
+ * buffers carry six or seven blits each, so that was 1242 waits in 2.1 s (metal_stats=1,
+ * logs/101521). freedreno does both on the 2D engine in a batch of their own (fd6_blitter.cc:
+ * emit_blit_buffer through resource_copy_region, fd6_clear_buffer), ordered against the batches
+ * that write what they read by its resource tracking and flushed without a wait, so they take
+ * their place in the work and nobody stands still for them.
+ */
+int
+rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer *src,
+                size_t src_offset, size_t size, char *why, size_t why_size)
+{
+   if (!dst || !src || dst->device != src->device) {
+      say(why, why_size, "a buffer copy needs two buffers of one device");
+      return -1;
+   }
+   if (dst_offset > dst->size || size > dst->size - dst_offset ||
+       src_offset > src->size || size > src->size - src_offset) {
+      say(why, why_size, "a buffer copy of %zu bytes from %zu of a %zu-byte buffer to %zu of a "
+                         "%zu-byte one runs past an end", size, src_offset, src->size,
+          dst_offset, dst->size);
+      return -1;
+   }
+   if (size == 0)
+      return 0;
+   struct pipe_box box;
+   u_box_1d((int)src_offset, (int)size, &box);
+   dst->device->pipe->resource_copy_region(dst->device->pipe, dst->res, 0, (unsigned)dst_offset,
+                                           0, 0, src->res, 0, &box);
+   return 0;
+}
+
+int
+rwa_buffer_fill(struct rwa_buffer *buffer, size_t offset, size_t size, unsigned char value,
+                char *why, size_t why_size)
+{
+   if (!buffer) {
+      say(why, why_size, "a fill needs a buffer");
+      return -1;
+   }
+   if (offset > buffer->size || size > buffer->size - offset) {
+      say(why, why_size, "a fill of %zu bytes from %zu of a %zu-byte buffer runs past its end",
+          size, offset, buffer->size);
+      return -1;
+   }
+   if (size == 0)
+      return 0;
+   buffer->device->pipe->clear_buffer(buffer->device->pipe, buffer->res, (unsigned)offset,
+                                      (unsigned)size, &value, 1);
+   return 0;
+}
+
 size_t
 rwa_buffer_size(struct rwa_buffer *buffer)
 {

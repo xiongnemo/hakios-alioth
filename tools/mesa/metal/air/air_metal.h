@@ -1403,6 +1403,15 @@ struct rwa_texture *rwa_texture_view(struct rwa_texture *texture,
 				     const struct rwa_texture_shape *shape, char *why,
 				     size_t why_size);
 
+/* (the K40's) A blit encoder's buffer copy and byte fill done by the GPU, in the context's order
+ * after what came before and before what comes after, with nobody waiting: `size` bytes from
+ * src_offset of `src` to dst_offset of `dst` (the two buffers of one device), and `size` bytes
+ * of `buffer` from `offset` set to `value`. 0, or -1 and why (a range outside its buffer). */
+int rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer *src,
+		    size_t src_offset, size_t size, char *why, size_t why_size);
+int rwa_buffer_fill(struct rwa_buffer *buffer, size_t offset, size_t size, unsigned char value,
+		    char *why, size_t why_size);
+
 /* stage 0 the vertex function (nothing for a generated vertex stage), 1 the fragment one.
  * 0, or -1 and why -- including when there are more than `max`. */
 int rwa_render_arguments(struct rwa_render *render, unsigned stage, struct rwa_argument *out,
