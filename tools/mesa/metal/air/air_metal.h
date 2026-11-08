@@ -1373,6 +1373,13 @@ struct rwa_argument {
 	const struct rwa_struct_member *members;
 };
 
+/* (the K40's) rwa_finish in two halves: the work submitted so far flushed and a fence for it
+ * returned (NULL: nothing to wait for), and a wait on it that also releases it. The wait takes
+ * no context, so another thread may make it while this device's context goes on being used
+ * (under the caller's own lock: the context is not thread-safe). 0, or -1 and why. */
+void *rwa_flush(struct rwa_device *device);
+int rwa_fence_wait(struct rwa_device *device, void *fence, char *why, size_t why_size);
+
 /* (the K40's) A texture view over the whole of `texture`: a second texture sharing its
  * memory, in shape->pixel_format (one of the same texel size and kind) and shape->type (the
  * same, or 2D and a one-slice 2D array); the rest of `shape` is ignored. Destroyed with

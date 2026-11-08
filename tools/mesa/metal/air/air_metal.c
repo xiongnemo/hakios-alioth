@@ -4004,6 +4004,39 @@ rwa_finish(struct rwa_device *device, char *why, size_t why_size)
    return finish_or_say_why(device, false, "work", why, why_size);
 }
 
+/* (the K40's) rwa_finish in two halves, so that the wait can be somebody else's: everything
+ * submitted so far flushed and a fence for it handed back (NULL: nothing to wait for), and a
+ * wait on that fence which also lets it go. The wait is the screen's fence_finish with no
+ * context, which a thread other than the context's may call -- that is the point: a Metal
+ * command buffer's completed handlers can wait for the GPU while the next one is encoded.
+ */
+void *
+rwa_flush(struct rwa_device *device)
+{
+   struct pipe_fence_handle *fence = NULL;
+
+   if (!device)
+      return NULL;
+   device->pipe->flush(device->pipe, &fence, 0);
+   return fence;
+}
+
+int
+rwa_fence_wait(struct rwa_device *device, void *fence, char *why, size_t why_size)
+{
+   struct pipe_fence_handle *f = fence;
+
+   if (!device || !f)
+      return 0;
+   bool done = device->screen->fence_finish(device->screen, NULL, f, RWA_FENCE_TIMEOUT_NS);
+   device->screen->fence_reference(device->screen, &f, NULL);
+   if (!done) {
+      say(why, why_size, "the GPU did not finish the work within two seconds");
+      return -1;
+   }
+   return 0;
+}
+
 /*
  * ---------------------------------------------------------------------------------------
  * Drawing.

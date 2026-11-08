@@ -98,6 +98,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>          /* for MTLSize and the public enumerations, nothing private */
 #import <objc/message.h>
+#include <pthread.h>                /* (the K40's) alioth_gpu, the one lock of the compiler library */
 #import <objc/runtime.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
@@ -587,7 +588,94 @@ static struct {
 	int (*compute_arguments)(struct rwa_compute *, struct rwa_argument *, unsigned, unsigned *, char *, size_t);
 	/* (the K40's) a texture view over the same memory; looked up, not required */
 	struct rwa_texture *(*texture_view)(struct rwa_texture *, const struct rwa_texture_shape *, char *, size_t);
+	/* (the K40's) rwa_finish in two halves: the wait off the encoding thread (AliothMetalCommandBuffer
+	 * -aliothDeliverHandlers); looked up, not required */
+	void *(*flush)(struct rwa_device *);
+	int (*fence_wait)(struct rwa_device *, void *, char *, size_t);
 } mesa;
+
+/*
+ * (the K40's) ONE LOCK FOR THE COMPILER LIBRARY. Its device is one Gallium pipe_context, which is not thread-safe,
+ * and since a command buffer's completed handlers wait for the GPU on a queue of their own (-aliothDeliverHandlers),
+ * a handler -- or the last release of a resource it held -- can call in while another thread commits. So every call
+ * that touches the context goes through a wrapper that holds this lock for the call (recursive: a handler run
+ * inline may call back in). Not wrapped: what reads only (buffer_map and _size, the arguments of reflection), the
+ * translation of module_argbufs, and fence_wait, whose whole point is to wait without it.
+ */
+static pthread_mutex_t alioth_gpu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+
+#define GPU_LOCKED(ret, name, params, args) \
+	static ret (*unlocked_##name) params; \
+	static ret locked_##name params \
+	{ \
+		pthread_mutex_lock(&alioth_gpu); \
+		ret gpu_locked_result = unlocked_##name args; \
+		pthread_mutex_unlock(&alioth_gpu); \
+		return gpu_locked_result; \
+	}
+#define GPU_LOCKED_VOID(name, params, args) \
+	static void (*unlocked_##name) params; \
+	static void locked_##name params \
+	{ \
+		pthread_mutex_lock(&alioth_gpu); \
+		unlocked_##name args; \
+		pthread_mutex_unlock(&alioth_gpu); \
+	}
+#define GPU_LOCK_WRAP(name) \
+	do { \
+		if (mesa.name != NULL) { \
+			unlocked_##name = mesa.name; \
+			mesa.name = locked_##name; \
+		} \
+	} while (0)
+
+GPU_LOCKED(struct rwa_device *, device_open, (char *w, size_t ws), (w, ws))
+GPU_LOCKED_VOID(device_close, (struct rwa_device *d), (d))
+GPU_LOCKED(struct rwa_buffer *, buffer_create, (struct rwa_device *d, size_t n, char *w, size_t ws), (d, n, w, ws))
+GPU_LOCKED_VOID(buffer_destroy, (struct rwa_buffer *b), (b))
+GPU_LOCKED(struct rwa_compute *, compute_create, (struct rwa_device *d, const void *bc, size_t n, const char *e,
+    struct rwa_compute_info *i, char *w, size_t ws), (d, bc, n, e, i, w, ws))
+GPU_LOCKED_VOID(compute_destroy, (struct rwa_compute *c), (c))
+GPU_LOCKED(struct rwa_texture *, texture_create, (struct rwa_device *d, const struct rwa_texture_shape *s, char *w,
+    size_t ws), (d, s, w, ws))
+GPU_LOCKED(int, texture_write, (struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3],
+    const unsigned z[3], const void *b, size_t st, char *w, size_t ws), (t, l, s, o, z, b, st, w, ws))
+GPU_LOCKED(int, texture_read, (struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3],
+    const unsigned z[3], void *b, size_t st, char *w, size_t ws), (t, l, s, o, z, b, st, w, ws))
+GPU_LOCKED(int, depth_read, (struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3], const unsigned z[3],
+    float *dp, uint8_t *sp, char *w, size_t ws), (t, l, s, o, z, dp, sp, w, ws))
+GPU_LOCKED_VOID(texture_destroy, (struct rwa_texture *t), (t))
+GPU_LOCKED(struct rwa_sampler *, sampler_create, (struct rwa_device *d, const struct rwa_sampler_state *s, char *w,
+    size_t ws), (d, s, w, ws))
+GPU_LOCKED_VOID(sampler_destroy, (struct rwa_sampler *s), (s))
+GPU_LOCKED(int, dispatch, (struct rwa_compute *c, const struct rwa_bindings *b, const unsigned g[3],
+    const unsigned z[3], char *w, size_t ws), (c, b, g, z, w, ws))
+GPU_LOCKED(int, dispatch_buffers, (struct rwa_compute *c, const struct rwa_bindings *b,
+    const struct rwa_buffer_bind *t, unsigned n, const unsigned g[3], const unsigned z[3], char *w, size_t ws),
+    (c, b, t, n, g, z, w, ws))
+GPU_LOCKED(int, argbuf_encode_buffer, (struct rwa_buffer *d, size_t o, unsigned i, struct rwa_buffer *b, size_t bo,
+    char *w, size_t ws), (d, o, i, b, bo, w, ws))
+GPU_LOCKED(int, argbuf_encode_texture, (struct rwa_buffer *d, size_t o, unsigned i, struct rwa_texture *t, char *w,
+    size_t ws), (d, o, i, t, w, ws))
+GPU_LOCKED(int, argbuf_encode_sampler, (struct rwa_buffer *d, size_t o, unsigned i, struct rwa_sampler *s, char *w,
+    size_t ws), (d, o, i, s, w, ws))
+GPU_LOCKED(struct rwa_render *, render_create, (struct rwa_device *d, const void *fb, size_t fn, const char *fe,
+    const void *vb, size_t vn, const char *ve, const struct rwa_render_shape *s, struct rwa_render_info *i, char *w,
+    size_t ws), (d, fb, fn, fe, vb, vn, ve, s, i, w, ws))
+GPU_LOCKED_VOID(render_destroy, (struct rwa_render *r), (r))
+GPU_LOCKED(int, render_draw, (struct rwa_render *r, const struct rwa_draw *dr, char *w, size_t ws), (r, dr, w, ws))
+GPU_LOCKED(int, render_clear, (struct rwa_device *d, struct rwa_texture *const *c, unsigned n, const float *cc,
+    struct rwa_texture *z, const float *cz, const unsigned *cs, char *w, size_t ws), (d, c, n, cc, z, cz, cs, w, ws))
+GPU_LOCKED(struct rwa_depth_stencil *, depth_stencil_create, (struct rwa_device *d,
+    const struct rwa_depth_stencil_state *s, char *w, size_t ws), (d, s, w, ws))
+GPU_LOCKED_VOID(depth_stencil_destroy, (struct rwa_depth_stencil *s), (s))
+GPU_LOCKED(int, finish, (struct rwa_device *d, char *w, size_t ws), (d, w, ws))
+GPU_LOCKED(int, compute_threadgroup_bytes, (struct rwa_compute *c, unsigned n, char *w, size_t ws), (c, n, w, ws))
+GPU_LOCKED(int, texture_resolve, (struct rwa_device *d, struct rwa_texture *s, struct rwa_texture *t, char *w,
+    size_t ws), (d, s, t, w, ws))
+GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const struct rwa_texture_shape *s, char *w,
+    size_t ws), (t, s, w, ws))
+GPU_LOCKED(void *, flush, (struct rwa_device *d), (d))
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
  * no library worth loading, and the device object still has to exist. */
@@ -652,6 +740,8 @@ mesa_available(void)
 	*(void **)&mesa.render_arguments = dlsym(mesa.handle, "rwa_render_arguments");
 	*(void **)&mesa.compute_arguments = dlsym(mesa.handle, "rwa_compute_arguments");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
+	*(void **)&mesa.flush = dlsym(mesa.handle, "rwa_flush");
+	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -664,6 +754,36 @@ mesa_available(void)
 		mesa.handle = NULL;
 		return false;
 	}
+	/* (the K40's) every call that touches the context, under the one lock (alioth_gpu says why) */
+	GPU_LOCK_WRAP(device_open);
+	GPU_LOCK_WRAP(device_close);
+	GPU_LOCK_WRAP(buffer_create);
+	GPU_LOCK_WRAP(buffer_destroy);
+	GPU_LOCK_WRAP(compute_create);
+	GPU_LOCK_WRAP(compute_destroy);
+	GPU_LOCK_WRAP(texture_create);
+	GPU_LOCK_WRAP(texture_write);
+	GPU_LOCK_WRAP(texture_read);
+	GPU_LOCK_WRAP(depth_read);
+	GPU_LOCK_WRAP(texture_destroy);
+	GPU_LOCK_WRAP(sampler_create);
+	GPU_LOCK_WRAP(sampler_destroy);
+	GPU_LOCK_WRAP(dispatch);
+	GPU_LOCK_WRAP(dispatch_buffers);
+	GPU_LOCK_WRAP(argbuf_encode_buffer);
+	GPU_LOCK_WRAP(argbuf_encode_texture);
+	GPU_LOCK_WRAP(argbuf_encode_sampler);
+	GPU_LOCK_WRAP(render_create);
+	GPU_LOCK_WRAP(render_destroy);
+	GPU_LOCK_WRAP(render_draw);
+	GPU_LOCK_WRAP(render_clear);
+	GPU_LOCK_WRAP(depth_stencil_create);
+	GPU_LOCK_WRAP(depth_stencil_destroy);
+	GPU_LOCK_WRAP(finish);
+	GPU_LOCK_WRAP(compute_threadgroup_bytes);
+	GPU_LOCK_WRAP(texture_resolve);
+	GPU_LOCK_WRAP(texture_view);
+	GPU_LOCK_WRAP(flush);
 	return true;
 }
 
@@ -1029,6 +1149,7 @@ struct gem_close { uint32_t handle, pad; };
 
 @interface AliothMetalCommandQueue : _MTLCommandQueue
 - (instancetype)initWithAliothDevice:(AliothMetalDevice *)device descriptor:(id)descriptor;
+- (dispatch_queue_t)aliothWaitQueue;    /* (the K40's) where its buffers wait for the GPU, in order */
 @end
 
 @interface AliothMetalCommandBuffer : _MTLCommandBuffer
@@ -4032,6 +4153,7 @@ alioth_clear_semaphore_debt(id commandBuffer)
 	 * lied to, and -setCompletionQueue: explains the third below. */
 	NSUInteger _gpuPriority, _backgroundGPUPriority;
 	dispatch_queue_t _completionQueue;   /* only used when Apple's own ivar is missing */
+	dispatch_queue_t _waitQueue;         /* (the K40's) where this queue's buffers wait for the GPU, in order */
 }
 
 - (instancetype)initWithAliothDevice:(AliothMetalDevice *)device descriptor:(id)descriptor
@@ -4210,12 +4332,27 @@ alioth_clear_semaphore_debt(id commandBuffer)
 	return ivar != NULL ? (dispatch_queue_t)object_getIvar(self, ivar) : _completionQueue;
 }
 
+/* (the K40's) One serial queue per command queue, made when first wanted: its buffers' GPU waits and completed
+ * handlers run there one after another, which is Metal's promise -- a queue's buffers complete in commit order. */
+- (dispatch_queue_t)aliothWaitQueue
+{
+	@synchronized (self) {
+		if (_waitQueue == nil) {
+			_waitQueue = dispatch_queue_create("aliothmetal.completion", DISPATCH_QUEUE_SERIAL);
+		}
+		return _waitQueue;
+	}
+}
+
 - (void)dealloc
 {
 	/* Only the copy this driver keeps itself: the one in Apple's ivar belongs to
 	 * -[_MTLCommandQueue dealloc], and releasing it twice would be worse than leaking
 	 * one dispatch queue in the Metal where that dealloc does not. */
 	[_completionQueue release];
+	if (_waitQueue != nil) {
+		dispatch_release(_waitQueue);
+	}
 	[super dealloc];
 }
 
@@ -4268,6 +4405,7 @@ enum {
 	BOOL _owesSlot;                 /* this buffer holds one of the queue's slots */
 	NSMutableArray *_scheduled, *_completed;   /* handler blocks, copied to the heap */
 	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
+	dispatch_group_t _done;         /* (the K40's) left when the GPU wait off this thread is over */
 }
 
 /*
@@ -4365,6 +4503,9 @@ enum {
 	[_scheduled release];
 	[_completed release];
 	[_queue release];
+	if (_done != nil) {
+		dispatch_release(_done);
+	}
 	[super dealloc];
 }
 
@@ -4943,7 +5084,12 @@ done:
 {
 	char why[512] = { 0 };
 
-	if (_status == RW_CB_ERROR) {
+	if (_status == RW_CB_ERROR || _status == RW_CB_COMPLETED) {
+		return;
+	}
+	/* (the K40's) the wait already going on off this thread (-aliothDeliverHandlers): its end, not a second one */
+	if (_done != nil) {
+		dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
 		return;
 	}
 	if (mesa.finish([[_queue device] mesaDevice], why, sizeof(why)) != 0) {
@@ -5012,6 +5158,13 @@ done:
 	if (handler == NULL) {
 		return;
 	}
+	/* (the K40's) added while the GPU wait off the encoding thread is still on: delivered after it, as promised */
+	if (_done != nil && _status == RW_CB_SCHEDULED) {
+		void (^copied)(id) = [[handler copy] autorelease];
+
+		dispatch_group_notify(_done, [_queue aliothWaitQueue], ^{ [self aliothDeliver:copied]; });
+		return;
+	}
 	if (_status >= RW_CB_SCHEDULED) {
 		[self aliothDeliver:handler];
 		return;
@@ -5034,16 +5187,53 @@ done:
 	for (id handler in scheduled) {
 		[self aliothDeliver:(void (^)(id))handler];
 	}
+	[scheduled release];
+
+	/*
+	 * (the K40's) THE WAIT OFF THIS THREAD. A completed handler is a promise about the GPU, so it is kept only once
+	 * the GPU has finished -- and that wait was made here, in -commit, so the thread that commits (SceneKit's and
+	 * SpriteKit's render loop, an MTKView's draw) stood still for the whole of the GPU's work before it could encode
+	 * the next frame: 39 frames a second on this driver where OpenGL ES made 60 (System Check, 2026-11-09). Now the
+	 * work is flushed with a fence here and the queue's own serial queue waits on it, sets the status and delivers
+	 * the handlers (on the application's completion queue if it named one), in commit order; -waitUntilCompleted
+	 * waits for that. The wait touches no context (rwa_fence_wait), and everything that does is under alioth_gpu.
+	 */
+	struct rwa_device *device = [[_queue device] mesaDevice];
+
+	if ([completed count] > 0 && _status != RW_CB_ERROR && device != NULL && mesa.flush != NULL &&
+	    mesa.fence_wait != NULL) {
+		void *fence = mesa.flush(device);
+		dispatch_group_t done = dispatch_group_create();
+
+		_done = done;
+		dispatch_group_enter(done);
+		dispatch_async([_queue aliothWaitQueue], ^{
+			char why[512] = { 0 };
+
+			if (mesa.fence_wait(device, fence, why, sizeof(why)) != 0) {
+				rw_print("THE GPU DID NOT FINISH: %s\n", why);
+				_error = [[NSError errorWithDomain:@"AliothMetal" code:3
+							  userInfo:@{ NSLocalizedDescriptionKey:
+								      [NSString stringWithUTF8String:why] }] retain];
+				_status = RW_CB_ERROR;
+			} else {
+				_status = RW_CB_COMPLETED;
+			}
+			for (id handler in completed) {
+				[self aliothDeliver:(void (^)(id))handler];
+			}
+			[completed release];
+			dispatch_group_leave(done);
+		});
+		return;
+	}
 	if ([completed count] > 0 && _status != RW_CB_ERROR) {
-		/* A completed handler is a promise about the GPU, so it is made true before it
-		 * is kept: -waitUntilCompleted is this driver's fence and sets the status the
-		 * handler will read. */
+		/* the same promise, kept here where the library cannot split the wait */
 		[self waitUntilCompleted];
 	}
 	for (id handler in completed) {
 		[self aliothDeliver:(void (^)(id))handler];
 	}
-	[scheduled release];
 	[completed release];
 }
 
