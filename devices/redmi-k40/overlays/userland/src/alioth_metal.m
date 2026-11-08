@@ -609,11 +609,134 @@ static struct {
  */
 static pthread_mutex_t alioth_gpu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 
+/*
+ * (the K40's) metal_stats=1 (a boot-arg): where command buffers' time goes, one line every 2 s while they are
+ * committed -- made to -commit (encode: the application's own work and its encoders'), -commit's recorded work (run)
+ * and the library's draw calls inside it, the flush, the GPU (flush to its fence), waits for the GPU inside -commit
+ * (finish: blits, signals, indirect draws) and in -waitUntilCompleted, the library's lock when another thread held
+ * it, and CAMetalLayer's -nextDrawable. Off, it costs one test where it would measure.
+ */
+#include <mach/mach_time.h>
+
+enum { ST_ENCODE, ST_RUN, ST_DRAW, ST_FLUSH, ST_GPU, ST_FINISH, ST_WAIT, ST_LOCK, ST_DRAWABLE, ST_N };
+static bool alioth_stats_on;
+static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_buffers, alioth_stats_since;
+static mach_timebase_info_data_t alioth_timebase;
+static id (*alioth_next_drawable_imp)(id, SEL);
+
+static void
+alioth_stat(unsigned which, uint64_t since)
+{
+	if (alioth_stats_on) {
+		__atomic_fetch_add(&alioth_stats_t[which], mach_absolute_time() - since, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&alioth_stats_n[which], 1, __ATOMIC_RELAXED);
+	}
+}
+
+static double
+alioth_ms(uint64_t ticks)
+{
+	return (double)ticks * alioth_timebase.numer / alioth_timebase.denom / 1e6;
+}
+
+/* each total over its count, in ms (0 for none) */
+static double
+alioth_stat_avg(const uint64_t *t, const uint64_t *n, unsigned which)
+{
+	return n[which] != 0 ? alioth_ms(t[which]) / (double)n[which] : 0.0;
+}
+
+/* at each -commit: the window's line once 2 s have passed (whichever thread sees it first prints it) */
+static void
+alioth_stats_commit(void)
+{
+	uint64_t now = mach_absolute_time(), since = __atomic_load_n(&alioth_stats_since, __ATOMIC_RELAXED);
+	uint64_t t[ST_N], n[ST_N], buffers;
+
+	if (!alioth_stats_on) {
+		return;
+	}
+	__atomic_fetch_add(&alioth_stats_buffers, 1, __ATOMIC_RELAXED);
+	if (since == 0) {
+		(void)__atomic_compare_exchange_n(&alioth_stats_since, &since, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+		return;
+	}
+	if (alioth_ms(now - since) < 2000.0 ||
+	    !__atomic_compare_exchange_n(&alioth_stats_since, &since, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+		return;
+	}
+	buffers = __atomic_exchange_n(&alioth_stats_buffers, 0, __ATOMIC_RELAXED);
+	for (unsigned i = 0; i < ST_N; i++) {
+		t[i] = __atomic_exchange_n(&alioth_stats_t[i], 0, __ATOMIC_RELAXED);
+		n[i] = __atomic_exchange_n(&alioth_stats_n[i], 0, __ATOMIC_RELAXED);
+	}
+	rw_print("stats: %.1f s, %llu buffers (%.0f/s); a buffer: encode %.2f ms, run %.2f ms (%.1f draws, %.2f ms of "
+	         "them in the library), flush %.2f ms, GPU %.2f ms after it (%llu fenced); finish %llu x %.2f ms, "
+	         "waitUntilCompleted %llu x %.2f ms, lock held elsewhere %llu x %.2f ms, nextDrawable %llu x %.2f ms\n",
+	         alioth_ms(now - since) / 1000.0, (unsigned long long)buffers,
+	         (double)buffers * 1000.0 / alioth_ms(now - since), alioth_stat_avg(t, n, ST_ENCODE),
+	         alioth_stat_avg(t, n, ST_RUN), buffers != 0 ? (double)n[ST_DRAW] / (double)buffers : 0.0,
+	         buffers != 0 ? alioth_ms(t[ST_DRAW]) / (double)buffers : 0.0, alioth_stat_avg(t, n, ST_FLUSH),
+	         alioth_stat_avg(t, n, ST_GPU), (unsigned long long)n[ST_GPU], (unsigned long long)n[ST_FINISH],
+	         alioth_stat_avg(t, n, ST_FINISH), (unsigned long long)n[ST_WAIT], alioth_stat_avg(t, n, ST_WAIT),
+	         (unsigned long long)n[ST_LOCK], alioth_stat_avg(t, n, ST_LOCK), (unsigned long long)n[ST_DRAWABLE],
+	         alioth_stat_avg(t, n, ST_DRAWABLE));
+}
+
+static id
+alioth_next_drawable(id layer, SEL selector)
+{
+	uint64_t t0 = mach_absolute_time();
+	id drawable = alioth_next_drawable_imp(layer, selector);
+
+	alioth_stat(ST_DRAWABLE, t0);
+	return drawable;
+}
+
+/* once, when the device is made: the boot-arg read, and -nextDrawable timed when it is on */
+static void
+alioth_stats_setup(void)
+{
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+		Class layer;
+		Method m;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0 || strstr(args, "metal_stats=1") == NULL) {
+			return;
+		}
+		mach_timebase_info(&alioth_timebase);
+		layer = objc_getClass("CAMetalLayer");
+		m = layer != Nil ? class_getInstanceMethod(layer, sel_registerName("nextDrawable")) : NULL;
+		if (m != NULL) {
+			alioth_next_drawable_imp = (id (*)(id, SEL))method_setImplementation(m, (IMP)alioth_next_drawable);
+		}
+		alioth_stats_on = true;
+		rw_print("metal_stats=1: where command buffers' time goes, a line every 2 s (-nextDrawable %s)\n",
+		         m != NULL ? "timed too" : "not found, not timed");
+	});
+}
+
+/* the library's lock; a wait for it, when another thread holds it, is counted (metal_stats=1) */
+static void
+alioth_gpu_lock(void)
+{
+	if (pthread_mutex_trylock(&alioth_gpu) != 0) {
+		uint64_t t0 = mach_absolute_time();
+
+		pthread_mutex_lock(&alioth_gpu);
+		alioth_stat(ST_LOCK, t0);
+	}
+}
+
 #define GPU_LOCKED(ret, name, params, args) \
 	static ret (*unlocked_##name) params; \
 	static ret locked_##name params \
 	{ \
-		pthread_mutex_lock(&alioth_gpu); \
+		alioth_gpu_lock(); \
 		ret gpu_locked_result = unlocked_##name args; \
 		pthread_mutex_unlock(&alioth_gpu); \
 		return gpu_locked_result; \
@@ -622,7 +745,7 @@ static pthread_mutex_t alioth_gpu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	static void (*unlocked_##name) params; \
 	static void locked_##name params \
 	{ \
-		pthread_mutex_lock(&alioth_gpu); \
+		alioth_gpu_lock(); \
 		unlocked_##name args; \
 		pthread_mutex_unlock(&alioth_gpu); \
 	}
@@ -681,6 +804,17 @@ GPU_LOCKED(int, texture_resolve, (struct rwa_device *d, struct rwa_texture *s, s
 GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const struct rwa_texture_shape *s, char *w,
     size_t ws), (t, s, w, ws))
 GPU_LOCKED(void *, flush, (struct rwa_device *d, unsigned f), (d, f))
+
+/* a wait for the GPU inside -commit (a blit, a signal, an indirect draw), counted with metal_stats=1 */
+static int
+alioth_finish(struct rwa_device *device, char *why, size_t size)
+{
+	uint64_t t0 = mach_absolute_time();
+	int rc = mesa.finish(device, why, size);
+
+	alioth_stat(ST_FINISH, t0);
+	return rc;
+}
 
 static NSUInteger alioth_texel_bytes(NSUInteger format);     /* (with the blit encoder, below) */
 
@@ -1475,6 +1609,7 @@ enum {
 			deferred(_mesa, 1);
 		}
 	}
+	alioth_stats_setup();
 
 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
 	 * demand: the pointer is handed out without a lock, from whichever thread a renderer
@@ -4461,6 +4596,7 @@ enum {
 	NSMutableArray *_scheduled, *_completed;   /* handler blocks, copied to the heap */
 	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
 	dispatch_group_t _done;         /* (the K40's) left when the GPU wait off this thread is over */
+	uint64_t _created;              /* (the K40's) mach time it was made, for metal_stats=1 */
 }
 
 /*
@@ -4525,6 +4661,7 @@ enum {
 	_status = RW_CB_ENQUEUED;   /* nothing is pending yet */
 	_owesSlot = YES;
 	[queue aliothTookSlot];
+	_created = mach_absolute_time();
 	return self;
 }
 
@@ -4725,7 +4862,7 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 	struct rwa_device *device = [[_queue device] mesaDevice];
 
 	/* what came before it in this buffer, finished: the processor reads and writes here */
-	if (device != NULL && mesa.finish(device, why, size) != 0) {
+	if (device != NULL && alioth_finish(device, why, size) != 0) {
 		[self failWith:why];
 		return NO;
 	}
@@ -4829,7 +4966,9 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 - (void)commit
 {
 	char why[512] = { 0 };
+	uint64_t committed = mach_absolute_time();
 
+	alioth_stat(ST_ENCODE, _created);
 	_status = RW_CB_COMMITTED;
 	for (id item in _work) {
 		AliothMetalWork *work = item;
@@ -4858,7 +4997,7 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 				continue;
 			}
 			/* what came before the signal, finished on the GPU: that is what the value says */
-			if (device != NULL && mesa.finish(device, why, sizeof(why)) != 0) {
+			if (device != NULL && alioth_finish(device, why, sizeof(why)) != 0) {
 				[self failWith:why];
 				goto done;
 			}
@@ -4951,6 +5090,7 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 	}
 	_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */
 done:
+	alioth_stat(ST_RUN, committed);
 	/* The queue's slot goes back here and on every way out of this method, a failed draw
 	 * included: a buffer that errored is as finished as one that drew, and a slot kept
 	 * because of an error would turn one bad draw into a queue that blocks for ever. */
@@ -4958,6 +5098,7 @@ done:
 	/* and only then the handlers, so that a handler which makes the next command buffer
 	 * is not waiting for a slot this one still holds */
 	[self aliothDeliverHandlers];
+	alioth_stats_commit();
 }
 
 /* A draw, built out of what the encoder recorded. Separate from the dispatch loop because the
@@ -5000,7 +5141,7 @@ done:
 			[self failWith:why];
 			return NO;
 		}
-		if (device != NULL && mesa.finish(device, why, size) != 0) {
+		if (device != NULL && alioth_finish(device, why, size) != 0) {
 			[self failWith:why];
 			return NO;
 		}
@@ -5162,11 +5303,14 @@ done:
 		return NO;
 	}
 
+	uint64_t drawn = mach_absolute_time();
+
 	if (mesa.render_draw([work->render render], &draw, why, size) != 0) {
 		rw_print("the draw failed: %s\n", why);
 		[self failWith:why];
 		return NO;
 	}
+	alioth_stat(ST_DRAW, drawn);
 	return YES;
 }
 
@@ -5187,12 +5331,18 @@ done:
 	if (_status == RW_CB_ERROR || _status == RW_CB_COMPLETED) {
 		return;
 	}
+	uint64_t waited = mach_absolute_time();
+
 	/* (the K40's) the wait already going on off this thread (-aliothDeliverHandlers): its end, not a second one */
 	if (_done != nil) {
 		dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+		alioth_stat(ST_WAIT, waited);
 		return;
 	}
-	if (mesa.finish([[_queue device] mesaDevice], why, sizeof(why)) != 0) {
+	int finished = mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
+
+	alioth_stat(ST_WAIT, waited);
+	if (finished != 0) {
 		rw_print("THE GPU DID NOT FINISH: %s\n", why);
 		_error = [[NSError errorWithDomain:@"AliothMetal" code:3
 					  userInfo:@{ NSLocalizedDescriptionKey:
@@ -5292,12 +5442,17 @@ done:
 	 * frame before the window server's reading of it. With a fence when completed handlers will wait on it.
 	 */
 	struct rwa_device *device = [[_queue device] mesaDevice];
-	BOOL async = [completed count] > 0 && _status != RW_CB_ERROR && device != NULL && mesa.flush != NULL &&
-	    mesa.fence_wait != NULL;
+	/* (with metal_stats=1 every buffer is fenced and waited for off this thread, handlers or not, so that each
+	 * one's GPU time is counted) */
+	BOOL async = ([completed count] > 0 || alioth_stats_on) && _status != RW_CB_ERROR && device != NULL &&
+	    mesa.flush != NULL && mesa.fence_wait != NULL;
 	void *fence = NULL;
+	uint64_t flushed = mach_absolute_time();
 
 	if (device != NULL && mesa.flush != NULL && _status != RW_CB_ERROR) {
 		fence = mesa.flush(device, async ? 1 : 0);
+		alioth_stat(ST_FLUSH, flushed);
+		flushed = mach_absolute_time();
 	}
 	for (id handler in scheduled) {
 		[self aliothDeliver:(void (^)(id))handler];
@@ -5321,7 +5476,10 @@ done:
 		dispatch_async([_queue aliothWaitQueue], ^{
 			char why[512] = { 0 };
 
-			if (mesa.fence_wait(device, fence, why, sizeof(why)) != 0) {
+			int waited = mesa.fence_wait(device, fence, why, sizeof(why));
+
+			alioth_stat(ST_GPU, flushed);
+			if (waited != 0) {
 				rw_print("THE GPU DID NOT FINISH: %s\n", why);
 				_error = [[NSError errorWithDomain:@"AliothMetal" code:3
 							  userInfo:@{ NSLocalizedDescriptionKey:
