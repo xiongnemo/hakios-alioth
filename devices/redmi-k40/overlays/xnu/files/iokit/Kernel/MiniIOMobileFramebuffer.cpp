@@ -350,6 +350,8 @@ public:
 	void aliothMoreSlots(void);
 	bool aliothSlotSeen(uint64_t phys, uint8_t * pixels);
 	MiniIOSurface * directSurface(const uint8_t * swap, MiniIOSurface ** surfaces);
+	bool topHides(const uint8_t * swap, MiniIOSurface * s);
+	uint32_t        fStatHidden;            /* frames whose layers under a whole-display opaque layer 0 were left out */
 	uint32_t        fFlipFlips, fFlipMissed;
 	bool            fFlipPending;           /* a flip issued, not yet seen taken: fComposeBase is still scanned */
 	bool aliothFlipStart(void);
@@ -808,28 +810,86 @@ IOMobileFramebuffer::aliothDirectTest(void)
 	return pass;
 }
 
-/* The swap's surface, if it can be scanned out as it is: one layer, of the display's size, all of it shown. */
+/* Layer 0's surface of the display's size, all of it shown over all of the display. */
+static bool
+wholeDisplay(const uint8_t * swap, MiniIOSurface * s, uint32_t width, uint32_t height)
+{
+	int32_t src[4], dst[4];
+
+	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
+	memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
+	return s != NULL && s->info.width == width && s->info.height == height && s->info.bytesPerElement == 4 &&
+	       s->info.planeCount == 0 &&
+	       !(src[2] > 0 && (src[0] != 0 || src[1] != 0 || (uint32_t) src[2] != width || (uint32_t) src[3] != height)) &&
+	       !(dst[2] > 0 && (dst[0] != 0 || dst[1] != 0 || (uint32_t) dst[2] != width || (uint32_t) dst[3] != height));
+}
+
+/* Every pixel of a grid of 32 x 48 over the surface of alpha 255 (the top byte of 'BGRA'): read as opaque. */
+static bool
+surfaceOpaque(MiniIOSurface * s)
+{
+	const uint8_t * pixels = s->pixels();
+	uint32_t width = s->info.width, height = s->info.height, row = s->info.bytesPerRow;
+
+	if (pixels == NULL || width == 0 || height == 0) {
+		return false;
+	}
+	for (uint32_t gy = 0; gy < 48; gy++) {
+		size_t y = (size_t) ((2 * gy + 1) * (uint64_t) height / 96);
+
+		for (uint32_t gx = 0; gx < 32; gx++) {
+			size_t x = (size_t) ((2 * gx + 1) * (uint64_t) width / 64);
+
+			if (pixels[y * row + x * 4 + 3] != 0xff) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/*
+ * (the K40's) Whether layer 0 -- the top one (a layer of a higher number is under one of a lower, see show()) -- is
+ * shown whole over the whole display and is opaque, so that the layers under it cannot be seen. CoreAnimation gives an
+ * application's full-screen CAMetalLayer or CAEAGLLayer a layer of its own, layer 0, with its own frame under it as
+ * layer 1; drawn here by the processors, scaled and blended, the two cost 14 to 20 ms a frame and held the application
+ * to the window server's 48 swaps a second (logs/082420: SceneKit waiting 17 ms in -nextDrawable for a drawable, 49
+ * swaps of two layers in 1.02 s). In some boots CoreAnimation gave the layer back after a third of a second and the
+ * same SceneKit made 94 frames a second, in most it did not. Opaque is read off the pixels -- the swap carries nothing
+ * this driver knows of that says it -- a grid of 32 x 48 of them, every one of alpha 255; one see-through point and
+ * the layers are blended as before.
+ */
+bool
+IOMobileFramebuffer::topHides(const uint8_t * swap, MiniIOSurface * s)
+{
+	bool others = false;
+
+	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
+		others = others || swapWord(swap, SWAP_SURFACE(layer)) != 0;
+	}
+	return others && wholeDisplay(swap, s, fWidth, fHeight) && surfaceOpaque(s);
+}
+
+/*
+ * The swap's surface, if it can be scanned out as it is: one layer, of the display's size, all of it shown -- or, with
+ * layers under it, one that hides them (topHides()).
+ */
 MiniIOSurface *
 IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	MiniIOSurface * s = surfaces[0];
-	int32_t src[4], dst[4];
+	bool others = false;
 
 	if (!fDirect || fRecBase != NULL || fDiff || s == NULL || s->scanPhys == 0) {
 		return NULL;
 	}
 	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
-		if (swapWord(swap, SWAP_SURFACE(layer)) != 0) {
-			return NULL;
-		}
+		others = others || swapWord(swap, SWAP_SURFACE(layer)) != 0;
 	}
-	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
-	memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
-	if (s->info.width != fWidth || s->info.height != fHeight || s->info.bytesPerElement != 4 || s->info.planeCount != 0 ||
-	    (src[2] > 0 && (src[0] != 0 || src[1] != 0 || (uint32_t) src[2] != fWidth || (uint32_t) src[3] != fHeight)) ||
-	    (dst[2] > 0 && (dst[0] != 0 || dst[1] != 0 || (uint32_t) dst[2] != fWidth || (uint32_t) dst[3] != fHeight))) {
+	if (!wholeDisplay(swap, s, fWidth, fHeight) || (others && !topHides(swap, s))) {
 		return NULL;
 	}
+	fStatHidden += others;
 	return s;
 }
 
@@ -1929,7 +1989,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * CAMetalLayer a layer of its own, makes it layer 0 and moves its own frame -- with what is under the Metal layer
 	 * drawn into it, the view's black background included -- to layer 1 (logs/052440, 2026-11-08); drawn from layer 0
 	 * on, the frame covered the Metal layer and the square was black.
+	 * (The K40's) Under a layer 0 that hides them (topHides()), they are not drawn at all: one copy, no blending.
 	 */
+	bool hides = direct == NULL && topHides(swap, surfaces[0]);
+
+	fStatHidden += hides;
 	for (int layer = SWAP_LAYERS - 1; direct == NULL && layer >= 0; layer--) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
@@ -1957,7 +2021,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    s ? (int) (s->info.pixelFormat >> 8 & 0xff) : '?', s ? (int) (s->info.pixelFormat & 0xff) : '?',
 			    src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], set);
 		}
-		if (s == NULL) {
+		if (s == NULL || (layer > 0 && hides)) {
 			continue;
 		}
 		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
@@ -2066,12 +2130,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
 		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
-		    "%u gave up; %u swaps came a refresh late themselves; %u scanned out of the surface itself\n", fStatFrames,
+		    "%u gave up; %u swaps came a refresh late themselves; %u scanned out of the surface itself; %u with the "
+		    "layers under a whole-display opaque layer 0 left out\n", fStatFrames,
 		    nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
-		    fStatHeld, fStatLost, fStatSwapsLate, fStatDirect);
+		    fStatHeld, fStatLost, fStatSwapsLate, fStatDirect, fStatHidden);
 		fStatSwapsLate = 0;
 		fStatDirect = 0;
+		fStatHidden = 0;
 		if (fStatEarly != 0 || fStatEarlyRisk != 0 || gSwapWaitTruth != 0) {
 			uint32_t asked = __atomic_exchange_n(&gStatSwapWaitAsked, 0, __ATOMIC_RELAXED);
 			uint32_t busy = __atomic_exchange_n(&gStatSwapWaitBusy, 0, __ATOMIC_RELAXED);
