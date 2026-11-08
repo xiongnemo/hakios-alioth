@@ -66,18 +66,21 @@ def accessibility_unwanted(path):
     return not ACCESSIBILITY_WANTED.match(path[len(ACCESSIBILITY):].split('/')[0])
 FRAMEWORKS = ('System/Library/Frameworks/', 'System/Library/PrivateFrameworks/')
 SMALL = 4 << 20
-# never from frameworks: machine-learning models, shader libraries, sound and video, big tables.
+# never from frameworks: machine-learning models, sound and video, big tables.
 # (Not the data models, .mom: an application that keeps its data with Core Data dies without its
-# model -- Notes did; nor the animations and vector pictures the interface is drawn with.)
-SKIP_EXT = ('.weights', '.weights_nonane', '.metallib', '.mov', '.pcm', '.scnz', '.espresso.net',
+# model -- Notes did; nor the animations and vector pictures the interface is drawn with. Nor, since
+# the port has Metal (2026-11-08), the shader libraries, .metallib: 142 of them, 188 MB; without its
+# default.metallib SpriteKit throws the moment it gets a Metal device -- SKEnsureGlobalMetalLibrary
+# hands +[NSURL fileURLWithPath:] the nil path -- and SceneKit and VectorKit need theirs the same way.)
+SKIP_EXT = ('.weights', '.weights_nonane', '.mov', '.pcm', '.scnz', '.espresso.net',
             '.espresso.shape', '.caf', '.m4a', '.aiff', '.mp4', '.heic', '.wav', '.art', '.scube',
             '.ds', '.dat', '.bin')
 # ... but '.dat' and '.bin' are also what these keep the tables in that the user interface is made with:
 # the layouts of the on-screen keyboard, the emoji, the list of public domain suffixes
 DATA_FRAMEWORKS = tuple(f'System/Library/{name}.framework/' for name in (
     'PrivateFrameworks/TextInputUI', 'PrivateFrameworks/CoreEmoji', 'Frameworks/CFNetwork'))
-# never from applications: their sound, video and 3D content
-SKIP_APP_EXT = ('.mov', '.mp4', '.m4a', '.caf', '.wav', '.heic', '.aiff', '.metallib', '.scnz', '.usdz')
+# never from applications: their sound, video and 3D content (their shader libraries stay: see SKIP_EXT)
+SKIP_APP_EXT = ('.mov', '.mp4', '.m4a', '.caf', '.wav', '.heic', '.aiff', '.scnz', '.usdz')
 # pictures the user interface is drawn with: small images, and asset catalogs up to this size
 # (the one with all the SF Symbols alone is 170 MB and is left out)
 MAX_ASSET_CATALOG = 4 << 20
