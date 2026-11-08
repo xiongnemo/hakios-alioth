@@ -447,6 +447,54 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "fast_fmax") || !strcmp(op, "fmax") || !strcmp(op, "max")) {
       r = is_float ? nir_fmax(&c->b, a[0], a[1])
                    : (is_signed ? nir_imax(&c->b, a[0], a[1]) : nir_umax(&c->b, a[0], a[1]));
+   } else if ((!strcmp(op, "fast_fmin3") || !strcmp(op, "fmin3") || !strcmp(op, "min3") ||
+               !strcmp(op, "fast_fmax3") || !strcmp(op, "fmax3") || !strcmp(op, "max3") ||
+               !strcmp(op, "fast_fmedian3") || !strcmp(op, "fmedian3") || !strcmp(op, "median3")) &&
+              argc >= 3) {
+      /* (the K40's) Metal's three-way min, max and median: air.fmax3.f16(half, half, half) and kin
+       * in 9 or 10 of VectorKit's modules each. The median is max(min(a, b), min(max(a, b), c)).
+       */
+      nir_def *lo = is_float ? nir_fmin(&c->b, a[0], a[1])
+                             : (is_signed ? nir_imin(&c->b, a[0], a[1]) : nir_umin(&c->b, a[0], a[1]));
+      nir_def *hi = is_float ? nir_fmax(&c->b, a[0], a[1])
+                             : (is_signed ? nir_imax(&c->b, a[0], a[1]) : nir_umax(&c->b, a[0], a[1]));
+      if (strstr(op, "min3"))
+         r = is_float ? nir_fmin(&c->b, lo, a[2])
+                      : (is_signed ? nir_imin(&c->b, lo, a[2]) : nir_umin(&c->b, lo, a[2]));
+      else if (strstr(op, "max3"))
+         r = is_float ? nir_fmax(&c->b, hi, a[2])
+                      : (is_signed ? nir_imax(&c->b, hi, a[2]) : nir_umax(&c->b, hi, a[2]));
+      else {
+         nir_def *mid = is_float ? nir_fmin(&c->b, hi, a[2])
+                                 : (is_signed ? nir_imin(&c->b, hi, a[2]) : nir_umin(&c->b, hi, a[2]));
+         r = is_float ? nir_fmax(&c->b, lo, mid)
+                      : (is_signed ? nir_imax(&c->b, lo, mid) : nir_umax(&c->b, lo, mid));
+      }
+   } else if (!strcmp(op, "is_uniform")) {
+      /* (the K40's) whether a value is the same in every thread of the SIMD group. VectorKit asks it
+       * of a constant (air.is_uniform.f16(half 0xH2C00)), which is uniform; anything else is answered
+       * "not known to be", which only ever sends a shader down the path that does not assume it.
+       */
+      r = nir_imm_bool(&c->b, a[0]->parent_instr->type == nir_instr_type_load_const);
+   } else if (!strcmp(op, "pack") && n->num >= 2) {
+      /* (the K40's) pack_float_to_unorm2x16, _snorm2x16, _unorm4x8, _snorm4x8 (VectorKit: 18, 9 and 3
+       * modules): GLSL's packUnorm2x16 and kin, component 0 in the low bits, so NIR's opcodes are the
+       * operations (ir3 lowers them, as it does unpack_unorm_4x8 above); halves widened first.
+       */
+      nir_def *v = a[0]->bit_size == 16 ? nir_f2f32(&c->b, a[0]) : a[0];
+
+      if (!strcmp(n->part[1], "unorm2x16"))
+         r = nir_pack_unorm_2x16(&c->b, v);
+      else if (!strcmp(n->part[1], "snorm2x16"))
+         r = nir_pack_snorm_2x16(&c->b, v);
+      else if (!strcmp(n->part[1], "unorm4x8"))
+         r = nir_pack_unorm_4x8(&c->b, v);
+      else if (!strcmp(n->part[1], "snorm4x8"))
+         r = nir_pack_snorm_4x8(&c->b, v);
+      else {
+         c->b.exact = was_exact;
+         return air_error(c, "intrinsic: air.pack.%s (a packing this frontend does not know)", n->part[1]);
+      }
    } else if (!strcmp(op, "fast_clamp") || !strcmp(op, "clamp")) {
       if (is_float)
          r = nir_fmin(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2]);
