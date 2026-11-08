@@ -21,6 +21,9 @@
  * locationd is not asked for it. trueHeading: the magnetic heading turned by the declination where the phone is
  * (NOAA's World Magnetic Model 2025, wmm2025.h), from the location manager's own last location; without one, the
  * magnetic heading, as before. Not yet: the raw field (x, y, z are 0).
+ *
+ * Metal, for the applications the owner allows and no others (metal_for_allowed(), boot-arg metal_apps=): the port's
+ * Metal driver registered in the application before its own code runs.
  */
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -1624,6 +1627,135 @@ hakios_compass_init(void)
 	_dyld_register_func_for_add_image(compass_hooks);
 }
 
+/*
+ * Metal for the applications the owner allows (the Metal plan's step 3, hk's allow-list). The port's Metal driver
+ * (libhakios.metal.dylib) is registered with Metal in this process -- MTLAddDevice, as System Check's Metal tab does
+ * it -- before the application's own code runs, so its MTLCreateSystemDefaultDevice() answers the Adreno. Nothing is
+ * allowed unless named: the boot-arg metal_apps=ID,ID,... or /redwood/etc/metal-apps, one bundle ID a line. Never a
+ * program of the system's: backboardd and SpringBoard never load this library (build.sh's INJECT is "*.app *.appex"),
+ * an application of /Applications or /System is not third_party(), and an app extension or widget is refused here by
+ * its path. The window server keeps OpenGL ES, which composites at 120 Hz where Metal composited at 14 to 27 fps.
+ *
+ * In the constructor, because a game makes its device in -application:didFinishLaunching... or earlier. CoreFoundation,
+ * Metal and IOKit are taken by dlopen and dlsym only when a list exists, so every other application loads nothing more
+ * than before; dlopen runs their initialisers, CoreFoundation's among them, before anything of theirs is used.
+ */
+#define METAL_DRIVER "/redwood/lib/libhakios.metal.dylib"
+#define METAL_APPS_FILE "/redwood/etc/metal-apps"
+
+/* whether `want` is one of the entries of `list`, separated by `separator` (blanks around an entry ignored) */
+static bool
+metal_listed(const char *want, const char *list, char separator)
+{
+	size_t n = strlen(want);
+
+	for (const char *p = list; p != NULL && *p != '\0';) {
+		const char *end = strchr(p, separator);
+		size_t len = end != NULL ? (size_t)(end - p) : strlen(p);
+
+		while (len != 0 && (*p == ' ' || *p == '\t')) {
+			p++;
+			len--;
+		}
+		while (len != 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' || p[len - 1] == '\r' || p[len - 1] == '\n')) {
+			len--;
+		}
+		if (len == n && strncmp(p, want, n) == 0) {
+			return true;
+		}
+		if (end == NULL) {
+			break;
+		}
+		p = end + 1;
+	}
+	return false;
+}
+
+static void
+metal_for_allowed(void)
+{
+	char path[1024], args[1024] = "", apps[1024] = "", file[4096] = "", bundle_id[256] = "";
+	uint32_t path_size = sizeof(path);
+	size_t args_size = sizeof(args) - 1;
+	const char *a;
+	int fd;
+
+	if (!third_party() || _NSGetExecutablePath(path, &path_size) != 0 || strstr(path, ".appex/") != NULL) {
+		return;
+	}
+	(void)sysctlbyname("kern.bootargs", args, &args_size, NULL, 0);
+	if ((a = strstr(args, "metal_apps=")) != NULL) {
+		size_t k = 0;
+
+		for (a += 11; *a != '\0' && *a != ' ' && k < sizeof(apps) - 1; a++) {
+			apps[k++] = *a;
+		}
+		apps[k] = '\0';
+	}
+	if ((fd = open(METAL_APPS_FILE, O_RDONLY)) >= 0) {
+		ssize_t got = read(fd, file, sizeof(file) - 1);
+
+		file[got > 0 ? got : 0] = '\0';
+		close(fd);
+	}
+	if (apps[0] == '\0' && file[0] == '\0') {
+		return;                 /* (no list: nothing allowed, nothing loaded, nothing said) */
+	}
+
+	/* the bundle ID, through CoreFoundation taken by name (this library links none of it) */
+	void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+	void *(*main_bundle)(void) = cf ? (void *(*)(void))dlsym(cf, "CFBundleGetMainBundle") : NULL;
+	const void *(*identifier)(void *) = cf ? (const void *(*)(void *))dlsym(cf, "CFBundleGetIdentifier") : NULL;
+	bool (*c_string)(const void *, char *, long, uint32_t) =
+	    cf ? (bool (*)(const void *, char *, long, uint32_t))dlsym(cf, "CFStringGetCString") : NULL;
+	void *bundle = main_bundle ? main_bundle() : NULL;
+	const void *bid = bundle && identifier ? identifier(bundle) : NULL;
+
+	if (bid == NULL || c_string == NULL ||
+	    !c_string(bid, bundle_id, sizeof(bundle_id), 0x08000100 /* kCFStringEncodingUTF8 */)) {
+		say("metal: no bundle ID to look up in the allow-list; not allowed\n");
+		return;
+	}
+	if (!metal_listed(bundle_id, apps, ',') && !metal_listed(bundle_id, file, '\n')) {
+		say("metal: %s is not on the allow-list (metal_apps=, %s); not allowed\n", bundle_id, METAL_APPS_FILE);
+		return;
+	}
+
+	void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW);
+	void (*add)(id) = metal ? (void (*)(id))dlsym(metal, "MTLAddDevice") : NULL;
+	void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+	void *(*matching)(const char *) = iokit ? (void *(*)(const char *))dlsym(iokit, "IOServiceMatching") : NULL;
+	unsigned (*service_of)(unsigned, void *) = iokit ? (unsigned (*)(unsigned, void *))dlsym(iokit,
+	    "IOServiceGetMatchingService") : NULL;
+	Class device_class;
+	unsigned service;
+	id device;
+
+	if (add == NULL || matching == NULL || service_of == NULL) {
+		say("metal: %s is allowed and %s; nothing registered\n", bundle_id, add == NULL ? "Metal has no MTLAddDevice" :
+		    "IOKit's matching calls are missing");
+		return;
+	}
+	if (dlopen(METAL_DRIVER, RTLD_NOW) == NULL || (device_class = objc_getClass("AliothMetalDevice")) == Nil) {
+		say("metal: %s is allowed and %s will not load: %s\n", bundle_id, METAL_DRIVER,
+		    dlerror() ?: "no AliothMetalDevice");
+		return;
+	}
+	if ((service = service_of(0, matching("IOAcceleratorES"))) == 0) {
+		say("metal: %s is allowed and there is no IOAcceleratorES service to hand the device\n", bundle_id);
+		return;
+	}
+	device = ((id (*)(id, SEL, unsigned))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)((id)device_class,
+	    sel_registerName("alloc")), sel_registerName("initWithAcceleratorPort:"), service);
+	if (device == nil) {
+		say("metal: %s is allowed and the device would not start (-initWithAcceleratorPort: gave nil)\n",
+		    bundle_id);
+		return;
+	}
+	add(device);
+	say("metal: %s is allowed: the port's Metal device is registered in it\n", bundle_id);
+}
+
 __attribute__((constructor))
 static void
 hakios_ui_init(void)
@@ -1635,6 +1767,7 @@ hakios_ui_init(void)
 	IMP original;
 
 	model_decide();
+	metal_for_allowed();
 	app_opengl_es();
 	cls = objc_getClass("CIContext");
 	method = cls ? class_getClassMethod(cls, sel_registerName("internalContextWithEAGLContext:options:")) : NULL;
