@@ -807,12 +807,27 @@ GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const str
     size_t ws), (t, s, w, ws))
 GPU_LOCKED(void *, flush, (struct rwa_device *d, unsigned f), (d, f))
 
-/* a wait for the GPU inside -commit (a blit, a signal, an indirect draw), counted with metal_stats=1 */
+/*
+ * (the K40's) rwa_finish in its two halves: flushed with a fence under the library's lock, the fence waited for
+ * outside it (rwa_fence_wait takes no lock), so that no other thread's calls stand behind the GPU's work. Whole,
+ * the finish held the lock for all of the wait: metal_stats=1 had it "held elsewhere" 26 times in 2 s, 5.7 ms each,
+ * while VectorKit drew (logs/094301).
+ */
+static int
+alioth_flush_wait(struct rwa_device *device, char *why, size_t size)
+{
+	if (mesa.flush != NULL && mesa.fence_wait != NULL) {
+		return mesa.fence_wait(device, mesa.flush(device, 1), why, size);
+	}
+	return mesa.finish(device, why, size);
+}
+
+/* a wait for the GPU inside -commit (a blit, an indirect draw), counted with metal_stats=1 */
 static int
 alioth_finish(struct rwa_device *device, char *why, size_t size)
 {
 	uint64_t t0 = mach_absolute_time();
-	int rc = mesa.finish(device, why, size);
+	int rc = alioth_flush_wait(device, why, size);
 
 	alioth_stat(ST_FINISH, t0);
 	return rc;
@@ -5352,7 +5367,7 @@ done:
 		alioth_stat(ST_WAIT, waited);
 		return;
 	}
-	int finished = mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
+	int finished = alioth_flush_wait([[_queue device] mesaDevice], why, sizeof(why));
 
 	alioth_stat(ST_WAIT, waited);
 	if (finished != 0) {
