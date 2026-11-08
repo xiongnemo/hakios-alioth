@@ -850,9 +850,11 @@ IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfac
  * send is over (the write pointer at the panel's height), with the flip to the new one taken at the next TE; or once
  * the flip is taken, whichever comes first; at once when the frames come in three surfaces in turn (as 1). With 2 the
  * owner saw a pull-to-refresh "jelly" (CoreAnimation drawing into a surface still being sent, a bounce at 120 Hz with
- * fr_min=120); with 1 the home screen was clearly less smooth.
+ * fr_min=120); with 1 the home screen was clearly less smooth. 3 is the default since 2026-11-08: no jelly, as smooth
+ * as 2 to the owner; nearly every swap was over at once, the send already done (logs/163607: 399 of 400 in 5 s, the
+ * write pointer at 2400 of 2400), GPU Check 81 / 0 crashed.
  */
-static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 2);
+static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 3);
 
 /*
  * fb_swap_wait=1 (2026-11-07; 0 the default until measured): SwapWait (selector 6) tells the truth. CoreAnimation asks it
