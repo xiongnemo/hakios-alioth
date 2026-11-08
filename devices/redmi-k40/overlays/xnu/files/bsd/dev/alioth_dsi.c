@@ -927,6 +927,13 @@ alioth_flip_issue(uint64_t phys)
 	flip_issued = mach_absolute_time();
 }
 
+/* 1 when the flip issued last has been taken, now, without waiting (fb_swap_early=3) */
+int
+alioth_flip_taken(void)
+{
+	return mdss != 0 && !(md_rd(CTL0_OFF + CTL_FLUSH) & CTL_FLUSH_VIG0);
+}
+
 /* 1 when the flip issued last has been taken (at once if it has already), 0 after timeout_us without */
 int
 alioth_flip_wait(uint32_t timeout_us)

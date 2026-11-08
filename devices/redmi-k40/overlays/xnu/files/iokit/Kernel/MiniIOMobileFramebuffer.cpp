@@ -65,6 +65,7 @@ extern "C" void alioth_flip_set_ready(bool on);
 extern "C" uint32_t alioth_flip_latch_max_us(void);
 extern "C" void alioth_flip_issue(uint64_t phys);
 extern "C" int alioth_flip_wait(uint32_t timeout_us);
+extern "C" int alioth_flip_taken(void);
 extern "C" void alioth_panel_start(void);
 extern "C" uint32_t alioth_panel_rate(void);
 extern "C" uint64_t alioth_panel_frame_ns(void);
@@ -341,6 +342,8 @@ public:
 	uint32_t        fEarlyShown;            /* ... the surface on the panel when the last swap was over early */
 	uint32_t        fDirectHeldID;          /* the swap fDirectHeld came in (fb_swap_wait: done when it is let go) */
 	uint32_t        fStatEarly, fStatEarlyRisk;     /* swaps over early; frames that came in fEarlyShown */
+	uint32_t        fStatEarlySent, fStatEarlyTaken, fStatSentMax;  /* (fb_swap_early=3) over as the send ended / the flip
+	                                                 * was taken; the highest write pointer seen */
 	bool swapEarly(uint32_t sid);
 	IOMemoryMap *   fMoreMap;               /* (fb_slots=3/4) the slots the loader took from the firmware's memory */
 	bool aliothDirectTest(void);
@@ -841,6 +844,13 @@ IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfac
  * is then the one shown two frames ago, which the engine no longer reads. 2: always (the surfaces on the panel read as
  * in use, MiniIOSurfaceUse(), to a drawer that asks IOSurfaceIsInUse()); 0: never, as before. The statistics say how
  * many frames still came in the surface that was on the panel as the swap before was over ("fEarlyShown").
+ *
+ * 3 (2026-11-08): over once nothing reads the surface shown until now. The panel is in command mode: at a TE the
+ * engine sends it the surface it has, and is idle after until the next one -- so that surface is free as soon as the
+ * send is over (the write pointer at the panel's height), with the flip to the new one taken at the next TE; or once
+ * the flip is taken, whichever comes first; at once when the frames come in three surfaces in turn (as 1). With 2 the
+ * owner saw a pull-to-refresh "jelly" (CoreAnimation drawing into a surface still being sent, a bounce at 120 Hz with
+ * fr_min=120); with 1 the home screen was clearly less smooth.
  */
 static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 2);
 
@@ -884,7 +894,7 @@ IOMobileFramebuffer::swapEarly(uint32_t sid)
 
 	fEarlyPrev[1] = fEarlyPrev[0];
 	fEarlyPrev[0] = sid;
-	return gSwapEarly >= 2 || (gSwapEarly == 1 && turn);
+	return gSwapEarly == 2 || ((gSwapEarly == 1 || gSwapEarly == 3) && turn);
 }
 
 void
@@ -1772,6 +1782,31 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatEarlyRisk += fEarlyShown != 0 && direct->sid == fEarlyShown;
 		fEarlyShown = 0;
 		bool early = swapEarly(direct->sid);
+		if (!early && gSwapEarly == 3 && fDirectHeld != NULL) {
+			/* fb_swap_early=3: the surface shown until now is free once the panel has been sent all of it, or the
+			 * flip is taken -- a frame at most (a still panel with refresh_idle sends nothing: free at once) */
+			uint64_t asked = mach_absolute_time(), limit;
+
+			nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &limit);
+			for (;;) {
+				uint32_t line = alioth_panel_line();
+
+				fStatSentMax = line > fStatSentMax ? line : fStatSentMax;
+				if (alioth_flip_taken()) {
+					fStatEarlyTaken++;
+					break;
+				}
+				if (line >= fPanelHeight) {
+					fStatEarlySent++;
+					break;
+				}
+				if (mach_absolute_time() - asked >= limit) {
+					break;
+				}
+				delay_for_interval(100, NSEC_PER_USEC);
+			}
+			early = true;
+		}
 		if (early) {
 			fEarlyShown = fDirectHeld != NULL ? fDirectHeld->sid : 0;
 			completeSwap();
@@ -2014,6 +2049,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    "was on the panel then; SwapWait asked %u times, %u busy (fb_swap_wait=%u); surfaces %u %u %u %u %u\n",
 			    fStatEarly, gSwapEarly, fStatEarlyRisk, asked, busy, gSwapWaitTruth, fStatSurfaces[0], fStatSurfaces[1],
 			    fStatSurfaces[2], fStatSurfaces[3], fStatSurfaces[4]);
+			if (gSwapEarly == 3) {
+				hakios_tl("display: fb_swap_early=3: %u over as the panel had been sent the surface before, %u as the flip "
+				    "was taken; write pointer up to %u of %u\n", fStatEarlySent, fStatEarlyTaken, fStatSentMax, fPanelHeight);
+				fStatEarlySent = fStatEarlyTaken = fStatSentMax = 0;
+			}
 			fStatEarly = fStatEarlyRisk = 0;
 		}
 		if (fStatScanWaits != 0) {
