@@ -88,6 +88,11 @@ struct rwa_device {
    unsigned max_threads_per_group;
    unsigned thread_execution_width;
 
+   /* (the K40's) rwa_device_set_deferred: a dispatch is not waited for; the caller's
+    * rwa_flush / rwa_fence_wait or rwa_finish says when it is done
+    */
+   bool deferred;
+
    /* One sampler for the slots nothing was bound to, made when a dispatch first needs
     * it. See rwa_dispatch: a kernel's read() is a texture fetch and ignores the
     * sampler, but softpipe dereferences the state of every unit a shader touches.
@@ -4013,10 +4018,23 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * whole time, so a caller that read them before the fence would read what it wrote
     * and call it a result. rwa_finish is for a caller that wants to wait again, or to
     * wait for work dispatched through another pipeline of the same device.
+    *
+    * (The K40's) unless the device is deferred (rwa_device_set_deferred): a Metal driver
+    * keeps that score with its command buffer's fence, and a wait per dispatch made every
+    * dispatch a submission of its own with the processor standing still for it, as the
+    * draws were (rwa_draw.keep_bound). Unbinding after the launch is safe either way: the
+    * batch holds its own references to what the dispatch reads and writes.
     */
-   int rc = finish_or_say_why(device, true, "dispatch", why, why_size);
+   int rc = device->deferred ? 0 : finish_or_say_why(device, true, "dispatch", why, why_size);
    unbind_stage(device, PIPE_SHADER_COMPUTE, &bound);
    return rc;
+}
+
+void
+rwa_device_set_deferred(struct rwa_device *device, unsigned deferred)
+{
+   if (device)
+      device->deferred = deferred != 0;
 }
 
 int

@@ -1443,6 +1443,14 @@ enum {
 		_mesa = mesa.device_open(why, sizeof(why));
 		rw_print("the compiler library %s\n",
 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
+		/* (the K40's) dispatches not waited for one by one: the command buffer's flush and fence say when its
+		 * work is done (-aliothDeliverHandlers, -waitUntilCompleted), as they do for its draws */
+		void (*deferred)(struct rwa_device *, unsigned) =
+		    (void (*)(struct rwa_device *, unsigned))dlsym(mesa.handle, "rwa_device_set_deferred");
+
+		if (_mesa != NULL && deferred != NULL) {
+			deferred(_mesa, 1);
+		}
 	}
 
 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on

@@ -1383,6 +1383,11 @@ struct rwa_argument {
  * The wait takes no context, so another thread may make it while this device's context goes on
  * being used (under the caller's own lock: the context is not thread-safe). 0, or -1 and why. */
 void *rwa_flush(struct rwa_device *device, unsigned want_fence);
+
+/* (the K40's) 1: rwa_dispatch and rwa_dispatch_buffers no longer wait for the GPU, so a command
+ * buffer's dispatches batch into one submission; the caller says when they are done (rwa_flush and
+ * rwa_fence_wait, or rwa_finish) and reads nothing before. 0, the default, waits as before. */
+void rwa_device_set_deferred(struct rwa_device *device, unsigned deferred);
 int rwa_fence_wait(struct rwa_device *device, void *fence, char *why, size_t why_size);
 
 /* (the K40's) A texture view over the whole of `texture`: a second texture sharing its
