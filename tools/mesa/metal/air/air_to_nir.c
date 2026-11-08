@@ -1681,7 +1681,13 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
    /* resources */
    if (md_key(node, "air.buffer") >= 0) {
       uint64_t as = 0, index = 0, size = 0;
-      md_key_int(node, "air.address_space", &as);
+      /* (the K40's) and with no air.address_space at all, the space of the argument's own
+       * pointer type: VectorKit's AlloyCommonLibrary.metallib (Metal 2.3) declares its
+       * Clear::clear_vertex constants as `ptr addrspace(2)` with a buffer node that names no
+       * address space, and five of MapKit's pipelines were refused for "address space 0"
+       */
+      if (!md_key_int(node, "air.address_space", &as) && t && t->kind == AIR_TYPE_POINTER)
+         as = t->addrspace;
       md_key_int(node, "air.location_index", &index);
       md_key_int(node, "air.buffer_size", &size);
       bool read = md_key(node, "air.read") >= 0 || md_key(node, "air.read_write") >= 0;
