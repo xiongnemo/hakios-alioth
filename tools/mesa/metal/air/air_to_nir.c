@@ -2060,7 +2060,34 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
     * that is written to nothing is a shader that draws without the clipping it
     * asked for, and nothing in this tree can check a vertex clip distance
     * numerically.
+    *
+    * (The K40's) CLIP DISTANCES ARE BUILT NOW, as NIR's own form: a compact float[N] at
+    * CLIP_DIST0 (CLIP_DIST1 holds 4 to 7), N from the array, which is what Metal's
+    * air.clip_distance_array_size says too. VectorKit has them -- [1 x float] in its route
+    * and transit-line vertex shaders, [2 x float] for elevated roads, [6 x float] in
+    * Flyover -- and emit_return stores every element of the aggregate. shader_info is
+    * filled here because nothing on this path gathers it: ir3 sizes its clip mask from
+    * clip_distance_array_size, and nir_lower_clip_vs looks for CLIP_DIST in
+    * outputs_written before it would add planes of its own; the library enables the
+    * planes in the rasterizer (clip_plane_enable), without which fd6 ignores them.
     */
+   if (location == VARYING_SLOT_CLIP_DIST0 && t->kind == AIR_TYPE_ARRAY && t->elem &&
+       t->elem->kind == AIR_TYPE_FLOAT && t->count >= 1 && t->count <= 8) {
+      unsigned n = (unsigned)t->count;
+      nir_variable *var = nir_variable_create(c->nir, nir_var_shader_out,
+                                              glsl_array_type(glsl_float_type(), n, 0),
+                                              name ? name : "clip_distance");
+      var->data.location = VARYING_SLOT_CLIP_DIST0;
+      var->data.compact = true;
+      var->data.driver_location = c->nir->num_outputs;
+      c->nir->num_outputs += DIV_ROUND_UP(n, 4);
+      c->nir->info.clip_distance_array_size = n;
+      c->nir->info.outputs_written |= VARYING_BIT_CLIP_DIST0 | (n > 4 ? VARYING_BIT_CLIP_DIST1 : 0);
+      c->outputs[field].location = location;
+      c->outputs[field].index = 0;
+      c->outputs[field].var = var;
+      return true;
+   }
    if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_STRUCT) {
       const char *tn = md_key_str(node, "air.arg_type_name");
       if (t->kind == AIR_TYPE_ARRAY)
@@ -2803,6 +2830,33 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
       for (unsigned i = 0; i < v->num_elems; i++) {
          if (!c->outputs[i].var)
             return air_error(c, "interface: field %u of the result has no output", i);
+         /* (the K40's) an array output -- the clip distances, the one kind declared as an
+          * array (translate_output) -- element by element, each a component of the compact
+          * variable; an element left undef is one nothing writes
+          */
+         if (v->elems[i] && glsl_type_is_array(c->outputs[i].var->type)) {
+            nir_variable *var = c->outputs[i].var;
+            unsigned n = glsl_get_length(var->type);
+            struct air_val *e = v->elems[i];
+
+            for (unsigned j = 0; j < n; j++) {
+               nir_def *d = NULL;
+
+               if (e->kind == AIR_VAL_AGG && j < e->num_elems && e->elems[j] &&
+                   e->elems[j]->kind == AIR_VAL_SSA)
+                  d = e->elems[j]->def;
+               else if (e->kind == AIR_VAL_SSA && j < e->def->num_components)
+                  d = nir_channel(&c->b, e->def, j);
+               if (!d)
+                  continue;
+               d = nir_channel(&c->b, d, 0);
+               if (d->bit_size != 32)
+                  d = nir_f2f32(&c->b, d);
+               nir_store_deref(&c->b, nir_build_deref_array_imm(&c->b, nir_build_deref_var(&c->b, var), j),
+                               d, 1);
+            }
+            continue;
+         }
          if (!v->elems[i] || v->elems[i]->kind != AIR_VAL_SSA)
             continue; /* a field left undef is a target nothing writes */
          nir_store_var(&c->b, c->outputs[i].var, v->elems[i]->def,

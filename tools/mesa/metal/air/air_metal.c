@@ -6326,6 +6326,10 @@ rwa_render_create(struct rwa_device *device,
    render->fs_cso = make_stage_cso(device, fs, why, why_size);
    if (!render->fs_cso)
       goto fail;
+   /* (the K40's) the clip distances the vertex stage writes (air_to_nir.c translate_output), read
+    * before the generated stage is freed below: the rasterizer enables that many planes
+    */
+   unsigned clip_planes = vs ? MIN2(vs->info.clip_distance_array_size, 8) : 0;
    render->vs_cso = make_stage_cso(device, vs, why, why_size);
    /* the generated stage is standalone (not under mem_ctx); the driver has a clone, so
     * the source is this library's to free either way
@@ -6400,10 +6404,12 @@ rwa_render_create(struct rwa_device *device,
     * util_framebuffer_get_num_samples) and emits with emit_msaa. So this bit is the
     * honest state for a multisample pass and not the thing that turns multisampling on.
     */
+   /* (and clip_plane_enable: every clip distance the vertex stage writes is a plane in Metal,
+    * which has no switch for them; fd6 masks the shader's clip distances with this) */
    render->rast_templ = (struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .multisample = samples > 1 };
+         .multisample = samples > 1, .clip_plane_enable = BITFIELD_MASK(clip_planes) };
    render->rast = device->pipe->create_rasterizer_state(device->pipe, &render->rast_templ);
    if (!render->blend || !render->dsa || !render->rast) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
