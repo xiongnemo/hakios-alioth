@@ -618,7 +618,7 @@ static pthread_mutex_t alioth_gpu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
  */
 #include <mach/mach_time.h>
 
-enum { ST_ENCODE, ST_RUN, ST_DRAW, ST_FLUSH, ST_GPU, ST_FINISH, ST_WAIT, ST_LOCK, ST_DRAWABLE, ST_N };
+enum { ST_ENCODE, ST_RUN, ST_DRAW, ST_FLUSH, ST_GPU, ST_FINISH, ST_WAIT, ST_LOCK, ST_DRAWABLE, ST_SIGNAL, ST_BLIT, ST_N };
 static bool alioth_stats_on;
 static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_buffers, alioth_stats_since;
 static mach_timebase_info_data_t alioth_timebase;
@@ -671,14 +671,16 @@ alioth_stats_commit(void)
 		n[i] = __atomic_exchange_n(&alioth_stats_n[i], 0, __ATOMIC_RELAXED);
 	}
 	rw_print("stats: %.1f s, %llu buffers (%.0f/s); a buffer: encode %.2f ms, run %.2f ms (%.1f draws, %.2f ms of "
-	         "them in the library), flush %.2f ms, GPU %.2f ms after it (%llu fenced); finish %llu x %.2f ms, "
+	         "them in the library), flush %.2f ms, GPU %.2f ms after it (%llu fenced); finish %llu x %.2f ms (%llu "
+	         "blits, %llu signals set after the fence), "
 	         "waitUntilCompleted %llu x %.2f ms, lock held elsewhere %llu x %.2f ms, nextDrawable %llu x %.2f ms\n",
 	         alioth_ms(now - since) / 1000.0, (unsigned long long)buffers,
 	         (double)buffers * 1000.0 / alioth_ms(now - since), alioth_stat_avg(t, n, ST_ENCODE),
 	         alioth_stat_avg(t, n, ST_RUN), buffers != 0 ? (double)n[ST_DRAW] / (double)buffers : 0.0,
 	         buffers != 0 ? alioth_ms(t[ST_DRAW]) / (double)buffers : 0.0, alioth_stat_avg(t, n, ST_FLUSH),
 	         alioth_stat_avg(t, n, ST_GPU), (unsigned long long)n[ST_GPU], (unsigned long long)n[ST_FINISH],
-	         alioth_stat_avg(t, n, ST_FINISH), (unsigned long long)n[ST_WAIT], alioth_stat_avg(t, n, ST_WAIT),
+	         alioth_stat_avg(t, n, ST_FINISH), (unsigned long long)n[ST_BLIT], (unsigned long long)n[ST_SIGNAL],
+	         (unsigned long long)n[ST_WAIT], alioth_stat_avg(t, n, ST_WAIT),
 	         (unsigned long long)n[ST_LOCK], alioth_stat_avg(t, n, ST_LOCK), (unsigned long long)n[ST_DRAWABLE],
 	         alioth_stat_avg(t, n, ST_DRAWABLE));
 }
@@ -4597,6 +4599,7 @@ enum {
 	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
 	dispatch_group_t _done;         /* (the K40's) left when the GPU wait off this thread is over */
 	uint64_t _created;              /* (the K40's) mach time it was made, for metal_stats=1 */
+	NSMutableArray *_signals;       /* (the K40's) its events' signals, set once the GPU has finished it */
 }
 
 /*
@@ -4694,6 +4697,7 @@ enum {
 	[_error release];
 	[_scheduled release];
 	[_completed release];
+	[_signals release];
 	[_queue release];
 	if (_done != nil) {
 		dispatch_release(_done);
@@ -4861,6 +4865,7 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 {
 	struct rwa_device *device = [[_queue device] mesaDevice];
 
+	alioth_stat(ST_BLIT, mach_absolute_time());
 	/* what came before it in this buffer, finished: the processor reads and writes here */
 	if (device != NULL && alioth_finish(device, why, size) != 0) {
 		[self failWith:why];
@@ -4996,12 +5001,20 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 				}
 				continue;
 			}
-			/* what came before the signal, finished on the GPU: that is what the value says */
-			if (device != NULL && alioth_finish(device, why, sizeof(why)) != 0) {
-				[self failWith:why];
-				goto done;
+			/*
+			 * What came before the signal, finished on the GPU: that is what the value says. (The K40's) It was
+			 * waited for HERE, which makes the GPU and the processor take turns for a renderer that signals an
+			 * event at every frame's end (VectorKit's buffers waited inside -commit once each, 3 ms, 186 in 2 s --
+			 * signals or blits; metal_stats=1 now counts the two apart). Now the signals are set in the buffer's
+			 * order once its fence has been paid, off this thread (-aliothDeliverHandlers): later than the point
+			 * Metal names, never before the work it stands for.
+			 */
+			alioth_stat(ST_SIGNAL, mach_absolute_time());
+			(void)device;
+			if (_signals == nil) {
+				_signals = [[NSMutableArray alloc] init];
 			}
-			[s->event aliothSignal:s->value];
+			[_signals addObject:s];
 			continue;
 		}
 		if (work->render != nil) {
@@ -5431,9 +5444,11 @@ done:
 {
 	NSArray *scheduled = _scheduled;
 	NSArray *completed = _completed;
+	NSArray *signals = _signals;    /* (the K40's) events to set once the GPU is done (-commit) */
 
 	_scheduled = nil;
 	_completed = nil;
+	_signals = nil;
 
 	/*
 	 * (the K40's) THE WORK SUBMITTED FIRST. The draws of a buffer are one batch now (rwa_draw.keep_bound) and
@@ -5444,8 +5459,8 @@ done:
 	struct rwa_device *device = [[_queue device] mesaDevice];
 	/* (with metal_stats=1 every buffer is fenced and waited for off this thread, handlers or not, so that each
 	 * one's GPU time is counted) */
-	BOOL async = ([completed count] > 0 || alioth_stats_on) && _status != RW_CB_ERROR && device != NULL &&
-	    mesa.flush != NULL && mesa.fence_wait != NULL;
+	BOOL async = ([completed count] > 0 || [signals count] > 0 || alioth_stats_on) && _status != RW_CB_ERROR &&
+	    device != NULL && mesa.flush != NULL && mesa.fence_wait != NULL;
 	void *fence = NULL;
 	uint64_t flushed = mach_absolute_time();
 
@@ -5479,6 +5494,12 @@ done:
 			int waited = mesa.fence_wait(device, fence, why, sizeof(why));
 
 			alioth_stat(ST_GPU, flushed);
+			/* (the events first, in the buffer's order: the GPU reached them before it finished the buffer;
+			 * set on a failure too, so that nothing waits for ever on a value a broken buffer owed) */
+			for (AliothMetalSignal *s in signals) {
+				[s->event aliothSignal:s->value];
+			}
+			[signals release];
 			if (waited != 0) {
 				rw_print("THE GPU DID NOT FINISH: %s\n", why);
 				_error = [[NSError errorWithDomain:@"AliothMetal" code:3
@@ -5496,10 +5517,16 @@ done:
 		});
 		return;
 	}
-	if ([completed count] > 0 && _status != RW_CB_ERROR) {
+	if (([completed count] > 0 || [signals count] > 0) && _status != RW_CB_ERROR) {
 		/* the same promise, kept here where the library cannot split the wait */
 		[self waitUntilCompleted];
 	}
+	/* (the K40's) the events, after the wait as above -- or at once for a buffer that failed, so that no waiter is
+	 * left with a value nothing will set */
+	for (AliothMetalSignal *s in signals) {
+		[s->event aliothSignal:s->value];
+	}
+	[signals release];
 	for (id handler in completed) {
 		[self aliothDeliver:(void (^)(id))handler];
 	}
