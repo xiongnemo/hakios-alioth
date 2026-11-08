@@ -1645,6 +1645,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
       if (!coord)
          return false;
+      const struct air_value *stored = in->operands[arg];
       nir_def *value = air_get_ssa(c, in->operands[arg++]);
       if (!value)
          return false;
@@ -1657,12 +1658,26 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       if (!tex.is_image)
          return air_error(c, "intrinsic: air.%s to a texture the interface says is not "
                              "written", n->part[0]);
+      /* The store's type is the VALUE's, not the void the call returns (which made every
+       * store a uint one). The Adreno converts a typed store from the instruction's type
+       * into the image's format, so a uint store is raw bits: (the K40, 2026-11-09)
+       * BlitKernel_Unorm's halves landed in an RGBA8Unorm texture as their low bytes,
+       * 0x3105 -> 5 where 40 was meant, while RGBA16Float came out right by the accident
+       * of raw halves being halves. A float or half value is a float store now, and the
+       * hardware does the conversion Metal promises; an integer one keeps the name's
+       * signedness. Halves are widened first: a 32-bit float typed store is the one GL's
+       * imageStore makes, the path freedreno's own tests walk.
+       */
+      bool is_float = air_type_is_float(air_type_scalar(stored->type));
+      if (is_float && value->bit_size == 16)
+         value = nir_f2f32(&c->b, value);
+      nir_alu_type src_type = is_float ? nir_type_float : nir_alu_type_get_base_type(dest_type);
       nir_image_store(&c->b, nir_imm_int(&c->b, tex.binding),
                       nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
                       nir_imm_int(&c->b, 0),
                       .image_dim = t.dim, .image_array = t.is_array,
-                      .src_type = dest_type);
+                      .src_type = src_type | value->bit_size);
       return true;
    }
 
