@@ -777,7 +777,11 @@ fi
 
 # --- the system image -----------------------------------------------------------------------------
 REMOVED_APPS=../devices/redmi-k40/system-apps-removed.txt
-if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
+# (SYSTEM_KEEP=1: an existing system.apfs stays as it is even where its inputs are newer -- a root made again from
+# prebuilt programs, whose stage0 differs only in its bytes, need not cost 5 GB read and 2.3 GB written)
+if [ -n "${SYSTEM_KEEP:-}" ] && [ -f system.apfs ] && [ -z "$SYSTEM" ]; then
+	echo "build.sh: SYSTEM_KEEP: system.apfs kept as it is"
+elif [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	{ [ ! -f system.apfs ] || [ obj/stage0 -nt system.apfs ] || [ $IOS/system.manifest -nt system.apfs ] ||
 	  [ $IOS/cryptex -nt system.apfs ] || [ $IOS/cryptex-app -nt system.apfs ] || [ $REMOVED_APPS -nt system.apfs ] ||
 	  [ -n "$SYSTEM" ]; }; then
