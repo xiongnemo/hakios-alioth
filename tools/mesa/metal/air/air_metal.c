@@ -260,6 +260,8 @@ struct rwa_compute {
    struct rwa_compute_info caps;
 
    bool dynamic_threadgroup;      /* a threadgroup buffer sized by the dispatch */
+   unsigned dynamic_bytes;        /* (the K40's) its size, rwa_compute_set_threadgroup_bytes; 0: none given */
+   unsigned cso_shared;           /* the threadgroup bytes `cso` was compiled with */
 
    /* the texture slots, as above, and the states built for the samplers the shader
     * declares for itself: those are nothing for a driver to create (rwa_compute_info
@@ -3001,13 +3003,14 @@ rwa_compute_destroy(struct rwa_compute *compute)
  * the next size.
  */
 static void *
-compute_state_for(struct rwa_compute *compute, const unsigned block[3],
+compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned shared_extra,
                   char *why, size_t why_size)
 {
    struct rwa_device *device = compute->device;
 
    if (compute->cso && compute->cso_block[0] == block[0] &&
-       compute->cso_block[1] == block[1] && compute->cso_block[2] == block[2])
+       compute->cso_block[1] == block[1] && compute->cso_block[2] == block[2] &&
+       compute->cso_shared == shared_extra)
       return compute->cso;
 
    if (compute->cso) {
@@ -3024,6 +3027,10 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
    cs->info.workgroup_size[1] = block[1];
    cs->info.workgroup_size[2] = block[2];
    cs->info.workgroup_size_variable = false;
+   /* (the K40's) the dispatch's threadgroup buffer, baked in like the block size: the front end puts the one
+    * [[threadgroup(0)]] argument at shared offset 0 (air_to_nir.c), so the shader's shared size is that buffer's,
+    * and the dispatch path has refused a kernel that also declares threadgroup memory of its own */
+   cs->info.shared_size += shared_extra;
 
    finalize_for_gallium(cs, device->screen);
 
@@ -3065,6 +3072,7 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
    compute->cso_block[0] = block[0];
    compute->cso_block[1] = block[1];
    compute->cso_block[2] = block[2];
+   compute->cso_shared = shared_extra;
    return cso;
 }
 
@@ -3887,10 +3895,18 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       return -1;
    }
 
-   if (compute->dynamic_threadgroup) {
+   /* (the K40's) the threadgroup buffer is sized by the dispatch now: rwa_compute_set_threadgroup_bytes, which a
+    * driver calls from -setThreadgroupMemoryLength:atIndex:. Without a size it is still refused, by name. */
+   if (compute->dynamic_threadgroup && compute->dynamic_bytes == 0) {
       say(why, why_size, "%s takes a threadgroup buffer whose size only the dispatch can "
-                         "give (Metal's -setThreadgroupMemoryLength:atIndex:), and this "
-                         "call has no argument for it", name);
+                         "give (Metal's -setThreadgroupMemoryLength:atIndex:), and none was set",
+          name);
+      return -1;
+   }
+   if (compute->dynamic_threadgroup && compute->nir->info.shared_size != 0) {
+      say(why, why_size, "%s takes a threadgroup buffer and declares %u bytes of threadgroup memory "
+                         "of its own, and this library places both at offset 0", name,
+          compute->nir->info.shared_size);
       return -1;
    }
 
@@ -3901,7 +3917,8 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
                       name, why, why_size) != 0)
       return -1;
 
-   void *cso = compute_state_for(compute, group_size, why, why_size);
+   void *cso = compute_state_for(compute, group_size,
+                                 compute->dynamic_threadgroup ? compute->dynamic_bytes : 0, why, why_size);
    if (!cso)
       return -1;
    pipe->bind_compute_state(pipe, cso);
@@ -6781,6 +6798,23 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    float znear = draw->depth_range ? draw->depth_range[0] : 0.0f;
    float zfar = draw->depth_range ? draw->depth_range[1] : 1.0f;
+   /* (the K40's) MTLViewport's rectangle, where one was given: the same transform over it instead of over the
+    * whole attachment -- its centre for the translation, half its size for the scale, y still negative. */
+   if (draw->viewport) {
+      float vx = draw->viewport[0], vy = draw->viewport[1], vw = draw->viewport[2], vh = draw->viewport[3];
+
+      if (!(vw > 0.0f) || !(vh > 0.0f)) {
+         say(why, why_size, "a viewport of %gx%g has nothing in it", vw, vh);
+         for (unsigned j = 0; j < draw->color_count; j++)
+            pipe->surface_destroy(pipe, surf[j]);
+         if (zsurf)
+            pipe->surface_destroy(pipe, zsurf);
+         return -1;
+      }
+      pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+         .scale = { vw / 2.0f, -(vh / 2.0f), zfar - znear },
+         .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } });
+   } else
    pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked
        * here. Metal's render-target origin is the top left and its NDC y points up, so clip
@@ -7072,4 +7106,24 @@ out:
    if (zsurf)
       pipe->surface_destroy(pipe, zsurf);
    return rc;
+}
+
+/* (the K40's) Metal's -setThreadgroupMemoryLength:atIndex: for index 0, the one threadgroup argument the front end
+ * places (air_to_nir.c): kept on the pipeline, baked into the compiled state at the next dispatch as the block size
+ * is. Rounded up to 16 as Metal requires of the length, and held to what the GPU has. */
+int
+rwa_compute_set_threadgroup_bytes(struct rwa_compute *compute, unsigned bytes, char *why, size_t why_size)
+{
+   if (!compute) {
+      say(why, why_size, "no pipeline");
+      return -1;
+   }
+   bytes = ALIGN_POT(bytes, 16);
+   /* (32 KB: the Adreno 6xx's shared memory, what MTLDevice.maxThreadgroupMemoryLength says here) */
+   if (bytes > 32768) {
+      say(why, why_size, "%u bytes of threadgroup memory, and this GPU has 32768", bytes);
+      return -1;
+   }
+   compute->dynamic_bytes = bytes;
+   return 0;
 }

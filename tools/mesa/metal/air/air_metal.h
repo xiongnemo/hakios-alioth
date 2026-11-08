@@ -1301,10 +1301,21 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+
+	/* (the K40's) MTLViewport's RECTANGLE, in the attachment's pixels from its top left -- originX, originY,
+	 * width, height -- with `depth_range` above still its znear and zfar. NULL is the whole attachment, which is
+	 * what every draw made before this field existed used. Appended, for the reason the tables above are. Clip
+	 * space is still clipped to [-1, 1], so nothing lands outside the rectangle. */
+	const float *viewport;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
+
+/* (the K40's) The threadgroup memory a kernel's [[threadgroup(0)]] argument gets at its next dispatch: Metal's
+ * -setThreadgroupMemoryLength:atIndex: with index 0, in bytes (rounded up to 16, as Metal's own rule says). Kept on
+ * the pipeline until set again; 0 refuses a dispatch of a kernel that takes one. 0, or -1 and why. */
+int rwa_compute_set_threadgroup_bytes(struct rwa_compute *compute, unsigned bytes, char *why, size_t why_size);
 
 /*
  * A pass that clears and draws nothing (the K40's addition): the colour attachments (NULL

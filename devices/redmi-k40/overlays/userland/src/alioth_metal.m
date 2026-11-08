@@ -313,6 +313,9 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+	/* (the K40's) MTLViewport's rectangle, { originX, originY, width, height }; NULL is the whole attachment.
+	 * Appended, as the tables were. */
+	const float *viewport;
 };
 
 /*
@@ -545,6 +548,8 @@ static struct {
 							  char *, size_t);
 	void (*depth_stencil_destroy)(struct rwa_depth_stencil *);
 	int (*finish)(struct rwa_device *, char *, size_t);
+	/* (the K40's) a kernel's [[threadgroup(0)]] size for its next dispatch; looked up, not required */
+	int (*compute_threadgroup_bytes)(struct rwa_compute *, unsigned, char *, size_t);
 } mesa;
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
@@ -605,6 +610,7 @@ mesa_available(void)
 	*(void **)&mesa.depth_stencil_create = dlsym(mesa.handle, "rwa_depth_stencil_create");
 	*(void **)&mesa.depth_stencil_destroy = dlsym(mesa.handle, "rwa_depth_stencil_destroy");
 	*(void **)&mesa.finish = dlsym(mesa.handle, "rwa_finish");
+	*(void **)&mesa.compute_threadgroup_bytes = dlsym(mesa.handle, "rwa_compute_set_threadgroup_bytes");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -1091,6 +1097,9 @@ enum {
 	unsigned stencilReference[2];
 	float depthRange[2];
 	BOOL hasDepthRange;
+	float viewport[4];                      /* (the K40's) MTLViewport's rectangle, when hasViewport */
+	BOOL hasViewport;
+	unsigned threadgroupBytes;              /* (the K40's) a dispatch's -setThreadgroupMemoryLength: for index 0 */
 	unsigned primitive, vertexStart, vertexCount;
 	/* the index buffer of an indexed draw and the three numbers that come with it in
 	 * the same Metal call; indexBuffer nil is -drawPrimitives:, and then vertexCount
@@ -4092,6 +4101,14 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 			.samplers = samplers, .sampler_count = work->samplerCount,
 		};
 
+		/* (the K40's) the threadgroup buffer's size for this dispatch, kept on the pipeline by the library */
+		if (work->threadgroupBytes != 0 && mesa.compute_threadgroup_bytes != NULL &&
+		    mesa.compute_threadgroup_bytes([work->pipeline compute], work->threadgroupBytes, why,
+						   sizeof(why)) != 0) {
+			rw_print("the dispatch's threadgroup memory: %s\n", why);
+			[self failWith:why];
+			goto done;
+		}
 		/* rwa_dispatch_buffers when the library has it, which is the same call with
 		 * Metal's offsets passed as well; a library too old to have it is used
 		 * through rwa_dispatch, and then a kernel with a set is refused by name
@@ -4267,6 +4284,7 @@ done:
 		.vertex_buffer_table_count = work->vertexBufferCount,
 		.fragment_buffer_table = fragment_table,
 		.fragment_buffer_table_count = work->count,
+		.viewport = work->hasViewport ? work->viewport : NULL,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
@@ -4451,6 +4469,8 @@ done:
 	unsigned _stencilReference[2];
 	float _depthRange[2];
 	BOOL _hasDepthRange;
+	float _viewport[4];
+	BOOL _hasViewport;
 	id _vertexBuffers[RW_MAX_BUFFERS];
 	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
 	id _fragmentBuffers[RW_MAX_BUFFERS];
@@ -4666,18 +4686,17 @@ done:
  */
 - (void)setViewport:(MTLViewport)viewport
 {
-	id first = _colorCount > 0 ? _color[0] : _depth;
+	id<MTLTexture> first = _colorCount > 0 ? _color[0] : _depth;
 	NSUInteger w = [first width], h = [first height];
 
-	if ((viewport.originX != 0.0 || viewport.originY != 0.0 ||
-	     (NSUInteger)viewport.width != w || (NSUInteger)viewport.height != h) &&
-	    !_complained) {
-		rw_print("a viewport rectangle is not implemented (asked for "
-		         "%gx%g at %g,%g of a %lux%lu attachment); the draw covers the whole "
-		         "attachment\n", viewport.width, viewport.height, viewport.originX,
-		         viewport.originY, (unsigned long)w, (unsigned long)h);
-		_complained = YES;
-	}
+	/* (the K40's) the rectangle is carried now (rwa_draw.viewport); the whole attachment is sent as none, which
+	 * is the draw every caller before the rectangle existed made */
+	_hasViewport = viewport.originX != 0.0 || viewport.originY != 0.0 || (NSUInteger)viewport.width != w ||
+	    (NSUInteger)viewport.height != h;
+	_viewport[0] = (float)viewport.originX;
+	_viewport[1] = (float)viewport.originY;
+	_viewport[2] = (float)viewport.width;
+	_viewport[3] = (float)viewport.height;
 	_depthRange[0] = (float)viewport.znear;
 	_depthRange[1] = (float)viewport.zfar;
 	_hasDepthRange = YES;
@@ -4770,6 +4789,10 @@ done:
 	work->depthRange[0] = _depthRange[0];
 	work->depthRange[1] = _depthRange[1];
 	work->hasDepthRange = _hasDepthRange;
+	work->hasViewport = _hasViewport;
+	for (unsigned i = 0; i < 4; i++) {
+		work->viewport[i] = _viewport[i];
+	}
 	work->primitive = (unsigned)primitive;
 	work->vertexStart = (unsigned)start;
 	work->vertexCount = (unsigned)count;
@@ -4800,6 +4823,13 @@ done:
 	[_commandBuffer recordWork:work];
 	[work release];
 	_drew = YES;
+	/* (the K40's) the pass's load actions belong to its FIRST draw: every draw is its own rwa_render_draw, and
+	 * one that carried the clears again cleared what the draws before it had drawn -- the depth buffer included,
+	 * so a farther triangle drawn later covered a nearer one (System Check's metal.depth), and a pass of many
+	 * sprites would have kept only the last. */
+	_clears = NO;
+	_clearsDepth = NO;
+	_clearsStencil = NO;
 }
 
 - (void)drawPrimitives:(NSUInteger)primitive
@@ -6015,6 +6045,7 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 	id _textures[RW_MAX_BUFFERS];
 	id _samplers[RW_MAX_BUFFERS];
 	unsigned _highest, _highestTexture, _highestSampler;
+	unsigned _threadgroupBytes;     /* (the K40's) -setThreadgroupMemoryLength: for index 0 */
 	BOOL _complained;
 }
 
@@ -6154,6 +6185,7 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 	work->size[0] = (unsigned)size.width;
 	work->size[1] = (unsigned)size.height;
 	work->size[2] = (unsigned)size.depth;
+	work->threadgroupBytes = _threadgroupBytes;
 	[_commandBuffer recordWork:work];
 	[work release];
 }
@@ -6190,7 +6222,14 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 - (void)memoryBarrierWithScope:(NSUInteger)scope { (void)scope; }
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	(void)length; (void)index;   /* only what the shader declares is given, for now */
+	/* (the K40's) index 0, the one threadgroup argument the compiler library places, is carried to the dispatch
+	 * (rwa_compute_set_threadgroup_bytes); another index is said once and not given */
+	if (index == 0) {
+		_threadgroupBytes = (unsigned)MIN(length, (NSUInteger)UINT32_MAX);
+	} else {
+		RW_ONCE("threadgroup memory at index %lu is not given: the compiler library places one threadgroup "
+			"argument, index 0\n", (unsigned long)index);
+	}
 }
 
 /*
