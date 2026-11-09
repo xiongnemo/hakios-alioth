@@ -1633,7 +1633,14 @@ enum {
 	id samplers[RW_MAX_BUFFERS];
 	unsigned count, textureCount, samplerCount;
 	unsigned groups[3], size[3];
+	/* (the K40's) set by -aliothRetainReferences (the command buffer's -recordWork:); keptIndirect is the indirect
+	 * buffer as retained, which outlives indirectBuffer's being cleared once it is read */
+	BOOL retainsReferences;
+	id keptIndirect;
 }
+/* (the K40's) everything this work refers to kept alive until the work is let go of, as Metal keeps what a command
+ * buffer references (retainedReferences) */
+- (void)aliothRetainReferences;
 @end
 
 @interface AliothMetalTexture : _MTLResource {
@@ -4524,6 +4531,71 @@ out:
 @end
 
 @implementation AliothMetalWork
+
+/*
+ * (the K40's) What a recorded work refers to, kept alive until the work goes: Metal retains whatever a command buffer
+ * references until it completes, and applications rely on that -- a pipeline, a texture or a buffer made for one pass
+ * and released before -commit. The work held raw pointers, and a commit read a freed pipeline (System Check's
+ * metal.view.range, 2026-11-09: -[work->render vertexStreamMask] faulted in objc_msgSend; the test's pipeline, made in
+ * an inner block, was released by ARC at its end). The counts bound the arrays, as the run does.
+ */
+- (void)aliothRetainReferences
+{
+	if (retainsReferences) {
+		return;
+	}
+	retainsReferences = YES;
+	[pipeline retain];
+	[render retain];
+	[depth retain];
+	[depthStencilState retain];
+	[indexBuffer retain];
+	keptIndirect = [indirectBuffer retain];
+	for (unsigned i = 0; i < colorCount && i < 8; i++) {
+		[color[i] retain];
+	}
+	for (unsigned i = 0; i < vertexBufferCount && i < RW_MAX_BUFFERS; i++) {
+		[vertexBuffers[i] retain];
+	}
+	for (unsigned i = 0; i < count && i < RW_MAX_BUFFERS; i++) {
+		[buffers[i] retain];
+	}
+	for (unsigned i = 0; i < textureCount && i < RW_MAX_BUFFERS; i++) {
+		[textures[i] retain];
+	}
+	for (unsigned i = 0; i < samplerCount && i < RW_MAX_BUFFERS; i++) {
+		[samplers[i] retain];
+	}
+}
+
+- (void)dealloc
+{
+	if (retainsReferences) {
+		[pipeline release];
+		[render release];
+		[depth release];
+		[depthStencilState release];
+		[indexBuffer release];
+		[keptIndirect release];
+		for (unsigned i = 0; i < colorCount && i < 8; i++) {
+			[color[i] release];
+		}
+		for (unsigned i = 0; i < vertexBufferCount && i < RW_MAX_BUFFERS; i++) {
+			[vertexBuffers[i] release];
+		}
+		for (unsigned i = 0; i < count && i < RW_MAX_BUFFERS; i++) {
+			[buffers[i] release];
+		}
+		for (unsigned i = 0; i < textureCount && i < RW_MAX_BUFFERS; i++) {
+			[textures[i] release];
+		}
+		for (unsigned i = 0; i < samplerCount && i < RW_MAX_BUFFERS; i++) {
+			[samplers[i] release];
+		}
+	}
+	[super dealloc];
+}
+
 @end
 
 /*
@@ -5075,6 +5147,7 @@ enum {
 
 - (void)recordWork:(AliothMetalWork *)work
 {
+	[work aliothRetainReferences];   /* (the K40's: what it refers to lives until it has run, as in Metal) */
 	[_work addObject:work];
 }
 
@@ -6188,7 +6261,20 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 
 - (id)device { return [_commandBuffer device]; }
 
-- (void)setRenderPipelineState:(id)state { _pipeline = state; }
+/* (the K40's) retained, as Metal's encoder does (the compute encoder says why) */
+- (void)setRenderPipelineState:(id)state
+{
+	if (state != _pipeline) {
+		[_pipeline release];
+		_pipeline = [state retain];
+	}
+}
+
+- (void)dealloc
+{
+	[_pipeline release];
+	[super dealloc];
+}
 
 /*
  * One table, two meanings, and the offset is no longer thrown away.
@@ -7904,9 +7990,20 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 
 - (id)device { return [_commandBuffer device]; }
 
+/* (the K40's) retained, as Metal's encoder does: a pipeline made in the call that sets it (ARC releases it after the
+ * statement) is still there at the dispatch */
 - (void)setComputePipelineState:(id)state
 {
-	_pipeline = state;
+	if (state != _pipeline) {
+		[_pipeline release];
+		_pipeline = [state retain];
+	}
+}
+
+- (void)dealloc
+{
+	[_pipeline release];
+	[super dealloc];
 }
 
 - (void)setBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
