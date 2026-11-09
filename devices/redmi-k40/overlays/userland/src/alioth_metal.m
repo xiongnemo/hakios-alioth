@@ -660,6 +660,18 @@ alioth_ms(uint64_t ticks)
 	return (double)ticks * alioth_timebase.numer / alioth_timebase.denom / 1e6;
 }
 
+/* (the K40's) a mach time as the seconds Metal's GPUStartTime and kin are in (CACurrentMediaTime's); 0 for never */
+static CFTimeInterval
+alioth_host_seconds(uint64_t t)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return t == 0 ? 0.0 : (double)t * tb.numer / tb.denom / 1e9;
+}
+
 /* each total over its count, in ms (0 for none) */
 static double
 alioth_stat_avg(const uint64_t *t, const uint64_t *n, unsigned which)
@@ -1449,6 +1461,8 @@ struct gem_close { uint32_t handle, pad; };
 @interface AliothMetalCommandQueue : _MTLCommandQueue
 - (instancetype)initWithAliothDevice:(AliothMetalDevice *)device descriptor:(id)descriptor;
 - (dispatch_queue_t)aliothWaitQueue;    /* (the K40's) where its buffers wait for the GPU, in order */
+/* (the K40's) on the wait queue only: when its last buffer was seen finished, for the next one's GPUStartTime */
+@property (nonatomic) uint64_t aliothLastGPUEnd;
 @end
 
 @interface AliothMetalCommandBuffer : _MTLCommandBuffer
@@ -5050,6 +5064,9 @@ enum {
 	dispatch_group_t _done;         /* (the K40's) left when the GPU wait off this thread is over */
 	uint64_t _created;              /* (the K40's) mach time it was made, for metal_stats=1 */
 	NSMutableArray *_signals;       /* (the K40's) its events' signals, set once the GPU has finished it */
+	/* (the K40's) mach times: -commit began and its work was flushed (kernelStart/EndTime); the GPU took it -- after
+	 * the flush and the queue's buffer before, its one ring being in order -- and was seen done (GPUStart/EndTime) */
+	uint64_t _kernelStart, _kernelEnd, _gpuStart, _gpuEnd;
 }
 
 /*
@@ -5545,6 +5562,7 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 	char why[512] = { 0 };
 	uint64_t committed = mach_absolute_time();
 
+	_kernelStart = committed;
 	alioth_stat(ST_ENCODE, _created);
 	_status = RW_CB_COMMITTED;
 	for (id item in _work) {
@@ -5990,9 +6008,22 @@ done:
 		return;
 	}
 	_status = RW_CB_COMPLETED;   /* the fence has been paid, and only now */
+	if (_gpuEnd == 0) {
+		_gpuStart = _kernelEnd != 0 ? _kernelEnd : waited;
+		_gpuEnd = mach_absolute_time();
+	}
 }
 
 - (void)waitUntilScheduled { }
+
+/* (the K40's) Metal's base class answered 0 for all four (System Check metal.api, 11-09); engines time their GPU
+ * frames with GPUStartTime / GPUEndTime (dynamic resolution, frame pacing). The GPU's own timestamps are not read: the
+ * start is when the work was flushed or the queue's buffer before was seen done, whichever came later, the end when
+ * this one was -- within the fence wait's wake-up of the GPU's own. */
+- (CFTimeInterval)kernelStartTime { return alioth_host_seconds(_kernelStart); }
+- (CFTimeInterval)kernelEndTime   { return alioth_host_seconds(_kernelEnd); }
+- (CFTimeInterval)GPUStartTime    { return alioth_host_seconds(_gpuStart); }
+- (CFTimeInterval)GPUEndTime      { return alioth_host_seconds(_gpuEnd); }
 
 /*
  * HANDLERS, AND WHERE THEY RUN.
@@ -6083,10 +6114,13 @@ done:
 	 * frame before the window server's reading of it. With a fence when completed handlers will wait on it.
 	 */
 	struct rwa_device *device = [[_queue device] mesaDevice];
-	/* (with metal_stats=1 every buffer is fenced and waited for off this thread, handlers or not, so that each
-	 * one's GPU time is counted) */
-	BOOL async = ([completed count] > 0 || [signals count] > 0 || alioth_stats_on) && _status != RW_CB_ERROR &&
-	    device != NULL && mesa.flush != NULL && mesa.fence_wait != NULL;
+	/*
+	 * (the K40's) Every buffer is fenced and waited for off this thread, handlers or not. Until 11-09 only those with
+	 * completed handlers or events were (and every one with metal_stats=1, which all of that day's rounds ran with):
+	 * a buffer with neither was never seen finished, so its -status stayed Scheduled for good -- an engine that polls
+	 * for Completed would wait for ever -- and its GPUStartTime / GPUEndTime were Metal's base class's 0.
+	 */
+	BOOL async = _status != RW_CB_ERROR && device != NULL && mesa.flush != NULL && mesa.fence_wait != NULL;
 	void *fence = NULL;
 	uint64_t flushed = mach_absolute_time();
 
@@ -6095,6 +6129,7 @@ done:
 		alioth_stat(ST_FLUSH, flushed);
 		flushed = mach_absolute_time();
 	}
+	_kernelEnd = flushed;
 	for (id handler in scheduled) {
 		[self aliothDeliver:(void (^)(id))handler];
 	}
@@ -6118,8 +6153,13 @@ done:
 			char why[512] = { 0 };
 
 			int waited = mesa.fence_wait(device, fence, why, sizeof(why));
+			uint64_t end = mach_absolute_time();
 
 			alioth_stat(ST_GPU, flushed);
+			/* (this queue's buffers are waited for in order, here: the one before was seen done at its end) */
+			_gpuStart = MAX(flushed, _queue.aliothLastGPUEnd);
+			_gpuEnd = end;
+			_queue.aliothLastGPUEnd = end;
 			/* (the events first, in the buffer's order: the GPU reached them before it finished the buffer;
 			 * set on a failure too, so that nothing waits for ever on a value a broken buffer owed) */
 			for (AliothMetalSignal *s in signals) {
