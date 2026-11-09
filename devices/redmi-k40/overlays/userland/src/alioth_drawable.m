@@ -294,6 +294,63 @@ rwd_surface_id(void *iosurface)
 	return get_id != NULL ? get_id(iosurface) : 0;
 }
 
+/*
+ * (the K40's) One plane of a surface of several -- a video frame's: 4:2:0 is luma, then chroma interleaved at half the
+ * size -- as IOSurface itself describes it, by name like IOSurfaceGetID above: where the plane begins from the surface's
+ * own first byte, its rows, its size and the bytes of one element. 0, or -1 when it has no such plane.
+ */
+struct rwd_plane {
+	uint64_t offset;
+	uint32_t row_bytes, width, height, element_bytes;
+};
+
+static int
+rwd_surface_plane(void *iosurface, unsigned long plane, struct rwd_plane *out)
+{
+	static size_t (*count)(void *), (*row)(void *, size_t), (*width)(void *, size_t), (*height)(void *, size_t),
+	    (*element)(void *, size_t);
+	static void *(*base)(void *), *(*plane_base)(void *, size_t);
+	static int looked;
+
+	if (!looked) {
+		*(void **)&count = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
+		*(void **)&row = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRowOfPlane");
+		*(void **)&width = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidthOfPlane");
+		*(void **)&height = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeightOfPlane");
+		*(void **)&element = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerElementOfPlane");
+		*(void **)&base = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+		*(void **)&plane_base = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddressOfPlane");
+		looked = 1;
+	}
+	if (count == NULL || row == NULL || width == NULL || height == NULL || element == NULL || base == NULL ||
+	    plane_base == NULL || iosurface == NULL || plane >= count(iosurface)) {
+		return -1;
+	}
+	uint8_t *first = base(iosurface), *at = plane_base(iosurface, plane);
+
+	if (first == NULL || at == NULL || at < first) {
+		return -1;
+	}
+	out->offset = (uint64_t)(at - first);
+	out->row_bytes = (uint32_t)row(iosurface, plane);
+	out->width = (uint32_t)width(iosurface, plane);
+	out->height = (uint32_t)height(iosurface, plane);
+	out->element_bytes = (uint32_t)element(iosurface, plane);
+	return 0;
+}
+
+/* (the K40's) the bytes of a pixel of the one- and two-channel formats a plane is read as (MTLPixelFormat numbers) */
+static unsigned
+rwd_plane_format_bytes(unsigned metal)
+{
+	switch (metal) {
+	case 1:  case 10: case 11: case 12: case 13: return 1;   /* A8, R8 (sRGB), R8 snorm/uint */
+	case 20: case 22: case 23: case 30: case 31: case 32: case 33: return 2;   /* R16, RG8 (sRGB, snorm, uint) */
+	case 60: case 62: case 63: return 4;   /* RG16 */
+	default: return 0;
+	}
+}
+
 int
 rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pixel,
 			char *why, size_t why_size)
@@ -548,15 +605,17 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		return NULL;
 	}
 	/*
-	 * Plane 0 and no other, said before anything is taken. CoreAnimation asks for plane 0
-	 * always on this path -- allocate_drawable_texture passes x4 = 0 at 0x1884b3590 -- so a
-	 * plane of anything else is an application's own IOSurface and not a drawable's, and it
-	 * would need a per-plane geometry this driver does not read.
+	 * (the K40's) A surface of planes -- a video frame: CVMetalTextureCache asks for its luma as R8 (plane 0) and its
+	 * chroma as RG8 (plane 1) -- is imported a plane at a time, with that plane's own geometry as IOSurface says it,
+	 * at its offset in the surface's memory. Until 11-10 only plane 0 of a one-plane surface was, and a video
+	 * frame's planes reached no texture (System Check metal.cvtexture). CoreAnimation's drawables have no planes and
+	 * take the road below as before.
 	 */
-	if (plane != 0) {
-		rwd_say(why, why_size, "plane %lu of a surface was asked for; this driver "
-		    "imports plane 0 only, and CoreAnimation's drawables never ask for another",
-		    plane);
+	struct rwd_plane pl;
+	int planar = rwd_surface_plane(iosurface, plane, &pl) == 0;
+
+	if (plane != 0 && !planar) {
+		rwd_say(why, why_size, "plane %lu of a surface with no such plane was asked for", plane);
 		return NULL;
 	}
 	id = rwd_surface_id(iosurface);
@@ -564,6 +623,54 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		rwd_say(why, why_size, "that surface has no ID, so there is nothing for the "
 		    "kernel to look up (a surface is given one when it is made shareable)");
 		return NULL;
+	}
+	if (planar) {
+		unsigned bpp = rwd_plane_format_bytes(want->pixel_format);
+
+		if (bpp == 0 || bpp != pl.element_bytes) {
+			rwd_say(why, why_size, "plane %lu of surface %u has elements of %u bytes, and Metal format %u is %s",
+			    plane, id, pl.element_bytes, want->pixel_format, bpp == 0 ? "not one a plane is read as here" :
+			    "another size");
+			return NULL;
+		}
+		if (pl.width != want->width || pl.height != want->height) {
+			rwd_say(why, why_size, "plane %lu of surface %u is %ux%u and the descriptor asks for %ux%u", plane, id,
+			    pl.width, pl.height, want->width, want->height);
+			return NULL;
+		}
+		if (pl.row_bytes % 64 != 0 || pl.row_bytes < pl.width * bpp) {
+			rwd_say(why, why_size, "plane %lu of surface %u has rows of %u bytes: freedreno takes multiples of 64 "
+			    "holding %u", plane, id, pl.row_bytes, pl.width * bpp);
+			return NULL;
+		}
+		connection = rwd_shared_connection();
+		if (connection == 0) {
+			rwd_say(why, why_size, "no connection to HakiosGPU: this kernel was booted without gpu=1");
+			return NULL;
+		}
+		if (rwd_surface_describe(connection, id, &surface, why, why_size) != 0) {
+			return NULL;
+		}
+		if ((uint64_t)surface.offset + pl.offset + (uint64_t)pl.row_bytes * pl.height > surface.size) {
+			rwd_say(why, why_size, "plane %lu of surface %u (%u rows of %u bytes from %llu) runs past its %llu "
+			    "bytes", plane, id, pl.height, pl.row_bytes, (unsigned long long)(surface.offset + pl.offset),
+			    (unsigned long long)surface.size);
+			return NULL;
+		}
+		import = rwd_import();
+		if (import == NULL) {
+			rwd_say(why, why_size, "the compiler library in this image has no rwa_texture_from_surface");
+			return NULL;
+		}
+		texture = import(mesa_device, want, (int)id, (uint32_t)(surface.offset + pl.offset), pl.row_bytes, why,
+		    why_size);
+		if (texture != NULL && took != NULL) {
+			*took = surface;
+			took->width = pl.width;
+			took->height = pl.height;
+			took->rowBytes = pl.row_bytes;
+		}
+		return texture;
 	}
 	if (rwd_format_of_metal(want->pixel_format, &fourcc, &bytes_per_pixel, why,
 	    why_size) != 0) {

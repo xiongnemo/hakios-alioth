@@ -3077,6 +3077,11 @@ enum {
 		rw_print("a drawable's texture needs the compiler library\n");
 		return nil;
 	}
+	/* (the K40's) a plane of a surface of several -- a video frame's, through CVMetalTextureCache -- said as it comes */
+	if (p != 0 || [d pixelFormat] != MTLPixelFormatBGRA8Unorm) {
+		RW_AGAIN("a texture over plane %lu of an IOSurface asked for: MTLPixelFormat %lu, %lux%lu\n", (unsigned long)p,
+			 (unsigned long)[d pixelFormat], (unsigned long)[d width], (unsigned long)[d height]);
+	}
 	memset(&shape, 0, sizeof(shape));
 	shape.pixel_format = (unsigned)[d pixelFormat];
 	shape.type = (unsigned)[d textureType];
