@@ -105,6 +105,7 @@
 #include <fcntl.h>
 
 #include "alioth_drawable.h"
+#include "pvrtc.h"                  /* (the K40's) PVRTC decoded for an Adreno, as the GL library does */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3537,6 +3538,47 @@ enum {
 - (BOOL)isAliasable                { return NO; }
 - (void)makeAliasable              { }
 
+/*
+ * (the K40's) A PVRTC level: no Adreno samples PVRTC, so the library stores the texture as RGBA8 (air_metal.c's table)
+ * and the blocks are decoded here by the GL library's decoder (pvrtc.h) -- the whole level at once, because PVRTC1's
+ * texels take colour from the neighbouring blocks too, and Metal writes a PVRTC level only whole. A level smaller than
+ * a block grid (8x8 texels, 16x8 at 2 bits) comes as that grid and its top-left corner is kept.
+ */
+- (void)aliothWritePVRTC:(const void *)bytes level:(NSUInteger)level slice:(NSUInteger)slice region:(MTLRegion)region
+{
+	NSUInteger format = _shape.pixel_format;
+	int two = format == MTLPixelFormatPVRTC_RGB_2BPP || format == MTLPixelFormatPVRTC_RGB_2BPP_sRGB ||
+	    format == MTLPixelFormatPVRTC_RGBA_2BPP || format == MTLPixelFormatPVRTC_RGBA_2BPP_sRGB;
+	BOOL alpha = format >= MTLPixelFormatPVRTC_RGBA_2BPP;
+	NSUInteger w = MAX(_shape.width >> level, 1u), h = MAX(_shape.height >> level, 1u);
+	NSUInteger pw = MAX(w, two ? 16u : 8u), ph = MAX(h, 8u);
+	unsigned origin[3] = { 0, 0, 0 }, size[3] = { (unsigned)w, (unsigned)h, 1 };
+	char why[256] = { 0 };
+	uint8_t *pixels;
+
+	if (region.origin.x != 0 || region.origin.y != 0 || region.size.width != w || region.size.height != h ||
+	    (w & (w - 1)) != 0 || (h & (h - 1)) != 0 || bytes == NULL) {
+		RW_AGAIN("a PVRTC write of %lux%lu at (%lu, %lu) into a %lux%lu level: PVRTC is written whole, with sides "
+			 "that are powers of two; not written\n", (unsigned long)region.size.width,
+			 (unsigned long)region.size.height, (unsigned long)region.origin.x, (unsigned long)region.origin.y,
+			 (unsigned long)w, (unsigned long)h);
+		return;
+	}
+	if ((pixels = malloc(pw * ph * 4)) == NULL) {
+		rw_print("no memory to decode a %lux%lu PVRTC level\n", (unsigned long)w, (unsigned long)h);
+		return;
+	}
+	pvr_decode(bytes, two, (int)pw, (int)ph, pixels);
+	for (size_t i = 3; !alpha && i < pw * ph * 4; i += 4) {
+		pixels[i] = 255;
+	}
+	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, pixels, pw * 4, why,
+			       sizeof(why)) != 0) {
+		rw_print("writing decoded PVRTC texels: %s\n", why);
+	}
+	free(pixels);
+}
+
 - (void)replaceRegion:(MTLRegion)region
 	  mipmapLevel:(NSUInteger)level
 		slice:(NSUInteger)slice
@@ -3551,6 +3593,10 @@ enum {
 			     (unsigned)region.size.depth };
 
 	(void)image;
+	if (_shape.pixel_format >= MTLPixelFormatPVRTC_RGB_2BPP && _shape.pixel_format <= MTLPixelFormatPVRTC_RGBA_4BPP_sRGB) {
+		[self aliothWritePVRTC:bytes level:level slice:slice region:region];
+		return;
+	}
 	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
 			       stride, why, sizeof(why)) != 0) {
 		rw_print("writing texels: %s\n", why);

@@ -947,6 +947,63 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    { 252, "MTLPixelFormatDepth32Float",    PIPE_FORMAT_Z32_FLOAT },
    { 253, "MTLPixelFormatStencil8",        PIPE_FORMAT_S8_UINT },
    { 260, "MTLPixelFormatDepth32Float_Stencil8", PIPE_FORMAT_Z32_FLOAT_S8X24_UINT },
+
+   /*
+    * (the K40's) The compressed formats an iPhone's games ship their textures in. ETC2/EAC and
+    * ASTC (LDR) the Adreno 650 samples itself: blocks in, blocks stored, regions in texels of
+    * whole blocks (texture_box) and the caller's rows rows of blocks (caller_stride). Until
+    * 11-09 every one of them was refused and a game's textures came back nil.
+    *
+    * PVRTC no Adreno samples: stored as RGBA8, and the caller -- the driver, which has the
+    * decoder the GL library uses (pvrtc.h) -- writes decoded texels into it. Read back, it
+    * gives RGBA8, not blocks.
+    */
+   { 160, "MTLPixelFormatPVRTC_RGB_2BPP",       PIPE_FORMAT_R8G8B8A8_UNORM },
+   { 161, "MTLPixelFormatPVRTC_RGB_2BPP_sRGB",  PIPE_FORMAT_R8G8B8A8_SRGB },
+   { 162, "MTLPixelFormatPVRTC_RGB_4BPP",       PIPE_FORMAT_R8G8B8A8_UNORM },
+   { 163, "MTLPixelFormatPVRTC_RGB_4BPP_sRGB",  PIPE_FORMAT_R8G8B8A8_SRGB },
+   { 164, "MTLPixelFormatPVRTC_RGBA_2BPP",      PIPE_FORMAT_R8G8B8A8_UNORM },
+   { 165, "MTLPixelFormatPVRTC_RGBA_2BPP_sRGB", PIPE_FORMAT_R8G8B8A8_SRGB },
+   { 166, "MTLPixelFormatPVRTC_RGBA_4BPP",      PIPE_FORMAT_R8G8B8A8_UNORM },
+   { 167, "MTLPixelFormatPVRTC_RGBA_4BPP_sRGB", PIPE_FORMAT_R8G8B8A8_SRGB },
+   { 170, "MTLPixelFormatEAC_R11Unorm",         PIPE_FORMAT_ETC2_R11_UNORM },
+   { 172, "MTLPixelFormatEAC_R11Snorm",         PIPE_FORMAT_ETC2_R11_SNORM },
+   { 174, "MTLPixelFormatEAC_RG11Unorm",        PIPE_FORMAT_ETC2_RG11_UNORM },
+   { 176, "MTLPixelFormatEAC_RG11Snorm",        PIPE_FORMAT_ETC2_RG11_SNORM },
+   { 178, "MTLPixelFormatEAC_RGBA8",            PIPE_FORMAT_ETC2_RGBA8 },
+   { 179, "MTLPixelFormatEAC_RGBA8_sRGB",       PIPE_FORMAT_ETC2_SRGBA8 },
+   { 180, "MTLPixelFormatETC2_RGB8",            PIPE_FORMAT_ETC2_RGB8 },
+   { 181, "MTLPixelFormatETC2_RGB8_sRGB",       PIPE_FORMAT_ETC2_SRGB8 },
+   { 182, "MTLPixelFormatETC2_RGB8A1",          PIPE_FORMAT_ETC2_RGB8A1 },
+   { 183, "MTLPixelFormatETC2_RGB8A1_sRGB",     PIPE_FORMAT_ETC2_SRGB8A1 },
+   { 186, "MTLPixelFormatASTC_4x4_sRGB",        PIPE_FORMAT_ASTC_4x4_SRGB },
+   { 187, "MTLPixelFormatASTC_5x4_sRGB",        PIPE_FORMAT_ASTC_5x4_SRGB },
+   { 188, "MTLPixelFormatASTC_5x5_sRGB",        PIPE_FORMAT_ASTC_5x5_SRGB },
+   { 189, "MTLPixelFormatASTC_6x5_sRGB",        PIPE_FORMAT_ASTC_6x5_SRGB },
+   { 190, "MTLPixelFormatASTC_6x6_sRGB",        PIPE_FORMAT_ASTC_6x6_SRGB },
+   { 192, "MTLPixelFormatASTC_8x5_sRGB",        PIPE_FORMAT_ASTC_8x5_SRGB },
+   { 193, "MTLPixelFormatASTC_8x6_sRGB",        PIPE_FORMAT_ASTC_8x6_SRGB },
+   { 194, "MTLPixelFormatASTC_8x8_sRGB",        PIPE_FORMAT_ASTC_8x8_SRGB },
+   { 195, "MTLPixelFormatASTC_10x5_sRGB",       PIPE_FORMAT_ASTC_10x5_SRGB },
+   { 196, "MTLPixelFormatASTC_10x6_sRGB",       PIPE_FORMAT_ASTC_10x6_SRGB },
+   { 197, "MTLPixelFormatASTC_10x8_sRGB",       PIPE_FORMAT_ASTC_10x8_SRGB },
+   { 198, "MTLPixelFormatASTC_10x10_sRGB",      PIPE_FORMAT_ASTC_10x10_SRGB },
+   { 199, "MTLPixelFormatASTC_12x10_sRGB",      PIPE_FORMAT_ASTC_12x10_SRGB },
+   { 200, "MTLPixelFormatASTC_12x12_sRGB",      PIPE_FORMAT_ASTC_12x12_SRGB },
+   { 204, "MTLPixelFormatASTC_4x4_LDR",         PIPE_FORMAT_ASTC_4x4 },
+   { 205, "MTLPixelFormatASTC_5x4_LDR",         PIPE_FORMAT_ASTC_5x4 },
+   { 206, "MTLPixelFormatASTC_5x5_LDR",         PIPE_FORMAT_ASTC_5x5 },
+   { 207, "MTLPixelFormatASTC_6x5_LDR",         PIPE_FORMAT_ASTC_6x5 },
+   { 208, "MTLPixelFormatASTC_6x6_LDR",         PIPE_FORMAT_ASTC_6x6 },
+   { 210, "MTLPixelFormatASTC_8x5_LDR",         PIPE_FORMAT_ASTC_8x5 },
+   { 211, "MTLPixelFormatASTC_8x6_LDR",         PIPE_FORMAT_ASTC_8x6 },
+   { 212, "MTLPixelFormatASTC_8x8_LDR",         PIPE_FORMAT_ASTC_8x8 },
+   { 213, "MTLPixelFormatASTC_10x5_LDR",        PIPE_FORMAT_ASTC_10x5 },
+   { 214, "MTLPixelFormatASTC_10x6_LDR",        PIPE_FORMAT_ASTC_10x6 },
+   { 215, "MTLPixelFormatASTC_10x8_LDR",        PIPE_FORMAT_ASTC_10x8 },
+   { 216, "MTLPixelFormatASTC_10x10_LDR",       PIPE_FORMAT_ASTC_10x10 },
+   { 217, "MTLPixelFormatASTC_12x10_LDR",       PIPE_FORMAT_ASTC_12x10 },
+   { 218, "MTLPixelFormatASTC_12x12_LDR",       PIPE_FORMAT_ASTC_12x12 },
 };
 
 /* Whether a format carries each aspect, asked of Mesa's own description rather than of
@@ -1059,15 +1116,9 @@ pixel_format_refusal(unsigned f)
    if (f >= 130 && f <= 153)
       return "one of the BC compressed formats, whose texels come in blocks this library "
              "cannot make and whose rows are not rows of pixels";
-   if (f >= 160 && f <= 167)
-      return "one of the PVRTC compressed formats, whose texels come in blocks this library "
-             "cannot make";
-   if (f >= 170 && f <= 183)
-      return "one of the EAC or ETC2 compressed formats, whose texels come in blocks this "
-             "library cannot make";
-   if (f >= 186 && f <= 236)
-      return "one of the ASTC compressed formats, whose texels come in blocks this library "
-             "cannot make";
+   if (f >= 222 && f <= 236)
+      return "one of the ASTC HDR formats, which this GPU's texture unit does not decode "
+             "(its ASTC is LDR, served)";
    if (f == 240 || f == 241)
       return "one of Metal's packed 4:2:2 video formats (GBGR422, BGRG422), where one block "
              "holds two texels and a region in texels is not a region in bytes";
@@ -1714,6 +1765,16 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
                          "%ux%ux%u", s[0], s[1], s[2], o[0], o[1], o[2], w, h, d);
       return false;
    }
+   /* (the K40's) a compressed format's region is whole blocks: it starts on a block and ends on
+    * one or at the level's edge, Metal's own rule for -replaceRegion: of such a texture */
+   unsigned bw = util_format_get_blockwidth(res->format), bh = util_format_get_blockheight(res->format);
+   if ((bw > 1 || bh > 1) && (o[0] % bw || o[1] % bh || (s[0] % bw && o[0] + s[0] != w) ||
+                              (s[1] % bh && o[1] + s[1] != h))) {
+      say(why, why_size, "a region of %ux%u texels at (%u, %u) of %s, whose blocks are %ux%u: it "
+                         "has to start on a block and end on one or at the level's edge",
+          s[0], s[1], o[0], o[1], texture->format_name, bw, bh);
+      return false;
+   }
 
    *box = (struct pipe_box){ .x = o[0], .width = s[0] };
    if (!rows) {
@@ -1733,14 +1794,15 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
 /* How wide a row of the caller's memory is, with Metal's convention that zero means
  * tightly packed, and the check that it is at least a row: a stride shorter than the
  * region would make every row after the first read from inside the one before it,
- * which produces an image rather than an error.
+ * which produces an image rather than an error. (The K40's: for a compressed format a
+ * row is a row of blocks, as Metal's bytesPerRow is.)
  */
 static bool
 caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, size_t stride,
               size_t *out, char *why, size_t why_size)
 {
    unsigned texel = util_format_get_blocksize(texture->res->format);
-   size_t least = (size_t)box->width * texel;
+   size_t least = (size_t)util_format_get_nblocksx(texture->res->format, box->width) * texel;
    if (stride == 0) {
       *out = least;
       return true;
@@ -1821,7 +1883,9 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
     */
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res,
                                           res_level(texture, level), PIPE_MAP_WRITE, &box,
-                                          bytes, row, row * box.height);
+                                          bytes, row,
+                                          row * util_format_get_nblocksy(texture->res->format,
+                                                                         box.height));
    return 0;
 }
 
@@ -1947,11 +2011,14 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
     * that a single memcpy would pass every test here and then tear on the phone, where
     * freedreno's pitch is aligned and softpipe's is not.
     */
-   size_t texel_row = (size_t)box.width * util_format_get_blocksize(texture->res->format);
+   /* (the K40's: rows of blocks for a compressed format, whose blocks it hands back as stored) */
+   size_t texel_row = (size_t)util_format_get_nblocksx(texture->res->format, box.width) *
+                      util_format_get_blocksize(texture->res->format);
+   unsigned rows = util_format_get_nblocksy(texture->res->format, box.height);
    uint8_t *dst = bytes;
    for (int z = 0; z < box.depth; z++)
-      for (int y = 0; y < box.height; y++)
-         memcpy(dst + ((size_t)z * box.height + y) * row,
+      for (unsigned y = 0; y < rows; y++)
+         memcpy(dst + ((size_t)z * rows + y) * row,
                 map + (size_t)z * xfer->layer_stride + (size_t)y * xfer->stride, texel_row);
 
    pipe->texture_unmap(pipe, xfer);
