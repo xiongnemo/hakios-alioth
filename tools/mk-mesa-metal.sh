@@ -78,6 +78,9 @@ BUILD=build-${DRIVERS//,/-}
 	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
 ninja -C $BUILD src/gallium/drivers/freedreno/libhakios.air.dylib src/gallium/drivers/freedreno/air_metal_test > ninja.log
+# (every symbol of the library as linked, local ones too, in address order: what names a fault's address inside
+# Mesa -- the stripped library below names only the rwa_*; CI keeps this file with its logs)
+llvm-nm -n --defined-only $BUILD/src/gallium/drivers/freedreno/libhakios.air.dylib > out/libhakios.air.nm || true
 # -x keeps the global symbols (the rwa_* of air_metal.h); the install name is the path on the phone
 llvm-strip -x -o out/libhakios.air.dylib $BUILD/src/gallium/drivers/freedreno/libhakios.air.dylib
 install_name_tool -id /redwood/lib/libhakios.air.dylib out/libhakios.air.dylib
