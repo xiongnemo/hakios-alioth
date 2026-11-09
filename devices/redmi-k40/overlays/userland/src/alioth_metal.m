@@ -1908,7 +1908,10 @@ enum {
 		size_t size = sizeof(args) - 1;
 		const char *at;
 
-		profile = 0;
+		/* (the K40's) 1 since 11-09: Apple2 (ASTC, which the driver samples natively; MPS answers) measured with no
+		 * test lost -- Metal tab 57, GPU tab 83/83 -- once Core Image's Metal road worked (unbound samplers, shadow
+		 * textures). metal_profile=0 claims Apple1 alone again */
+		profile = 1;
 		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
 		    (at = strstr(args, "metal_profile=")) != NULL && (at == args || at[-1] == ' ')) {
 			profile = (NSUInteger)strtoul(at + strlen("metal_profile="), NULL, 10);
