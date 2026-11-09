@@ -120,7 +120,9 @@ stage1() {
 	# would generate, which the macOS SDK of the same XNU release ships ready-made.
 	if [ ! -d MacOSX13.3.sdk/System/Library/Frameworks/Kernel.framework/Headers/DriverKit ]; then
 		log "downloading the macOS 13.3 SDK for its DriverKit headers"
-		curl -L --fail --retry 3 -s -o macos-sdk.tar.xz "$MACOS_SDK_URL" || die "download failed: $MACOS_SDK_URL"
+		# (retried for two minutes: GitHub's release downloads answered 504 for a while on 2026-11-09)
+		curl -L --fail --retry 6 --retry-delay 20 --retry-all-errors -s -o macos-sdk.tar.xz "$MACOS_SDK_URL" ||
+			die "download failed: $MACOS_SDK_URL"
 		local wild=--wildcards; [ "$XNU_HOST_OS" = Darwin ] && wild=        # bsdtar: patterns as they are
 		tar -xJf macos-sdk.tar.xz $wild '*MacOSX13.3.sdk/System/Library/Frameworks/Kernel.framework*' ||
 			die "cannot unpack the macOS SDK"
