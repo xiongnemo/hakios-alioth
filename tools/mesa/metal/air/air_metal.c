@@ -106,6 +106,15 @@ struct rwa_device {
     */
    void *default_sampler;
 
+   /* (the K40's) What an API sampler slot nobody bound holds: MTLSamplerDescriptor as it is made
+    * (nearest, clamp to edge, normalized coordinates, no mipmaps). A GPU reads whatever state its
+    * slot has, and Core Image's Metal kernels count on that: ciKernelMain declares a sampler that
+    * Core Image binds none for, and its dispatch was refused here -- SpriteKit's texture read back
+    * through Core Image came out black (System Check spritekit.texture with metal_profile=1,
+    * 2026-11-09). Made when a draw or dispatch first needs it.
+    */
+   void *metal_default_sampler;
+
    /* Whether this is the rasterizer in plain C rather than the Adreno. Kept because one
     * refusal has to name it: a software screen HAS a resource_from_handle, and it is the
     * winsys under it that imports nothing, so a failed import there would otherwise come
@@ -615,6 +624,8 @@ rwa_device_close(struct rwa_device *device)
       return;
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
+   if (device->metal_default_sampler)
+      device->pipe->delete_sampler_state(device->pipe, device->metal_default_sampler);
    device->pipe->destroy(device->pipe);
    device->screen->destroy(device->screen);
    free(device);
@@ -3654,6 +3665,24 @@ default_sampler(struct rwa_device *device)
    return device->default_sampler;
 }
 
+/* (the K40's) the state of an API sampler slot nothing was bound to (struct rwa_device) */
+static void *
+metal_default_sampler(struct rwa_device *device)
+{
+   if (!device->metal_default_sampler) {
+      device->metal_default_sampler = device->pipe->create_sampler_state(device->pipe,
+         &(struct pipe_sampler_state){
+            .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+            .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+            .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+            .max_lod = 1000.0f });
+   }
+   return device->metal_default_sampler;
+}
+
 /*
  * Which Metal buffer indices a module declares ARGUMENT BUFFERS at, one bit each, and a
  * refusal when one is past the 32 a mask holds.
@@ -3830,14 +3859,10 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
           * about a sampler state: it is a created object of this device or the encoding
           * was refused.
           */
-         if (member)
-            break;
-         if (r->index >= bindings->sampler_count || !bindings->samplers[r->index]) {
-            say(why, why_size, "%s takes sampler %u from the API and %u sampler%s bound",
-                name, r->index, bindings->sampler_count,
-                bindings->sampler_count == 1 ? " was" : "s were");
-            return -1;
-         }
+         /* (the K40's) and one the API did not bind is no refusal either: the slot reads as
+          * Metal's default sampler (struct rwa_device, metal_default_sampler), as a GPU's
+          * slot reads whatever it holds -- Core Image binds none for ciKernelMain's.
+          */
          break;
 
       case AIR_RESOURCE_THREADGROUP_BUFFER:
@@ -3938,7 +3963,8 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             t = bindings->textures[r->index];
             break;
          case AIR_RESOURCE_SAMPLER:
-            if (!r->inline_sampler)
+            /* (the K40's) a slot past those bound, or one left empty: none, Metal's default below */
+            if (!r->inline_sampler && r->index < bindings->sampler_count)
                sm = bindings->samplers[r->index];
             break;
          default:
@@ -4121,10 +4147,18 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             samplers[r->index] = own_sampler[r->index];
          } else {
             /* Metal's sampler, and the instruction's choice of which of its two state
-             * objects: struct rwa_sampler.
+             * objects: struct rwa_sampler. (The K40's) none bound: Metal's default.
              */
-            samplers[r->index] = (compare_sampler && compare_sampler[r->index])
-                                    ? sm->cso_compare : sm->cso;
+            if (!sm) {
+               samplers[r->index] = metal_default_sampler(device);
+               if (!samplers[r->index]) {
+                  say(why, why_size, "%s would not make a sampler at all", rwa_device_name(device));
+                  return -1;
+               }
+            } else {
+               samplers[r->index] = (compare_sampler && compare_sampler[r->index])
+                                       ? sm->cso_compare : sm->cso;
+            }
          }
          num_samplers = MAX2(num_samplers, r->index + 1);
          break;
