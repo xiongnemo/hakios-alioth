@@ -1046,6 +1046,9 @@ format_has_depth(enum pipe_format f)
    return util_format_has_depth(util_format_description(f));
 }
 
+/* (the K40's) MTLPixelFormatStencil8, whose attachments are Depth32Float_Stencil8 underneath (rwa_texture_create) */
+#define METAL_STENCIL8 253
+
 static bool
 format_has_stencil(enum pipe_format f)
 {
@@ -1477,6 +1480,20 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
     */
    unsigned query_samples = samples > 1 ? samples : 0;
 
+   /*
+    * (the K40's) Stencil8 as an attachment: the Adreno has no stencil-only depth/stencil buffer -- fd6_pipe2depth
+    * knows Z16, Z24S8 and Z32F[_S8X24] and nothing else, so S8_UINT is refused for PIPE_BIND_DEPTH_STENCIL at any
+    * sample count. Such a texture is a Depth32Float_Stencil8 instead, whose depth aspect nothing uses: a pass with it
+    * has no depth (rwa_render_draw), and rwa_depth_read reads its stencil through util_format as before. Flutter's
+    * Impeller clips with 4-sample Stencil8 attachments (System Check metal.msaa.stencil, 2026-11-10). A Stencil8
+    * texture only sampled keeps S8_UINT.
+    */
+   enum pipe_format pf = fmt->pipe;
+   if (pf == PIPE_FORMAT_S8_UINT && (bind & PIPE_BIND_DEPTH_STENCIL) && !import &&
+       !device->screen->is_format_supported(device->screen, pf, target, query_samples,
+                                            query_samples, bind))
+      pf = PIPE_FORMAT_Z32_FLOAT_S8X24_UINT;
+
    /* Asked before it is allocated, so that a format the driver does not do for this
     * binding is a sentence naming both rather than a NULL from resource_create naming
     * neither. WHICH sample counts exist is the back end's answer and not a list here:
@@ -1486,7 +1503,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
     * is (softpipe/sp_screen.c: "if (sample_count > 1) return false", and
     * caps->fake_sw_msaa, which asks the frontend to pretend with one sample).
     */
-   if (!device->screen->is_format_supported(device->screen, fmt->pipe, target,
+   if (!device->screen->is_format_supported(device->screen, pf, target,
                                             query_samples, query_samples, bind)) {
       char ms[48] = "";
       if (query_samples)
@@ -1509,7 +1526,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
     */
    unsigned attach = depth_stencil ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET;
    if (!import && !(bind & attach) &&
-       device->screen->is_format_supported(device->screen, fmt->pipe, target, query_samples,
+       device->screen->is_format_supported(device->screen, pf, target, query_samples,
                                            query_samples, bind | attach))
       bind |= attach;
 
@@ -1533,7 +1550,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
     * (fd_blit: "blit unsupported"), the resolve texture left as it was.
     */
    struct pipe_resource templ = {
-      .target = target, .format = fmt->pipe,
+      .target = target, .format = pf,
       .width0 = width, .height0 = height, .depth0 = depth,
       .array_size = array_size, .last_level = mips - 1, .nr_samples = query_samples,
       .nr_storage_samples = query_samples,
@@ -4930,6 +4947,10 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
 struct rwa_depth_stencil {
    struct rwa_device *device;
    void *cso;
+   /* (the K40's) the same state without the aspects a pass's attachment has not got, made when first drawn with:
+    * [has depth | has stencil << 1], [3] being cso itself (depth_stencil_for) */
+   struct pipe_depth_stencil_alpha_state state;
+   void *variant[3];
 };
 
 /* MTLCompareFunction, spelled out so a refusal names what the caller passed. */
@@ -5100,6 +5121,7 @@ rwa_depth_stencil_create(struct rwa_device *device,
       return NULL;
    }
    ds->device = device;
+   ds->state = dsa;
    ds->cso = device->pipe->create_depth_stencil_alpha_state(device->pipe, &dsa);
    if (!ds->cso) {
       say(why, why_size, "%s would not make a depth/stencil state of %s%s",
@@ -5125,7 +5147,40 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
     */
    state->device->pipe->bind_depth_stencil_alpha_state(state->device->pipe, NULL);
    state->device->pipe->delete_depth_stencil_alpha_state(state->device->pipe, state->cso);
+   for (unsigned i = 0; i < ARRAY_SIZE(state->variant); i++) {
+      if (state->variant[i])
+         state->device->pipe->delete_depth_stencil_alpha_state(state->device->pipe, state->variant[i]);
+   }
    free(state);
+}
+
+/*
+ * (the K40's) A depth/stencil state as a pass with this attachment can use it: Metal tests and writes only the aspects
+ * the pass's attachment has -- none without one -- and Gallium's drivers take an enabled test for an attachment to use.
+ * freedreno reads pfb->zsbuf->texture for an enabled depth or stencil test, and every state this library makes has
+ * depth enabled (rwa_depth_stencil_create): Flutter's Impeller sets one on passes without a depth/stencil attachment,
+ * and its first frame faulted at address 8 in batch_draw_tracking (Flutter Check, 2026-11-10). NULL when the driver
+ * would not make the narrower state.
+ */
+static void *
+depth_stencil_for(struct rwa_depth_stencil *ds, bool has_depth, bool has_stencil)
+{
+   unsigned which = (has_depth ? 1 : 0) | (has_stencil ? 2 : 0);
+   if (which == 3)
+      return ds->cso;
+   if (!ds->variant[which]) {
+      struct pipe_depth_stencil_alpha_state s = ds->state;
+      if (!has_depth) {
+         s.depth_enabled = 0;
+         s.depth_writemask = 0;
+         s.depth_func = PIPE_FUNC_ALWAYS;
+      }
+      if (!has_stencil) {
+         memset(s.stencil, 0, sizeof(s.stencil));
+      }
+      ds->variant[which] = ds->device->pipe->create_depth_stencil_alpha_state(ds->device->pipe, &s);
+   }
+   return ds->variant[which];
 }
 
 /*
@@ -7340,9 +7395,23 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    pipe->bind_blend_state(pipe, render->blend);
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
     * behaviour with no MTLDepthStencilState set: no test and no write.
+    *
+    * (the K40's) The caller's as far as this pass's attachment goes: only the aspects it has
+    * (depth_stencil_for). A Stencil8 attachment is a Depth32Float_Stencil8 underneath
+    * (rwa_texture_create), whose depth is no aspect of it.
     */
-   pipe->bind_depth_stencil_alpha_state(pipe, draw->depth_stencil ? draw->depth_stencil->cso
-                                                                  : render->dsa);
+   void *dsa = render->dsa;
+   if (draw->depth_stencil) {
+      bool has_stencil = draw->depth && format_has_stencil(draw->depth->res->format);
+      bool has_depth = draw->depth && draw->depth->shape.pixel_format != METAL_STENCIL8 &&
+                       format_has_depth(draw->depth->res->format);
+      if (!(dsa = depth_stencil_for(draw->depth_stencil, has_depth, has_stencil))) {
+         say(why, why_size, "%s would not make the depth/stencil state without the aspects "
+                            "this pass's attachment has not got", rwa_device_name(device));
+         return -1;
+      }
+   }
+   pipe->bind_depth_stencil_alpha_state(pipe, dsa);
    /* Metal keeps the reference value on the encoder and not in the state object, so it
     * is set per draw. Gallium's is one byte per face, which is the stencil buffer's
     * width; Metal's is a uint32 and only those bits can match anything.
