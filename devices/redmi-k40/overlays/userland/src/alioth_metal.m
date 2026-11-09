@@ -3077,10 +3077,12 @@ enum {
 		rw_print("a drawable's texture needs the compiler library\n");
 		return nil;
 	}
-	/* (the K40's) a plane of a surface of several -- a video frame's, through CVMetalTextureCache -- said as it comes */
-	if (p != 0 || [d pixelFormat] != MTLPixelFormatBGRA8Unorm) {
-		RW_AGAIN("a texture over plane %lu of an IOSurface asked for: MTLPixelFormat %lu, %lux%lu\n", (unsigned long)p,
-			 (unsigned long)[d pixelFormat], (unsigned long)[d width], (unsigned long)[d height]);
+	/* (the K40's) a plane of a surface of several -- a video frame's, through CVMetalTextureCache -- said as it comes
+	 * (CoreAnimation's drawables, BGRA8 and its sRGB view, are not) */
+	if (p != 0 || ([d pixelFormat] != MTLPixelFormatBGRA8Unorm && [d pixelFormat] != MTLPixelFormatBGRA8Unorm_sRGB)) {
+		RW_AGAIN("a texture over plane %lu of an IOSurface asked for: MTLPixelFormat %lu, %lux%lu, usage %#lx\n",
+			 (unsigned long)p, (unsigned long)[d pixelFormat], (unsigned long)[d width], (unsigned long)[d height],
+			 (unsigned long)[d usage]);
 	}
 	memset(&shape, 0, sizeof(shape));
 	shape.pixel_format = (unsigned)[d pixelFormat];
@@ -3097,6 +3099,14 @@ enum {
 	 * MTLTextureUsageRenderTarget" -- while a pass that only cleared it went through, Metal Check 2026-11-08.)
 	 */
 	shape.usage = (unsigned)([d usage] | MTLTextureUsageRenderTarget);
+	/*
+	 * (the K40's) MTLTextureUsageUnknown (0) is Metal's "anything", and stays that: the RenderTarget above would have
+	 * narrowed it to drawing alone. CVMetalTextureCache's textures of a video frame's planes came so, and a kernel that
+	 * read the luma plane was refused for want of ShaderRead (System Check metal.cvtexture, 11-10).
+	 */
+	if ([d usage] == MTLTextureUsageUnknown) {
+		shape.usage = (unsigned)(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget);
+	}
 	texture = rwd_texture_for_surface(_mesa, s, p, (const struct rwd_texture_shape *)&shape,
 					  &took, why, sizeof(why));
 	if (texture == NULL) {
