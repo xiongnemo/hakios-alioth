@@ -1697,12 +1697,20 @@ enum {
 	NSMutableDictionary *_attachmentViews;   /* (the K40's) views of one level and slice passes drew into */
 	BOOL _swizzled;                          /* (the K40's) sampling reads _swizzle's channels (rwa_texture_swizzle) */
 	MTLTextureSwizzleChannels _swizzle;
+	void *_shadowSurface;                    /* (the K40's) the IOSurface this texture stands in for, retained */
+	NSUInteger _shadowPlane;
 }
 @property (readonly) struct rwa_texture *mesaTexture;
 /* (the K40's) what a pass draws into for this texture at an attachment's level and slice */
 - (id)aliothAttachmentLevel:(NSUInteger)level slice:(NSUInteger)slice;
 /* (the K40's) what sampling it reads, channel by channel: MTLTextureDescriptor.swizzle, a view's */
 - (BOOL)aliothSetSwizzle:(MTLTextureSwizzleChannels)swizzle;
+/* (the K40's) a SHADOW: this texture stands in for an IOSurface built around memory of the process's own, which the
+ * GPU cannot take (the kernel will not describe it) -- filled from the surface now, written back into it after each
+ * command buffer that draws or computes into it is done (-[AliothMetalCommandBuffer aliothShadowsBack]) */
+- (BOOL)aliothShadowSurface:(void *)surface plane:(NSUInteger)plane;
+- (AliothMetalTexture *)aliothShadowRoot;      /* the shadow this texture is, or is a view of; nil for none */
+- (void)aliothShadowWriteBack;
 /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
  * refuses a depth texture through it by name, so a caller that wants to know what a depth
@@ -3065,6 +3073,27 @@ enum {
 	texture = rwd_texture_for_surface(_mesa, s, p, (const struct rwd_texture_shape *)&shape,
 					  &took, why, sizeof(why));
 	if (texture == NULL) {
+		/*
+		 * (the K40's) A surface around memory of the process's own -- Core Image wraps the bitmap of the CGImage it
+		 * renders into one (SpriteKit's textureFromNode: then .CGImage, System Check spritekit.texture with
+		 * metal_profile=1) -- is refused by the kernel: the GPU cannot take such memory (alioth_drawable.m says
+		 * which answer that is). An ordinary texture stands in for it: filled from it now, written back into it after
+		 * each command buffer that draws or computes into it (a SHADOW, -aliothShadowSurface:plane:).
+		 */
+		if (strstr(why, "wraps memory of the process's own") != NULL) {
+			MTLTextureDescriptor *own = [[d copy] autorelease];
+			AliothMetalTexture *shadow;
+
+			[own setUsage:[d usage] | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+			    MTLTextureUsageShaderWrite];
+			shadow = [self newTextureWithDescriptor:own];
+			if (shadow != nil && [shadow aliothShadowSurface:s plane:p]) {
+				RW_ONCE("a texture over an IOSurface of the process's own memory: an ordinary texture in its "
+					"place, filled from it and written back after each command buffer that draws into it\n");
+				return shadow;
+			}
+			[shadow release];
+		}
 		RW_AGAIN("no drawable: %s\n", why);
 		return nil;
 	}
@@ -3507,6 +3536,43 @@ enum {
 }
 @end
 
+/* (the K40's) The IOSurface calls a shadow texture needs, by name: this library links no IOSurface.framework (as
+ * alioth_drawable.m takes IOSurfaceGetID). A surface with no planes answers through the plain calls only. */
+static struct {
+	int (*lock)(void *, uint32_t, uint32_t *);
+	int (*unlock)(void *, uint32_t, uint32_t *);
+	size_t (*planes)(void *);
+	void *(*base)(void *);
+	size_t (*row)(void *), (*width)(void *), (*height)(void *);
+	void *(*plane_base)(void *, size_t);
+	size_t (*plane_row)(void *, size_t), (*plane_width)(void *, size_t), (*plane_height)(void *, size_t);
+} alioth_surface;
+static unsigned alioth_shadows;   /* shadow textures alive (__atomic_*): none, and a command buffer looks for none */
+
+static BOOL
+alioth_surface_calls(void)
+{
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		*(void **)&alioth_surface.lock = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+		*(void **)&alioth_surface.unlock = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+		*(void **)&alioth_surface.planes = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
+		*(void **)&alioth_surface.base = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+		*(void **)&alioth_surface.row = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+		*(void **)&alioth_surface.width = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidth");
+		*(void **)&alioth_surface.height = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
+		*(void **)&alioth_surface.plane_base = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddressOfPlane");
+		*(void **)&alioth_surface.plane_row = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRowOfPlane");
+		*(void **)&alioth_surface.plane_width = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidthOfPlane");
+		*(void **)&alioth_surface.plane_height = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeightOfPlane");
+	});
+	return alioth_surface.lock != NULL && alioth_surface.unlock != NULL && alioth_surface.planes != NULL &&
+	    alioth_surface.base != NULL && alioth_surface.row != NULL && alioth_surface.width != NULL &&
+	    alioth_surface.height != NULL && alioth_surface.plane_base != NULL && alioth_surface.plane_row != NULL &&
+	    alioth_surface.plane_width != NULL && alioth_surface.plane_height != NULL;
+}
+
 @implementation AliothMetalTexture
 
 + (void)load
@@ -3553,7 +3619,81 @@ enum {
 		mesa.texture_destroy(_texture);
 	}
 	[_parent release];
+	if (_shadowSurface != NULL) {
+		CFRelease(_shadowSurface);
+		__atomic_fetch_sub(&alioth_shadows, 1, __ATOMIC_RELAXED);
+	}
 	[super dealloc];
+}
+
+/* (the K40's) the surface's plane as memory: its base, rows and size, or NO (locked by the caller) */
+static BOOL
+alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *row, size_t *width, size_t *height)
+{
+	if (alioth_surface.planes(surface) == 0) {
+		*base = alioth_surface.base(surface);
+		*row = alioth_surface.row(surface);
+		*width = alioth_surface.width(surface);
+		*height = alioth_surface.height(surface);
+	} else {
+		*base = alioth_surface.plane_base(surface, plane);
+		*row = alioth_surface.plane_row(surface, plane);
+		*width = alioth_surface.plane_width(surface, plane);
+		*height = alioth_surface.plane_height(surface, plane);
+	}
+	return *base != NULL && *row != 0 && *width != 0 && *height != 0;
+}
+
+- (BOOL)aliothShadowSurface:(void *)surface plane:(NSUInteger)plane
+{
+	uint8_t *base;
+	size_t row, width, height;
+	BOOL ok;
+
+	if (!alioth_surface_calls() || surface == NULL || _shape.mip_levels > 1 || _shape.type != MTLTextureType2D) {
+		return NO;
+	}
+	(void)alioth_surface.lock(surface, 1 /* kIOSurfaceLockReadOnly */, NULL);
+	ok = alioth_surface_plane(surface, plane, &base, &row, &width, &height) && width >= _shape.width &&
+	    height >= _shape.height;
+	if (ok) {
+		[self replaceRegion:MTLRegionMake2D(0, 0, _shape.width, _shape.height) mipmapLevel:0 withBytes:base
+			bytesPerRow:row];
+	}
+	(void)alioth_surface.unlock(surface, 1, NULL);
+	if (!ok) {
+		return NO;
+	}
+	_shadowSurface = (void *)CFRetain(surface);
+	_shadowPlane = plane;
+	__atomic_fetch_add(&alioth_shadows, 1, __ATOMIC_RELAXED);
+	return YES;
+}
+
+- (AliothMetalTexture *)aliothShadowRoot
+{
+	AliothMetalTexture *t = self;
+
+	while (t->_shadowSurface == NULL && t->_parent != nil && [t->_parent isKindOfClass:[AliothMetalTexture class]]) {
+		t = t->_parent;
+	}
+	return t->_shadowSurface != NULL ? t : nil;
+}
+
+- (void)aliothShadowWriteBack
+{
+	uint8_t *base;
+	size_t row, width, height;
+
+	if (_shadowSurface == NULL) {
+		return;
+	}
+	(void)alioth_surface.lock(_shadowSurface, 0, NULL);
+	if (alioth_surface_plane(_shadowSurface, _shadowPlane, &base, &row, &width, &height)) {
+		[self getBytes:base bytesPerRow:row fromRegion:MTLRegionMake2D(0, 0, _shape.width, _shape.height)
+		    mipmapLevel:0];
+	}
+	(void)alioth_surface.unlock(_shadowSurface, 0, NULL);
 }
 
 - (struct rwa_texture *)mesaTexture { return _texture; }
@@ -6007,6 +6147,54 @@ done:
 	return device == NULL || alioth_finish(device, why, size) == 0;
 }
 
+/*
+ * (the K40's) Once the GPU is done with this buffer, before anyone is told: every shadow texture it drew or computed
+ * into, or blitted to, written back into the IOSurface it stands in for (-[AliothMetalTexture aliothShadowSurface:...]),
+ * so that what the surface's owner reads after a completed handler is what was drawn. A texture only sampled is left.
+ */
+- (void)aliothShadowsBack
+{
+	NSMutableSet *done = nil;
+
+	if (__atomic_load_n(&alioth_shadows, __ATOMIC_RELAXED) == 0) {
+		return;
+	}
+	for (id item in _work) {
+		id candidates[RW_MAX_BUFFERS + 9];
+		unsigned n = 0;
+
+		if ([item isKindOfClass:[AliothMetalWork class]]) {
+			AliothMetalWork *w = item;
+
+			if (w->pipeline != nil) {
+				for (unsigned i = 0; i < w->textureCount && n < RW_MAX_BUFFERS; i++) {
+					candidates[n++] = w->textures[i];
+				}
+			} else {
+				for (unsigned i = 0; i < w->colorCount && i < 8; i++) {
+					candidates[n++] = w->color[i];
+				}
+				candidates[n++] = w->depth;
+			}
+		} else if ([item isKindOfClass:[AliothMetalBlit class]]) {
+			candidates[n++] = ((AliothMetalBlit *)item)->destination;
+		}
+		for (unsigned i = 0; i < n; i++) {
+			AliothMetalTexture *root = [candidates[i] isKindOfClass:[AliothMetalTexture class]] ?
+			    [candidates[i] aliothShadowRoot] : nil;
+
+			if (root == nil || [done containsObject:root]) {
+				continue;
+			}
+			[root aliothShadowWriteBack];
+			if (done == nil) {
+				done = [NSMutableSet set];
+			}
+			[done addObject:root];
+		}
+	}
+}
+
 /* The fence is the whole point: a dispatch that the GPU does not finish must not read as a
  * result. air_run learned that the expensive way (docs/air.md section 5). */
 - (void)waitUntilCompleted
@@ -6035,6 +6223,7 @@ done:
 		_status = RW_CB_ERROR;
 		return;
 	}
+	[self aliothShadowsBack];
 	_status = RW_CB_COMPLETED;   /* the fence has been paid, and only now */
 	if (_gpuEnd == 0) {
 		_gpuStart = _kernelEnd != 0 ? _kernelEnd : waited;
@@ -6201,6 +6390,7 @@ done:
 								      [NSString stringWithUTF8String:why] }] retain];
 				_status = RW_CB_ERROR;
 			} else {
+				[self aliothShadowsBack];
 				_status = RW_CB_COMPLETED;
 			}
 			for (id handler in completed) {
