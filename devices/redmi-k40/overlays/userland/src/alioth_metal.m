@@ -5055,11 +5055,10 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 	 * written back by the processor after a finish.
 	 */
 	/*
-	 * (Off unless boot-arg metal_gpu_t2t=1: with it on, GL work in the same process crashed through lazy-binding
-	 * pointers of libhakios.gl.dylib that had become zero -- _glClientWaitSync, _glBindFramebuffer, pc 0 -- under Core
-	 * Image and SceneKit, in two of three GPU-tab runs after VectorKit had been copying textures this way, and in none
-	 * before (logs/112310, 115914, 121056). Memory written that was not the copy's; until the copy is shown not to be
-	 * the writer, the processor's road below.)
+	 * (On unless boot-arg metal_gpu_t2t=0. It was off for an afternoon on suspicion: GL work in the same process
+	 * crashed with pc 0 after VectorKit had been copying textures this way. The crash was the GL library's -- a
+	 * context freed on one thread while current on another, its address reused (hk f7b94ce, "a freed context was
+	 * this thread's current one ... forgotten" in the rounds after) -- and the copy was clean with the fix.)
 	 */
 	static int gpu_t2t = -1;
 
@@ -5067,7 +5066,7 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 		char args[1024] = "";
 		size_t len = sizeof(args) - 1;
 
-		gpu_t2t = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_gpu_t2t=1") != NULL;
+		gpu_t2t = !(sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_gpu_t2t=0") != NULL);
 	}
 	if (b->kind == ALIOTH_BLIT_TEXTURE_TO_TEXTURE && mesa.texture_copy != NULL && gpu_t2t) {
 		struct rwa_texture *src = [b->source mesaTexture], *dst = [b->destination mesaTexture];
