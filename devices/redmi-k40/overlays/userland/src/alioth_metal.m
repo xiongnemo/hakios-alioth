@@ -5461,6 +5461,34 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 			.samplers = samplers, .sampler_count = work->samplerCount,
 		};
 
+		/* (the K40's) an indirect dispatch's grid, read now: after the GPU's writes to its buffer, so a grid a
+		 * kernel wrote earlier in this buffer is the grid run (-dispatchThreadgroupsWithIndirectBuffer:...) */
+		if (work->indirectBuffer != nil) {
+			const char *base = [work->indirectBuffer respondsToSelector:@selector(contents)] ?
+			    (const char *)[work->indirectBuffer contents] : NULL;
+
+			if (base == NULL || work->indirectOffset % 4 != 0 ||
+			    work->indirectOffset + 12 > [work->indirectBuffer length]) {
+				snprintf(why, sizeof(why), "an indirect dispatch whose grid (3 words at %lu) is not in its "
+					 "buffer", (unsigned long)work->indirectOffset);
+				[self failWith:why];
+				goto done;
+			}
+			if (![self aliothWaitForWrites:work->indirectBuffer why:why size:sizeof(why)]) {
+				[self failWith:why];
+				goto done;
+			}
+			const uint32_t *g = (const uint32_t *)(base + work->indirectOffset);
+
+			work->groups[0] = g[0];
+			work->groups[1] = g[1];
+			work->groups[2] = g[2];
+			work->indirectBuffer = nil;     /* (read once) */
+			if (g[0] == 0 || g[1] == 0 || g[2] == 0) {
+				continue;       /* no threadgroups: Metal runs nothing, and so does this */
+			}
+		}
+
 		/* (the K40's) the threadgroup buffer's size for this dispatch, kept on the pipeline by the library */
 		if (work->threadgroupBytes != 0 && mesa.compute_threadgroup_bytes != NULL &&
 		    mesa.compute_threadgroup_bytes([work->pipeline compute], work->threadgroupBytes, why,
@@ -5532,7 +5560,6 @@ done:
 	if (work->indirectBuffer != nil) {
 		BOOL indexed = work->indexBuffer != nil;
 		NSUInteger words = indexed ? 5 : 4;
-		struct rwa_device *device = [[_queue device] mesaDevice];
 		const char *base = [work->indirectBuffer respondsToSelector:@selector(contents)] ?
 		    (const char *)[work->indirectBuffer contents] : NULL;
 
@@ -5543,7 +5570,8 @@ done:
 			[self failWith:why];
 			return NO;
 		}
-		if (device != NULL && alioth_finish(device, why, size) != 0) {
+		/* (only that buffer's writes since 11-09; it was a finish of everything) */
+		if (![self aliothWaitForWrites:work->indirectBuffer why:why size:size]) {
 			[self failWith:why];
 			return NO;
 		}
@@ -5722,6 +5750,20 @@ done:
 				  userInfo:@{ NSLocalizedDescriptionKey:
 					      [NSString stringWithUTF8String:reason] }] retain];
 	_status = RW_CB_ERROR;
+}
+
+/* (the K40's) What the GPU has been given so far that writes `buffer`, finished, so the processor can read what a kernel
+ * left there (an indirect draw's or dispatch's arguments): that buffer's own wait when it is the library's
+ * (rwa_buffer_wait), else everything. NO and why. */
+- (BOOL)aliothWaitForWrites:(id)buffer why:(char *)why size:(size_t)size
+{
+	struct rwa_device *device = [[_queue device] mesaDevice];
+	struct rwa_buffer *mb = [buffer respondsToSelector:@selector(mesaBuffer)] ? [buffer mesaBuffer] : NULL;
+
+	if (mb != NULL && mesa.buffer_wait != NULL) {
+		return mesa.buffer_wait(mb, 0, why, size) == 0;
+	}
+	return device == NULL || alioth_finish(device, why, size) == 0;
 }
 
 /* The fence is the whole point: a dispatch that the GPU does not finish must not read as a
@@ -7930,16 +7972,17 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 	}
 }
 
-- (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)size
+/* a dispatch's work from what is bound now, its grid left to the caller; nil (said) when it is dropped */
+- (AliothMetalWork *)aliothDispatchWork:(MTLSize)size
 {
-	AliothMetalWork *work = [[AliothMetalWork alloc] init];
+	AliothMetalWork *work;
 
 	if (_pipeline == nil || _complained) {
 		rw_print("this dispatch has %s and is dropped\n",
 		         _pipeline == nil ? "no pipeline state" : "a binding this driver refused");
-		[work release];
-		return;
+		return nil;
 	}
+	work = [[[AliothMetalWork alloc] init] autorelease];
 	work->pipeline = _pipeline;
 	work->count = _highest;
 	work->textureCount = _highestTexture;
@@ -7954,15 +7997,45 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 	for (unsigned i = 0; i < _highestSampler; i++) {
 		work->samplers[i] = _samplers[i];
 	}
-	work->groups[0] = (unsigned)groups.width;
-	work->groups[1] = (unsigned)groups.height;
-	work->groups[2] = (unsigned)groups.depth;
 	work->size[0] = (unsigned)size.width;
 	work->size[1] = (unsigned)size.height;
 	work->size[2] = (unsigned)size.depth;
 	work->threadgroupBytes = _threadgroupBytes;
+	return work;
+}
+
+/* (the K40's) An indirect dispatch: its grid is three words a kernel may have written earlier in this command buffer,
+ * so they are read at -commit, after the GPU's writes to that buffer (-aliothWaitForWrites:), as an indirect draw's
+ * are. It was dropped with a sentence until 11-09. */
+- (void)dispatchThreadgroupsWithIndirectBuffer:(id)buffer
+			  indirectBufferOffset:(NSUInteger)offset
+			 threadsPerThreadgroup:(MTLSize)size
+{
+	AliothMetalWork *work;
+
+	if (buffer == nil) {
+		rw_print("an indirect dispatch with no indirect buffer is dropped\n");
+		return;
+	}
+	if ((work = [self aliothDispatchWork:size]) == nil) {
+		return;
+	}
+	work->indirectBuffer = buffer;
+	work->indirectOffset = offset;
 	[_commandBuffer recordWork:work];
-	[work release];
+}
+
+- (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)size
+{
+	AliothMetalWork *work = [self aliothDispatchWork:size];
+
+	if (work == nil) {
+		return;
+	}
+	work->groups[0] = (unsigned)groups.width;
+	work->groups[1] = (unsigned)groups.height;
+	work->groups[2] = (unsigned)groups.depth;
+	[_commandBuffer recordWork:work];
 }
 
 /* Metal counts threads here and threadgroups above; the division is Metal's own, and a
@@ -8073,18 +8146,8 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
  * driver returns when a pipeline was not built with it, so the caller has this path. */
 - (id)newKernelDebugInfo { return nil; }
 
-/* Declined, and each says its name once. An indirect dispatch reads its grid out of GPU
- * memory, which means the size is not known when the command is recorded -- this driver
- * records sizes, so there is nothing to record. A dispatch that vanishes without a word is
- * the worst outcome available, hence the line. */
-- (void)dispatchThreadgroupsWithIndirectBuffer:(id)buffer
-			  indirectBufferOffset:(NSUInteger)offset
-			 threadsPerThreadgroup:(MTLSize)size
-{
-	(void)buffer; (void)offset; (void)size;
-	RW_ONCE("an indirect dispatch is not implemented (the grid lives in GPU "
-		"memory and this driver records the grid); this dispatch is dropped\n");
-}
+/* Declined, and each says its name once: a command that vanishes without a word is the worst
+ * outcome available, hence the line. */
 - (void)executeCommandsInBuffer:(id)buffer withRange:(NSRange)range
 {
 	(void)buffer; (void)range;
