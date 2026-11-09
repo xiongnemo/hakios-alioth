@@ -25,6 +25,14 @@ jobs:
           sudo docker image prune --all --force > /dev/null || true
           df -h /
       - uses: actions/checkout@v4
+      # GitHub's own release downloads answered 504 for hours on 2026-11-09 (7-Zip's and the toolchain's, retries and
+      # all): the two archives are kept in the Actions cache once fetched, saved as soon as they are here
+      - name: Downloads, from the cache
+        id: dl
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/dl
+          key: dl-7z2501-iostc210562a-v1
       - name: Packages
         run: |
           sudo apt-get update -qq
@@ -36,18 +44,19 @@ jobs:
           sudo update-alternatives --set awk /usr/bin/gawk
           # 7-Zip 23 or newer reads APFS
           # (downloads into a file, retried: a 504 from the server failed a whole run on 2026-11-09, and a retry
-          # inside "curl | tar" would hand tar a broken stream)
-          curl -fsSL --retry 5 --retry-delay 15 --retry-all-errors -o /tmp/7z.tar.xz \
+          # inside "curl | tar" would hand tar a broken stream; the cache's copy when there is one)
+          mkdir -p ~/dl
+          [ -s ~/dl/7z.tar.xz ] || curl -fsSL --retry 5 --retry-delay 15 --retry-all-errors -o ~/dl/7z.tar.xz \
             https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz
-          sudo tar -xJf /tmp/7z.tar.xz -C /usr/local/bin 7zz
+          sudo tar -xJf ~/dl/7z.tar.xz -C /usr/local/bin 7zz
           sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
       - name: theos (its Linux toolchain and the iOS 16.5 SDK)
         run: |
           T=$HOME/theos
           mkdir -p $T/toolchain/linux/iphone $T/sdks /tmp/tc
-          curl -fsSL --retry 5 --retry-delay 15 --retry-all-errors -o /tmp/tc.tar.xz \
+          [ -s ~/dl/tc.tar.xz ] || curl -fsSL --retry 5 --retry-delay 15 --retry-all-errors -o ~/dl/tc.tar.xz \
             https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz
-          tar -xJf /tmp/tc.tar.xz -C /tmp/tc
+          tar -xJf ~/dl/tc.tar.xz -C /tmp/tc
           c=$(find /tmp/tc -path '*/bin/clang' \( -type f -o -type l \) | head -1)
           [ -n "$c" ] || { echo "no bin/clang in the toolchain archive"; find /tmp/tc -maxdepth 3; exit 1; }
           cp -a "$(dirname "$(dirname "$c")")"/. $T/toolchain/linux/iphone/
@@ -55,6 +64,12 @@ jobs:
           git -C $T/sdks-git sparse-checkout set iPhoneOS16.5.sdk
           ln -s ../sdks-git/iPhoneOS16.5.sdk $T/sdks/iPhoneOS16.5.sdk
           echo "THEOS=$T" >> "$GITHUB_ENV"
+      - name: Downloads, into the cache
+        if: steps.dl.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/dl
+          key: dl-7z2501-iostc210562a-v1
       - name: The kernel and the programs (METAL=1)
         env:
           METAL: '1'
