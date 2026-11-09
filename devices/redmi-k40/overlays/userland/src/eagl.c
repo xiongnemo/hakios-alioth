@@ -3957,6 +3957,28 @@ my_glLinkProgram(void *context, GLuint program)
 	EAGL_LEAVE(e, 0x12c0);
 }
 
+/*
+ * (the K40's) A program or shader deleted on a thread where no context could be made current -- Core Image frees its
+ * programs on a dispatch queue (CI::GLMainProgram::~GLMainProgram), and once in two GPU-tab runs that found no Mesa
+ * context there and Mesa read a NULL one (SIGSEGV at 0x1e470, logs/112310-play.log). The object is left, not the
+ * application: said once, and nothing called.
+ */
+static bool
+delete_has_context(void)
+{
+	static bool said;
+
+	if (hakios_gl_has_current()) {
+		return true;
+	}
+	if (!said) {
+		said = true;
+		say("hakios-gl: %s: a program or shader deleted with no context current on this thread: left as it is\n",
+		    getprogname());
+	}
+	return false;
+}
+
 /* iOS's library has one entry for deleting a program and deleting a shader. */
 static void
 my_glDeleteProgram(void *context, GLuint name)
@@ -3964,6 +3986,9 @@ my_glDeleteProgram(void *context, GLuint name)
 	struct eagl *e = context;
 
 	EAGL_ENTER(e, 0x1280);
+	if (!delete_has_context()) {
+		return;
+	}
 	if (glIsProgram(name)) {
 		glDeleteProgram(name);
 	} else {
@@ -4081,6 +4106,9 @@ static void
 app_glDeleteProgram(void *context, GLuint name)
 {
 	EAGL_ENTER(context, 0x1280);
+	if (!delete_has_context()) {
+		return;
+	}
 	if (name != 0 && glIsShader(name)) {
 		glDeleteShader(name);
 	} else {

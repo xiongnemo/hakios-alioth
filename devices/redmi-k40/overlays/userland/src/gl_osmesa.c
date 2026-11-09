@@ -166,6 +166,12 @@ hakios_gl_make_current(struct hakios_gl *gl)
 	return done;
 }
 
+int
+hakios_gl_has_current(void)
+{
+	return _mesa_glapi_get_context() != NULL;
+}
+
 void
 hakios_gl_destroy(struct hakios_gl *gl)
 {
