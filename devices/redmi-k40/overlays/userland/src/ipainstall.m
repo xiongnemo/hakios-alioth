@@ -143,11 +143,19 @@ write_entry(const char *path, const uint8_t *data, uint64_t csize, uint64_t size
 		unlink(path);
 		return symlink(target, path);
 	}
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (mode & 0777) ? (mode & 0777) : 0644);
+	/*
+	 * (the K40's) Every file readable by the application, as installd leaves a bundle: the zip's mode says who could
+	 * read a file on the computer that made it, and here a bundle belongs to root while the application runs as
+	 * mobile. Flutter's engine ships its ICU data at 0600 (Flutter.framework/icudtl.dat) and stopped at launch for
+	 * want of reading it (Flutter Check, 2026-11-10). Executable stays executable.
+	 */
+	mode_t perm = (mode & 0111) ? 0755 : 0644;
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, perm);
 
 	if (fd < 0) {
 		return -1;
 	}
+	(void)fchmod(fd, perm);         /* (a file there before keeps its old mode through O_TRUNC) */
 	int ret = 0;
 
 	if (method == 0) {
