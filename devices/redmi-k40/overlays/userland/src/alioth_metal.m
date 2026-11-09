@@ -614,6 +614,8 @@ static struct {
 	 * -aliothDeliverHandlers); looked up, not required */
 	void *(*flush)(struct rwa_device *, unsigned);
 	int (*fence_wait)(struct rwa_device *, void *, char *, size_t);
+	/* (the K40's) what sampling a texture reads, channel by channel (air_metal.h rwa_texture_swizzle) */
+	int (*texture_swizzle)(struct rwa_texture *, const unsigned char *, char *, size_t);
 } mesa;
 
 /*
@@ -929,6 +931,7 @@ GPU_LOCKED(int, texture_copy, (struct rwa_texture *d, unsigned dl, unsigned ds, 
     struct rwa_texture *s, unsigned sl, unsigned ss, const unsigned sor[3], const unsigned z[3], char *w, size_t ws),
     (d, dl, ds, dor, s, sl, ss, sor, z, w, ws))
 GPU_LOCKED(int, buffer_wait, (struct rwa_buffer *b, unsigned fw, char *w, size_t ws), (b, fw, w, ws))
+GPU_LOCKED(int, texture_swizzle, (struct rwa_texture *t, const unsigned char *s, char *w, size_t ws), (t, s, w, ws))
 
 /*
  * (the K40's) rwa_finish in its two halves: flushed with a fence under the library's lock, the fence waited for
@@ -1030,6 +1033,7 @@ mesa_available(void)
 	*(void **)&mesa.buffer_wait = dlsym(mesa.handle, "rwa_buffer_wait");
 	*(void **)&mesa.flush = dlsym(mesa.handle, "rwa_flush");
 	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
+	*(void **)&mesa.texture_swizzle = dlsym(mesa.handle, "rwa_texture_swizzle");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -1078,6 +1082,7 @@ mesa_available(void)
 	GPU_LOCK_WRAP(texture_copy);
 	GPU_LOCK_WRAP(buffer_wait);
 	GPU_LOCK_WRAP(flush);
+	GPU_LOCK_WRAP(texture_swizzle);
 	return true;
 }
 
@@ -1672,10 +1677,14 @@ enum {
 	id _parent;                /* (the K40's) a view's texture, retained: -parentTexture */
 	NSUInteger _parentLevel, _parentSlice;   /* (the K40's) where a view starts in its parent */
 	NSMutableDictionary *_attachmentViews;   /* (the K40's) views of one level and slice passes drew into */
+	BOOL _swizzled;                          /* (the K40's) sampling reads _swizzle's channels (rwa_texture_swizzle) */
+	MTLTextureSwizzleChannels _swizzle;
 }
 @property (readonly) struct rwa_texture *mesaTexture;
 /* (the K40's) what a pass draws into for this texture at an attachment's level and slice */
 - (id)aliothAttachmentLevel:(NSUInteger)level slice:(NSUInteger)slice;
+/* (the K40's) what sampling it reads, channel by channel: MTLTextureDescriptor.swizzle, a view's */
+- (BOOL)aliothSetSwizzle:(MTLTextureSwizzleChannels)swizzle;
 /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
  * refuses a depth texture through it by name, so a caller that wants to know what a depth
@@ -2333,9 +2342,15 @@ enum {
 		rw_print("%s\n", why);
 		return nil;
 	}
-	return [[AliothMetalTexture alloc] initWithAliothDevice:self
-							 texture:texture
-							   shape:&shape];
+	AliothMetalTexture *made = [[AliothMetalTexture alloc] initWithAliothDevice:self texture:texture shape:&shape];
+
+	/* (the K40's) MTLTextureDescriptor.swizzle: what sampling it reads (nil when that cannot be done: a
+	 * texture whose channels came back in another order would be found much later, by a picture) */
+	if (made != nil && ![made aliothSetSwizzle:[descriptor swizzle]]) {
+		[made release];
+		return nil;
+	}
+	return made;
 }
 
 /* The sampler's own base class exists and owes its protocol nothing, so this is the cheapest
@@ -3798,8 +3813,38 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 		texture->_parent = [self retain];
 		texture->_parentLevel = levels.location;
 		texture->_parentSlice = slices.location;
+		/* (the library's view keeps the texture's swizzle: so does what it is asked) */
+		texture->_swizzled = _swizzled;
+		texture->_swizzle = _swizzle;
 	}
 	return texture;
+}
+
+/* (the K40's) sampling reads these channels (Metal's MTLTextureSwizzle, each of the texel as its format gives
+ * it), by rwa_texture_swizzle; NO, said, when the library cannot. The identity needs nothing. */
+- (BOOL)aliothSetSwizzle:(MTLTextureSwizzleChannels)swizzle
+{
+	const unsigned char channels[4] = { swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha };
+	BOOL identity = swizzle.red == MTLTextureSwizzleRed && swizzle.green == MTLTextureSwizzleGreen &&
+	    swizzle.blue == MTLTextureSwizzleBlue && swizzle.alpha == MTLTextureSwizzleAlpha;
+	char why[256] = { 0 };
+
+	if (identity && !_swizzled) {
+		return YES;
+	}
+	if (mesa.texture_swizzle == NULL) {
+		RW_AGAIN("a texture swizzled %u %u %u %u, and this compiler library has no rwa_texture_swizzle; nil\n",
+			 channels[0], channels[1], channels[2], channels[3]);
+		return NO;
+	}
+	if (mesa.texture_swizzle(_texture, channels, why, sizeof(why)) != 0) {
+		RW_AGAIN("a texture swizzled %u %u %u %u: %s; nil\n", channels[0], channels[1], channels[2], channels[3],
+			 why);
+		return NO;
+	}
+	_swizzled = !identity;
+	_swizzle = swizzle;
+	return YES;
 }
 
 /*
@@ -3858,9 +3903,15 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 			     slices:(NSRange)slices
 			    swizzle:(MTLTextureSwizzleChannels)swizzle
 {
-	(void)swizzle;
-	return [self newTextureViewWithPixelFormat:format textureType:type levels:levels
-					    slices:slices];
+	AliothMetalTexture *view = [self newTextureViewWithPixelFormat:format textureType:type levels:levels
+							       slices:slices];
+
+	/* (the K40's) the view's own channels, over the texel as its format gives it; until 11-09 ignored */
+	if (view != nil && ![view aliothSetSwizzle:swizzle]) {
+		[view release];
+		return nil;
+	}
+	return view;
 }
 - (id)newSharedTextureHandle { return nil; }   /* nothing here is shared between processes */
 
@@ -3872,15 +3923,19 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 {
 	return (_shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray) ? 6 : 1;
 }
-/* The identity swizzle, and it is the truth rather than a default: a texture of this driver
- * is made from a descriptor's format alone and nothing reorders its channels, so red reads
- * as red. MTLTextureSwizzleChannelsDefault is that same quadruple. */
+/* The swizzle it was made with (descriptor or view, -aliothSetSwizzle:), else the identity --
+ * MTLTextureSwizzleChannelsDefault's quadruple: nothing reorders its channels, red reads red. */
 - (MTLTextureSwizzleChannels)swizzle
 {
-	return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
-					     MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+	return _swizzled ? _swizzle : MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+								      MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
 }
-- (unsigned int)swizzleKey { return 0; }   /* the key of "nothing is swizzled" */
+/* 0, the key of "nothing is swizzled"; else the four channels, a byte each */
+- (unsigned int)swizzleKey
+{
+	return _swizzled ? (unsigned)_swizzle.red | (unsigned)_swizzle.green << 8 | (unsigned)_swizzle.blue << 16 |
+	    (unsigned)_swizzle.alpha << 24 : 0;
+}
 /* Nothing here is a view, so every texture is its own root, and nil is what Apple's own
  * resource answers for one that was allocated rather than derived. */
 - (id)rootResource { return nil; }

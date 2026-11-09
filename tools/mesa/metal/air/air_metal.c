@@ -217,6 +217,12 @@ struct rwa_texture {
    unsigned base_level, base_layer, levels;
    enum pipe_texture_target view_target;
 
+   /* (the K40's) Metal's MTLTextureSwizzle for each channel its sampler views read
+    * (rwa_texture_swizzle), when `swizzled`; else the format's channels as they are
+    */
+   bool swizzled;
+   unsigned char swizzle[4];
+
    /* (the K40's) its render surface, made when it is first an attachment and kept: the same
     * surface for every draw into it is what lets freedreno see one framebuffer and batch the
     * draws into one pass (texture_surface)
@@ -4019,6 +4025,19 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             if (t->res->target != PIPE_TEXTURE_3D) {
                tmpl.u.tex.first_layer = t->base_layer;
                tmpl.u.tex.last_layer = t->base_layer + t->layers - 1;
+            }
+            /* (the K40's) Metal's swizzle chooses among the channels the view gives */
+            if (t->swizzled) {
+               const unsigned given[4] = { tmpl.swizzle_r, tmpl.swizzle_g, tmpl.swizzle_b,
+                                           tmpl.swizzle_a };
+               unsigned chosen[4];
+               for (unsigned c = 0; c < 4; c++)
+                  chosen[c] = t->swizzle[c] == 0 ? PIPE_SWIZZLE_0 :
+                              t->swizzle[c] == 1 ? PIPE_SWIZZLE_1 : given[t->swizzle[c] - 2];
+               tmpl.swizzle_r = chosen[0];   /* (bit fields: no pointers to them) */
+               tmpl.swizzle_g = chosen[1];
+               tmpl.swizzle_b = chosen[2];
+               tmpl.swizzle_a = chosen[3];
             }
             t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
             if (!t->view) {
@@ -8016,6 +8035,33 @@ rwa_texture_subview(struct rwa_texture *texture, const struct rwa_texture_shape 
    view->shape.mip_levels = levels;
    view->shape.array_length = want == RWA_TYPE_CUBE_ARRAY ? slices / 6 : arrayed ? slices : 1;
    return view;
+}
+
+int
+rwa_texture_swizzle(struct rwa_texture *texture, const unsigned char swizzle[4], char *why,
+                    size_t why_size)
+{
+   if (!texture || !swizzle) {
+      say(why, why_size, "a swizzle needs a texture and its four channels");
+      return -1;
+   }
+   for (unsigned c = 0; c < 4; c++) {
+      if (swizzle[c] > 5) {
+         say(why, why_size, "a swizzle of %u for channel %u: MTLTextureSwizzle is 0 to 5",
+             swizzle[c], c);
+         return -1;
+      }
+   }
+   bool identity = swizzle[0] == 2 && swizzle[1] == 3 && swizzle[2] == 4 && swizzle[3] == 5;
+   texture->swizzled = !identity;
+   memcpy(texture->swizzle, swizzle, 4);
+   /* (a view made before reads the old channels: the next binding makes another. Metal sets a
+    * swizzle when it makes the texture, before anything samples it, so there is none) */
+   if (texture->view) {
+      texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
+      texture->view = NULL;
+   }
+   return 0;
 }
 
 /* (the K40's) the whole of the texture: rwa_texture_subview over every level and slice */

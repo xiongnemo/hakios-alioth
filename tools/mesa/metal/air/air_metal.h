@@ -1435,6 +1435,15 @@ struct rwa_texture *rwa_texture_subview(struct rwa_texture *texture,
  * not filter and render to). */
 int rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size);
 
+/* (the K40's) What sampling `texture` (or a view) reads, channel by channel: Metal's
+ * MTLTextureSwizzleChannels as four MTLTextureSwizzle values (0 zero, 1 one, 2 red, 3 green,
+ * 4 blue, 5 alpha), each choosing from the texel as its format gives it (R8: red, 0, 0, 1) --
+ * -newTextureViewWithPixelFormat:...swizzle: and MTLTextureDescriptor.swizzle. Sampling and
+ * read() only: not image writes, render targets or copies. A view made afterwards keeps it.
+ * 0, or -1 and why (a value over 5). */
+int rwa_texture_swizzle(struct rwa_texture *texture, const unsigned char swizzle[4], char *why,
+			size_t why_size);
+
 /* (the K40's) A blit encoder's buffer copy and byte fill done by the GPU, in the context's order
  * after what came before and before what comes after, with nobody waiting: `size` bytes from
  * src_offset of `src` to dst_offset of `dst` (the two buffers of one device), and `size` bytes
