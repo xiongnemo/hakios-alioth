@@ -329,6 +329,9 @@ struct rwa_draw {
 	/* (the K40's) the blend colour (NULL: zero) and the depth bias { bias, slope, clamp } (NULL: none) */
 	const float *blend_color;
 	const float *depth_bias;
+	/* (the K40's) an indirect draw's arguments for the GPU to read (only when rwa_draw_features() says so) */
+	struct rwa_buffer *indirect_buffer;
+	size_t indirect_offset;
 };
 /* (the K40's) Metal's pipeline reflection, air_metal.h's rwa_argument (rwa_render_arguments) */
 struct rwa_struct_member {
@@ -599,6 +602,8 @@ static struct {
 	    unsigned, unsigned, unsigned, char *, size_t);
 	/* (the K40's) -generateMipmapsForTexture: by the GPU (air_metal.h rwa_texture_mipmaps) */
 	int (*texture_mipmaps)(struct rwa_texture *, char *, size_t);
+	/* (the K40's) what rwa_render_draw takes beyond its first shape: bit 0, GPU-read indirect arguments */
+	unsigned (*draw_features)(void);
 	/* (the K40's) a blit encoder's buffer copy and fill, by the GPU (air_metal.h rwa_buffer_copy) */
 	int (*buffer_copy)(struct rwa_buffer *, size_t, struct rwa_buffer *, size_t, size_t, char *, size_t);
 	int (*buffer_fill)(struct rwa_buffer *, size_t, size_t, unsigned char, char *, size_t);
@@ -1018,6 +1023,7 @@ mesa_available(void)
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	*(void **)&mesa.texture_subview = dlsym(mesa.handle, "rwa_texture_subview");
 	*(void **)&mesa.texture_mipmaps = dlsym(mesa.handle, "rwa_texture_mipmaps");
+	*(void **)&mesa.draw_features = dlsym(mesa.handle, "rwa_draw_features");
 	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
 	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
 	*(void **)&mesa.texture_copy = dlsym(mesa.handle, "rwa_texture_copy");
@@ -5671,10 +5677,20 @@ done:
 		[self failWith:why];
 		return NO;
 	}
+	/* (the K40's) An indirect draw whose arguments the GPU reads itself (rwa_draw.indirect_buffer, a library with
+	 * RWA_DRAW_INDIRECT): nothing waits, as in Metal. An indexed one from an index-buffer offset other than 0 has no
+	 * such form in Gallium and takes the road below. */
+	struct rwa_buffer *gpu_indirect = NULL;
+
+	if (work->indirectBuffer != nil && mesa.draw_features != NULL && (mesa.draw_features() & 1u) &&
+	    (work->indexBuffer == nil || work->indexBufferOffset == 0)) {
+		gpu_indirect = [work->indirectBuffer respondsToSelector:@selector(mesaBuffer)] ?
+		    [work->indirectBuffer mesaBuffer] : NULL;
+	}
 	/* (the K40's) An indirect draw's arguments, read NOW: what came before it in this buffer finished on the GPU
 	 * first, so a count a kernel wrote is the count drawn (see -drawPrimitives:indirectBuffer:...). Then the same
 	 * road as any draw, with the numbers in the work. */
-	if (work->indirectBuffer != nil) {
+	if (work->indirectBuffer != nil && gpu_indirect == NULL) {
 		BOOL indexed = work->indexBuffer != nil;
 		NSUInteger words = indexed ? 5 : 4;
 		const char *base = [work->indirectBuffer respondsToSelector:@selector(contents)] ?
@@ -5841,6 +5857,8 @@ done:
 		.keep_bound = 1,
 		.blend_color = work->blendColor,
 		.depth_bias = work->depthBias,
+		.indirect_buffer = gpu_indirect,
+		.indirect_offset = gpu_indirect != NULL ? work->indirectOffset : 0,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {

@@ -6871,6 +6871,13 @@ attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char 
    return true;
 }
 
+/* (the K40's) what rwa_render_draw takes beyond the struct's first shape (air_metal.h) */
+unsigned
+rwa_draw_features(void)
+{
+   return RWA_DRAW_INDIRECT;
+}
+
 int
 rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                 char *why, size_t why_size)
@@ -6912,7 +6919,31 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    enum mesa_prim prim;
    if (!mesa_prim_from_metal(draw->primitive, &prim, why, why_size))
       return -1;
-   if (draw->vertex_count == 0) {
+   /* (the K40's) an indirect draw: its counts are in GPU memory for the GPU to read, so what
+    * is checked of them here is that the arguments are inside their buffer and aligned */
+   bool indirect = draw->indirect_buffer != NULL;
+   if (indirect) {
+      size_t words = draw->index_buffer ? 5 : 4;
+      if (draw->indirect_offset % 4 != 0 ||
+          draw->indirect_offset + words * 4 > rwa_buffer_size(draw->indirect_buffer)) {
+         say(why, why_size, "an indirect draw whose %zu argument words at offset %zu are not "
+                            "inside their %zu-byte buffer, four-byte aligned", words,
+             draw->indirect_offset, rwa_buffer_size(draw->indirect_buffer));
+         return -1;
+      }
+      if (render->generated_vertex) {
+         say(why, why_size, "an indirect draw of the generated full-screen quad, whose four "
+                            "corners are this library's own and not the GPU's to count");
+         return -1;
+      }
+      if (draw->index_buffer && draw->index_buffer_offset != 0) {
+         say(why, why_size, "an indexed indirect draw from byte %zu of its index buffer: the "
+                            "GPU's indirect draw starts the indices at the buffer's first byte",
+             draw->index_buffer_offset);
+         return -1;
+      }
+   }
+   if (!indirect && draw->vertex_count == 0) {
       /* A draw of no vertices is the quad trap from the other side: it rasterises
        * nothing and leaves every attachment as it was, which reads like a shader that
        * stored nothing rather than like a draw that never ran.
@@ -6964,6 +6995,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       if (!index_size_from_metal(draw->index_type, &index_size, why, why_size))
          return -1;
+   }
+   if (draw->index_buffer && !indirect) {
       /* Apple's own rule, in Apple's own words in MTLRenderCommandEncoder.h:
        * "indexBufferOffset must be a multiple of the index size". Gallium counts the
        * start in elements, so this division is the whole of the conversion and it has to
@@ -7052,7 +7085,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * reads is the hardware's arithmetic over the base instance and the divisor, and a
        * bound computed from the wrong formula would refuse legal draws (air_metal.h).
        */
-      if (!(vst->per_vertex & (1u << k)))
+      /* (and not for an indirect draw, whose vertex range only the GPU knows) */
+      if (indirect || !(vst->per_vertex & (1u << k)))
          continue;
       int64_t first = (int64_t)s->offset + (int64_t)vst->stride[k] * low_vertex;
       if (first < 0) {
@@ -7472,9 +7506,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * caller's rwa_buffer, which outlives this draw and may be drawn with again.
        */
       struct pipe_draw_info info = {
-         .mode = prim, .index_bounds_valid = true,
+         .mode = prim, .index_bounds_valid = !indirect,
          .index_size = (uint16_t)index_size,
-         .min_index = min_index, .max_index = max_index,
+         .min_index = indirect ? 0 : min_index, .max_index = indirect ? ~0u : max_index,
          .instance_count = instances,
          .start_instance = draw->base_instance,
       };
@@ -7485,7 +7519,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .count = draw->vertex_count,
          .index_bias = index_size ? draw->base_vertex : 0,
       };
-      pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
+      /* (the K40's) an indirect draw: the counts are the GPU's own read of its arguments */
+      struct pipe_draw_indirect_info ind = {
+         .buffer = indirect ? draw->indirect_buffer->res : NULL,
+         .offset = (unsigned)draw->indirect_offset,
+         .stride = 0,
+         .draw_count = 1,
+      };
+      pipe->draw_vbo(pipe, &info, 0, indirect ? &ind : NULL, &sc, 1);
    }
 
    /* Waited for here, on the same grounds as a dispatch: a picture that was never drawn

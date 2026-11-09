@@ -1324,7 +1324,21 @@ struct rwa_draw {
 	 * { bias, slope scale, clamp }; NULL or zeros is none. Appended, as above. */
 	const float *blend_color;
 	const float *depth_bias;
+	/* (the K40's) an indirect draw's arguments in GPU memory, read by the GPU itself (Gallium's
+	 * pipe_draw_indirect_info, freedreno's CP_DRAW_INDIRECT): Metal's
+	 * MTLDraw(Indexed)PrimitivesIndirectArguments, whose words are Gallium's in Gallium's order.
+	 * vertex_count, vertex_start, instance_count and base_instance (and base_vertex) are then
+	 * the GPU's to read and ignored here, and the checks that need them on the processor are not
+	 * made; an indexed one starts at the index buffer's first byte (index_buffer_offset 0).
+	 * NULL: a direct draw. Only a library answering rwa_draw_features() & RWA_DRAW_INDIRECT
+	 * reads these, and an older one would draw the counts it was given instead. Appended. */
+	struct rwa_buffer *indirect_buffer;
+	size_t indirect_offset;
 };
+
+/* (the K40's) what this library's rwa_render_draw takes beyond the struct's first shape */
+#define RWA_DRAW_INDIRECT 1u
+unsigned rwa_draw_features(void);
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
