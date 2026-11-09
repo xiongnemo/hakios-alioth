@@ -2635,8 +2635,14 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[2]);
       if (!v || !x || !i)
          return false;
-      if (!nir_src_is_const(nir_src_for_ssa(i)))
-         return air_error(c, "instruction: insertelement at a run-time index");
+      if (!nir_src_is_const(nir_src_for_ssa(i))) {
+         /* (the K40's) at a run-time index: each lane takes the new value where the index names it
+          * (nir_vector_insert's compare and select) -- Impeller's sRGB/linear filters write a
+          * colour's lanes in a loop (refused until 2026-11-10: LinearToSrgbFilter,
+          * SrgbToLinearFilter) */
+         air_set(c, &in->base, air_val_ssa(c, nir_vector_insert(&c->b, v, x, nir_u2u32(&c->b, i))));
+         return true;
+      }
       air_set(c, &in->base,
               air_val_ssa(c, nir_vector_insert_imm(&c->b, v, x,
                                                    nir_src_as_uint(nir_src_for_ssa(i)))));
