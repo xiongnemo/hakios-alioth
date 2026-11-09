@@ -297,3 +297,25 @@ diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
  			goto out;
  		}
  		CS_GenericBlob* xmlblob = NULL;
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 9ba4ffb..a3b162e 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2163,12 +2163,11 @@ STATIC int
+ sysctl_sysctl_bootargs
+ (__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+ {
+-	int error;
+-	char buf[BOOT_LINE_LENGTH];
+-
+-	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
+-	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
+-	return error;
++	/*
++	 * (redmi-k40) all of a line longer than boot_args' BOOT_LINE_LENGTH, from the device tree (pexpert/arm/
++	 * pe_bootargs.c): straight from PE_boot_args(), which is never written after the boot -- read only (size 0)
++	 */
++	return sysctl_io_string(req, PE_boot_args(), 0, 0, NULL);
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, bootargs,

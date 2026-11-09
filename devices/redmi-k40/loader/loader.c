@@ -68,6 +68,9 @@ struct boot_video {
 };
 
 #define BOOT_LINE_LENGTH 608
+/* all of the kernel's arguments, of which boot_args holds BOOT_LINE_LENGTH - 1 (the rest: /chosen "alioth-boot-args") */
+#define KERNEL_LINE_LENGTH 1024
+static char kernel_line[KERNEL_LINE_LENGTH];
 
 struct boot_args {
 	uint16_t revision;
@@ -3586,13 +3589,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	const char *base_cmdline = (PLAT->uart != 0 && !own_serial) ? "debug=0x8 serial=3 " : "debug=0x8 ";
 	uint32_t n = 0;
-	for (const char *c = base_cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-		ba->commandLine[n++] = *c;
+	for (const char *c = base_cmdline; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+		kernel_line[n++] = *c;
 	}
 	/* one processor unless the payload asks for more (of two "cpus=" the kernel takes the first) */
 	if (!more_cores) {
-		for (const char *c = "cpus=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = "cpus=1 "; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
 	}
 #if defined(LOADER_ALIOTH)
@@ -3618,8 +3621,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			usb_connected = 0;
 			usb_rx_queued = 0;
 			usb_lent = 1;
-			for (const char *a = "usbfree=1 "; *a && n < BOOT_LINE_LENGTH - 1; a++) {
-				ba->commandLine[n++] = *a;
+			for (const char *a = "usbfree=1 "; *a && n < KERNEL_LINE_LENGTH - 1; a++) {
+				kernel_line[n++] = *a;
 			}
 		}
 	}
@@ -3630,13 +3633,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		own_root |= starts_with(c, "rd=") && (c == pi.cmdline || c[-1] == ' ');
 	}
 	if (rd_size != 0 && !own_root) {
-		for (const char *c = "rd=md0 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = "rd=md0 "; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
 	}
 	if (wdt_armed) {
-		for (const char *c = "hv_wdt_pet=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = "hv_wdt_pet=1 "; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
 	}
 	/*
@@ -3651,8 +3654,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		own_compression |= starts_with(c, "vm_compression_limit=");
 	}
 	if (win_size > 0x200000000ULL && !own_compression) {
-		for (const char *c = "vm_compression_limit=262144 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = "vm_compression_limit=262144 "; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
 	}
 #if defined(LOADER_ALIOTH)
@@ -3665,17 +3668,17 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (scan_slots_n != 0 && !own_slots) {
 		static const char hex[] = "0123456789abcdef";
 
-		for (const char *c = "fb_slots_more="; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = "fb_slots_more="; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
-		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = (char)('0' + scan_slots_n);
-		for (const char *c = " fb_slots_pa=0x"; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		if (n < KERNEL_LINE_LENGTH - 1) kernel_line[n++] = (char)('0' + scan_slots_n);
+		for (const char *c = " fb_slots_pa=0x"; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
-		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
-			ba->commandLine[n++] = hex[(scan_slots_pa >> shift) & 0xf];
+		for (int shift = 60; shift >= 0 && n < KERNEL_LINE_LENGTH - 1; shift -= 4) {
+			kernel_line[n++] = hex[(scan_slots_pa >> shift) & 0xf];
 		}
-		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+		if (n < KERNEL_LINE_LENGTH - 1) kernel_line[n++] = ' ';
 	}
 #endif
 	if (block_enabled) {
@@ -3683,13 +3686,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		static const char hex[] = "0123456789abcdef";
 		uint64_t address = (uint64_t)(uintptr_t)&block_shared;
 
-		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = prefix; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
-		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
-			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		for (int shift = 60; shift >= 0 && n < KERNEL_LINE_LENGTH - 1; shift -= 4) {
+			kernel_line[n++] = hex[(address >> shift) & 0xf];
 		}
-		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+		if (n < KERNEL_LINE_LENGTH - 1) kernel_line[n++] = ' ';
 	}
 	if (block_enabled && df_state > 0 && df_map.magic != 0) {
 		/* darwin as a file: where its map is, for the kernel's own UFS driver (darwinfile.c) */
@@ -3697,35 +3700,51 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		static const char hex[] = "0123456789abcdef";
 		uint64_t address = (uint64_t)(uintptr_t)&df_map;
 
-		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = prefix; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
-		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
-			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		for (int shift = 60; shift >= 0 && n < KERNEL_LINE_LENGTH - 1; shift -= 4) {
+			kernel_line[n++] = hex[(address >> shift) & 0xf];
 		}
-		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+		if (n < KERNEL_LINE_LENGTH - 1) kernel_line[n++] = ' ';
 	}
 	if (battery_requested) {
 		static const char prefix[] = "battery_shared_pa=0x";
 		static const char hex[] = "0123456789abcdef";
 		uint64_t address = (uint64_t)(uintptr_t)&charger_shared;
 
-		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = prefix; *c && n < KERNEL_LINE_LENGTH - 1; c++) {
+			kernel_line[n++] = *c;
 		}
-		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
-			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		for (int shift = 60; shift >= 0 && n < KERNEL_LINE_LENGTH - 1; shift -= 4) {
+			kernel_line[n++] = hex[(address >> shift) & 0xf];
 		}
-		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+		if (n < KERNEL_LINE_LENGTH - 1) kernel_line[n++] = ' ';
 	}
 	const char *cut = pi.cmdline;
-	for (; *cut && n < BOOT_LINE_LENGTH - 1; cut++) {
-		ba->commandLine[n++] = *cut;
+	for (; *cut && n < KERNEL_LINE_LENGTH - 1; cut++) {
+		kernel_line[n++] = *cut;
 	}
 	if (*cut) {
 		/* (the payload's own come last: what does not fit is lost, and said) */
-		SAY("run: THE KERNEL'S ARGUMENTS ARE LONGER THAN %d CHARACTERS: cut before \"%s\"\n", (uint64_t)(BOOT_LINE_LENGTH - 1), cut);
+		SAY("run: THE KERNEL'S ARGUMENTS ARE LONGER THAN %d CHARACTERS: cut before \"%s\"\n", (uint64_t)(KERNEL_LINE_LENGTH - 1), cut);
 	}
+	kernel_line[n] = 0;
+	/*
+	 * boot_args holds BOOT_LINE_LENGTH - 1 characters: a longer line is cut there where an argument ends (a kernel that
+	 * only reads boot_args loses the last ones whole, not wifi_mac= less its last digit as on 2026-11-09), and all of it
+	 * goes to the device tree too, /chosen "alioth-boot-args", which the device's kernel parses instead
+	 * (pexpert/arm/pe_bootargs.c in overlays/xnu)
+	 */
+	uint32_t kept = n;
+	if (kept > BOOT_LINE_LENGTH - 1) {
+		kept = BOOT_LINE_LENGTH - 1;
+		while (kept > 0 && kernel_line[kept] != ' ') {
+			kept--;
+		}
+	}
+	memcpy(ba->commandLine, kernel_line, kept);
+	ba->commandLine[kept] = 0;
 
 	/* --- device tree ---------------------------------------------------- */
 	const struct platform *plat = PLAT;
@@ -3761,6 +3780,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	dt_begin(&w, "chosen");
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
+	/* a line longer than boot_args holds: all of it (see kernel_line above) */
+	if (n > BOOT_LINE_LENGTH - 1) {
+		dt_prop_str(&w, "alioth-boot-args", kernel_line);
+	}
 	dt_prop_u64(&w, "dram-base", phys_base);
 	dt_prop_u64(&w, "dram-size", win_size);
 	dt_prop_u32(&w, "debug-enabled", 1);
@@ -4007,7 +4030,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	ba->deviceTreeP = dt_pa - slide;
 	ba->deviceTreeLength = dt_len;
 	print("device tree %x len %x, boot_args %x, top %x\n", dt_pa, (uint64_t)dt_len, ba_pa, top);
-	print("cmdline: %s\n", ba->commandLine);
+	print("cmdline: %s\n", kernel_line);
+	if (n > BOOT_LINE_LENGTH - 1) {
+		print("cmdline: %d characters: boot_args holds the first %d, /chosen alioth-boot-args all of them\n", (uint64_t)n,
+		    (uint64_t)kept);
+	}
 	if (kernel_mpidr != this_mpidr) {
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
 	}
