@@ -1631,7 +1631,8 @@ hakios_compass_init(void)
  * Metal for the applications the owner allows (the Metal plan's step 3, hk's allow-list). The port's Metal driver
  * (libhakios.metal.dylib) is registered with Metal in this process -- MTLAddDevice, as System Check's Metal tab does
  * it -- before the application's own code runs, so its MTLCreateSystemDefaultDevice() answers the Adreno. Nothing is
- * allowed unless named: the boot-arg metal_apps=ID,ID,... or /redwood/etc/metal-apps, one bundle ID a line. Never a
+ * allowed unless named: the boot-arg metal_apps=ID,ID,... or /redwood/etc/metal-apps, one bundle ID a line -- or, with
+ * the boot-arg metal_flutter=1, by embedding Flutter.framework (Flutter has no other way to draw). Never a
  * program of the system's: backboardd and SpringBoard never load this library (build.sh's INJECT is "*.app *.appex"),
  * an application of /Applications or /System is not third_party(), and an app extension or widget is refused here by
  * its path. The window server keeps OpenGL ES, which composites at 120 Hz where Metal composited at 14 to 27 fps.
@@ -1698,7 +1699,24 @@ metal_for_allowed(void)
 		file[got > 0 ? got : 0] = '\0';
 		close(fd);
 	}
-	if (apps[0] == '\0' && file[0] == '\0') {
+	/*
+	 * (the K40's) metal_flutter=1: an application that embeds Flutter.framework is allowed without being named. Flutter
+	 * on an iPhone draws through Metal and nothing else -- given no device, its engine stops the application at launch
+	 * (Flutter Check: SIGABRT 0.1 s in, 2026-11-10).
+	 */
+	bool flutter = false;
+
+	if (strstr(args, "metal_flutter=1") != NULL) {
+		char framework[sizeof(path) + 48];
+		const char *slash = strrchr(path, '/');
+
+		if (slash != NULL) {
+			snprintf(framework, sizeof(framework), "%.*s/Frameworks/Flutter.framework/Flutter", (int)(slash - path),
+			    path);
+			flutter = access(framework, F_OK) == 0;
+		}
+	}
+	if (apps[0] == '\0' && file[0] == '\0' && !flutter) {
 		return;                 /* (no list: nothing allowed, nothing loaded, nothing said) */
 	}
 
@@ -1717,8 +1735,12 @@ metal_for_allowed(void)
 		return;
 	}
 	if (!metal_listed(bundle_id, apps, ',') && !metal_listed(bundle_id, file, '\n')) {
-		say("metal: %s is not on the allow-list (metal_apps=, %s); not allowed\n", bundle_id, METAL_APPS_FILE);
-		return;
+		if (!flutter) {
+			say("metal: %s is not on the allow-list (metal_apps=, %s); not allowed\n", bundle_id, METAL_APPS_FILE);
+			return;
+		}
+		say("metal: %s embeds Flutter.framework, which draws through Metal only (metal_flutter=1): allowed\n",
+		    bundle_id);
 	}
 
 	void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW);
