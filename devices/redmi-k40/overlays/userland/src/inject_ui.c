@@ -1791,6 +1791,41 @@ metal_for_allowed(void)
 	say("metal: %s is allowed: the port's Metal device is registered in it\n", bundle_id);
 }
 
+/*
+ * (the K40's) boot-arg app_images=1: every image an application has or loads outside the shared cache, said with its
+ * address as it comes. The kernel's "fault:" lines give bare addresses, the cache's named by its slide and these by
+ * nothing -- Flutter Check's first frame died at 0x10707d87c in an image no log named (2026-11-10).
+ */
+static uintptr_t image_cache_start, image_cache_end;
+
+static void
+image_said(const struct mach_header *header, intptr_t image_slide)
+{
+	Dl_info info;
+
+	(void)image_slide;
+	if ((uintptr_t)header >= image_cache_start && (uintptr_t)header < image_cache_end) {
+		return;
+	}
+	if (dladdr(header, &info) != 0 && info.dli_fname != NULL) {
+		say("image %#lx %s\n", (unsigned long)(uintptr_t)header, info.dli_fname);
+	}
+}
+
+static void
+images_said(const void *cache, size_t length)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || strstr(args, "app_images=1") == NULL) {
+		return;
+	}
+	image_cache_start = (uintptr_t)cache;
+	image_cache_end = (uintptr_t)cache + length;
+	_dyld_register_func_for_add_image(image_said);      /* (at once for those loaded, then for each new one) */
+}
+
 __attribute__((constructor))
 static void
 hakios_ui_init(void)
@@ -1801,6 +1836,7 @@ hakios_ui_init(void)
 	Method method;
 	IMP original;
 
+	images_said(cache, length);
 	model_decide();
 	metal_for_allowed();
 	app_opengl_es();
