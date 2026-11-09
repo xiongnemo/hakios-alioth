@@ -1905,20 +1905,19 @@ enum {
 	id vertex = [descriptor vertexFunction];
 	id fragment = [descriptor fragmentFunction];
 
-	if (fragment == nil) {
-		return [self fail:error with:@"the descriptor has no fragment function, and this "
-					     @"driver has nothing to draw without one"];
-	}
-	if (![fragment respondsToSelector:bitcode] ||
+	/* (the K40's) no fragment function is Metal's depth-only pipeline -- a shadow map, a depth prepass -- and the
+	 * compiler library makes an empty fragment stage for it (rwa_render_create with no fragment module, which it
+	 * refuses with a colour attachment); this driver refused every such pipeline until 11-09 */
+	if ((fragment != nil && ![fragment respondsToSelector:bitcode]) ||
 	    (vertex != nil && ![vertex respondsToSelector:bitcode])) {
 		return [self fail:error with:@"a function in this descriptor does not answer "
 					     @"bitcodeData, so its AIR cannot be read"];
 	}
-	NSData *fragment_air = ((NSData *(*)(id, SEL))objc_msgSend)(fragment, bitcode);
+	NSData *fragment_air = fragment != nil ? ((NSData *(*)(id, SEL))objc_msgSend)(fragment, bitcode) : nil;
 	NSData *vertex_air = vertex != nil ?
 	    ((NSData *(*)(id, SEL))objc_msgSend)(vertex, bitcode) : nil;
 
-	if (fragment_air == nil || [fragment_air length] == 0) {
+	if (fragment != nil && (fragment_air == nil || [fragment_air length] == 0)) {
 		return [self fail:error with:@"the fragment function has no bitcode"];
 	}
 
@@ -2084,8 +2083,8 @@ enum {
 	    vertex_air != nil ? [vertex_air bytes] : NULL,
 	    vertex_air != nil ? [vertex_air length] : 0,
 	    vertex != nil ? [[vertex name] UTF8String] : NULL,
-	    [fragment_air bytes], [fragment_air length], [[fragment name] UTF8String],
-	    &shape, &info, why, sizeof(why));
+	    fragment_air != nil ? [fragment_air bytes] : NULL, fragment_air != nil ? [fragment_air length] : 0,
+	    fragment != nil ? [[fragment name] UTF8String] : NULL, &shape, &info, why, sizeof(why));
 
 	if (render == NULL) {
 		/* PRINTED as well as returned, and RW_AGAIN because the same specification

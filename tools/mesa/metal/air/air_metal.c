@@ -6269,8 +6269,17 @@ rwa_render_create(struct rwa_device *device,
       say(why, why_size, "a render pipeline with no attachment description");
       return NULL;
    }
-   if (!fragment_bitcode || fragment_size < 4) {
+   /* (the K40's) no fragment module at all is Metal's depth-only pipeline -- fragmentFunction
+    * nil for a shadow map or a depth prepass -- and gets an empty fragment stage of this
+    * library's below; with a colour attachment there would be nothing to write it */
+   if (fragment_bitcode && fragment_size < 4) {
       say(why, why_size, "%zu bytes is not a fragment shader module", fragment_size);
+      return NULL;
+   }
+   if (!fragment_bitcode && shape->color_count != 0) {
+      say(why, why_size, "no fragment function and %u colour attachment%s: only a depth-only "
+                         "pipeline may leave the fragment stage out", shape->color_count,
+          shape->color_count == 1 ? "" : "s");
       return NULL;
    }
    /* No colour attachment is allowed only with a depth one, which is Metal's own rule
@@ -6423,17 +6432,28 @@ rwa_render_create(struct rwa_device *device,
     * error between the stages cannot surface until the draw, because ir3 compiles and
     * links at draw time (ir3_cache_lookup), so the two belong to two different calls.
     */
-   struct air_constant_value *ffc;
-   unsigned num_ffc =
-      air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
-   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
    const char *error;
-   nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
-                               fragment_entry, &fopts, device->nir_options, &render->finfo,
-                               &error);
-   if (!fs) {
-      say(why, why_size, "%s", error ? error : "the fragment module could not be translated");
-      goto fail;
+   nir_shader *fs;
+   if (!fragment_bitcode) {
+      /* (the K40's) the depth-only pipeline's fragment stage: empty -- nothing bound, nothing
+       * written but the depth the rasterizer makes -- and its reflection empty with it */
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, device->nir_options,
+                                                     "rwa_depth_only");
+      fs = b.shader;
+      ralloc_steal(render->mem_ctx, fs);
+      memset(&render->finfo, 0, sizeof(render->finfo));
+      render->finfo.stage = MESA_SHADER_FRAGMENT;
+   } else {
+      struct air_constant_value *ffc;
+      unsigned num_ffc =
+         air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
+      const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
+      fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size, fragment_entry, &fopts,
+                      device->nir_options, &render->finfo, &error);
+      if (!fs) {
+         say(why, why_size, "%s", error ? error : "the fragment module could not be translated");
+         goto fail;
+      }
    }
    if (render->finfo.stage != MESA_SHADER_FRAGMENT) {
       say(why, why_size, "%s is a %s shader, and this makes render pipelines with a "
