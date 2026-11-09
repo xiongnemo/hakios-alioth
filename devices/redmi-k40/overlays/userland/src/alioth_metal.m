@@ -3592,9 +3592,22 @@ enum {
 	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
 			     (unsigned)region.size.depth };
 
-	(void)image;
 	if (_shape.pixel_format >= MTLPixelFormatPVRTC_RGB_2BPP && _shape.pixel_format <= MTLPixelFormatPVRTC_RGBA_4BPP_sRGB) {
 		[self aliothWritePVRTC:bytes level:level slice:slice region:region];
+		return;
+	}
+	/* (the K40's) planes of a 3D region one at a time when the caller says how far apart they are: the library takes
+	 * them packed, rows times height, and bytesPerImage may be more (it was ignored: a padded volume came in sheared) */
+	if (size[2] > 1 && image != 0) {
+		for (unsigned z = 0; z < size[2]; z++) {
+			unsigned at[3] = { origin[0], origin[1], origin[2] + z }, one[3] = { size[0], size[1], 1 };
+
+			if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, at, one,
+					       (const char *)bytes + (size_t)z * image, stride, why, sizeof(why)) != 0) {
+				rw_print("writing texels: %s\n", why);
+				return;
+			}
+		}
 		return;
 	}
 	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
@@ -3625,7 +3638,19 @@ enum {
 	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
 			     (unsigned)region.size.depth };
 
-	(void)image;
+	/* (the K40's) a 3D region plane by plane at the caller's bytesPerImage, as -replaceRegion: above */
+	if (size[2] > 1 && image != 0) {
+		for (unsigned z = 0; z < size[2]; z++) {
+			unsigned at[3] = { origin[0], origin[1], origin[2] + z }, one[3] = { size[0], size[1], 1 };
+
+			if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, at, one,
+					      (char *)bytes + (size_t)z * image, stride, why, sizeof(why)) != 0) {
+				rw_print("reading texels: %s\n", why);
+				return;
+			}
+		}
+		return;
+	}
 	if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
 			      stride, why, sizeof(why)) != 0) {
 		rw_print("reading texels: %s\n", why);
