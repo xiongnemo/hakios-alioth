@@ -148,6 +148,17 @@ air_nir_bit_size(struct air_ctx *c, const struct air_type *t)
     * returned so that the instruction under construction stays well formed
     * while the error just set discards the shader.
     */
+   /* (the K40's) An odd integer width -- i2, i3, i4 ... i63, which Apple's compiler makes of a
+    * value it can prove small (a face index, vid / 6) and SPIRV-Cross of an HLSL bit field -- is
+    * CARRIED in the next width NIR has, 32 up to 32 bits and 64 above, zero-extended; the few
+    * operations whose result depends on the width wrap or sign-extend it there (odd_width and
+    * its helpers, at translate_binop, translate_cast, translate_cmp and the constants). It was
+    * refused, and System Check's metal.engine -- a shader written by hand -- met an i3.
+    */
+   if (t->kind != AIR_TYPE_ARRAY && t->kind != AIR_TYPE_STRUCT && t->kind != AIR_TYPE_POINTER &&
+       air_type_scalar(t)->kind == AIR_TYPE_INT && bits > 1 && bits < 64 && bits != 8 &&
+       bits != 16 && bits != 32)
+      return bits < 32 ? 32 : 64;
    if (bits != 1 && bits != 8 && bits != 16 && bits != 32 && bits != 64) {
       /* Zero is a different fact wearing the same symptom, and saying so in one
        * message made 79 modules read as carrying a 0-bit integer when what they
@@ -271,6 +282,34 @@ air_get_ssa(struct air_ctx *c, const struct air_value *v)
    return val->def;
 }
 
+/* -- odd integer widths (the K40's: air_nir_bit_size says how they are carried) -- */
+
+/* an integer type's own width when NIR carries it in a wider one (i3 in 32 bits); else 0 */
+static unsigned
+odd_width(const struct air_type *t)
+{
+   if (!t || t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_POINTER)
+      return 0;
+   const struct air_type *s = air_type_scalar(t);
+   unsigned n = s->kind == AIR_TYPE_INT ? s->bits : 0;
+   return n > 1 && n < 64 && n != 8 && n != 16 && n != 32 ? n : 0;
+}
+
+/* the low n bits of x: an odd-width value is kept zero-extended in its container */
+static nir_def *
+odd_mask(struct air_ctx *c, nir_def *x, unsigned n)
+{
+   return nir_iand_imm(&c->b, x, (1ull << n) - 1);
+}
+
+/* x, an odd-width value kept zero-extended, sign-extended from its bit n-1 across its container */
+static nir_def *
+odd_sext(struct air_ctx *c, nir_def *x, unsigned n)
+{
+   unsigned s = x->bit_size - n;
+   return nir_ishr_imm(&c->b, nir_ishl_imm(&c->b, x, s), s);
+}
+
 /* -- constants ---------------------------------------------------------- */
 
 static nir_def *
@@ -279,6 +318,8 @@ scalar_constant(struct air_ctx *c, const struct air_type *t, uint64_t bits)
    unsigned n = air_type_bit_size(t);
    if (t->kind == AIR_TYPE_INT && t->bits == 1)
       return nir_imm_bool(&c->b, bits & 1);
+   if (odd_width(t))   /* (the K40's: zero-extended in its container, as every odd-width value) */
+      return nir_imm_intN_t(&c->b, bits & ((1ull << n) - 1), n < 32 ? 32 : 64);
    if (air_type_is_float(t)) {
       switch (n) {
       case 16: return nir_imm_intN_t(&c->b, bits, 16);
@@ -2235,6 +2276,16 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
    if (is_float)
       c->b.exact = !(in->flags & (AIR_FMF_UNSAFE_ALGEBRA | AIR_FMF_REASSOC));
 
+   /* (the K40's) an odd width: the signed operations see the value sign-extended from its own
+    * top bit, and every result is wrapped back to the width below */
+   unsigned odd = is_float ? 0 : odd_width(in->base.type);
+   if (odd && (in->sub == AIR_BINOP_SDIV || in->sub == AIR_BINOP_SREM)) {
+      x = odd_sext(c, x, odd);
+      y = odd_sext(c, y, odd);
+   }
+   if (odd && in->sub == AIR_BINOP_ASHR)
+      x = odd_sext(c, x, odd);
+
    switch (in->sub) {
    case AIR_BINOP_ADD: res = is_float ? nir_fadd(&c->b, x, y) : nir_iadd(&c->b, x, y); break;
    case AIR_BINOP_SUB: res = is_float ? nir_fsub(&c->b, x, y) : nir_isub(&c->b, x, y); break;
@@ -2254,6 +2305,8 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
       return air_error(c, "instruction: binary operator %u", in->sub);
    }
    c->b.exact = was_exact;
+   if (odd)
+      res = odd_mask(c, res, odd);
    air_set(c, &in->base, air_val_ssa(c, res));
    return true;
 }
@@ -2279,6 +2332,11 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
       return false;
    unsigned bits = air_nir_bit_size(c, dt);
    nir_def *res;
+   /* (the K40's) odd widths: a signed reading of one sign-extends it from its own top bit first,
+    * and a result of one is wrapped to its width after (zero-extension needs neither) */
+   unsigned src_odd = odd_width(st), dst_odd = odd_width(dt);
+   if (src_odd && x->bit_size > 1 && (in->sub == AIR_CAST_SEXT || in->sub == AIR_CAST_SITOFP))
+      x = odd_sext(c, x, src_odd);
    switch (in->sub) {
    case AIR_CAST_TRUNC:
       res = bits == 1 ? nir_i2b(&c->b, nir_iand_imm(&c->b, x, 1)) : nir_u2uN(&c->b, x, bits);
@@ -2369,6 +2427,8 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
    default:
       return air_error(c, "instruction: cast %u", in->sub);
    }
+   if (dst_odd && res->bit_size > 1)
+      res = odd_mask(c, res, dst_odd);
    air_set(c, &in->base, air_val_ssa(c, res));
    return true;
 }
@@ -2380,6 +2440,13 @@ translate_cmp(struct air_ctx *c, const struct air_inst *in)
    nir_def *y = air_get_ssa(c, in->operands[1]);
    if (!x || !y)
       return false;
+   /* (the K40's) an odd width compared as signed: both sides sign-extended from its top bit */
+   unsigned odd = odd_width(in->operands[0]->type);
+   if (odd && x->bit_size > 1 && (in->sub == AIR_ICMP_SGT || in->sub == AIR_ICMP_SGE ||
+                                  in->sub == AIR_ICMP_SLT || in->sub == AIR_ICMP_SLE)) {
+      x = odd_sext(c, x, odd);
+      y = odd_sext(c, y, odd);
+   }
    nir_def *res;
    switch (in->sub) {
    /* NaN never appears in these shaders (nnan is set on every one), so the
