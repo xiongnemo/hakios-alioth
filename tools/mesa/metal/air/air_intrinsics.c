@@ -591,6 +591,19 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
        */
       r = nir_reduce(&c->b, a[0],
                      .reduction_op = is_float ? nir_op_fadd : nir_op_iadd);
+   } else if ((!strcmp(op, "simd_shuffle_down") || !strcmp(op, "simd_shuffle_up")) && argc >= 2) {
+      /* (the K40's) Metal's simd_shuffle_down / _up: the value of the lane delta above / below,
+       * and -- unlike NIR's, which leaves them undefined -- the lanes with none keep their own
+       * value. Core Image's stdlib uses the down form (air.simd_shuffle_down.v2f32(<2 x float>,
+       * i16)). ir3 on a6xx has no shuffle instruction; nir_lower_subgroups lowers this one.
+       */
+      bool down = !strcmp(op, "simd_shuffle_down");
+      nir_def *delta = nir_u2u32(&c->b, a[1]);
+      nir_def *lane = nir_load_subgroup_invocation(&c->b);
+      nir_def *moved = down ? nir_shuffle_down(&c->b, a[0], delta) : nir_shuffle_up(&c->b, a[0], delta);
+      nir_def *inside = down ? nir_ult(&c->b, nir_iadd(&c->b, lane, delta), nir_load_subgroup_size(&c->b))
+                             : nir_uge(&c->b, lane, delta);
+      r = nir_bcsel(&c->b, inside, moved, a[0]);
    } else if (!strcmp(op, "normalize_function_constant_predicate")) {
       /* Metal's compiler stores the predicates that say whether a dependent
        * function constant applies in `__metal_implicit_fc_pred_N` bytes, and
@@ -1625,6 +1638,18 @@ static bool
 texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
    struct air_tex_name t;
+
+   /* (the K40's) air.is_null_texture_2d(texture) and kin: whether the argument has a texture
+    * bound. Answered "no, it is not null", because that is the one answer the library makes
+    * safe -- it refuses, by name, every dispatch and draw whose shader reads a slot nothing is
+    * bound to -- so a kernel given its texture works and one given none is refused rather than
+    * reading nothing. Core Image's depth-aware applyCoefficients* kernels ask it (6 modules of
+    * its default.metallib); refused, the whole pipeline was.
+    */
+   if (!strncmp(n->part[0], "is_null_", 8)) {
+      air_set(c, &in->base, air_val_ssa(c, nir_imm_false(&c->b)));
+      return true;
+   }
    if (!parse_tex_name(n->part[0], &t))
       return air_error(c, "intrinsic: air.%s (a texture name this cannot take apart)",
                        n->part[0]);
