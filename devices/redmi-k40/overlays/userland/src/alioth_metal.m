@@ -1530,9 +1530,24 @@ enum {
 }
 @end
 
+/* (the K40's) MTLParallelRenderCommandEncoder (its comment is at its implementation) */
+@interface AliothMetalParallelRenderEncoder : NSObject {
+	AliothMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder */
+	MTLRenderPassDescriptor *_descriptor;
+	NSMutableArray *_recorders;
+	NSString *_label;
+	BOOL _ended;
+}
+- (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
+				  descriptor:(MTLRenderPassDescriptor *)descriptor;
+@end
+
 @interface AliothMetalRenderEncoder : _MTLCommandEncoder
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
 				  descriptor:(id)descriptor;
+/* (the K40's) where this encoder's work goes: its command buffer, or a parallel encoder's recorder for one of its
+ * sub-encoders (anything answering -recordWork: and -recordBlit:; not retained: it outlives the encoder) */
+- (void)aliothSetRecorder:(id)recorder;
 /* Every form of every draw method records through this one, indexed or not: the thirteen
  * lines that copy the encoder's state into the work item are the same either way, and two
  * copies of them are how one form ends up carrying state the other does not. */
@@ -5097,10 +5112,15 @@ enum {
 		   autorelease];
 }
 
+/* (the K40's) one pass, several sub-encoders: AliothMetalParallelRenderEncoder (it answered nil) */
 - (id)parallelRenderCommandEncoderWithDescriptor:(id)descriptor
 {
-	(void)descriptor;
-	return nil;   /* one encoder at a time here; a parallel pass needs the split */
+	if (descriptor == nil) {
+		rw_print("a parallel render pass needs a descriptor\n");
+		return nil;
+	}
+	return [[[AliothMetalParallelRenderEncoder alloc] initWithAliothCommandBuffer:self descriptor:descriptor]
+		   autorelease];
 }
 
 /* The rest of what MTLCommandBuffer requires of a driver. Each declines rather than being
@@ -6097,6 +6117,7 @@ done:
 
 @implementation AliothMetalRenderEncoder {
 	AliothMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder */
+	id _recorder;                               /* (the K40's) -aliothSetRecorder:; _commandBuffer by default */
 	AliothMetalRenderPipeline *_pipeline;
 	id _color[8];
 	id _resolve[8];         /* (the K40's) each colour attachment's resolveTexture, resolved at -endEncoding */
@@ -6160,6 +6181,7 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 		return nil;
 	}
 	_commandBuffer = commandBuffer;
+	_recorder = commandBuffer;
 
 	/* What the pass is drawing into, and whether it begins by clearing. Metal keeps this in
 	 * the pass descriptor rather than in the pipeline, so it belongs to the encoder. */
@@ -6259,6 +6281,8 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 }
 
 - (id)device { return [_commandBuffer device]; }
+
+- (void)aliothSetRecorder:(id)recorder { _recorder = recorder != nil ? recorder : _commandBuffer; }
 
 /* (the K40's) retained, as Metal's encoder does (the compute encoder says why) */
 - (void)setRenderPipelineState:(id)state
@@ -6547,7 +6571,7 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 	for (unsigned i = 0; i < _fragmentSamplerCount; i++) {
 		work->samplers[i] = _fragmentSamplers[i];
 	}
-	[_commandBuffer recordWork:work];
+	[_recorder recordWork:work];
 	[work release];
 	_drew = YES;
 	/* (the K40's) the pass's load actions belong to its FIRST draw: every draw is its own rwa_render_draw, and
@@ -7563,7 +7587,7 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		work->clearStencil = _clearStencil;
 		work->clearsDepth = _clearsDepth;
 		work->clearsStencil = _clearsStencil;
-		[_commandBuffer recordWork:work];
+		[_recorder recordWork:work];
 		[work release];
 	}
 	/* (the K40's) the pass's resolves, after its work in the command buffer's order */
@@ -7579,11 +7603,165 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		b->kind = ALIOTH_BLIT_RESOLVE;
 		b->source = [from retain];
 		b->destination = [to retain];
-		[_commandBuffer recordBlit:b];
+		[_recorder recordBlit:b];
 		[b release];
 	}
 	_ended = YES;
 	[super endEncoding];
+}
+
+@end
+
+/*
+ * (the K40's) One sub-encoder's work, kept until its parallel encoder ends: a parallel pass's sub-encoders may encode
+ * at the same time on different threads, and Metal runs them in the order they were MADE, not the order their
+ * commands arrive -- so each records here, and -[AliothMetalParallelRenderEncoder endEncoding] hands the lists to the
+ * command buffer one after the other. A work's references are kept from the moment it is recorded, as the command
+ * buffer's own -recordWork: keeps them.
+ */
+@interface AliothMetalRecorder : NSObject {
+@public
+	NSMutableArray *items;
+}
+@end
+
+@implementation AliothMetalRecorder
+
+- (instancetype)init
+{
+	if ((self = [super init]) != nil) {
+		items = [[NSMutableArray alloc] init];
+	}
+	return self;
+}
+
+- (void)dealloc
+{
+	[items release];
+	[super dealloc];
+}
+
+- (void)recordWork:(AliothMetalWork *)work
+{
+	[work aliothRetainReferences];
+	@synchronized (self) {
+		[items addObject:work];
+	}
+}
+
+- (void)recordBlit:(id)blit
+{
+	@synchronized (self) {
+		[items addObject:blit];
+	}
+}
+
+@end
+
+/*
+ * (the K40's) MTLParallelRenderCommandEncoder: one render pass encoded by several sub-encoders, each on a thread of
+ * the application's (Unreal's Metal back end, Unity's graphics jobs). It answered nil, and an engine that asks for one
+ * does not expect nil. Each -renderCommandEncoder is an ordinary render encoder of this driver over the same pass --
+ * the first with the pass's load actions, the later ones loading what the earlier ones drew -- recording into its own
+ * AliothMetalRecorder; -endEncoding gives the command buffer every sub-encoder's work in the order they were made, and
+ * the pass's resolves once, after the last.
+ */
+@implementation AliothMetalParallelRenderEncoder
+
++ (void)load
+{
+	Protocol *p = objc_getProtocol("MTLParallelRenderCommandEncoder");
+
+	if (p != NULL && !class_conformsToProtocol(self, p) && !class_addProtocol(self, p)) {
+		rw_print("class_addProtocol(MTLParallelRenderCommandEncoder) refused\n");
+	}
+}
+
+- (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
+				  descriptor:(MTLRenderPassDescriptor *)descriptor
+{
+	if ((self = [super init]) == nil) {
+		return nil;
+	}
+	_commandBuffer = commandBuffer;
+	_descriptor = [descriptor copy];
+	_recorders = [[NSMutableArray alloc] init];
+	return self;
+}
+
+- (void)dealloc
+{
+	[_descriptor release];
+	[_recorders release];
+	[_label release];
+	[super dealloc];
+}
+
+- (id)device                                  { return [_commandBuffer device]; }
+- (NSString *)label                           { return _label; }
+- (void)setLabel:(NSString *)label            { [_label release]; _label = [label copy]; }
+- (void)pushDebugGroup:(NSString *)group      { (void)group; }
+- (void)popDebugGroup                         { }
+- (void)insertDebugSignpost:(NSString *)name  { (void)name; }
+/* a store action the descriptor left MTLStoreActionUnknown, given now: the sub-encoders made after it take it */
+- (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index
+{
+	_descriptor.colorAttachments[index].storeAction = action;
+}
+- (void)setDepthStoreAction:(MTLStoreAction)action    { _descriptor.depthAttachment.storeAction = action; }
+- (void)setStencilStoreAction:(MTLStoreAction)action  { _descriptor.stencilAttachment.storeAction = action; }
+- (void)setColorStoreActionOptions:(MTLStoreActionOptions)options atIndex:(NSUInteger)index
+{
+	(void)options; (void)index;
+}
+- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)options    { (void)options; }
+- (void)setStencilStoreActionOptions:(MTLStoreActionOptions)options  { (void)options; }
+
+- (id)renderCommandEncoder
+{
+	MTLRenderPassDescriptor *d = [[_descriptor copy] autorelease];
+	AliothMetalRecorder *recorder = [[[AliothMetalRecorder alloc] init] autorelease];
+	AliothMetalRenderEncoder *encoder;
+
+	@synchronized (self) {
+		/* the first sub-encoder clears as the pass says; the later ones load what the earlier ones drew */
+		if (_recorders.count != 0) {
+			for (unsigned i = 0; i < 8; i++) {
+				if (d.colorAttachments[i].texture != nil) {
+					d.colorAttachments[i].loadAction = MTLLoadActionLoad;
+				}
+			}
+			d.depthAttachment.loadAction = MTLLoadActionLoad;
+			d.stencilAttachment.loadAction = MTLLoadActionLoad;
+		}
+		[_recorders addObject:recorder];
+	}
+	encoder = [[[AliothMetalRenderEncoder alloc] initWithAliothCommandBuffer:_commandBuffer descriptor:d] autorelease];
+	[encoder aliothSetRecorder:recorder];
+	return encoder;
+}
+
+- (void)endEncoding
+{
+	NSUInteger n;
+
+	if (_ended) {
+		return;
+	}
+	_ended = YES;
+	n = _recorders.count;
+	for (NSUInteger k = 0; k < n; k++) {
+		AliothMetalRecorder *r = _recorders[k];
+
+		for (id item in r->items) {
+			if ([item isKindOfClass:[AliothMetalWork class]]) {
+				[_commandBuffer recordWork:item];
+			} else if (k + 1 == n || ((AliothMetalBlit *)item)->kind != ALIOTH_BLIT_RESOLVE) {
+				/* (a resolve once, the last sub-encoder's: an earlier one's would resolve part of the pass) */
+				[_commandBuffer recordBlit:item];
+			}
+		}
+	}
 }
 
 @end
