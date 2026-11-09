@@ -1415,6 +1415,12 @@ struct rwa_texture *rwa_texture_subview(struct rwa_texture *texture,
 					unsigned base_slice, unsigned slices, char *why,
 					size_t why_size);
 
+/* (the K40's) -generateMipmapsForTexture: by the GPU: every level after the texture's first
+ * made from the one above it, for every slice, in the context's order with nobody waiting.
+ * 0, or -1 and why (a depth, integer, compressed or multisample format, or one the GPU does
+ * not filter and render to). */
+int rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size);
+
 /* (the K40's) A blit encoder's buffer copy and byte fill done by the GPU, in the context's order
  * after what came before and before what comes after, with nobody waiting: `size` bytes from
  * src_offset of `src` to dst_offset of `dst` (the two buffers of one device), and `size` bytes

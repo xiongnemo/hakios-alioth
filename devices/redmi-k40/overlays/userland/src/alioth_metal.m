@@ -596,6 +596,8 @@ static struct {
 	/* (the K40's) the same over a range of levels and slices (air_metal.h rwa_texture_subview) */
 	struct rwa_texture *(*texture_subview)(struct rwa_texture *, const struct rwa_texture_shape *, unsigned,
 	    unsigned, unsigned, unsigned, char *, size_t);
+	/* (the K40's) -generateMipmapsForTexture: by the GPU (air_metal.h rwa_texture_mipmaps) */
+	int (*texture_mipmaps)(struct rwa_texture *, char *, size_t);
 	/* (the K40's) a blit encoder's buffer copy and fill, by the GPU (air_metal.h rwa_buffer_copy) */
 	int (*buffer_copy)(struct rwa_buffer *, size_t, struct rwa_buffer *, size_t, size_t, char *, size_t);
 	int (*buffer_fill)(struct rwa_buffer *, size_t, size_t, unsigned char, char *, size_t);
@@ -911,6 +913,7 @@ GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const str
     size_t ws), (t, s, w, ws))
 GPU_LOCKED(struct rwa_texture *, texture_subview, (struct rwa_texture *t, const struct rwa_texture_shape *s,
     unsigned bl, unsigned nl, unsigned bs, unsigned ns, char *w, size_t ws), (t, s, bl, nl, bs, ns, w, ws))
+GPU_LOCKED(int, texture_mipmaps, (struct rwa_texture *t, char *w, size_t ws), (t, w, ws))
 GPU_LOCKED(void *, flush, (struct rwa_device *d, unsigned f), (d, f))
 GPU_LOCKED(int, buffer_copy, (struct rwa_buffer *d, size_t do_, struct rwa_buffer *s, size_t so, size_t n, char *w,
     size_t ws), (d, do_, s, so, n, w, ws))
@@ -1013,6 +1016,7 @@ mesa_available(void)
 	*(void **)&mesa.compute_arguments = dlsym(mesa.handle, "rwa_compute_arguments");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	*(void **)&mesa.texture_subview = dlsym(mesa.handle, "rwa_texture_subview");
+	*(void **)&mesa.texture_mipmaps = dlsym(mesa.handle, "rwa_texture_mipmaps");
 	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
 	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
 	*(void **)&mesa.texture_copy = dlsym(mesa.handle, "rwa_texture_copy");
@@ -1061,6 +1065,7 @@ mesa_available(void)
 	GPU_LOCK_WRAP(texture_resolve);
 	GPU_LOCK_WRAP(texture_view);
 	GPU_LOCK_WRAP(texture_subview);
+	GPU_LOCK_WRAP(texture_mipmaps);
 	GPU_LOCK_WRAP(buffer_copy);
 	GPU_LOCK_WRAP(buffer_fill);
 	GPU_LOCK_WRAP(texture_copy);
@@ -5176,6 +5181,19 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 			}
 			return YES;
 		}
+	}
+	/*
+	 * (the K40's) Mipmaps by the GPU too (rwa_texture_mipmaps: a linear blit a level, every slice and face, in the
+	 * work's order): no finish first, and every colour format the GPU renders -- the processor's road below makes
+	 * slice 0 of 8-bit formats only, after waiting for everything. If the library declines, that road.
+	 */
+	if (b->kind == ALIOTH_BLIT_MIPMAPS && mesa.texture_mipmaps != NULL && [b->destination mesaTexture] != NULL) {
+		alioth_stat(ST_BLIT_GPU, mach_absolute_time());
+		if (mesa.texture_mipmaps([b->destination mesaTexture], why, size) == 0) {
+			return YES;
+		}
+		RW_AGAIN("mipmaps by the GPU: %s; by the processor instead\n", why);
+		why[0] = 0;
 	}
 	alioth_stat(ST_BLIT, mach_absolute_time());
 	if (alioth_stats_on && b->kind < 8) {

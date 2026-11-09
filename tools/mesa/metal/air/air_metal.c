@@ -59,6 +59,7 @@
 #include "util/u_inlines.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
+#include "util/u_gen_mipmap.h"
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
@@ -7523,6 +7524,37 @@ rwa_compute_set_threadgroup_bytes(struct rwa_compute *compute, unsigned bytes, c
       return -1;
    }
    compute->dynamic_bytes = bytes;
+   return 0;
+}
+
+/* (the K40's) A blit encoder's -generateMipmapsForTexture: by the GPU: each of the texture's levels after its first
+ * made from the one above (util_gen_mipmap, as st/mesa's glGenerateMipmap: a linear blit a level, which freedreno does
+ * with its blitter's draws), every slice and face, in the view's format (sRGB filtered as sRGB), ordered by freedreno's
+ * resource tracking with nobody waiting. 0, or -1 and why. */
+int
+rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size)
+{
+   if (!texture) {
+      say(why, why_size, "mipmaps need a texture");
+      return -1;
+   }
+   if (texture->levels < 2)
+      return 0;
+   enum pipe_format format = texture->view_format;
+   if (util_format_is_depth_or_stencil(format) || util_format_is_pure_integer(format) ||
+       util_format_is_compressed(format) || texture->res->nr_samples > 1) {
+      say(why, why_size, "mipmaps of %s: Metal makes them for colour formats a GPU filters and renders to",
+          texture->format_name);
+      return -1;
+   }
+   bool volume = texture->res->target == PIPE_TEXTURE_3D;
+   if (!util_gen_mipmap(texture->device->pipe, texture->res, format, texture->base_level,
+                        texture->base_level + texture->levels - 1, volume ? 0 : texture->base_layer,
+                        volume ? 0 : texture->base_layer + texture->layers - 1, PIPE_TEX_FILTER_LINEAR)) {
+      say(why, why_size, "%s does not filter and render %s, so it makes no mipmaps of it",
+          rwa_device_name(texture->device), texture->format_name);
+      return -1;
+   }
    return 0;
 }
 
