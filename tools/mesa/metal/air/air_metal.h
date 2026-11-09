@@ -1396,12 +1396,24 @@ void rwa_device_set_deferred(struct rwa_device *device, unsigned deferred);
 int rwa_fence_wait(struct rwa_device *device, void *fence, char *why, size_t why_size);
 
 /* (the K40's) A texture view over the whole of `texture`: a second texture sharing its
- * memory, in shape->pixel_format (one of the same texel size and kind) and shape->type (the
- * same, or 2D and a one-slice 2D array); the rest of `shape` is ignored. Destroyed with
+ * memory, in shape->pixel_format (one of the same texel size and kind) and shape->type (one
+ * Metal allows, rwa_texture_subview); the rest of `shape` is ignored. Destroyed with
  * rwa_texture_destroy, in either order with the texture. NULL and why. */
 struct rwa_texture *rwa_texture_view(struct rwa_texture *texture,
 				     const struct rwa_texture_shape *shape, char *why,
 				     size_t why_size);
+
+/* (the K40's) The same over `levels` levels from `base_level` and `slices` slices (a cube's
+ * faces counted) from `base_slice` of `texture`'s own: Metal's
+ * -newTextureViewWithPixelFormat:textureType:levels:slices:, and a render pass's attachment
+ * level and slice. The view's level 0 is that level (its size the level's), its slice 0 that
+ * slice -- for sampling, image access, rendering, copies and the processor's reads and writes.
+ * Types and ranges by Metal's rules (a cube six slices, a 2D view one). NULL and why. */
+struct rwa_texture *rwa_texture_subview(struct rwa_texture *texture,
+					const struct rwa_texture_shape *shape,
+					unsigned base_level, unsigned levels,
+					unsigned base_slice, unsigned slices, char *why,
+					size_t why_size);
 
 /* (the K40's) A blit encoder's buffer copy and byte fill done by the GPU, in the context's order
  * after what came before and before what comes after, with nobody waiting: `size` bytes from

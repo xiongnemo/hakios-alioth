@@ -208,6 +208,14 @@ struct rwa_texture {
     */
    enum pipe_format view_format;
 
+   /* (the K40's) where it lies in the resource: its level 0 is the resource's base_level and its
+    * slice 0 the resource's base_layer, and it has `levels` levels (and `layers` slices above).
+    * 0, 0 and every level for a texture of its own; a range of them for a view of a texture's
+    * levels or slices (rwa_texture_subview), whose sampler views are made as view_target
+    */
+   unsigned base_level, base_layer, levels;
+   enum pipe_texture_target view_target;
+
    /* (the K40's) its render surface, made when it is first an attachment and kept: the same
     * surface for every draw into it is what lets freedreno see one framebuffer and batch the
     * draws into one pass (texture_surface)
@@ -1436,6 +1444,8 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
    texture->shape = *shape;
    texture->format_name = fmt->name;
    texture->layers = array_size;
+   texture->levels = mips;
+   texture->view_target = target;
    texture->shader_read = read;
    texture->shader_write = write;
 
@@ -1612,13 +1622,38 @@ rwa_texture_destroy(struct rwa_texture *texture)
    free(texture);
 }
 
+/* (the K40's) What a texture renders into: its level 0 and slice 0, which for a view are the
+ * resource's base_level and base_layer -- a pass into one level of a mip chain, one face of a
+ * cube or one plane of a 3D texture -- and that level's size. */
+static struct pipe_surface
+surface_template(const struct rwa_texture *t)
+{
+   struct pipe_surface tmpl = { .format = t->view_format };
+   tmpl.u.tex.level = t->base_level;
+   tmpl.u.tex.first_layer = tmpl.u.tex.last_layer = t->base_layer;
+   return tmpl;
+}
+
+static unsigned
+texture_width(const struct rwa_texture *t)
+{
+   return u_minify(t->res->width0, t->base_level);
+}
+
+static unsigned
+texture_height(const struct rwa_texture *t)
+{
+   return u_minify(t->res->height0, t->base_level);
+}
+
 /* (the K40's) A texture's render surface, made once and kept with it (struct rwa_texture). */
 static struct pipe_surface *
 texture_surface(struct rwa_device *device, struct rwa_texture *t)
 {
-   if (!t->surface)
-      t->surface = device->pipe->create_surface(device->pipe, t->res,
-                                                &(struct pipe_surface){ .format = t->view_format });
+   if (!t->surface) {
+      struct pipe_surface tmpl = surface_template(t);
+      t->surface = device->pipe->create_surface(device->pipe, t->res, &tmpl);
+   }
    return t->surface;
 }
 
@@ -1631,7 +1666,16 @@ texture_surface(struct rwa_device *device, struct rwa_texture *t)
  * softpipe asserts exactly that (sp_texture.c, softpipe_transfer_map), so a 1D array
  * written through z lands on the wrong slice -- and in a release build, where that
  * assertion is compiled out, it lands there quietly.
+ *
+ * (the K40's) `level` and `layer` are the texture's own; the box is in the resource's layers
+ * (base_layer added), and the level to give Gallium with it is res_level's.
  */
+static unsigned
+res_level(const struct rwa_texture *texture, unsigned level)
+{
+   return texture->base_level + level;
+}
+
 static bool
 texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
             const unsigned origin[3], const unsigned size[3], struct pipe_box *box,
@@ -1644,16 +1688,16 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
     */
    unsigned o[3] = { origin ? origin[0] : 0, origin ? origin[1] : 0, origin ? origin[2] : 0 };
 
-   if (level > res->last_level) {
-      say(why, why_size, "level %u of a texture with %u", level, res->last_level + 1);
+   if (level >= texture->levels) {
+      say(why, why_size, "level %u of a texture with %u", level, texture->levels);
       return false;
    }
 
    bool volume = res->target == PIPE_TEXTURE_3D;
    bool rows = res->target != PIPE_TEXTURE_1D && res->target != PIPE_TEXTURE_1D_ARRAY;
-   unsigned w = u_minify(res->width0, level);
-   unsigned h = rows ? u_minify(res->height0, level) : 1;
-   unsigned d = volume ? u_minify(res->depth0, level) : 1;
+   unsigned w = u_minify(res->width0, res_level(texture, level));
+   unsigned h = rows ? u_minify(res->height0, res_level(texture, level)) : 1;
+   unsigned d = volume ? u_minify(res->depth0, res_level(texture, level)) : 1;
    unsigned s[3] = { size ? size[0] : w, size ? size[1] : h, size ? size[2] : d };
 
    if (layer >= texture->layers) {
@@ -1672,14 +1716,14 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
 
    *box = (struct pipe_box){ .x = o[0], .width = s[0] };
    if (!rows) {
-      box->y = layer;
+      box->y = texture->base_layer + layer;
       box->height = 1;
       box->z = 0;
       box->depth = 1;
    } else {
       box->y = o[1];
       box->height = s[1];
-      box->z = volume ? o[2] : layer;
+      box->z = volume ? o[2] : texture->base_layer + layer;
       box->depth = volume ? s[2] : 1;
    }
    return true;
@@ -1774,9 +1818,9 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
     * what -replaceRegion:...bytesPerRow:bytesPerImage: is given when bytesPerImage is
     * the obvious product.
     */
-   texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
-                                          PIPE_MAP_WRITE, &box, bytes, row,
-                                          row * box.height);
+   texture->device->pipe->texture_subdata(texture->device->pipe, texture->res,
+                                          res_level(texture, level), PIPE_MAP_WRITE, &box,
+                                          bytes, row, row * box.height);
    return 0;
 }
 
@@ -1810,8 +1854,9 @@ rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice
    if (!texture_box(src, src_level, src_slice, src_origin, size, &from, why, why_size) ||
        !texture_box(dst, dst_level, dst_slice, dst_origin, size, &to, why, why_size))
       return -1;
-   dst->device->pipe->resource_copy_region(dst->device->pipe, dst->res, dst_level, to.x, to.y,
-                                           to.z, src->res, src_level, &from);
+   dst->device->pipe->resource_copy_region(dst->device->pipe, dst->res, res_level(dst, dst_level),
+                                           to.x, to.y, to.z, src->res, res_level(src, src_level),
+                                           &from);
    return 0;
 }
 
@@ -1888,8 +1933,8 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
       return -1;
 
    struct pipe_transfer *xfer = NULL;
-   const uint8_t *map = pipe->texture_map(pipe, texture->res, level, PIPE_MAP_READ, &box,
-                                          &xfer);
+   const uint8_t *map = pipe->texture_map(pipe, texture->res, res_level(texture, level),
+                                          PIPE_MAP_READ, &box, &xfer);
    if (!map) {
       say(why, why_size, "the GPU driver would not map a %ux%u region of this texture for "
                          "the processor", box.width, box.height);
@@ -1981,8 +2026,8 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
    }
 
    struct pipe_transfer *xfer = NULL;
-   const uint8_t *map = pipe->texture_map(pipe, texture->res, level, PIPE_MAP_READ, &box,
-                                          &xfer);
+   const uint8_t *map = pipe->texture_map(pipe, texture->res, res_level(texture, level),
+                                          PIPE_MAP_READ, &box, &xfer);
    if (!map) {
       say(why, why_size, "the GPU driver would not map a %ux%u region of this %s texture "
                          "for the processor", box.width, box.height, texture->format_name);
@@ -3889,6 +3934,15 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
          if (!t->view) {
             struct pipe_sampler_view tmpl = { 0 };
             u_sampler_view_default_template(&tmpl, t->res, t->view_format);
+            /* (the K40's) a view's own levels, slices and type (rwa_texture_subview);
+             * a 3D texture's depth is not slices and stays the default's */
+            tmpl.target = t->view_target;
+            tmpl.u.tex.first_level = t->base_level;
+            tmpl.u.tex.last_level = t->base_level + t->levels - 1;
+            if (t->res->target != PIPE_TEXTURE_3D) {
+               tmpl.u.tex.first_layer = t->base_layer;
+               tmpl.u.tex.last_layer = t->base_layer + t->layers - 1;
+            }
             t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
             if (!t->view) {
                say(why, why_size, "%s would not make a sampler view of the %s bound at "
@@ -3912,10 +3966,13 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
                       (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
             .shader_access = (r->read ? PIPE_IMAGE_ACCESS_READ : 0) |
                              (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
-            .u.tex.level = 0,
-            .u.tex.first_layer = 0,
-            .u.tex.last_layer = (t->shape.type == RWA_TYPE_3D ? t->res->depth0
-                                                              : t->layers) - 1,
+            /* (the K40's) a view's level 0 and slices are the resource's base_level and
+             * base_layer on (rwa_texture_subview); a 3D level's planes are all of it */
+            .u.tex.level = t->base_level,
+            .u.tex.first_layer = t->shape.type == RWA_TYPE_3D ? 0 : t->base_layer,
+            .u.tex.last_layer = t->shape.type == RWA_TYPE_3D
+                                   ? u_minify(t->res->depth0, t->base_level) - 1
+                                   : t->base_layer + t->layers - 1,
          };
          num_images = MAX2(num_images, r->index + 1);
          break;
@@ -7385,24 +7442,30 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
           (unsigned)PIPE_MAX_COLOR_BUFS);
       return -1;
    }
-   for (unsigned i = 0; i < color_count && !first; i++)
+   struct rwa_texture *first_t = NULL;
+   for (unsigned i = 0; i < color_count && !first; i++) {
       first = color[i] ? color[i]->res : NULL;
-   if (!first && depth)
+      first_t = color[i];
+   }
+   if (!first && depth) {
       first = depth->res;
+      first_t = depth;
+   }
    if (!first) {
       say(why, why_size, "a pass with nothing to clear");
       return -1;
    }
-   struct pipe_framebuffer_state fb = { .width = first->width0, .height = first->height0,
+   struct pipe_framebuffer_state fb = { .width = texture_width(first_t),
+                                        .height = texture_height(first_t),
                                         .nr_cbufs = color_count,
                                         .samples = MAX2(first->nr_samples, 1) };
    for (unsigned i = 0; i < color_count; i++) {
       if (!color[i])
          continue;
-      fb.width = MIN2(fb.width, color[i]->res->width0);
-      fb.height = MIN2(fb.height, color[i]->res->height0);
-      surf[i] = pipe->create_surface(pipe, color[i]->res,
-         &(struct pipe_surface){ .format = color[i]->view_format });
+      fb.width = MIN2(fb.width, texture_width(color[i]));
+      fb.height = MIN2(fb.height, texture_height(color[i]));
+      struct pipe_surface tmpl = surface_template(color[i]);
+      surf[i] = pipe->create_surface(pipe, color[i]->res, &tmpl);
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
@@ -7413,8 +7476,8 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
          mask |= PIPE_CLEAR_COLOR0 << i;
    }
    if (depth) {
-      zsurf = pipe->create_surface(pipe, depth->res,
-         &(struct pipe_surface){ .format = depth->view_format });
+      struct pipe_surface tmpl = surface_template(depth);
+      zsurf = pipe->create_surface(pipe, depth->res, &tmpl);
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
@@ -7474,9 +7537,9 @@ rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, struct r
       say(why, why_size, "a resolve needs a device and two textures");
       return -1;
    }
-   if (src->res->width0 != dst->res->width0 || src->res->height0 != dst->res->height0) {
-      say(why, why_size, "a resolve from %ux%u into %ux%u", src->res->width0, src->res->height0,
-          dst->res->width0, dst->res->height0);
+   if (texture_width(src) != texture_width(dst) || texture_height(src) != texture_height(dst)) {
+      say(why, why_size, "a resolve from %ux%u into %ux%u", texture_width(src), texture_height(src),
+          texture_width(dst), texture_height(dst));
       return -1;
    }
    /* pipe->blit says nothing when it does nothing, so what freedreno's fallback asks
@@ -7495,15 +7558,21 @@ rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, struct r
           src->res->nr_samples, dst->format_name);
       return -1;
    }
+   /* (the K40's) each side's level 0 and slice 0: a view's base_level and base_layer, which is
+    * where Metal's resolveLevel/resolveSlice land (the driver passes a view of them) */
    struct pipe_blit_info blit = { 0 };
    blit.src.resource = src->res;
    blit.src.format = src->res->format;
-   blit.src.box.width = src->res->width0;
-   blit.src.box.height = src->res->height0;
+   blit.src.level = src->base_level;
+   blit.src.box.z = (int)src->base_layer;
+   blit.src.box.width = texture_width(src);
+   blit.src.box.height = texture_height(src);
    blit.src.box.depth = 1;
    blit.dst.resource = dst->res;
    blit.dst.format = dst->res->format;
+   blit.dst.level = dst->base_level;
    blit.dst.box = blit.src.box;
+   blit.dst.box.z = (int)dst->base_layer;
    blit.mask = util_format_is_depth_or_stencil(src->res->format) ? PIPE_MASK_ZS : PIPE_MASK_RGBA;
    blit.filter = PIPE_TEX_FILTER_NEAREST;
    device->pipe->blit(device->pipe, &blit);
@@ -7649,16 +7718,59 @@ rwa_render_arguments(struct rwa_render *render, unsigned stage, struct rwa_argum
 
 /*
  * (the K40's) A texture view: a second texture over the same memory, Metal's
- * -newTextureViewWithPixelFormat: and the textureType:levels:slices: form over the whole of
- * the texture. The format may change to one of the same texel size and kind -- the sRGB and
- * linear twins SceneKit and CoreAnimation reach for, or a cast between same-size colour
- * formats -- and the type between the same-dimensioned ones (2D and a one-slice 2D array).
- * The resource is shared by reference; what changes is the format and target every view and
- * surface of it is made in (view_format, and the shape Metal is answered from).
+ * -newTextureViewWithPixelFormat: and its textureType:levels:slices: form. The format may change
+ * to one of the same texel size and kind -- the sRGB and linear twins SceneKit and CoreAnimation
+ * reach for, or a cast between same-size colour formats. The resource is shared by reference;
+ * what changes is the format, target, levels and slices every view and surface of it is made in
+ * (view_format, view_target, base_level/levels, base_layer/layers, and the shape Metal is
+ * answered from).
+ *
+ * The type and the range by Metal's own rules (MTLTexture.h, on the textureType:levels:slices:
+ * form): 1D and 1D arrays view as either; a 2D texture as 2D or a 2D array; a 2D array, a cube
+ * and a cube array as any of those four; a 3D texture as 3D; a multisample texture as
+ * multisample. A cube view takes six slices, a cube array a multiple of six, a 1D, 2D or 3D view
+ * one. Levels and slices are counted in `texture`'s own, so a view of a view lands where its
+ * parent does in their resource.
  */
+static enum pipe_texture_target
+view_target_of(unsigned type)
+{
+   switch (type) {
+   case RWA_TYPE_1D: return PIPE_TEXTURE_1D;
+   case RWA_TYPE_1D_ARRAY: return PIPE_TEXTURE_1D_ARRAY;
+   case RWA_TYPE_2D_ARRAY: case RWA_TYPE_2D_MULTISAMPLE_ARRAY: return PIPE_TEXTURE_2D_ARRAY;
+   case RWA_TYPE_CUBE: return PIPE_TEXTURE_CUBE;
+   case RWA_TYPE_CUBE_ARRAY: return PIPE_TEXTURE_CUBE_ARRAY;
+   case RWA_TYPE_3D: return PIPE_TEXTURE_3D;
+   default: return PIPE_TEXTURE_2D;
+   }
+}
+
+static bool
+view_type_allowed(unsigned have, unsigned want)
+{
+   unsigned bit = 1u << want;
+   const unsigned one_d = 1u << RWA_TYPE_1D | 1u << RWA_TYPE_1D_ARRAY;
+   const unsigned layered = 1u << RWA_TYPE_2D | 1u << RWA_TYPE_2D_ARRAY | 1u << RWA_TYPE_CUBE |
+                            1u << RWA_TYPE_CUBE_ARRAY;
+   const unsigned ms = 1u << RWA_TYPE_2D_MULTISAMPLE | 1u << RWA_TYPE_2D_MULTISAMPLE_ARRAY;
+
+   if (want > RWA_TYPE_2D_MULTISAMPLE_ARRAY)
+      return false;
+   switch (have) {
+   case RWA_TYPE_1D: case RWA_TYPE_1D_ARRAY: return bit & one_d;
+   case RWA_TYPE_2D: return bit & (1u << RWA_TYPE_2D | 1u << RWA_TYPE_2D_ARRAY);
+   case RWA_TYPE_2D_ARRAY: case RWA_TYPE_CUBE: case RWA_TYPE_CUBE_ARRAY: return bit & layered;
+   case RWA_TYPE_3D: return want == RWA_TYPE_3D;
+   case RWA_TYPE_2D_MULTISAMPLE: case RWA_TYPE_2D_MULTISAMPLE_ARRAY: return bit & ms;
+   default: return false;
+   }
+}
+
 struct rwa_texture *
-rwa_texture_view(struct rwa_texture *texture, const struct rwa_texture_shape *shape, char *why,
-                 size_t why_size)
+rwa_texture_subview(struct rwa_texture *texture, const struct rwa_texture_shape *shape,
+                    unsigned base_level, unsigned levels, unsigned base_slice, unsigned slices,
+                    char *why, size_t why_size)
 {
    if (!texture || !shape) {
       say(why, why_size, "a view needs a texture and the shape it is to have");
@@ -7680,12 +7792,30 @@ rwa_texture_view(struct rwa_texture *texture, const struct rwa_texture_shape *sh
       return NULL;
    }
    unsigned have = texture->shape.type, want = shape->type;
-   bool flat = (have == RWA_TYPE_2D || have == RWA_TYPE_2D_ARRAY) &&
-               (want == RWA_TYPE_2D || want == RWA_TYPE_2D_ARRAY) && texture->layers == 1;
-   if (have != want && !flat) {
-      say(why, why_size, "a view of a %s as a %s: only the same type, or a 2D texture and a "
-                         "one-slice 2D array, are viewed here", texture_type_name(have),
-          texture_type_name(want) ? texture_type_name(want) : "type nobody has");
+   const char *want_name = texture_type_name(want) ? texture_type_name(want) : "type nobody has";
+   if (!view_type_allowed(have, want)) {
+      say(why, why_size, "a view of a %s as a %s: Metal views a 1D texture as 1D types, a 2D "
+                         "one as 2D or a 2D array, a 2D array or a cube as 2D, 2D arrays and "
+                         "cubes, a 3D one as 3D and a multisample one as multisample",
+          texture_type_name(have), want_name);
+      return NULL;
+   }
+   if (levels == 0 || base_level >= texture->levels || levels > texture->levels - base_level) {
+      say(why, why_size, "a view of levels %u+%u of a texture with %u", base_level, levels,
+          texture->levels);
+      return NULL;
+   }
+   if (slices == 0 || base_slice >= texture->layers || slices > texture->layers - base_slice) {
+      say(why, why_size, "a view of slices %u+%u of a texture with %u", base_slice, slices,
+          texture->layers);
+      return NULL;
+   }
+   bool arrayed = want == RWA_TYPE_1D_ARRAY || want == RWA_TYPE_2D_ARRAY ||
+                  want == RWA_TYPE_2D_MULTISAMPLE_ARRAY;
+   if ((want == RWA_TYPE_CUBE && slices != 6) || (want == RWA_TYPE_CUBE_ARRAY && slices % 6) ||
+       (!arrayed && want != RWA_TYPE_CUBE && want != RWA_TYPE_CUBE_ARRAY && slices != 1)) {
+      say(why, why_size, "a %s view of %u slices: a cube takes six, a cube array a multiple of "
+                         "six, and a texture that is not an array one", want_name, slices);
       return NULL;
    }
    struct rwa_texture *view = calloc(1, sizeof(*view));
@@ -7695,14 +7825,41 @@ rwa_texture_view(struct rwa_texture *texture, const struct rwa_texture_shape *sh
    }
    *view = *texture;
    view->view = NULL;
-   view->surface = NULL;   /* (its own, in its own format) */
+   view->surface = NULL;   /* (its own, in its own format, level and slice) */
    view->res = NULL;
    pipe_resource_reference(&view->res, texture->res);
-   view->shape.pixel_format = shape->pixel_format;
-   view->shape.type = want;
    view->format_name = fmt->name;
    view->view_format = fmt->pipe;
+   view->base_level = texture->base_level + base_level;
+   view->base_layer = texture->base_layer + base_slice;
+   view->levels = levels;
+   view->layers = slices;
+   view->view_target = view_target_of(want);
+
+   /* the shape it answers Metal from: its own level 0's size, levels and slices */
+   const struct pipe_resource *res = texture->res;
+   bool rows = res->target != PIPE_TEXTURE_1D && res->target != PIPE_TEXTURE_1D_ARRAY;
+   view->shape.pixel_format = shape->pixel_format;
+   view->shape.type = want;
+   view->shape.width = u_minify(res->width0, view->base_level);
+   view->shape.height = rows ? u_minify(res->height0, view->base_level) : 1;
+   view->shape.depth = res->target == PIPE_TEXTURE_3D ? u_minify(res->depth0, view->base_level) : 1;
+   view->shape.mip_levels = levels;
+   view->shape.array_length = want == RWA_TYPE_CUBE_ARRAY ? slices / 6 : arrayed ? slices : 1;
    return view;
+}
+
+/* (the K40's) the whole of the texture: rwa_texture_subview over every level and slice */
+struct rwa_texture *
+rwa_texture_view(struct rwa_texture *texture, const struct rwa_texture_shape *shape, char *why,
+                 size_t why_size)
+{
+   if (!texture) {
+      say(why, why_size, "a view needs a texture and the shape it is to have");
+      return NULL;
+   }
+   return rwa_texture_subview(texture, shape, 0, texture->levels, 0, texture->layers, why,
+                              why_size);
 }
 
 int

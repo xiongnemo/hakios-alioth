@@ -593,6 +593,9 @@ static struct {
 	int (*compute_arguments)(struct rwa_compute *, struct rwa_argument *, unsigned, unsigned *, char *, size_t);
 	/* (the K40's) a texture view over the same memory; looked up, not required */
 	struct rwa_texture *(*texture_view)(struct rwa_texture *, const struct rwa_texture_shape *, char *, size_t);
+	/* (the K40's) the same over a range of levels and slices (air_metal.h rwa_texture_subview) */
+	struct rwa_texture *(*texture_subview)(struct rwa_texture *, const struct rwa_texture_shape *, unsigned,
+	    unsigned, unsigned, unsigned, char *, size_t);
 	/* (the K40's) a blit encoder's buffer copy and fill, by the GPU (air_metal.h rwa_buffer_copy) */
 	int (*buffer_copy)(struct rwa_buffer *, size_t, struct rwa_buffer *, size_t, size_t, char *, size_t);
 	int (*buffer_fill)(struct rwa_buffer *, size_t, size_t, unsigned char, char *, size_t);
@@ -906,6 +909,8 @@ GPU_LOCKED(int, texture_resolve, (struct rwa_device *d, struct rwa_texture *s, s
     size_t ws), (d, s, t, w, ws))
 GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const struct rwa_texture_shape *s, char *w,
     size_t ws), (t, s, w, ws))
+GPU_LOCKED(struct rwa_texture *, texture_subview, (struct rwa_texture *t, const struct rwa_texture_shape *s,
+    unsigned bl, unsigned nl, unsigned bs, unsigned ns, char *w, size_t ws), (t, s, bl, nl, bs, ns, w, ws))
 GPU_LOCKED(void *, flush, (struct rwa_device *d, unsigned f), (d, f))
 GPU_LOCKED(int, buffer_copy, (struct rwa_buffer *d, size_t do_, struct rwa_buffer *s, size_t so, size_t n, char *w,
     size_t ws), (d, do_, s, so, n, w, ws))
@@ -1007,6 +1012,7 @@ mesa_available(void)
 	*(void **)&mesa.render_arguments = dlsym(mesa.handle, "rwa_render_arguments");
 	*(void **)&mesa.compute_arguments = dlsym(mesa.handle, "rwa_compute_arguments");
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
+	*(void **)&mesa.texture_subview = dlsym(mesa.handle, "rwa_texture_subview");
 	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
 	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
 	*(void **)&mesa.texture_copy = dlsym(mesa.handle, "rwa_texture_copy");
@@ -1054,6 +1060,7 @@ mesa_available(void)
 	GPU_LOCK_WRAP(compute_threadgroup_bytes);
 	GPU_LOCK_WRAP(texture_resolve);
 	GPU_LOCK_WRAP(texture_view);
+	GPU_LOCK_WRAP(texture_subview);
 	GPU_LOCK_WRAP(buffer_copy);
 	GPU_LOCK_WRAP(buffer_fill);
 	GPU_LOCK_WRAP(texture_copy);
@@ -1629,8 +1636,12 @@ enum {
 	struct rwa_texture_shape _shape;
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
 	id _parent;                /* (the K40's) a view's texture, retained: -parentTexture */
+	NSUInteger _parentLevel, _parentSlice;   /* (the K40's) where a view starts in its parent */
+	NSMutableDictionary *_attachmentViews;   /* (the K40's) views of one level and slice passes drew into */
 }
 @property (readonly) struct rwa_texture *mesaTexture;
+/* (the K40's) what a pass draws into for this texture at an attachment's level and slice */
+- (id)aliothAttachmentLevel:(NSUInteger)level slice:(NSUInteger)slice;
 /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
  * refuses a depth texture through it by name, so a caller that wants to know what a depth
@@ -3466,6 +3477,7 @@ enum {
 
 - (void)dealloc
 {
+	[_attachmentViews release];
 	if (_texture != NULL) {
 		mesa.texture_destroy(_texture);
 	}
@@ -3488,8 +3500,8 @@ enum {
 - (BOOL)isFramebufferOnly          { return NO; }
 - (BOOL)allowGPUOptimizedContents  { return NO; }
 - (id)parentTexture                { return _parent; }
-- (NSUInteger)parentRelativeLevel  { return 0; }
-- (NSUInteger)parentRelativeSlice  { return 0; }
+- (NSUInteger)parentRelativeLevel  { return _parentLevel; }
+- (NSUInteger)parentRelativeSlice  { return _parentSlice; }
 - (id)buffer                       { return nil; }
 - (NSUInteger)bufferOffset         { return 0; }
 - (NSUInteger)bufferBytesPerRow    { return 0; }
@@ -3621,11 +3633,31 @@ enum {
  * REQUIRE: 27 methods with no answer anywhere in this chain before this section. The same
  * three kinds as everywhere else -- served, true by construction, or refused out loud.
  *
- * A view is the whole of the texture in another format of its texel size or another type of
- * its dimensions (rwa_texture_view); a range of its levels or slices is refused out loud, nil,
- * because a view that aliased the wrong part would be found much later, by a picture that did
- * not change.
+ * A view is the texture, or a range of its levels and slices (rwa_texture_subview, 11-09: a
+ * pass into one level, a cube's faces sampled as a 2D array), in another format of its texel
+ * size or another type Metal allows. With a library older than rwa_texture_subview a range is
+ * refused out loud, nil, because a view that aliased the wrong part would be found much later,
+ * by a picture that did not change.
  */
+/* the shape of a view of `levels` and `slices` of a texture shaped `from`, in shape->type: its
+ * own level 0's size -- rwa_texture_subview's, which the library keeps for itself */
+static void
+alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shape *from, NSRange levels,
+    NSRange slices)
+{
+	unsigned l = (unsigned)levels.location;
+	BOOL rows = from->type != MTLTextureType1D && from->type != MTLTextureType1DArray;
+	BOOL arrayed = shape->type == MTLTextureType1DArray || shape->type == MTLTextureType2DArray ||
+	    shape->type == MTLTextureType2DMultisampleArray;
+
+	shape->width = MAX(from->width >> l, 1u);
+	shape->height = rows ? MAX(from->height >> l, 1u) : 1;
+	shape->depth = from->type == MTLTextureType3D ? MAX(from->depth >> l, 1u) : 1;
+	shape->mip_levels = (unsigned)levels.length;
+	shape->array_length = shape->type == MTLTextureTypeCubeArray ? (unsigned)slices.length / 6 :
+	    arrayed ? (unsigned)slices.length : 1;
+}
+
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
 			     levels:(NSRange)levels
@@ -3634,31 +3666,88 @@ enum {
 	char why[512] = { 0 };
 	struct rwa_texture_shape shape = _shape;
 	struct rwa_texture *view;
+	BOOL whole = levels.location == 0 && levels.length == MAX(_shape.mip_levels, 1) && slices.location == 0 &&
+	    slices.length == [self aliothSlices];
 
-	if (mesa.texture_view == NULL) {
-		RW_ONCE("a texture view, and this compiler library has no rwa_texture_view; nil\n");
-		return nil;
-	}
-	if (levels.location != 0 || levels.length != MAX(_shape.mip_levels, 1) || slices.location != 0 ||
-	    slices.length != [self aliothSlices]) {
-		RW_AGAIN("a texture view of levels %lu+%lu and slices %lu+%lu: only a view of the whole texture is "
-			 "made here; nil\n", (unsigned long)levels.location, (unsigned long)levels.length,
-			 (unsigned long)slices.location, (unsigned long)slices.length);
+	if (mesa.texture_subview == NULL && (mesa.texture_view == NULL || !whole)) {
+		RW_AGAIN("a texture view of levels %lu+%lu and slices %lu+%lu, and this compiler library has %s; nil\n",
+			 (unsigned long)levels.location, (unsigned long)levels.length, (unsigned long)slices.location,
+			 (unsigned long)slices.length, mesa.texture_view == NULL ? "no rwa_texture_view" :
+			 "no rwa_texture_subview (views of the whole texture only)");
 		return nil;
 	}
 	shape.pixel_format = (unsigned)format;
 	shape.type = (unsigned)type;
-	if ((view = mesa.texture_view(_texture, &shape, why, sizeof(why))) == NULL) {
-		RW_AGAIN("a texture view: %s; nil\n", why);
+	view = mesa.texture_subview != NULL ?
+	    mesa.texture_subview(_texture, &shape, (unsigned)levels.location, (unsigned)levels.length,
+		(unsigned)slices.location, (unsigned)slices.length, why, sizeof(why)) :
+	    mesa.texture_view(_texture, &shape, why, sizeof(why));
+	if (view == NULL) {
+		RW_AGAIN("a texture view of levels %lu+%lu and slices %lu+%lu: %s; nil\n", (unsigned long)levels.location,
+			 (unsigned long)levels.length, (unsigned long)slices.location, (unsigned long)slices.length, why);
 		return nil;
 	}
+	alioth_view_shape(&shape, &_shape, levels, slices);
 	AliothMetalTexture *texture = [[AliothMetalTexture alloc] initWithAliothDevice:_owner texture:view
 										 shape:&shape];
 
 	if (texture != nil) {
 		texture->_parent = [self retain];
+		texture->_parentLevel = levels.location;
+		texture->_parentSlice = slices.location;
 	}
 	return texture;
+}
+
+/*
+ * (the K40's) What a render pass draws into for an attachment of this texture at `level` and
+ * `slice` (a mip level, a cube's face, an array's slice): itself when that is all of a 2D
+ * texture, else a 2D view of that one level and slice, made once and kept with the texture --
+ * the same object every pass, so its kept surface lets freedreno batch a pass's draws. The pass
+ * drew into level 0 and slice 0 whatever it asked for, until 11-09. The view does not retain
+ * this texture (it is kept BY it); nil when the library cannot make it.
+ */
+- (id)aliothAttachmentLevel:(NSUInteger)level slice:(NSUInteger)slice
+{
+	BOOL ms = _shape.type == MTLTextureType2DMultisample || _shape.type == MTLTextureType2DMultisampleArray;
+	NSNumber *key = [NSNumber numberWithUnsignedLongLong:((unsigned long long)level << 32) | slice];
+	struct rwa_texture_shape shape = _shape;
+	char why[512] = { 0 };
+	struct rwa_texture *t;
+	AliothMetalTexture *view;
+
+	if (level == 0 && slice == 0 && (_shape.type == MTLTextureType2D || _shape.type == MTLTextureType2DMultisample)) {
+		return self;
+	}
+	@synchronized (self) {
+		if ((view = [_attachmentViews objectForKey:key]) != nil) {
+			return view;
+		}
+		if (mesa.texture_subview == NULL) {
+			RW_ONCE("a pass into level %lu, slice %lu of a texture, and this compiler library has no "
+				"rwa_texture_subview; drawn into the texture as it is\n", (unsigned long)level,
+				(unsigned long)slice);
+			return nil;
+		}
+		shape.type = ms ? MTLTextureType2DMultisample : MTLTextureType2D;
+		t = mesa.texture_subview(_texture, &shape, (unsigned)level, 1, (unsigned)slice, 1, why, sizeof(why));
+		if (t == NULL) {
+			RW_AGAIN("a pass into level %lu, slice %lu of a texture: %s; drawn into the texture as it is\n",
+				 (unsigned long)level, (unsigned long)slice, why);
+			return nil;
+		}
+		alioth_view_shape(&shape, &_shape, NSMakeRange(level, 1), NSMakeRange(slice, 1));
+		view = [[AliothMetalTexture alloc] initWithAliothDevice:_owner texture:t shape:&shape];
+		if (view == nil) {
+			return nil;
+		}
+		if (_attachmentViews == nil) {
+			_attachmentViews = [[NSMutableDictionary alloc] init];
+		}
+		[_attachmentViews setObject:view forKey:key];
+		[view release];
+		return view;
+	}
 }
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
@@ -5841,6 +5930,25 @@ done:
 	BOOL _drew, _ended;     /* (the K40's: a draw was recorded; -endEncoding has run) */
 }
 
+/* (the K40's) The texture a pass draws into for an attachment's texture, level, slice and depthPlane:
+ * a view of that level and slice (-aliothAttachmentLevel:slice:), or the texture itself when it is all
+ * of a 2D one. A 3D texture's plane is not served (the library refuses a 3D attachment by name). */
+static id
+alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInteger plane)
+{
+	id view;
+
+	if (texture == nil || ![texture isKindOfClass:[AliothMetalTexture class]]) {
+		return texture;
+	}
+	if (plane != 0) {
+		RW_ONCE("a pass into depth plane %lu of a 3D texture: not served here\n", (unsigned long)plane);
+		return texture;
+	}
+	view = [(AliothMetalTexture *)texture aliothAttachmentLevel:level slice:slice];
+	return view != nil ? view : texture;
+}
+
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
 				  descriptor:(MTLRenderPassDescriptor *)descriptor
 {
@@ -5860,6 +5968,8 @@ done:
 		if (texture == nil) {
 			continue;
 		}
+		texture = alioth_attachment_texture(texture, [attachment level], [attachment slice],
+						    [attachment depthPlane]);
 		_color[i] = texture;
 		_colorCount = i + 1;
 		/*
@@ -5876,7 +5986,9 @@ done:
 		if (store == MTLStoreActionMultisampleResolve ||
 		    store == MTLStoreActionStoreAndMultisampleResolve) {
 			if ([attachment resolveTexture] != nil) {
-				_resolve[i] = [attachment resolveTexture];
+				_resolve[i] = alioth_attachment_texture([attachment resolveTexture],
+				    [attachment resolveLevel], [attachment resolveSlice],
+				    [attachment resolveDepthPlane]);
 			} else {
 				rw_print("colour attachment %u asks for a multisample resolve "
 				         "(storeAction %lu) with no resolveTexture; the attachment is "
@@ -5916,7 +6028,10 @@ done:
 		         "different textures; one texture carries both aspects here, so this "
 		         "pass is encoded with neither\n");
 	} else {
-		_depth = ztex != nil ? ztex : stex;
+		/* (the K40's) at its level and slice: a shadow cube's face is a slice */
+		MTLRenderPassAttachmentDescriptor *zd = ztex != nil ? (MTLRenderPassAttachmentDescriptor *)za : sa;
+
+		_depth = alioth_attachment_texture(ztex != nil ? ztex : stex, [zd level], [zd slice], [zd depthPlane]);
 		if (ztex != nil && [za loadAction] == MTLLoadActionClear) {
 			_clearDepth = (float)[za clearDepth];
 			_clearsDepth = YES;
@@ -5925,7 +6040,8 @@ done:
 		if (ztex != nil && [za resolveTexture] != nil &&
 		    ([za storeAction] == MTLStoreActionMultisampleResolve ||
 		     [za storeAction] == MTLStoreActionStoreAndMultisampleResolve)) {
-			_depthResolve = [za resolveTexture];
+			_depthResolve = alioth_attachment_texture([za resolveTexture], [za resolveLevel],
+			    [za resolveSlice], [za resolveDepthPlane]);
 			if ([za depthResolveFilter] != MTLMultisampleDepthResolveFilterSample0) {
 				RW_ONCE("a depth resolve asks for the minimum or maximum of the samples; "
 					"this driver resolves depth to sample 0\n");
