@@ -1899,6 +1899,25 @@ enum {
  * Common2 (Common2 promises tessellation, which this driver has not); 5 + Apple4 (tile shaders, imageblocks,
  * raster order groups: not here either); 6 + Apple5 Common3; 7 + Apple6 Metal3; 8 + Apple7; 9 + Apple8.
  */
+/*
+ * (the K40's) MPS asks the device's families through this -- MPSDevice::GetMPSDevice, Apple8 down to Apple2 -- and is
+ * told none. MPSImage's and MPSNeuralNetwork's kernels are not in the system as AIR (iOS 16.5's IPSW has a metallib for
+ * MPSFunctions, MPSMatrix and MPSRayIntersector only; an AGX device's driver supplies the rest), so with Apple2
+ * claimed a Gaussian blur made on this device aborted in MPSDevice::GetLibrary (System Check metal.mps, 2026-11-10).
+ * Told no family, MPSSupportsMTLDevice answers NO: Core Image and careful applications take their own roads, as at
+ * profile 0. Every other caller is answered from the feature profile (Apple2: ASTC for engines).
+ */
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	Dl_info info;
+
+	if (dladdr(__builtin_return_address(0), &info) != 0 && info.dli_fname != NULL &&
+	    strstr(info.dli_fname, "/MPSCore.framework/") != NULL) {
+		return NO;
+	}
+	return [super supportsFamily:family];
+}
+
 - (NSUInteger)featureProfile
 {
 	static NSUInteger profile = (NSUInteger)-1;
