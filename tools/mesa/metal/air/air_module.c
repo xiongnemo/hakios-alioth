@@ -7,7 +7,10 @@
  * Bitcode records -> struct air_module. The record layouts are those LLVM
  * has written since the 4.0/5.0 days (string table, relative value ids,
  * explicit types on loads, GEPs and calls), which is what Apple's
- * metalfe-31001 emits: typed pointers, MODULE_CODE_VERSION 2.
+ * metalfe-31001 emits: typed pointers, MODULE_CODE_VERSION 2. Version 1, which
+ * Apple's compiler still writes for old deployment targets (air64-apple-ios11,
+ * Flutter's Impeller shaders), is the same but for names: no string table,
+ * names in the symbol tables (record_base, read_module_vst).
  */
 
 #include "air_module.h"
@@ -851,23 +854,36 @@ read_metadata_kind_block(struct reader *r)
 
 /* -- module records ----------------------------------------------------- */
 
+/*
+ * MODULE_CODE_VERSION 2 begins a global's and a function's records with where the name is in the string table.
+ * Version 1 has no string table -- the names come in the module's own symbol table (read_module_vst) -- and the
+ * record is the same without those two: Apple's compiler writes it so for old deployment targets (air64-apple-ios11:
+ * Flutter's Impeller shaders, 2026-11-10). `b` is where the record proper begins.
+ */
+static unsigned
+record_base(const struct air_module *m)
+{
+   return m->version >= 2 ? 2 : 0;
+}
+
 static bool
 read_globalvar(struct reader *r, const struct air_bs_entry *e)
 {
    struct air_module *m = r->m;
-   if (r->m->version < 2)
-      return fail(r, "module version %u: only bitcode with a string table is read", m->version);
-   if (e->num_ops < 8)
+   const unsigned b = record_base(m);
+   if (e->num_ops < b + 6)
       return fail(r, "GLOBALVAR too short");
 
    struct air_global *g = rzalloc(m, struct air_global);
    g->base.kind = AIR_VALUE_GLOBAL;
-   g->strtab_offset = e->ops[0];
-   g->strtab_size = e->ops[1];
-   const struct air_type *t = type_by_id(r, e->ops[2]);
+   if (b) {
+      g->strtab_offset = e->ops[0];
+      g->strtab_size = e->ops[1];
+   }
+   const struct air_type *t = type_by_id(r, e->ops[b]);
    if (!t)
       return false;
-   uint64_t flags = e->ops[3];
+   uint64_t flags = e->ops[b + 1];
    g->is_const = flags & 1;
    if (flags & 2) {
       g->value_type = t;
@@ -879,19 +895,19 @@ read_globalvar(struct reader *r, const struct air_bs_entry *e)
       g->addrspace = t->addrspace;
    }
    g->base.type = pointer_to(r, g->value_type, g->addrspace);
-   g->init_id = e->ops[4];
-   g->linkage = e->ops[5];
-   g->align = e->ops[6] ? 1u << (e->ops[6] - 1) : 0;
-   if (e->ops[7]) {
-      if (e->ops[7] - 1 >= m->num_section_names)
-         return fail(r, "GLOBALVAR names section %" PRIu64, e->ops[7] - 1);
-      g->section = m->section_names[e->ops[7] - 1];
+   g->init_id = e->ops[b + 2];
+   g->linkage = e->ops[b + 3];
+   g->align = e->ops[b + 4] ? 1u << (e->ops[b + 4] - 1) : 0;
+   if (e->ops[b + 5]) {
+      if (e->ops[b + 5] - 1 >= m->num_section_names)
+         return fail(r, "GLOBALVAR names section %" PRIu64, e->ops[b + 5] - 1);
+      g->section = m->section_names[e->ops[b + 5] - 1];
    }
-   if (e->num_ops > 10)
-      g->unnamed_addr = e->ops[10];
-   if (e->num_ops > 11)
-      g->externally_initialized = e->ops[11];
-   if (e->num_ops > 9 && e->ops[9])
+   if (e->num_ops > b + 8)
+      g->unnamed_addr = e->ops[b + 8];
+   if (e->num_ops > b + 9)
+      g->externally_initialized = e->ops[b + 9];
+   if (e->num_ops > b + 7 && e->ops[b + 7])
       return fail(r, "thread-local global");
 
    m->globals = reralloc(m, m->globals, struct air_global *, m->num_globals + 1);
@@ -904,16 +920,17 @@ static bool
 read_function_record(struct reader *r, const struct air_bs_entry *e)
 {
    struct air_module *m = r->m;
-   if (m->version < 2)
-      return fail(r, "module version %u: only bitcode with a string table is read", m->version);
-   if (e->num_ops < 8)
+   const unsigned b = record_base(m);
+   if (e->num_ops < b + 6)
       return fail(r, "FUNCTION too short");
 
    struct air_function *f = rzalloc(m, struct air_function);
    f->base.kind = AIR_VALUE_FUNCTION;
-   f->strtab_offset = e->ops[0];
-   f->strtab_size = e->ops[1];
-   const struct air_type *t = type_by_id(r, e->ops[2]);
+   if (b) {
+      f->strtab_offset = e->ops[0];
+      f->strtab_size = e->ops[1];
+   }
+   const struct air_type *t = type_by_id(r, e->ops[b]);
    if (!t)
       return false;
    if (t->kind == AIR_TYPE_POINTER && t->elem)
@@ -921,21 +938,21 @@ read_function_record(struct reader *r, const struct air_bs_entry *e)
    if (t->kind != AIR_TYPE_FUNCTION)
       return fail(r, "FUNCTION record of a non-function type");
    f->fn_type = t;
-   unsigned as = e->num_ops > 18 ? e->ops[18] : 0;
+   unsigned as = e->num_ops > b + 16 ? e->ops[b + 16] : 0;
    f->base.type = pointer_to(r, t, as);
-   f->cc = e->ops[3];
-   f->is_declaration = e->ops[4];
-   f->linkage = e->ops[5];
-   f->paramattr = e->ops[6];
-   f->align = e->ops[7] ? 1u << (e->ops[7] - 1) : 0;
-   if (e->ops[8]) {
-      if (e->ops[8] - 1 >= m->num_section_names)
-         return fail(r, "FUNCTION names section %" PRIu64, e->ops[8] - 1);
-      f->section = m->section_names[e->ops[8] - 1];
+   f->cc = e->ops[b + 1];
+   f->is_declaration = e->ops[b + 2];
+   f->linkage = e->ops[b + 3];
+   f->paramattr = e->ops[b + 4];
+   f->align = e->ops[b + 5] ? 1u << (e->ops[b + 5] - 1) : 0;
+   if (e->num_ops > b + 6 && e->ops[b + 6]) {
+      if (e->ops[b + 6] - 1 >= m->num_section_names)
+         return fail(r, "FUNCTION names section %" PRIu64, e->ops[b + 6] - 1);
+      f->section = m->section_names[e->ops[b + 6] - 1];
    }
-   if (e->num_ops > 11)
-      f->unnamed_addr = e->ops[11];
-   if (e->num_ops > 16 && e->ops[16])
+   if (e->num_ops > b + 9)
+      f->unnamed_addr = e->ops[b + 9];
+   if (e->num_ops > b + 14 && e->ops[b + 14])
       return fail(r, "function with a personality");
 
    f->num_args = t->num_members;
@@ -1690,6 +1707,35 @@ read_function_block(struct reader *r)
 
 /* -- the module block --------------------------------------------------- */
 
+/*
+ * Version 1's names of globals and functions (record_base): ENTRY [value id, name...] for a global or a declaration,
+ * FNENTRY [value id, body offset, name...] for a function with a body -- whose offset this reader does not need, the
+ * bodies coming in order. In version 2 the same block holds only FNENTRY [id, offset], and is skipped.
+ */
+static bool
+read_module_vst(struct reader *r)
+{
+   for (;;) {
+      struct air_bs_entry e = air_bs_next(&r->bs);
+      if (e.kind == AIR_BS_END_BLOCK)
+         return true;
+      if (e.kind == AIR_BS_ENTER_BLOCK) {
+         if (!air_bs_skip_block(&r->bs))
+            return check_bs(r) && fail(r, "a block in the module's symbol table");
+         continue;
+      }
+      if (e.kind != AIR_BS_RECORD)
+         return check_bs(r) && fail(r, "the module's symbol table ends early");
+      unsigned skip = e.id == VST_CODE_ENTRY ? 1 : e.id == VST_CODE_FNENTRY ? 2 : 0;
+      if (!skip || e.num_ops < skip)
+         continue;
+      struct air_value *v = value_by_id(r, e.ops[0]);
+      if (!v)
+         return false;
+      v->name = air_bs_ops_to_string(r->m, e.ops + skip, e.num_ops - skip);
+   }
+}
+
 static bool
 read_module_block(struct reader *r)
 {
@@ -1730,6 +1776,14 @@ read_module_block(struct reader *r)
             }
             air_bs_enter(&r->bs, e.id);
             ok = ok && read_function_block(r);
+            break;
+         case VALUE_SYMTAB_BLOCK_ID:
+            if (record_base(m)) {
+               ok = air_bs_skip_block(&r->bs);
+               break;
+            }
+            air_bs_enter(&r->bs, e.id);
+            ok = read_module_vst(r);
             break;
          default:
             /* attributes, symbol table, operand bundle tags, sync scopes,
@@ -1909,12 +1963,12 @@ air_module_read(void *mem_ctx, const void *data, size_t size, const char **error
       goto out;
    }
 
-   /* the string table comes after the module, so names come last */
-   for (unsigned i = 0; i < m->num_globals; i++)
+   /* the string table comes after the module, so names come last (version 1's came in its symbol table) */
+   for (unsigned i = 0; i < m->num_globals && record_base(m); i++)
       if (!(m->globals[i]->base.name =
                strtab_name(&r, m->globals[i]->strtab_offset, m->globals[i]->strtab_size)))
          goto out;
-   for (unsigned i = 0; i < m->num_functions; i++)
+   for (unsigned i = 0; i < m->num_functions && record_base(m); i++)
       if (!(m->functions[i]->base.name =
                strtab_name(&r, m->functions[i]->strtab_offset, m->functions[i]->strtab_size)))
          goto out;
