@@ -5054,7 +5054,22 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 	 * engine in the work's order). VectorKit makes about five a frame (1083 in 2 s, logs/105822), each read out and
 	 * written back by the processor after a finish.
 	 */
-	if (b->kind == ALIOTH_BLIT_TEXTURE_TO_TEXTURE && mesa.texture_copy != NULL) {
+	/*
+	 * (Off unless boot-arg metal_gpu_t2t=1: with it on, GL work in the same process crashed through lazy-binding
+	 * pointers of libhakios.gl.dylib that had become zero -- _glClientWaitSync, _glBindFramebuffer, pc 0 -- under Core
+	 * Image and SceneKit, in two of three GPU-tab runs after VectorKit had been copying textures this way, and in none
+	 * before (logs/112310, 115914, 121056). Memory written that was not the copy's; until the copy is shown not to be
+	 * the writer, the processor's road below.)
+	 */
+	static int gpu_t2t = -1;
+
+	if (gpu_t2t < 0) {
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		gpu_t2t = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_gpu_t2t=1") != NULL;
+	}
+	if (b->kind == ALIOTH_BLIT_TEXTURE_TO_TEXTURE && mesa.texture_copy != NULL && gpu_t2t) {
 		struct rwa_texture *src = [b->source mesaTexture], *dst = [b->destination mesaTexture];
 
 		if (src != NULL && dst != NULL) {
