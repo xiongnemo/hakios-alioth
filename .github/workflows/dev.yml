@@ -35,13 +35,19 @@ jobs:
           # (XNU's build wants GNU awk: mawk breaks its system call table)
           sudo update-alternatives --set awk /usr/bin/gawk
           # 7-Zip 23 or newer reads APFS
-          curl -fsSL https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz | sudo tar -xJ -C /usr/local/bin 7zz
+          # (downloads into a file, retried: a 504 from the server failed a whole run on 2026-11-09, and a retry
+          # inside "curl | tar" would hand tar a broken stream)
+          curl -fsSL --retry 5 --retry-delay 15 --retry-all-errors -o /tmp/7z.tar.xz \
+            https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz
+          sudo tar -xJf /tmp/7z.tar.xz -C /usr/local/bin 7zz
           sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
       - name: theos (its Linux toolchain and the iOS 16.5 SDK)
         run: |
           T=$HOME/theos
           mkdir -p $T/toolchain/linux/iphone $T/sdks /tmp/tc
-          curl -fsSL https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz | tar -xJ -C /tmp/tc
+          curl -fsSL --retry 5 --retry-delay 15 --retry-all-errors -o /tmp/tc.tar.xz \
+            https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz
+          tar -xJf /tmp/tc.tar.xz -C /tmp/tc
           c=$(find /tmp/tc -path '*/bin/clang' \( -type f -o -type l \) | head -1)
           [ -n "$c" ] || { echo "no bin/clang in the toolchain archive"; find /tmp/tc -maxdepth 3; exit 1; }
           cp -a "$(dirname "$(dirname "$c")")"/. $T/toolchain/linux/iphone/
