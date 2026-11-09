@@ -5190,12 +5190,30 @@ fb_command(char *cmd)
 			} else if (str_eq(var, "result")) {
 				fb_reply("OKAY", last_result);
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
-				/* width height bytes-per-row */
-				uint32_t mark = log_len;
-				print("%d %d %d", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, (uint64_t)SCREEN.stride);
-				log_buf[log_len] = 0;
-				fb_reply("OKAY", log_buf + mark);
-				log_len = mark;
+				/* width height bytes-per-row -- made here: through print() into the log it was "" once the
+				 * log was full (a run and some idle minutes, 2026-11-09), and it went onto the screen too */
+				const uint64_t v[3] = { SCREEN.width, SCREEN.height, SCREEN.stride };
+				char reply[64];
+				uint32_t n = 0;
+
+				for (int k = 0; k < 3; k++) {
+					char digits[24];
+					int j = 0;
+					uint64_t x = v[k];
+
+					do {
+						digits[j++] = (char)('0' + x % 10);
+						x /= 10;
+					} while (x != 0);
+					if (k != 0) {
+						reply[n++] = ' ';
+					}
+					while (j != 0) {
+						reply[n++] = digits[--j];
+					}
+				}
+				reply[n] = 0;
+				fb_reply("OKAY", reply);
 			} else {
 				fb_reply("OKAY", "");
 			}
