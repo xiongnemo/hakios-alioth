@@ -918,6 +918,19 @@ IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfac
 static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 3);
 
 /*
+ * fb_present_now (default 0 until measured with the owner's eyes on the home screen: every frame CoreAnimation sends that
+ * is not scanned out of its own surface takes this road; 1, 2026-11-09): a frame drawn HERE (copied into our buffer, then
+ * flipped to) is reported
+ * presented (frameInfoPresented) once its flip is taken, waited for right after it is issued -- as a frame scanned out
+ * of its own surface always was. 0: as before, reported only when the NEXT swap comes and finds the flip pending. An app
+ * with two drawables sends no next swap until CoreAnimation gives it one back, which waits for that report: System
+ * Check's metal.engine.screen2 drew 4.2 frames a second, nextDrawable waiting 417 ms each (three drawables: 44, 18.7 ms
+ * waits). Core Animation was released from the swap before (completeSwap), and the next frame drawn here would wait
+ * for this flip anyway (it draws into the buffer the flip moves away from), so nothing waits longer than it did.
+ */
+static TUNABLE(uint32_t, gPresentNow, "fb_present_now", 0);
+
+/*
  * fb_swap_wait=1 (2026-11-07; 0 the default until measured): SwapWait (selector 6) tells the truth. CoreAnimation asks it
  * of every swap it means to draw into again -- QuartzCore's swap_wait_timeout() calls IOMobileFramebufferSwapWait, and
  * while that is not 0 sleeps 100 us and asks again, within a time of its own -- and IOMFBDisplay::can_update() keeps a
@@ -2070,6 +2083,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				alioth_flip_issue(fFlipPhys[back]);
 				fFlipPending = true;
 				fPendingSwapID = swapWord(swap, SWAP_ID);
+				/* (fb_present_now: the frame reported presented as its flip is taken, not at the next swap) */
+				if (gPresentNow && alioth_flip_wait(40000)) {
+					uint64_t taken = mach_absolute_time();
+
+					fFlipFlips++;
+					if (micros(taken - shown) > 150) {
+						gTEAt = taken;
+					}
+					frameInfoPresented(fPendingSwapID, taken);
+					fFlipPending = false;
+				}
 			}
 			fFlipFront = back;
 			fComposeBase = fFlipBase[fSingle ? 0 : back ^ 1];
