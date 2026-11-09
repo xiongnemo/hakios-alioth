@@ -2251,6 +2251,24 @@ enum {
 }
 
 /*
+ * (the K40's) A library from source, asynchronously: Flutter's engine (Impeller) makes an application's own fragment
+ * programs this way. Metal's own form of it was never tried on this device; its synchronous form is, every round
+ * (System Check's source-built kernels), so this one is made of that one and answers at once, like the pipelines above.
+ */
+- (void)newLibraryWithSource:(NSString *)source
+		     options:(id)options
+	   completionHandler:(void (^)(id, NSError *))handler
+{
+	NSError *error = nil;
+	id library = [self newLibraryWithSource:source options:options error:&error];
+
+	if (handler != NULL) {
+		handler(library, error);
+	}
+	[library release];
+}
+
+/*
  * The mesh forms are the opposite hazard: they are NOT routed through the compiler, they ask
  * the mesh descriptor for a plain render pipeline descriptor and re-enter one of the four
  * forms above on self (0x181aabf60 and its three neighbours). Inherited, they would hand a
