@@ -352,6 +352,8 @@ public:
 	MiniIOSurface * directSurface(const uint8_t * swap, MiniIOSurface ** surfaces);
 	bool topHides(const uint8_t * swap, MiniIOSurface * s);
 	uint32_t        fStatHidden;            /* frames whose layers under a whole-display opaque layer 0 were left out */
+	uint32_t        fNoDirectUntil;         /* (the K40's) no direct scan-out before this many frames shown (show()) */
+	uint32_t        fStatHeldBack;          /* frames that could have been scanned out, copied as the ones around them */
 	uint32_t        fFlipFlips, fFlipMissed;
 	bool            fFlipPending;           /* a flip issued, not yet seen taken: fComposeBase is still scanned */
 	bool aliothFlipStart(void);
@@ -1863,6 +1865,29 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * its surfaces in turn, may draw into that one again. Nothing is drawn here.
 	 */
 	MiniIOSurface * direct = directSurface(swap, surfaces);
+	/*
+	 * (the K40's) ONE ROAD FOR AN APPLICATION'S DRAWABLES. A scan-out slot is given to a surface when it is made, first
+	 * come first served, so an application's drawables in turn may be some with a slot and some without: MapKit's three
+	 * in System Check's metal.mapkit, one with (148) and two made after all four slots were taken. The frames were then
+	 * scanned out and copied by turns -- the engine's scaler on one, the processors' nearest neighbour on the other,
+	 * the engine switched between the two settings 30 times a second -- and the owner saw the screen flicker (2026-11-09;
+	 * the kernel log: layer 0 changing every third swap, 50 times a second). So once an application's layer of the
+	 * display's size, over CoreAnimation's frame, came in a surface without a slot, no such frame is scanned out for the
+	 * next 30 frames: they are all copied while its frames come in both kinds of surface. A frame copied only for this
+	 * does not begin another such stretch, and CoreAnimation's own frames (one layer, all with slots) are not held.
+	 */
+	bool app_layer = false;
+
+	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
+		app_layer = app_layer || swapWord(swap, SWAP_SURFACE(layer)) != 0;
+	}
+	app_layer = app_layer && surfaces[0] != NULL && wholeDisplay(swap, surfaces[0], fWidth, fHeight);
+	if (direct == NULL && app_layer && surfaces[0]->scanPhys == 0 && fDirect && fRecBase == NULL && !fDiff) {
+		fNoDirectUntil = fSwapsShown + 30;
+	} else if (direct != NULL && app_layer && fSwapsShown < fNoDirectUntil) {
+		direct = NULL;
+		fStatHeldBack++;
+	}
 	if (direct != NULL) {
 		/*
 		 * The engine's source geometry is the surface's own: surfaces of the display's size come with rows of
@@ -2154,13 +2179,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
 		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
-		    "%u gave up; %u swaps came a refresh late themselves; %u scanned out of the surface itself; %u with the "
-		    "layers under a whole-display opaque layer 0 left out\n", fStatFrames,
-		    nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
+		    "%u gave up; %u swaps came a refresh late themselves; %u scanned out of the surface itself (%u more copied "
+		    "with the frames around them: one road); %u with the layers under a whole-display opaque layer 0 left out\n",
+		    fStatFrames, nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
-		    fStatHeld, fStatLost, fStatSwapsLate, fStatDirect, fStatHidden);
+		    fStatHeld, fStatLost, fStatSwapsLate, fStatDirect, fStatHeldBack, fStatHidden);
 		fStatSwapsLate = 0;
 		fStatDirect = 0;
+		fStatHeldBack = 0;
 		fStatHidden = 0;
 		if (fStatEarly != 0 || fStatEarlyRisk != 0 || gSwapWaitTruth != 0) {
 			uint32_t asked = __atomic_exchange_n(&gStatSwapWaitAsked, 0, __ATOMIC_RELAXED);
