@@ -930,7 +930,14 @@ static TUNABLE(uint32_t, gSwapEarly, "fb_swap_early", 3);
  * waits). Core Animation was released from the swap before (completeSwap), and the next frame drawn here would wait
  * for this flip anyway (it draws into the buffer the flip moves away from), so nothing waits longer than it did.
  */
-static TUNABLE(uint32_t, gPresentNow, "fb_present_now", 0);
+/*
+ * 2 (the default since 2026-11-10): for an application's own whole-display layer over CoreAnimation's frame alone -- a
+ * Metal or GL game's frames, which a two-drawable one starved for -- and not for CoreAnimation's own frames. Measured
+ * then (tools/present-ab.ps1, home-screen page swipes, Settings scrolled, Control Center): 1 for every frame changed
+ * nothing to speak of (refreshes missed 16.5% -> 18.9%, the five-second rates the same), so the home screen keeps 0's
+ * road and the frames that gain take the other.
+ */
+static TUNABLE(uint32_t, gPresentNow, "fb_present_now", 2);
 
 /*
  * fb_swap_wait=1 (2026-11-07; 0 the default until measured): SwapWait (selector 6) tells the truth. CoreAnimation asks it
@@ -2111,8 +2118,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				alioth_flip_issue(fFlipPhys[back]);
 				fFlipPending = true;
 				fPendingSwapID = swapWord(swap, SWAP_ID);
-				/* (fb_present_now: the frame reported presented as its flip is taken, not at the next swap) */
-				if (gPresentNow && alioth_flip_wait(40000)) {
+				/* (fb_present_now: the frame reported presented as its flip is taken, not at the next swap -- 1 every
+				 * frame, 2 an application's whole-display layer's) */
+				if ((gPresentNow == 1 || (gPresentNow == 2 && app_layer)) && alioth_flip_wait(40000)) {
 					uint64_t taken = mach_absolute_time();
 
 					fFlipFlips++;
