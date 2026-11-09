@@ -14,6 +14,9 @@
 
 #include "MiniDrivers.h"
 
+/* bsd/dev/hakios.adreno.c: a range's lines out of this processor's cache (readPixels()) */
+extern "C" void hakios_gpu_from_memory(void * start, uint64_t size);
+
 #define MINISURF_MAX_PLANES     4
 #define MINISURF_RESULT_MAX     0xa68           /* what IOSurface.framework reserves for a result */
 
@@ -126,6 +129,14 @@ public:
 	uint32_t                        purgeable;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
 	uint64_t                        scanPhys;       /* the pixels' physical address if the display can scan them out (one piece below 4 GB), else 0 */
+	/*
+	 * (the K40's) A slot's pixels once more in the kernel, CACHED, for the framebuffer's reads alone (readPixels()):
+	 * the slot's own mapping is write-combined, through which the processors read uncached -- scaling a display-sized
+	 * frame out of a slot took 14 ms, out of ordinary memory 3 (touch_lat trace, 2026-11-10). Nothing writes through
+	 * it, so it never holds a dirty line, and its lines are dropped before every read.
+	 */
+	IOMemoryMap *                   readMap;
+	uint8_t *                       kreadPixels;
 
 	virtual bool
 	init(void) APPLE_KEXT_OVERRIDE
@@ -133,6 +144,8 @@ public:
 		drawn = 0;
 		gpu_written = false;
 		scanPhys = 0;
+		readMap = NULL;
+		kreadPixels = NULL;
 		return OSObject::init();
 	}
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
@@ -152,6 +165,20 @@ public:
 	pixels(void) const
 	{
 		return kpixels + info.offset;
+	}
+	/*
+	 * (the K40's) The pixels for the processors to READ -- the framebuffer's copies of a frame: a slot's through its
+	 * cached alias, the lines of all of it dropped first (dc ivac: what the GPU or a program wrote since is what is
+	 * read); any other surface's as they are.
+	 */
+	const uint8_t *
+	readPixels(void) const
+	{
+		if (kreadPixels == NULL) {
+			return pixels();
+		}
+		hakios_gpu_from_memory(kreadPixels, info.allocSize);
+		return kreadPixels + info.offset;
 	}
 	void updateValuesState(void);
 };

@@ -1552,7 +1552,10 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 			fColumn[x] = (uint32_t) (sx + (int64_t) (x - px0) * sw / (px1 - px0));
 		}
 	}
-	job.pixels = s->pixels();
+	/* (the K40's) a slot's through its cached alias, its lines dropped first (MiniIOSurface::readPixels): read through
+	 * the write-combined mapping a display-sized frame took 14 ms to scale, 3 out of ordinary memory, and since one
+	 * road (show()) every frame of an application whose drawables are partly in slots is copied */
+	job.pixels = s->readPixels();
 	job.stride = s->info.bytesPerRow;
 	job.sx = sx;
 	job.sy = sy;

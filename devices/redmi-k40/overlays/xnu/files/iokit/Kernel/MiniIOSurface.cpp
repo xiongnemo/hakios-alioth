@@ -382,6 +382,8 @@ MiniIOSurface::free(void)
 	}
 
 	OSSafeReleaseNULL(values);
+	kreadPixels = NULL;
+	OSSafeReleaseNULL(readMap);
 	OSSafeReleaseNULL(clientMap);
 	if (client != NULL) {
 		client->complete();
@@ -750,6 +752,10 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		s->kpixels = (uint8_t *) s->clientMap->getVirtualAddress();
 		bzero(s->kpixels, alloc);
 		__asm__ volatile ("dsb sy" ::: "memory");
+		/* (and cached, for the framebuffer's reads alone: MiniIOSurface.h readMap. Without it, those read uncached.
+		 * Writable, though nothing writes through it: dc ivac is checked as a write) */
+		s->readMap = s->client->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache);
+		s->kreadPixels = s->readMap != NULL ? (uint8_t *) s->readMap->getVirtualAddress() : NULL;
 	}
 	if (wrapped != NULL) {
 		s->clientTask = current_task();
