@@ -958,6 +958,19 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
     * decoder the GL library uses (pvrtc.h) -- writes decoded texels into it. Read back, it
     * gives RGBA8, not blocks.
     */
+   /*
+    * (the K40's) The packed 32-bit formats, first-named channel in the low bits: the layout
+    * Vulkan fixes for the formats MoltenVK maps onto these (A2B10G10R10 -> RGB10A2Unorm,
+    * B10G11R11_UFLOAT -> RG11B10Float, E5B9G9R9_UFLOAT -> RGB9E5Float, A2R10G10B10 ->
+    * BGR10A2Unorm), and Gallium's names for the same words. Unity's URP takes RG11B10Float
+    * for an HDR camera on iOS from a table of its own, so a refusal was a nil target there.
+    * System Check's metal.packed32 writes one word of each and samples it.
+    */
+   {  90, "MTLPixelFormatRGB10A2Unorm",         PIPE_FORMAT_R10G10B10A2_UNORM },
+   {  91, "MTLPixelFormatRGB10A2Uint",          PIPE_FORMAT_R10G10B10A2_UINT },
+   {  92, "MTLPixelFormatRG11B10Float",         PIPE_FORMAT_R11G11B10_FLOAT },
+   {  93, "MTLPixelFormatRGB9E5Float",          PIPE_FORMAT_R9G9B9E5_FLOAT },
+   {  94, "MTLPixelFormatBGR10A2Unorm",         PIPE_FORMAT_B10G10R10A2_UNORM },
    { 160, "MTLPixelFormatPVRTC_RGB_2BPP",       PIPE_FORMAT_R8G8B8A8_UNORM },
    { 161, "MTLPixelFormatPVRTC_RGB_2BPP_sRGB",  PIPE_FORMAT_R8G8B8A8_SRGB },
    { 162, "MTLPixelFormatPVRTC_RGB_4BPP",       PIPE_FORMAT_R8G8B8A8_UNORM },
@@ -1109,10 +1122,6 @@ pixel_format_refusal(unsigned f)
       return "MTLPixelFormatBGRA4Unorm, which Metal.framework's own enumeration carries at "
              "44 and this device's MTLPixelFormat.h does not declare at all: a format no "
              "public header names is one whose layout nothing here can read";
-   if (f >= 90 && f <= 94)
-      return "one of Metal's formats packed into a 32-bit word (RGB10A2, RG11B10, RGB9E5, "
-             "BGR10A2), whose field order and bias this library will not guess: an error of "
-             "two bits in a channel is a picture, not a failure";
    if (f >= 130 && f <= 153)
       return "one of the BC compressed formats, whose texels come in blocks this library "
              "cannot make and whose rows are not rows of pixels";
