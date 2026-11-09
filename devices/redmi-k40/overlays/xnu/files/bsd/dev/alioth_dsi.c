@@ -1059,9 +1059,12 @@ alioth_scan_source(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride)
  * that what the loader draws is seen. No waiting: it is taken at the next frame.
  *
  * If the display was off when the run ended (the side button, then a test run's minutes up; or a panic meanwhile),
- * the panel is woken first and lit -- DBV 511, where iOS starts; the display's off left 0 -- or nothing the loader
- * draws is seen and the phone looks dead in its loader (2026-11-02). One processor is left, its interrupts off: no
- * lock is taken and nothing printed (dsi_alone); the waits are loops; what happened goes to the loader's log.
+ * the panel is woken first and lit -- the display's off left 0 -- or nothing the loader draws is seen and the phone
+ * looks dead in its loader (2026-11-02). Lit or awake, the panel is then set to DBV 175, where iOS starts (the
+ * backlight's ALIOTH_BL_INIT): the loader's screen is still text that stays put for as long as nobody sends a
+ * command, on an OLED, and iOS may have left the panel at any level (the owner, 2026-11-09: burn-in). One processor
+ * is left, its interrupts off: no lock is taken and nothing printed (dsi_alone); the waits are loops; what happened
+ * goes to the loader's log.
  */
 extern void loader_log_putc(char c);
 
@@ -1069,19 +1072,21 @@ void
 alioth_display_quiesce(void)
 {
 	if (mdss == 0) return;
-	if (panel_asleep && dsi != NULL && !dsi_dead) {
-		static const uint8_t lit[] = { 0x51, 0x01, 0xff };
-		const char *said;
-		int rc;
+	if (dsi != NULL && !dsi_dead) {
+		static const uint8_t dim[] = { 0x51, 0x00, 0xaf };
+		const char *said = NULL;
+		int rc = 0;
 
 		dsi_alone = true;
-		rc = panel_wake_steps();
-		if (rc == 0) {
-			rc = alioth_dsi_dcs_write(lit, 3, true, 0);
+		if (panel_asleep) {
+			rc = panel_wake_steps();
+			said = rc == 0 ? "alioth panel: awake again for the loader (the display was off at the run's end)\n" :
+			    "alioth panel: THE PANEL DID NOT WAKE for the loader (the display was off at the run's end)\n";
 		}
-		said = rc == 0 ? "alioth panel: awake and lit again for the loader (the display was off at the run's end)\n" :
-		    "alioth panel: THE PANEL DID NOT WAKE for the loader (the display was off at the run's end)\n";
-		for (; *said != 0; said++) {
+		if (rc == 0 && alioth_dsi_dcs_write(dim, 3, true, 0) != 0) {
+			said = "alioth panel: the loader's dim level (DBV 175) was not taken\n";
+		}
+		for (; said != NULL && *said != 0; said++) {
 			loader_log_putc(*said);
 		}
 	}

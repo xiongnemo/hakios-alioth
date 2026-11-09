@@ -3110,14 +3110,20 @@ publishAccelerator(IOService * provider)
  * 0x133 at power-up), written through DSI0's command DMA (alioth_dsi.c) from a work loop of its own;
  * a fade is steps of 33 ms (a DCS write waits for the MDP's frame transfer to end: up to 20 ms at
  * 120 Hz). The display's power (the framebuffer's RequestPowerChange) takes the panel to 0 and back.
- * Boot-args: panel_bl=0 (none), panel_bl_init=N (the level set at start, iOS's scale; 1023),
+ * Boot-args: panel_bl=0 (none), panel_bl_init=N (the level set at start, iOS's scale; 600),
  * panel_bl_curve=1 (iOS's level to the panel as it is, not squared).
  */
 extern "C" int alioth_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lp, uint8_t force_type);
 extern "C" bool hakios_board_is_alioth(void);
 
 #define ALIOTH_BL_MAX           0x7ff
-#define ALIOTH_BL_INIT          1023            /* (iOS's scale: half way, a quarter of the panel's light squared) */
+/*
+ * (iOS's scale) 600, squared DBV 175, about 43 nits: what the panel shows until somebody moves the slider, and
+ * CoreBrightness sets nothing before that -- a test run's whole 12 minutes of static screens, then the loader's text
+ * (alioth_display_quiesce sets 175 too). 1023 until 2026-11-09 (DBV 511, a quarter of the light, ~125 nits): too
+ * bright for an OLED left showing the same picture, the owner said.
+ */
+#define ALIOTH_BL_INIT          600
 #define ALIOTH_BL_STEP_MS       33
 #define ALIOTH_BL_NITS_MAX      500             /* (the K11A's light at DBV 0x7ff, outside its high-brightness mode) */
 #define ALIOTH_BL_FADE_MAX_MS   5000

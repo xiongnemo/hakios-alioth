@@ -1057,6 +1057,37 @@ seconds_since(uint64_t then)
 	return (READ_SYSREG(CNTVCT_EL0) - then) / READ_SYSREG(CNTFRQ_EL0);
 }
 
+/*
+ * The screen of a loader nobody talks to, on an OLED (the owner, 2026-11-09: burn-in): its text stays where it is
+ * for as long as the loader waits -- between test runs, ten minutes and more. From two minutes without a command, each
+ * minute's idle line is drawn alone on a cleared screen, in dark grey, a few rows further down each time; what is said
+ * next is in light grey again, below it. (The kernel leaves the panel dim on its way back: alioth_display_quiesce.)
+ */
+static int screen_dimmed;
+
+static void
+screen_idle_begin(void)
+{
+	static unsigned minute;
+
+	if (ST->con_out == NULL || ST->con_out->clear_screen == NULL || seconds_since(usb_last_command_at) < 120) {
+		return;
+	}
+	(void)ST->con_out->clear_screen(ST->con_out);
+	(void)ST->con_out->set_cursor_position(ST->con_out, 0, 2 + (minute++ * 7) % 40);
+	(void)ST->con_out->set_attribute(ST->con_out, EFI_DARKGRAY);
+	screen_dimmed = 1;
+}
+
+static void
+screen_idle_end(void)
+{
+	if (screen_dimmed) {
+		(void)ST->con_out->set_attribute(ST->con_out, EFI_LIGHTGRAY);
+		screen_dimmed = 0;
+	}
+}
+
 /* Reverse a stretch of memory in place. */
 static void
 reverse(char *p, uint64_t n)
@@ -4820,8 +4851,10 @@ usb_wait(uint8_t endpoint)
 			}
 			if (running_live == NULL && READ_SYSREG(CNTVCT_EL0) - said >= 60 * freq) {
 				said = READ_SYSREG(CNTVCT_EL0);
+				screen_idle_begin();
 				SAY("idle: %s (the loader's own link); %s; last run: %s\n", usb_connected ? "waiting for a command" :
 				    "no cable", resident_rd_size != 0 ? "a system image is in" : "no system image yet", last_result);
+				screen_idle_end();
 			}
 			if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
 				break;
@@ -4838,11 +4871,13 @@ usb_wait(uint8_t endpoint)
 		/* a minute and more of waiting for a command or a cable, no kernel running: say so once a minute */
 		if (running_live == NULL && (endpoint == USB_EP_OUT || endpoint == 0xff) && READ_SYSREG(CNTVCT_EL0) - said >= 60 * freq) {
 			said = READ_SYSREG(CNTVCT_EL0);
+			screen_idle_begin();
 			SAY("idle: %s; %s; last run: %s\n", usb_connected ? "waiting for a command" : "no cable",
 			    resident_rd_size != 0 ? "a system image is in" : "no system image yet", last_result);
 			if (usb_lost_in_run) {
 				SAY("      the PC lost this link during that run: unplug the cable and plug it in again\n");
 			}
+			screen_idle_end();
 		}
 
 		USB->handle_event(&msg, &size, &data);
@@ -5618,6 +5653,10 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	/* (light grey, not white: an OLED, and text that stays -- screen_idle_begin) */
+	if (ST->con_out != NULL && ST->con_out->set_attribute != NULL) {
+		(void)ST->con_out->set_attribute(ST->con_out, EFI_LIGHTGRAY);
+	}
 	print("== XNULOADER v3 ==\n");
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);

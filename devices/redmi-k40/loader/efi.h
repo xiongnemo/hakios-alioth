@@ -30,7 +30,17 @@ struct efi_text_output;
 typedef struct efi_text_output {
 	void *reset;
 	efi_status (EFIAPI *output_string)(struct efi_text_output *self, const char16 *str);
+	void *test_string, *query_mode, *set_mode;
+	/* (EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL's order: the loader's screen kept dark while it waits) */
+	efi_status (EFIAPI *set_attribute)(struct efi_text_output *self, uint64_t attribute);
+	efi_status (EFIAPI *clear_screen)(struct efi_text_output *self);
+	efi_status (EFIAPI *set_cursor_position)(struct efi_text_output *self, uint64_t column, uint64_t row);
+	void *enable_cursor, *mode;
 } efi_text_output;
+
+/* text attributes: a foreground colour, a background one << 4 (EDK2's graphics console: DARKGRAY 0x30 of 0xff) */
+#define EFI_LIGHTGRAY 0x07
+#define EFI_DARKGRAY  0x08
 
 enum { EfiLoaderData = 2, EfiConventionalMemory = 7 };
 enum { AllocateAnyPages = 0, AllocateMaxAddress = 1, AllocateAddress = 2 };

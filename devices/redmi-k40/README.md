@@ -103,8 +103,10 @@ own tuning.
 125 mA, 30 s at a time). Verified: on and off from Control Center.
 
 Brightness: `AppleARMBacklight` in `MiniIOMobileFramebuffer.cpp` takes CoreBrightness's level (0..2047) to
-the panel's DBV by DCS 0x51 (`alioth_dsi.c`), squared (`panel_bl_curve=1`: linear), starting at half of
-iOS's scale (a quarter of the panel's light; `panel_bl_init=N`) since the data volume is new at every boot.
+the panel's DBV by DCS 0x51 (`alioth_dsi.c`), squared (`panel_bl_curve=1`: linear), starting at 600 of
+iOS's scale (DBV 175, about 43 nits; `panel_bl_init=N`) since the data volume is new at every boot -- low, because
+it is an OLED that a test run leaves showing the same screens; the way back to the loader sets DBV 175 too, and the
+loader clears its text to one dim line after two minutes without a command.
 Verified: Control Center's slider changes the panel's brightness. Automatic brightness: the ambient light sensor on the sensor DSP (`slpi=1`) feeds CoreBrightness.
 
 ## Default arguments (Redmi K40)

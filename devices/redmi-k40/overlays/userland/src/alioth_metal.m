@@ -1867,6 +1867,11 @@ enum {
  * +[MTLFXSpatialScalerDescriptor supportsDevice:] take this for a discrete GPU and say yes
  * unconditionally -- so there is no answer here that is safe by default, only one that is
  * measured. Apple's own A11 driver answers 5.
+ *
+ * (the K40, 11-09) The whole ladder, read out of iOS 16.5's -initGPUFamilySupport (a jump table on the
+ * profile, each rung adding to the one below): 0 Apple1 Common1; 1 + Apple2 (ASTC); 2 and 3 abort; 4 + Apple3
+ * Common2 (Common2 promises tessellation, which this driver has not); 5 + Apple4 (tile shaders, imageblocks,
+ * raster order groups: not here either); 6 + Apple5 Common3; 7 + Apple6 Metal3; 8 + Apple7; 9 + Apple8.
  */
 - (NSUInteger)featureProfile
 {
