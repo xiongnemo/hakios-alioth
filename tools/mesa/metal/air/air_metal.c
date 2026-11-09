@@ -1780,6 +1780,67 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
    return 0;
 }
 
+/*
+ * (the K40's) A blit encoder's texture-to-texture copy by the GPU: resource_copy_region, which
+ * freedreno does on the 2D engine, ordered against what writes the source and reads the
+ * destination by its resource tracking, with nobody waiting. VectorKit copies textures about
+ * five times a frame (metal_stats=1: 1083 in 2 s, logs/105822), and the driver did each through
+ * the processor -- read out, written back -- after a finish.
+ */
+int
+rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice,
+                 const unsigned dst_origin[3], struct rwa_texture *src, unsigned src_level,
+                 unsigned src_slice, const unsigned src_origin[3], const unsigned size[3], char *why,
+                 size_t why_size)
+{
+   struct pipe_box from, to;
+
+   if (!dst || !src || dst->device != src->device) {
+      say(why, why_size, "a texture copy needs two textures of one device");
+      return -1;
+   }
+   if (util_format_get_blocksize(dst->res->format) != util_format_get_blocksize(src->res->format) ||
+       util_format_get_blockwidth(dst->res->format) != util_format_get_blockwidth(src->res->format) ||
+       util_format_get_blockheight(dst->res->format) != util_format_get_blockheight(src->res->format) ||
+       dst->res->nr_samples != src->res->nr_samples) {
+      say(why, why_size, "a copy from %s to %s: Metal copies between textures of one texel size "
+                         "and sample count", src->format_name, dst->format_name);
+      return -1;
+   }
+   if (!texture_box(src, src_level, src_slice, src_origin, size, &from, why, why_size) ||
+       !texture_box(dst, dst_level, dst_slice, dst_origin, size, &to, why, why_size))
+      return -1;
+   dst->device->pipe->resource_copy_region(dst->device->pipe, dst->res, dst_level, to.x, to.y,
+                                           to.z, src->res, src_level, &from);
+   return 0;
+}
+
+/*
+ * (the K40's) A wait for the GPU's use of one buffer, before the processor reads it (for_write 0:
+ * its pending writes) or writes it (1: everything pending on it) -- a map of the whole buffer and
+ * its unmap, which in freedreno flushes the batches that use it and waits on its fence alone, and
+ * with READ in the usage never shadows the buffer (freedreno_resource.c: only a write-only
+ * DISCARD_RANGE map does), so the mapping the driver holds stays the buffer's. What the blit
+ * encoder's processor copies wait for instead of everything.
+ */
+int
+rwa_buffer_wait(struct rwa_buffer *buffer, unsigned for_write, char *why, size_t why_size)
+{
+   struct pipe_transfer *xfer = NULL;
+
+   if (!buffer) {
+      say(why, why_size, "a wait needs a buffer");
+      return -1;
+   }
+   if (!pipe_buffer_map_range(buffer->device->pipe, buffer->res, 0, buffer->size,
+                              PIPE_MAP_READ | (for_write ? PIPE_MAP_WRITE : 0), &xfer)) {
+      say(why, why_size, "a %zu-byte buffer could not be mapped to wait for the GPU", buffer->size);
+      return -1;
+   }
+   pipe_buffer_unmap(buffer->device->pipe, xfer);
+   return 0;
+}
+
 int
 rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                  const unsigned origin[3], const unsigned size[3], void *bytes,

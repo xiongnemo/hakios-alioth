@@ -1411,6 +1411,15 @@ int rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer
 		    size_t src_offset, size_t size, char *why, size_t why_size);
 int rwa_buffer_fill(struct rwa_buffer *buffer, size_t offset, size_t size, unsigned char value,
 		    char *why, size_t why_size);
+/* (the K40's) A texture-to-texture copy by the GPU, as above (the region `size` at src_origin of
+ * src_level / src_slice to dst_origin of dst_level / dst_slice; one texel size and sample count);
+ * and a wait for the GPU's use of one buffer only -- its writes (for_write 0) or everything
+ * pending on it (1) -- before the processor touches it. 0, or -1 and why. */
+int rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice,
+		     const unsigned dst_origin[3], struct rwa_texture *src, unsigned src_level,
+		     unsigned src_slice, const unsigned src_origin[3], const unsigned size[3],
+		     char *why, size_t why_size);
+int rwa_buffer_wait(struct rwa_buffer *buffer, unsigned for_write, char *why, size_t why_size);
 
 /* stage 0 the vertex function (nothing for a generated vertex stage), 1 the fragment one.
  * 0, or -1 and why -- including when there are more than `max`. */

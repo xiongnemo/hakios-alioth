@@ -596,6 +596,9 @@ static struct {
 	/* (the K40's) a blit encoder's buffer copy and fill, by the GPU (air_metal.h rwa_buffer_copy) */
 	int (*buffer_copy)(struct rwa_buffer *, size_t, struct rwa_buffer *, size_t, size_t, char *, size_t);
 	int (*buffer_fill)(struct rwa_buffer *, size_t, size_t, unsigned char, char *, size_t);
+	int (*texture_copy)(struct rwa_texture *, unsigned, unsigned, const unsigned[3], struct rwa_texture *, unsigned,
+	    unsigned, const unsigned[3], const unsigned[3], char *, size_t);
+	int (*buffer_wait)(struct rwa_buffer *, unsigned, char *, size_t);
 	/* (the K40's) rwa_finish in two halves: the wait off the encoding thread (AliothMetalCommandBuffer
 	 * -aliothDeliverHandlers); looked up, not required */
 	void *(*flush)(struct rwa_device *, unsigned);
@@ -908,6 +911,10 @@ GPU_LOCKED(int, buffer_copy, (struct rwa_buffer *d, size_t do_, struct rwa_buffe
     size_t ws), (d, do_, s, so, n, w, ws))
 GPU_LOCKED(int, buffer_fill, (struct rwa_buffer *b, size_t o, size_t n, unsigned char v, char *w, size_t ws),
     (b, o, n, v, w, ws))
+GPU_LOCKED(int, texture_copy, (struct rwa_texture *d, unsigned dl, unsigned ds, const unsigned dor[3],
+    struct rwa_texture *s, unsigned sl, unsigned ss, const unsigned sor[3], const unsigned z[3], char *w, size_t ws),
+    (d, dl, ds, dor, s, sl, ss, sor, z, w, ws))
+GPU_LOCKED(int, buffer_wait, (struct rwa_buffer *b, unsigned fw, char *w, size_t ws), (b, fw, w, ws))
 
 /*
  * (the K40's) rwa_finish in its two halves: flushed with a fence under the library's lock, the fence waited for
@@ -1002,6 +1009,8 @@ mesa_available(void)
 	*(void **)&mesa.texture_view = dlsym(mesa.handle, "rwa_texture_view");
 	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
 	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
+	*(void **)&mesa.texture_copy = dlsym(mesa.handle, "rwa_texture_copy");
+	*(void **)&mesa.buffer_wait = dlsym(mesa.handle, "rwa_buffer_wait");
 	*(void **)&mesa.flush = dlsym(mesa.handle, "rwa_flush");
 	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
@@ -1047,6 +1056,8 @@ mesa_available(void)
 	GPU_LOCK_WRAP(texture_view);
 	GPU_LOCK_WRAP(buffer_copy);
 	GPU_LOCK_WRAP(buffer_fill);
+	GPU_LOCK_WRAP(texture_copy);
+	GPU_LOCK_WRAP(buffer_wait);
 	GPU_LOCK_WRAP(flush);
 	return true;
 }
@@ -5038,12 +5049,58 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 		}
 		return YES;
 	}
+	/*
+	 * (the K40's) A texture-to-texture copy between the library's textures: the GPU's too (rwa_texture_copy, the 2D
+	 * engine in the work's order). VectorKit makes about five a frame (1083 in 2 s, logs/105822), each read out and
+	 * written back by the processor after a finish.
+	 */
+	if (b->kind == ALIOTH_BLIT_TEXTURE_TO_TEXTURE && mesa.texture_copy != NULL) {
+		struct rwa_texture *src = [b->source mesaTexture], *dst = [b->destination mesaTexture];
+
+		if (src != NULL && dst != NULL) {
+			const unsigned so[3] = { (unsigned)b->sourceOrigin.x, (unsigned)b->sourceOrigin.y,
+			    (unsigned)b->sourceOrigin.z };
+			const unsigned dor[3] = { (unsigned)b->destinationOrigin.x, (unsigned)b->destinationOrigin.y,
+			    (unsigned)b->destinationOrigin.z };
+			const unsigned z[3] = { (unsigned)b->size.width, (unsigned)b->size.height,
+			    (unsigned)MAX(b->size.depth, 1) };
+
+			alioth_stat(ST_BLIT_GPU, mach_absolute_time());
+			if (mesa.texture_copy(dst, (unsigned)b->destinationLevel, (unsigned)b->destinationSlice, dor, src,
+			    (unsigned)b->sourceLevel, (unsigned)b->sourceSlice, so, z, why, size) != 0) {
+				[self failWith:why];
+				return NO;
+			}
+			return YES;
+		}
+	}
 	alioth_stat(ST_BLIT, mach_absolute_time());
 	if (alioth_stats_on && b->kind < 8) {
 		__atomic_fetch_add(&alioth_blit_kinds[b->kind], 1, __ATOMIC_RELAXED);
 	}
+	/*
+	 * (the K40's) Between a buffer and a texture the processor copies, and waits only for the buffer's own GPU work
+	 * (rwa_buffer_wait: its writes before reading it, everything on it before writing it); the texture side is
+	 * waited for by the library's own write and read of it (texture_subdata, a READ transfer), which freedreno
+	 * synchronises per resource. VectorKit uploads into textures about once a frame (284 in 2 s).
+	 */
+	BOOL waited = NO;
+
+	if ((b->kind == ALIOTH_BLIT_BUFFER_TO_TEXTURE || b->kind == ALIOTH_BLIT_TEXTURE_TO_BUFFER) &&
+	    mesa.buffer_wait != NULL) {
+		id buffer = b->kind == ALIOTH_BLIT_BUFFER_TO_TEXTURE ? b->source : b->destination;
+		struct rwa_buffer *mb = [buffer respondsToSelector:@selector(mesaBuffer)] ? [buffer mesaBuffer] : NULL;
+
+		if (mb != NULL) {
+			if (mesa.buffer_wait(mb, b->kind == ALIOTH_BLIT_TEXTURE_TO_BUFFER, why, size) != 0) {
+				[self failWith:why];
+				return NO;
+			}
+			waited = YES;
+		}
+	}
 	/* what came before it in this buffer, finished: the processor reads and writes here */
-	if (device != NULL && alioth_finish(device, why, size) != 0) {
+	if (!waited && device != NULL && alioth_finish(device, why, size) != 0) {
 		[self failWith:why];
 		return NO;
 	}
