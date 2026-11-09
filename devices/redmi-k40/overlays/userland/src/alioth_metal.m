@@ -1677,6 +1677,10 @@ enum {
 	 * buffer as retained, which outlives indirectBuffer's being cleared once it is read */
 	BOOL retainsReferences;
 	id keptIndirect;
+	/* (the K40's) a draw's vertex stage's textures and samplers (rwa_draw.vertex): until 11-09 never bound */
+	id vertexTextures[RW_MAX_BUFFERS];
+	id vertexSamplers[RW_MAX_BUFFERS];
+	unsigned vertexTextureCount, vertexSamplerCount;
 }
 /* (the K40's) everything this work refers to kept alive until the work is let go of, as Metal keeps what a command
  * buffer references (retainedReferences) */
@@ -4660,6 +4664,12 @@ out:
 	for (unsigned i = 0; i < samplerCount && i < RW_MAX_BUFFERS; i++) {
 		[samplers[i] retain];
 	}
+	for (unsigned i = 0; i < vertexTextureCount && i < RW_MAX_BUFFERS; i++) {
+		[vertexTextures[i] retain];
+	}
+	for (unsigned i = 0; i < vertexSamplerCount && i < RW_MAX_BUFFERS; i++) {
+		[vertexSamplers[i] retain];
+	}
 }
 
 - (void)dealloc
@@ -4685,6 +4695,12 @@ out:
 		}
 		for (unsigned i = 0; i < samplerCount && i < RW_MAX_BUFFERS; i++) {
 			[samplers[i] release];
+		}
+		for (unsigned i = 0; i < vertexTextureCount && i < RW_MAX_BUFFERS; i++) {
+			[vertexTextures[i] release];
+		}
+		for (unsigned i = 0; i < vertexSamplerCount && i < RW_MAX_BUFFERS; i++) {
+			[vertexSamplers[i] release];
 		}
 	}
 	[super dealloc];
@@ -5743,6 +5759,8 @@ done:
 	struct rwa_buffer *fragment_buffers[RW_MAX_BUFFERS] = { NULL };
 	struct rwa_texture *fragment_textures[RW_MAX_BUFFERS] = { NULL };
 	struct rwa_sampler *fragment_samplers[RW_MAX_BUFFERS] = { NULL };
+	struct rwa_texture *vertex_textures[RW_MAX_BUFFERS] = { NULL };     /* (the K40's) the vertex stage's */
+	struct rwa_sampler *vertex_samplers[RW_MAX_BUFFERS] = { NULL };
 	/* and Metal's own table for each stage: the same entries as the arrays above with
 	 * the OFFSET beside each, which rwa_bindings has nowhere to put. One array for
 	 * both of the things an offset means -- which encoding of an argument buffer, and
@@ -5874,6 +5892,12 @@ done:
 	for (unsigned i = 0; i < work->samplerCount; i++) {
 		fragment_samplers[i] = [work->samplers[i] mesaSampler];
 	}
+	for (unsigned i = 0; i < work->vertexTextureCount; i++) {
+		vertex_textures[i] = [work->vertexTextures[i] mesaTexture];
+	}
+	for (unsigned i = 0; i < work->vertexSamplerCount; i++) {
+		vertex_samplers[i] = [work->vertexSamplers[i] mesaSampler];
+	}
 	struct rwa_draw draw = {
 		.color = color,
 		.color_count = work->colorCount,
@@ -5889,7 +5913,11 @@ done:
 		.depth_stencil = [work->depthStencilState mesaDepthStencil],
 		.stencil_reference = { work->stencilReference[0], work->stencilReference[1] },
 		.depth_range = work->hasDepthRange ? work->depthRange : NULL,
-		.vertex = { .buffers = vertex_buffers, .buffer_count = work->vertexBufferCount },
+		.vertex = {
+			.buffers = vertex_buffers, .buffer_count = work->vertexBufferCount,
+			.textures = vertex_textures, .texture_count = work->vertexTextureCount,
+			.samplers = vertex_samplers, .sampler_count = work->vertexSamplerCount,
+		},
 		/* and the streams the layout fetches from, at Metal's own indices with
 		 * Metal's own offsets; the count is what the library needs covered, which
 		 * is the highest index the pipeline fetches from plus one. */
@@ -6268,6 +6296,9 @@ done:
 	id _fragmentSamplers[RW_MAX_BUFFERS];
 	unsigned _vertexBufferCount, _fragmentBufferCount;
 	unsigned _fragmentTextureCount, _fragmentSamplerCount;
+	id _vertexTextures[RW_MAX_BUFFERS];             /* (the K40's) the vertex stage's, as the fragment's */
+	id _vertexSamplers[RW_MAX_BUFFERS];
+	unsigned _vertexTextureCount, _vertexSamplerCount;
 	BOOL _complained;
 	BOOL _drew, _ended;     /* (the K40's: a draw was recorded; -endEncoding has run) */
 }
@@ -6689,6 +6720,14 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 	for (unsigned i = 0; i < _fragmentSamplerCount; i++) {
 		work->samplers[i] = _fragmentSamplers[i];
 	}
+	work->vertexTextureCount = _vertexTextureCount;
+	for (unsigned i = 0; i < _vertexTextureCount; i++) {
+		work->vertexTextures[i] = _vertexTextures[i];
+	}
+	work->vertexSamplerCount = _vertexSamplerCount;
+	for (unsigned i = 0; i < _vertexSamplerCount; i++) {
+		work->vertexSamplers[i] = _vertexSamplers[i];
+	}
 	[_recorder recordWork:work];
 	[work release];
 	_drew = YES;
@@ -6779,28 +6818,52 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 	}
 }
 
+/*
+ * (the K40's) The vertex stage's textures and samplers, kept as the fragment stage's are and handed to the library in
+ * rwa_draw.vertex, which has had room for them all along. Until 11-09 they were dropped here ("the contract binds
+ * textures to the fragment stage only"), and a vertex shader that reads a texture had its draw refused: MapKit's
+ * labels with a halo (GlyphWithNormalHalo's vertex function reads texture 7), 8 to 22 refusals in each run's map test.
+ */
 - (void)setVertexTexture:(id)texture atIndex:(NSUInteger)index
 {
-	(void)texture; (void)index;   /* the contract binds textures to the fragment stage only */
+	if (index >= RW_MAX_BUFFERS) {
+		return;
+	}
+	_vertexTextures[index] = texture;
+	if (index + 1 > _vertexTextureCount) {
+		_vertexTextureCount = (unsigned)index + 1;
+	}
 }
 - (void)setVertexTextures:(const id *)textures withRange:(NSRange)range
 {
-	(void)textures; (void)range;
+	for (NSUInteger i = 0; i < range.length; i++) {
+		[self setVertexTexture:textures[i] atIndex:range.location + i];
+	}
 }
 - (void)setVertexSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-	(void)sampler; (void)index;
+	if (index >= RW_MAX_BUFFERS) {
+		return;
+	}
+	_vertexSamplers[index] = sampler;
+	if (index + 1 > _vertexSamplerCount) {
+		_vertexSamplerCount = (unsigned)index + 1;
+	}
 }
 - (void)setVertexSamplerState:(id)sampler
 		  lodMinClamp:(float)lodMin
 		  lodMaxClamp:(float)lodMax
 		      atIndex:(NSUInteger)index
 {
-	(void)sampler; (void)lodMin; (void)lodMax; (void)index;
+	/* (the sampler's own range, as for the fragment stage: a per-binding clamp is not carried) */
+	(void)lodMin; (void)lodMax;
+	[self setVertexSamplerState:sampler atIndex:index];
 }
 - (void)setVertexSamplerStates:(const id *)samplers withRange:(NSRange)range
 {
-	(void)samplers; (void)range;
+	for (NSUInteger i = 0; i < range.length; i++) {
+		[self setVertexSamplerState:samplers[i] atIndex:range.location + i];
+	}
 }
 - (void)setFragmentTextures:(const id *)textures withRange:(NSRange)range
 {
