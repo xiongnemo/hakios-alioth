@@ -484,7 +484,8 @@ static void clear_now(struct eagl *e);
 static void
 eagl_enter(struct eagl *e, unsigned offset)
 {
-	if (current != e) {
+	/* (the same eagl by address is not enough: a freed one's address comes back -- hakios_gl_is_current()) */
+	if (current != e || !hakios_gl_is_current(e->gl)) {
 		if (!hakios_gl_make_current(e->gl)) {
 			say("hakios-gl: the context cannot be made this thread's\n");
 		}
@@ -558,7 +559,7 @@ app_settle(const char *after)
 	struct eagl *own = held != nil ? context_of(held) : NULL;
 	static _Atomic unsigned told;
 
-	if (current == own) {
+	if (current == own && (own == NULL || hakios_gl_is_current(own->gl))) {
 		return;
 	}
 	if (told < 12) {
@@ -5143,7 +5144,7 @@ app_setCurrentContext(id self, SEL selector, id context)
 			say("hakios-gl: %s: +setCurrentContext: on %s thread %p\n", getprogname(), pthread_main_np() ? "the main" : "another",
 			    (void *)pthread_self());
 		}
-		if (current != e && !hakios_gl_make_current(e->gl)) {
+		if ((current != e || !hakios_gl_is_current(e->gl)) && !hakios_gl_make_current(e->gl)) {
 			say("hakios-gl: %s: the context cannot be made this thread's\n", getprogname());
 			return NO;
 		}
@@ -5336,7 +5337,7 @@ storage_now(id self, SEL selector, unsigned long target, id drawable)
 	if (e == NULL || target != GL_RENDERBUFFER) {
 		return NO;
 	}
-	if (current != e && !hakios_gl_make_current(e->gl)) {
+	if ((current != e || !hakios_gl_is_current(e->gl)) && !hakios_gl_make_current(e->gl)) {
 		return NO;
 	}
 	current = e;
@@ -5749,7 +5750,7 @@ present_now(id self, SEL selector, unsigned long target)
 	if (e == NULL || target != GL_RENDERBUFFER) {
 		return NO;
 	}
-	if (current != e && !hakios_gl_make_current(e->gl)) {
+	if ((current != e || !hakios_gl_is_current(e->gl)) && !hakios_gl_make_current(e->gl)) {
 		return NO;
 	}
 	current = e;

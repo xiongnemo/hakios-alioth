@@ -57,8 +57,20 @@ extern unsigned glGetError(void);
 struct hakios_gl {
 	OSMesaContext context;
 	void *current;                  /* Mesa's context of it, as the thread's current one once made so */
+	uint64_t serial;                /* (the K40's) never the same for two contexts, unlike their addresses */
 	unsigned char window[WINDOW * WINDOW * 4];
 };
+
+/*
+ * (the K40's) Which context this thread made current last, by serial: eagl.c asks it before it skips a make-current
+ * (hakios_gl_is_current()). Its own check was "the same eagl as last time" by address, and an address comes back:
+ * Core Image and SceneKit free contexts on one queue's thread while another still has them current, and when the
+ * next context lands where the freed one was, that thread went on calling through the dead context's dispatch
+ * table -- Mesa's gl* tail-call through it, so pc 0 with our wrapper as the caller (GPU tab coreimage.default and
+ * scenekit.gles2, 2026-11-09, logs/112310, 115914, 121056, 131443; the wrapper's own pointers were all intact).
+ */
+static uint64_t gl_serials;
+static __thread uint64_t thread_serial;
 
 /*
  * Every context alive, by Mesa's own pointer (what the thread's current one is). A thread whose current context is
@@ -109,6 +121,7 @@ forget_dead_current(void)
 	if (!alive) {
 		_mesa_glapi_set_context(NULL);
 		_mesa_glapi_set_dispatch(NULL);
+		thread_serial = 0;
 		if (forgotten++ < 8) {
 			gl_say("hakios-gl: %s: a freed context was this thread's current one (%p, thread %p): forgotten\n",
 			    getprogname(), current, (void *)pthread_self());
@@ -132,6 +145,7 @@ hakios_gl_create_shared(int version, struct hakios_gl *share)
 		gl = NULL;
 	}
 	if (gl != NULL) {
+		gl->serial = __atomic_add_fetch(&gl_serials, 1, __ATOMIC_RELAXED);
 		pthread_mutex_lock(&live_lock);
 		for (unsigned i = 0; i < LIVE; i++) {
 			if (live[i] == NULL) {
@@ -157,11 +171,15 @@ hakios_gl_make_current(struct hakios_gl *gl)
 
 	forget_dead_current();
 	if (gl == NULL) {
+		thread_serial = 0;
 		return OSMesaMakeCurrent(NULL, NULL, 0, 0, 0);
 	}
 	done = OSMesaMakeCurrent(gl->context, gl->window, GL_UNSIGNED_BYTE, WINDOW, WINDOW);
 	if (done) {
 		gl->current = _mesa_glapi_get_context();
+		thread_serial = gl->serial;
+	} else {
+		thread_serial = 0;
 	}
 	return done;
 }
@@ -170,6 +188,13 @@ int
 hakios_gl_has_current(void)
 {
 	return _mesa_glapi_get_context() != NULL;
+}
+
+int
+hakios_gl_is_current(const struct hakios_gl *gl)
+{
+	return gl != NULL && gl->serial != 0 && thread_serial == gl->serial && gl->current != NULL &&
+	       _mesa_glapi_get_context() == gl->current;
 }
 
 void

@@ -11,6 +11,7 @@ struct hakios_gl *hakios_gl_create(int version);              /* a context of Op
 struct hakios_gl *hakios_gl_create_shared(int version, struct hakios_gl *share);  /* ... sharing share's objects */
 int hakios_gl_make_current(struct hakios_gl *gl);             /* ... the calling thread's (NULL: none); 0 on failure */
 int hakios_gl_has_current(void);                               /* (the K40's) a context is the calling thread's now */
+int hakios_gl_is_current(const struct hakios_gl *gl);         /* (the K40's) ... and it is this one, by serial, not address */
 void hakios_gl_destroy(struct hakios_gl *gl);
 const char *hakios_gl_library(void);                           /* for the log */
 
