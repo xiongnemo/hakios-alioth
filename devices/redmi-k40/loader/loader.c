@@ -1088,6 +1088,118 @@ screen_idle_end(void)
 	}
 }
 
+#if defined(LOADER_ALIOTH)
+/*
+ * The panel's brightness from the loader itself: the firmware leaves this OLED bright, and the loader's screen is
+ * the first thing on it (the owner, 2026-11-09). One DCS write on DSI0 made as bsd/dev/alioth_dsi.c's
+ * alioth_dsi_dcs_write makes it -- the packet through the test pattern generator's FIFO, the command DMA triggered by
+ * software, its done bit waited for, the registers put back as found -- and only on a running command-mode DSI 2.x
+ * controller (the firmware's: the display engine's registers are mapped for the loader, oem screenshot reads them).
+ * 0 when the controller said done.
+ */
+#define LDSI0                   0x0ae94000UL
+#define LDSI_HW_VERSION         0x000
+#define LDSI_CTRL               0x004   /* bit0 ENABLE, bit2 CMD_MODE_EN */
+#define LDSI_STATUS             0x008   /* bit1 CMD_MODE_DMA_BUSY, bit2 CMD_MODE_MDP_BUSY */
+#define LDSI_CMD_DMA_CTRL       0x03c   /* 31 BROADCAST_EN, 30 MASTER, 28 EMBEDDED, 26 LOW_POWER */
+#define LDSI_DMA_CMD_LENGTH     0x04c
+#define LDSI_TRIG_CTRL          0x084   /* [3:0] DMA trigger, 4 = software */
+#define LDSI_CMD_DMA_SW_TRIGGER 0x090
+#define LDSI_INT_CTRL           0x110   /* even bits status (write 1 clears), odd bits enables */
+#define LDSI_TPG_CTRL           0x15c
+#define LDSI_TPG_CMD_DMA_INIT   0x17c   /* the FIFO port */
+#define LDSI_TPG_DMA_FIFO_RESET 0x1ec
+
+static inline uint32_t ldsi_rd(uint32_t off) { return *(volatile uint32_t *)(uintptr_t)(LDSI0 + off); }
+static inline void ldsi_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(uintptr_t)(LDSI0 + off) = v; }
+
+static int
+panel_dcs_write(const uint8_t *buf, uint32_t len)
+{
+	uint32_t words[2 + 60 / 4], n = 0, i, ver = ldsi_rd(LDSI_HW_VERSION), ctrl = ldsi_rd(LDSI_CTRL);
+
+	if ((ver >> 28) != 2 || (ctrl & 0x5u) != 0x5u || len == 0 || len > 60) {
+		return -1;
+	}
+	uint8_t dt = len == 1 ? 0x05 : len == 2 ? 0x15 : 0x39;
+	if (dt != 0x39) {
+		words[n++] = 1u << 31 | (uint32_t)dt << 16 | (len >= 2 ? (uint32_t)buf[1] << 8 : 0u) | buf[0];
+	} else {
+		words[n++] = 1u << 31 | 1u << 30 | (uint32_t)dt << 16 | len;
+		for (i = 0; i < len; i += 4) {
+			uint32_t w = 0;
+
+			for (uint32_t b = 0; b < 4 && i + b < len; b++) {
+				w |= (uint32_t)buf[i + b] << (8 * b);
+			}
+			words[n++] = w;
+		}
+	}
+	uint32_t bytes = n * 4;
+	if (n & 1u) {
+		words[n++] = 0;         /* the FIFO takes an even number of words */
+	}
+	for (i = 0; i < 250 && (ldsi_rd(LDSI_STATUS) & 2u); i++) {
+		BS->stall(20);
+	}
+	if (ldsi_rd(LDSI_STATUS) & 2u) {
+		return -2;              /* someone else's command never finished: not touched */
+	}
+	for (i = 0; i < 1000 && (ldsi_rd(LDSI_STATUS) & 4u); i++) {
+		BS->stall(20);          /* between frames */
+	}
+	uint32_t tpg = ldsi_rd(LDSI_TPG_CTRL), dma = ldsi_rd(LDSI_CMD_DMA_CTRL), trig = ldsi_rd(LDSI_TRIG_CTRL);
+	int done = 0;
+
+	if ((trig & 0xfu) != 4u) {
+		ldsi_wr(LDSI_TRIG_CTRL, (trig & ~0xfu) | 4u);
+	}
+	ldsi_wr(LDSI_INT_CTRL, (ldsi_rd(LDSI_INT_CTRL) & 0xaaaaaaaau) | 1u);
+	ldsi_wr(LDSI_TPG_CTRL, 3u << 16 | 1u << 2 | 1u << 1);
+	for (uint32_t w = 0; w < n; w++) {
+		ldsi_wr(LDSI_TPG_CMD_DMA_INIT, words[w]);
+	}
+	ldsi_wr(LDSI_CMD_DMA_CTRL, (dma & ~(1u << 31 | 1u << 30 | 1u << 26)) | 1u << 28 | 1u << 26);
+	ldsi_wr(LDSI_DMA_CMD_LENGTH, bytes);
+	__asm__ volatile("dsb sy" ::: "memory");
+	ldsi_wr(LDSI_CMD_DMA_SW_TRIGGER, 1);
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (i = 0; i < 1250 && !done; i++) {          /* 25 ms */
+		done = (ldsi_rd(LDSI_INT_CTRL) & 1u) != 0;
+		if (!done) {
+			BS->stall(20);
+		}
+	}
+	ldsi_wr(LDSI_INT_CTRL, (ldsi_rd(LDSI_INT_CTRL) & 0xaaaaaaaau) | 1u);
+	ldsi_wr(LDSI_TPG_CTRL, 0);
+	ldsi_wr(LDSI_TPG_DMA_FIFO_RESET, 1);
+	__asm__ volatile("dsb sy" ::: "memory");
+	BS->stall(1);
+	ldsi_wr(LDSI_TPG_DMA_FIFO_RESET, 0);
+	ldsi_wr(LDSI_TPG_CTRL, tpg);
+	ldsi_wr(LDSI_CMD_DMA_CTRL, dma);
+	if ((trig & 0xfu) != 4u) {
+		ldsi_wr(LDSI_TRIG_CTRL, trig);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	return done ? 0 : -3;
+}
+
+/* DBV 175 (DCS 0x51, two bytes high first), where iOS starts and where the kernel leaves it on its way back */
+static void
+panel_dim_for_loader(void)
+{
+	static const uint8_t bctrl[2] = { 0x53, 0x20 }, dim[3] = { 0x51, 0x00, 0xaf };
+	int rc = panel_dcs_write(bctrl, 2);
+
+	if (rc == 0) {
+		rc = panel_dcs_write(dim, 3);
+	}
+	print(rc == 0 ? "display: the panel dimmed to DBV 175 for the loader's screen\n" :
+	    "display: the panel's brightness left as the firmware set it (DSI0 said -%d)\n", (uint64_t)(-rc));
+}
+#endif
+
 /* Reverse a stretch of memory in place. */
 static void
 reverse(char *p, uint64_t n)
@@ -5698,6 +5810,9 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	install_exception_hook();
 	wdt_arm();
+#if defined(LOADER_ALIOTH)
+	panel_dim_for_loader();
+#endif
 
 	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {
