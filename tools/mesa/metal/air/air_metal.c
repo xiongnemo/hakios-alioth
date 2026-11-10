@@ -6475,7 +6475,15 @@ rwa_render_create(struct rwa_device *device,
          return NULL;
       }
       unsigned q = samples > 1 ? samples : 0;
-      if (!device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D,
+      /* (the K40's) a Stencil8 attachment is a Depth32Float_Stencil8 underneath (rwa_texture_create), asked so here
+       * too -- Impeller's clip pipelines were refused for it (System Check metal.msaa.stencil, Flutter Check's
+       * clip path, 2026-11-10) */
+      enum pipe_format zpf = fmt->pipe;
+      if (zpf == PIPE_FORMAT_S8_UINT &&
+          !device->screen->is_format_supported(device->screen, zpf, PIPE_TEXTURE_2D, q, q,
+                                               PIPE_BIND_DEPTH_STENCIL))
+         zpf = PIPE_FORMAT_Z32_FLOAT_S8X24_UINT;
+      if (!device->screen->is_format_supported(device->screen, zpf, PIPE_TEXTURE_2D,
                                                q, q, PIPE_BIND_DEPTH_STENCIL)) {
          char ms[48] = "";
          if (q)
