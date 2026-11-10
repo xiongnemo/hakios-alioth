@@ -5979,9 +5979,6 @@ my_dealloc(id self, SEL selector)
 {
 	struct objc_super super = { self, class_getSuperclass(objc_getClass("EAGLContext")) };
 	struct eagl *e = context_of(self);
-	/* (this thread's current context, if another: put back after -- a context let go of by a block on the main queue,
-	   app_present()'s, must not leave the application's main thread with none) */
-	struct eagl *before = current;
 
 	if (e != NULL) {
 		say("hakios-gl: the context goes\n");
@@ -6012,8 +6009,14 @@ my_dealloc(id self, SEL selector)
 			current = NULL;
 		}
 		hakios_gl_destroy(e->gl);
-		if (before != NULL && before != e && hakios_gl_make_current(before->gl)) {
-			current = before;
+		/*
+		 * The thread's own context current again (app_settle(): the one it holds, retained, so alive), not none: a
+		 * context let go of by app_present()'s block on the main queue must not leave the main thread with no
+		 * context. Not `current` as it was on the way in -- that may name a context freed on another thread since
+		 * (GPU Check's tests hop between a queue's threads): put back, it faulted in OSMesaMakeCurrent (11-10 22:35).
+		 */
+		if (app_role) {
+			app_settle("a context's -dealloc");
 		}
 		if (e->sharegroup != nil) {
 			((void (*)(id, SEL))objc_msgSend)(e->sharegroup, sel_registerName("release"));
