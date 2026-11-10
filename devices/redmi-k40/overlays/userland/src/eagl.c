@@ -760,12 +760,37 @@ static bool
 surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
+	const char *why = NULL;
 
-	if (!share_surfaces || (image->target && copy_targets) || image->invert || image->alpha_first || image->format != GL_BGRA ||
-	    image->type != GL_UNSIGNED_BYTE ||
-	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
-	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
-	    !hakios_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	if (!share_surfaces || (image->target && copy_targets)) {
+		why = "copies asked for";
+	} else if (image->invert) {
+		why = "turned upside down";
+	} else if (image->alpha_first) {
+		why = "opacity first";
+	} else if (image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE) {
+		why = "not blue-first bytes";
+	} else if (image->plane != 0) {
+		why = "a plane";
+	} else if ((size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
+		why = "part of the surface";
+	} else if (!hakios_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+		why = "the GPU driver would not make a buffer of it";
+	}
+	if (why != NULL) {
+		/*
+		 * (the K40's) said for the big ones, the first few: a surface copied is copied by the processor when it
+		 * is drawn with, and an application's GPU may not have finished drawing into it then -- Flutter's frames
+		 * came out black while they moved (Flutter Check, 2026-11-10). Which surfaces, and why, is the question.
+		 */
+		static unsigned said;
+
+		if (image->width * image->height >= 256 * 256 && said < 12) {
+			said++;
+			say("hakios-gl: surface %u (%d x %d, pixel format %#x) is copied into its texture, not used in place: "
+			    "%s (format %#x, type %#x)\n", IOSurfaceGetID(surface), image->width, image->height,
+			    (unsigned)IOSurfaceGetPixelFormat(surface), why, image->format, image->type);
+		}
 		e->refused++;
 		return false;
 	}
