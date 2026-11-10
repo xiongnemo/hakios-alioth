@@ -4342,6 +4342,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 /*   fastboot oem hang             stop petting the watchdog (test)         */
 /*   fastboot oem verify           CRC-32 of the last download (INFO line)  */
 /*   fastboot reboot               cold reset                               */
+/*   fastboot oem help             every command, a line each (fb_help)     */
+/*   fastboot getvar all           every variable (fb_getvar_all)           */
 
 #define USB_EP_OUT   0x01
 #define USB_EP_IN    0x81
@@ -5128,6 +5130,201 @@ starts_with(const char *s, const char *prefix)
 }
 
 /*
+ * A reply's text made a piece at a time, in its own buffer: not through print(), which also puts it on the screen
+ * and gives "" once the log is full (getvar screen's lesson, 2026-11-09). fb_reply sends at most 63 bytes of it.
+ */
+struct fb_text {
+	char s[64];
+	uint32_t n;
+};
+
+static void
+ft_str(struct fb_text *t, const char *s)
+{
+	while (*s && t->n < sizeof(t->s) - 1) {
+		t->s[t->n++] = *s++;
+	}
+	t->s[t->n] = 0;
+}
+
+static void
+ft_dec(struct fb_text *t, uint64_t v)
+{
+	char d[24];
+	int j = 0;
+
+	do {
+		d[j++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v != 0);
+	while (j != 0 && t->n < sizeof(t->s) - 1) {
+		t->s[t->n++] = d[--j];
+	}
+	t->s[t->n] = 0;
+}
+
+static void
+ft_hex(struct fb_text *t, uint64_t v)
+{
+	int shift = 60;
+
+	ft_str(t, "0x");
+	while (shift > 0 && ((v >> shift) & 15) == 0) {
+		shift -= 4;
+	}
+	for (; shift >= 0 && t->n < sizeof(t->s) - 1; shift -= 4) {
+		t->s[t->n++] = "0123456789abcdef"[(v >> shift) & 15];
+	}
+	t->s[t->n] = 0;
+}
+
+/* one "name:value" line of getvar all, as Android's bootloaders send them (the tool prints "(bootloader) ...") */
+static void
+fb_var(const char *name, const struct fb_text *value)
+{
+	struct fb_text line = { { 0 }, 0 };
+
+	ft_str(&line, name);
+	ft_str(&line, ":");
+	ft_str(&line, value->s);
+	fb_reply("INFO", line.s);
+}
+
+static void
+fb_var_str(const char *name, const char *value)
+{
+	struct fb_text t = { { 0 }, 0 };
+
+	ft_str(&t, value);
+	fb_var(name, &t);
+}
+
+/*
+ * "fastboot getvar all": every variable this loader has, then OKAY. The same values as the single getvars, and the
+ * state a person playing with the loader wants to see: what is staged, the memory window, the link, the kernel's
+ * heartbeat while one runs. (The phone's serial number is not among them: `fastboot devices` says it.)
+ */
+static void
+fb_getvar_all(int busy)
+{
+	struct fb_text t;
+
+	fb_var_str("product", "xnuloader");
+	fb_var_str("version", "0.5");
+	fb_var_str("device", PLAT != NULL && PLAT->name != NULL ? PLAT->name : "?");
+	fb_var_str("max-download-size", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
+	fb_var_str("result", last_result);
+	t = (struct fb_text){ { 0 }, 0 };
+	if (busy) {
+		ft_str(&t, "running, beat ");
+		ft_dec(&t, run_beat);
+		ft_str(&t, " ");
+		ft_dec(&t, seconds_since(run_beat_at));
+		ft_str(&t, " s ago, ");
+		ft_dec(&t, seconds_since(run_started));
+		ft_str(&t, " s in");
+	} else {
+		ft_str(&t, "not running");
+	}
+	fb_var("kernel", &t);
+	t = (struct fb_text){ { 0 }, 0 };
+	if (win_size != 0) {
+		ft_hex(&t, win_base);
+		ft_str(&t, ", ");
+		ft_dec(&t, win_size >> 20);
+		ft_str(&t, " MB");
+	} else {
+		ft_str(&t, "not chosen yet (oem ramdisk chooses it)");
+	}
+	fb_var("memory-window", &t);
+	t = (struct fb_text){ { 0 }, 0 };
+	ft_dec(&t, mem_max >> 20);
+	ft_str(&t, " MB");
+	fb_var("memory-max", &t);
+	t = (struct fb_text){ { 0 }, 0 };
+	if (resident_rd_size != 0) {
+		ft_dec(&t, (resident_rd_size + (1 << 19)) >> 20);
+		ft_str(&t, " MB staged");
+	} else {
+		ft_str(&t, "none (oem ramdisk, then stage it)");
+	}
+	fb_var("system-image", &t);
+	t = (struct fb_text){ { 0 }, 0 };
+	ft_dec(&t, last_download_len);
+	ft_str(&t, " bytes at ");
+	ft_hex(&t, last_download_at);
+	fb_var("last-download", &t);
+	t = (struct fb_text){ { 0 }, 0 };
+	ft_hex(&t, payload_at);
+	fb_var("downloads-at", &t);
+	t = (struct fb_text){ { 0 }, 0 };
+	ft_dec(&t, staged_len);
+	ft_str(&t, " bytes (get_staged FILE fetches them)");
+	fb_var("staged", &t);
+#if defined(LOADER_ALIOTH)
+	fb_var_str("usb", usb_lent ? "lent to the kernel" : usb_own ? "the loader's own" : "the firmware's");
+#else
+	fb_var_str("usb", usb_lent ? "lent to the kernel" : "the firmware's");
+#endif
+	t = (struct fb_text){ { 0 }, 0 };
+	if (SCREEN.base != 0) {
+		ft_dec(&t, SCREEN.width);
+		ft_str(&t, " ");
+		ft_dec(&t, SCREEN.height);
+		ft_str(&t, " ");
+		ft_dec(&t, SCREEN.stride);
+		ft_str(&t, " at ");
+		ft_hex(&t, SCREEN.base);
+	} else {
+		ft_str(&t, "none");
+	}
+	fb_var("screen", &t);
+	fb_reply("OKAY", "");
+}
+
+/*
+ * "fastboot oem help": what can be said to this loader, a line each (the tool prints them as "(bootloader) ...").
+ * Each line is at most 59 characters: fb_reply sends 63 bytes, "INFO" is four of them.
+ */
+static void
+fb_help(void)
+{
+	static const char *const lines[] = {
+		"xnuloader 0.5 -- what fastboot can ask it:",
+		"getvar all          every variable, name:value",
+		"getvar result       the last run: idle, running, returned",
+		"getvar screen       the display: width height stride",
+		"stage FILE          a payload: the kernel and its line",
+		"oem ramdisk         the next stage is the system image",
+		"oem ramdisk none    forget the staged system image",
+		"oem run [N]         run the kernel (N: stop at check N)",
+		"oem selftest        run the kernel to its self-test",
+		"oem stop            end the kernel that runs",
+		"oem log             stage the logs (then get_staged F)",
+		"oem screenshot      stage the screen (then get_staged F)",
+		"oem recording       stage the kernel's screen recording",
+		"oem sound           stage the kernel's sound recording",
+		"get_staged FILE     fetch what was staged last",
+		"oem verify          CRC-32 of the last download",
+		"oem clearscreen     the screen black",
+		"oem memmap          the firmware's memory map -> oem log",
+#if defined(LOADER_ALIOTH)
+		"oem usb-own         the loader's own USB link (faster)",
+#endif
+		"oem memmax MB       cap the kernel's memory (tests)",
+		"oem stage away|back where downloads go (tests)",
+		"oem hang            stop the watchdog: it resets (test)",
+		"reboot              cold reset: Android starts",
+		"while a kernel runs: getvar, oem log/screenshot/stop",
+	};
+
+	for (unsigned i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
+		fb_reply("INFO", lines[i]);
+	}
+	fb_reply("OKAY", "");
+}
+
+/*
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
  */
@@ -5172,9 +5369,13 @@ fb_command(char *cmd)
 				}
 			}
 #endif
+		} else if (starts_with(cmd, "oem help")) {
+			fb_help();
 		} else if (starts_with(cmd, "getvar:")) {
 			const char *var = cmd + 7;
-			if (str_eq(var, "product")) {
+			if (str_eq(var, "all")) {
+				fb_getvar_all(busy);
+			} else if (str_eq(var, "product")) {
 				fb_reply("OKAY", "xnuloader");
 			} else if (str_eq(var, "version")) {
 				fb_reply("OKAY", "0.5");
