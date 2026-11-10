@@ -50,6 +50,17 @@ jobs:
             https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz
           sudo tar -xJf ~/dl/7z.tar.xz -C /usr/local/bin 7zz
           sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
+      # ldid (ProcursusTeam's, pinned): userland/build.sh signs the programs that need an entitlement with it. Without
+      # it they came out unsigned and were refused -- loc_enable could not turn Location Services on (11-09 to 11-10),
+      # so every application was denied a location.
+      - name: ldid
+        run: |
+          git init -q /tmp/ldid
+          git -C /tmp/ldid fetch -q --depth 1 https://github.com/ProcursusTeam/ldid.git af86971ae72ec3ed3d0a699107c4e882324c941b
+          git -C /tmp/ldid checkout -q FETCH_HEAD
+          make -C /tmp/ldid -j4 > /dev/null
+          sudo install -m 755 /tmp/ldid/ldid /usr/local/bin/ldid
+          command -v ldid
       - name: theos (its Linux toolchain and the iOS 16.5 SDK)
         run: |
           T=$HOME/theos
