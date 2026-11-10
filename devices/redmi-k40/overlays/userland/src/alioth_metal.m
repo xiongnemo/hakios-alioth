@@ -1458,11 +1458,16 @@ struct gem_close { uint32_t handle, pad; };
 - (id)aliothReflection;
 @end
 
+@class AliothMetalCommandBuffer;
+
 @interface AliothMetalCommandQueue : _MTLCommandQueue
 - (instancetype)initWithAliothDevice:(AliothMetalDevice *)device descriptor:(id)descriptor;
 - (dispatch_queue_t)aliothWaitQueue;    /* (the K40's) where its buffers wait for the GPU, in order */
 /* (the K40's) on the wait queue only: when its last buffer was seen finished, for the next one's GPUStartTime */
 @property (nonatomic) uint64_t aliothLastGPUEnd;
+/* (the K40's) its buffers run in enqueue order: a place taken at -enqueue, the run at -commit once it is first */
+- (void)aliothEnqueue:(AliothMetalCommandBuffer *)buffer;
+- (void)aliothCommitInOrder:(AliothMetalCommandBuffer *)buffer;
 @end
 
 @interface AliothMetalCommandBuffer : _MTLCommandBuffer
@@ -1470,6 +1475,8 @@ struct gem_close { uint32_t handle, pad; };
 - (void)recordWork:(AliothMetalWork *)work;
 - (void)recordBlit:(id)blit;
 - (id)device;
+- (BOOL)aliothCommitted;
+- (void)aliothRun;
 @end
 
 @interface AliothMetalComputeEncoder : _MTLCommandEncoder
@@ -5021,6 +5028,8 @@ alioth_clear_semaphore_debt(id commandBuffer)
 	NSUInteger _gpuPriority, _backgroundGPUPriority;
 	dispatch_queue_t _completionQueue;   /* only used when Apple's own ivar is missing */
 	dispatch_queue_t _waitQueue;         /* (the K40's) where this queue's buffers wait for the GPU, in order */
+	NSMutableArray *_order;              /* (the K40's) buffers enqueued and not yet run, in enqueue order */
+	BOOL _draining;                      /* (the K40's) a thread is running them (-aliothCommitInOrder:) */
 }
 
 - (instancetype)initWithAliothDevice:(AliothMetalDevice *)device descriptor:(id)descriptor
@@ -5211,6 +5220,55 @@ alioth_clear_semaphore_debt(id commandBuffer)
 	}
 }
 
+/*
+ * (the K40's) THE ORDER A QUEUE'S BUFFERS RUN IN: enqueue order, which is Metal's. A buffer takes its place at
+ * -enqueue -- or at -commit, which enqueues one that was not -- and runs once it is committed and every buffer before
+ * it has run: on the thread that commits the first of them, which then runs the committed ones behind it as well.
+ * Until 11-10 each buffer ran at its own -commit. Flutter's Impeller enqueues a frame's buffer on its raster thread,
+ * encodes and commits it on a worker, and presents from a "present waiter" buffer made after it -- which ran first
+ * here, so every frame of a moving picture was handed to the window server before its drawing had been submitted,
+ * and the screen showed black until the picture stood still (Flutter Check, 2026-11-10).
+ *
+ * A buffer enqueued and never committed holds back the ones after it for good, as in Metal. A handler run by this
+ * loop that waits for a later buffer of the same queue to be scheduled would wait for itself.
+ */
+- (void)aliothEnqueue:(AliothMetalCommandBuffer *)buffer
+{
+	@synchronized (self) {
+		if (_order == nil) {
+			_order = [[NSMutableArray alloc] init];
+		}
+		if ([_order indexOfObjectIdenticalTo:buffer] == NSNotFound) {
+			[_order addObject:buffer];
+		}
+	}
+}
+
+- (void)aliothCommitInOrder:(AliothMetalCommandBuffer *)buffer
+{
+	[self aliothEnqueue:buffer];
+	@synchronized (self) {
+		if (_draining) {
+			return;         /* (the thread running this queue's buffers comes to it in its turn) */
+		}
+		_draining = YES;
+	}
+	for (;;) {
+		AliothMetalCommandBuffer *next;
+
+		@synchronized (self) {
+			if ([_order count] == 0 || ![[_order objectAtIndex:0] aliothCommitted]) {
+				_draining = NO;
+				return;
+			}
+			next = [[_order objectAtIndex:0] retain];
+			[_order removeObjectAtIndex:0];
+		}
+		[next aliothRun];
+		[next release];
+	}
+}
+
 - (void)dealloc
 {
 	/* Only the copy this driver keeps itself: the one in Apple's ivar belongs to
@@ -5220,6 +5278,7 @@ alioth_clear_semaphore_debt(id commandBuffer)
 	if (_waitQueue != nil) {
 		dispatch_release(_waitQueue);
 	}
+	[_order release];
 	[super dealloc];
 }
 
@@ -5278,6 +5337,10 @@ enum {
 	/* (the K40's) mach times: -commit began and its work was flushed (kernelStart/EndTime); the GPU took it -- after
 	 * the flush and the queue's buffer before, its one ring being in order -- and was seen done (GPUStart/EndTime) */
 	uint64_t _kernelStart, _kernelEnd, _gpuStart, _gpuEnd;
+	/* (the K40's) -commit was called; it has run (-aliothRun: its work submitted, scheduled handlers delivered);
+	 * _ranGroup is left once when it has, for -waitUntilScheduled (the queue's enqueue order decides when) */
+	BOOL _committed, _ran;
+	dispatch_group_t _ranGroup;
 }
 
 /*
@@ -5343,6 +5406,8 @@ enum {
 	_owesSlot = YES;
 	[queue aliothTookSlot];
 	_created = mach_absolute_time();
+	_ranGroup = dispatch_group_create();
+	dispatch_group_enter(_ranGroup);
 	return self;
 }
 
@@ -5380,8 +5445,16 @@ enum {
 	if (_done != nil) {
 		dispatch_release(_done);
 	}
+	if (_ranGroup != nil) {
+		if (!_ran) {
+			dispatch_group_leave(_ranGroup);        /* (never committed: libdispatch wants a group even) */
+		}
+		dispatch_release(_ranGroup);
+	}
 	[super dealloc];
 }
+
+- (BOOL)aliothCommitted { return _committed; }
 
 - (id)device       { return [_queue device]; }
 - (id)commandQueue { return _queue; }
@@ -5765,10 +5838,25 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 	return YES;
 }
 
-- (void)enqueue { }
+/* (the K40's) a place in the queue's order, taken now (-[AliothMetalCommandQueue aliothCommitInOrder:]) */
+- (void)enqueue
+{
+	[_queue aliothEnqueue:self];
+}
+
+/* (the K40's) run when every buffer enqueued before it has run -- now, or by the thread that runs those */
+- (void)commit
+{
+	if (_committed) {
+		return;         /* (committed twice: Metal's validation would stop the application; once is what ran) */
+	}
+	_committed = YES;
+	_status = RW_CB_COMMITTED;
+	[_queue aliothCommitInOrder:self];
+}
 
 /* Metal's own rule, kept: the recorded dispatches run here and not when they were encoded. */
-- (void)commit
+- (void)aliothRun
 {
 	char why[512] = { 0 };
 	uint64_t committed = mach_absolute_time();
@@ -5941,6 +6029,11 @@ done:
 	 * is not waiting for a slot this one still holds */
 	[self aliothDeliverHandlers];
 	alioth_stats_commit();
+	/* (the K40's) scheduled, for -waitUntilScheduled and -waitUntilCompleted: its work is with the GPU */
+	if (!_ran) {
+		_ran = YES;
+		dispatch_group_leave(_ranGroup);
+	}
 }
 
 /* A draw, built out of what the encoder recorded. Separate from the dispatch loop because the
@@ -6261,6 +6354,14 @@ done:
 	}
 	uint64_t waited = mach_absolute_time();
 
+	/* (the K40's) committed and not yet run -- buffers enqueued before it are still to come: its run first */
+	if (_committed && !_ran) {
+		dispatch_group_wait(_ranGroup, DISPATCH_TIME_FOREVER);
+		if (_status == RW_CB_ERROR || _status == RW_CB_COMPLETED) {
+			return;
+		}
+	}
+
 	/* (the K40's) the wait already going on off this thread (-aliothDeliverHandlers): its end, not a second one */
 	if (_done != nil) {
 		dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
@@ -6286,7 +6387,14 @@ done:
 	}
 }
 
-- (void)waitUntilScheduled { }
+/* (the K40's) until it has run: its work submitted, in the queue's enqueue order (-aliothCommitInOrder:) -- until
+ * 11-10 this returned at once, which was true only while every buffer ran at its own -commit */
+- (void)waitUntilScheduled
+{
+	if (_committed && !_ran) {
+		dispatch_group_wait(_ranGroup, DISPATCH_TIME_FOREVER);
+	}
+}
 
 /* (the K40's) Metal's base class answered 0 for all four (System Check metal.api, 11-09); engines time their GPU
  * frames with GPUStartTime / GPUEndTime (dynamic resolution, frame pacing). The GPU's own timestamps are not read: the
