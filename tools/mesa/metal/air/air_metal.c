@@ -5699,6 +5699,13 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why
  * (texturedFragment2DDepth returns {undef, depth}), so a shader's variables say what it
  * might write and only its stores say what it does -- air_run makes the same walk for
  * the colour side and refuses to read back an attachment nothing stored to.
+ *
+ * Only a store to an OUTPUT counts. FRAG_RESULT_DEPTH is 0, which is also the location of
+ * every function-temp variable, and a temporary nir_lower_vars_to_ssa could not take
+ * apart (what is left of a helper function after nir_inline_functions, say) made a
+ * shader that writes no depth "store to [[depth]]": the Map application's fill shader,
+ * whose clip test was a function of its own, was refused on 11-10 with "f_fill stores to
+ * [[depth]] and this pipeline has no depth attachment".
  */
 static bool
 fragment_writes_depth(nir_shader *fs)
@@ -5713,6 +5720,7 @@ fragment_writes_depth(nir_shader *fs)
                continue;
             nir_deref_instr *d = nir_src_as_deref(in->src[0]);
             if (d && d->deref_type == nir_deref_type_var &&
+                d->var->data.mode == nir_var_shader_out &&
                 d->var->data.location == FRAG_RESULT_DEPTH)
                return true;
          }
