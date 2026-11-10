@@ -21,7 +21,8 @@
  * them. Linux hands such memory around as file descriptors; here it has a name already. That
  * memory is ordinary, cached memory, which everybody else reads and writes as such.
  *
- * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
+ * Not here yet: interrupts (waiting is asking again, twenty times a millisecond at first and less
+ * often the longer it goes on: gpuWait()), more than one
  * program's worth of care (every client's buffers are in the one address space; a client that
  * goes takes its own away), recovery of a GPU that has stopped answering (it is reported, see
  * hakios_gpu_report(), and stays stopped), fences and buffers as file descriptors.
@@ -227,8 +228,20 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		if (mach_absolute_time() - began >= patience || gGPUReported) {
 			break;                  /* (a GPU that has stopped answering is not waited for again) */
 		}
+		/*
+		 * (the K40's) Asked again every 50 us for the first millisecond -- where the display's own waits end, and
+		 * where 200 us cost every frame 0.1 ms (GPU_ASK_AGAIN_US) -- then every 200 us to 4 ms, and every 500 us
+		 * after. A client waiting for a whole frame of GPU work (an application's command buffer, 10-20 ms) woke
+		 * this processor up to 20000 times a second: Flutter Check 7500 a second, "caught waking the CPU"
+		 * (2026-11-10). A wait that long now learns of its end at most 0.5 ms late, 0.25 ms on average.
+		 */
+		uint64_t waited_ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &waited_ns);
+		uint32_t again = waited_ns < 1000000 ? GPU_ASK_AGAIN_US : waited_ns < 4000000 ? 200 : 500;
+
 		IOLockUnlock(gGPULock);
-		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+		delay_for_interval(again, NSEC_PER_USEC);
 		IOLockLock(gGPULock);
 	}
 	if (milliseconds >= 1000 && !gGPUReported) {
