@@ -5870,7 +5870,7 @@ handed:
 	 * answer taps (2026-11-01).
 	 */
 	{
-		id layer = d->layer;
+		id layer = d->layer, context = e->object;
 		struct app_drawable *counted = d;
 		uint64_t sent = now_us();
 		IOSurfaceRef older;
@@ -5882,6 +5882,14 @@ handed:
 			d->replaced++;
 		} else {
 			((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("retain"));
+			/*
+			 * And the context: `counted` is inside it (e->drawables), which its -dealloc frees. Map 2.0 let its
+			 * context go right after a present, to draw with Metal instead, and this block then read the freed
+			 * drawable on the main queue: SIGSEGV (2026-11-10 22:03). Held, the context goes after the block.
+			 */
+			if (context != nil) {
+				((id (*)(id, SEL))objc_msgSend)(context, sel_registerName("retain"));
+			}
 			dispatch_async(dispatch_get_main_queue(), ^{
 				IOSurfaceRef surface = __atomic_exchange_n(&counted->waiting, NULL, __ATOMIC_ACQ_REL);
 
@@ -5895,6 +5903,9 @@ handed:
 					counted->shown_late_us += now_us() - sent;
 				}
 				((void (*)(id, SEL))objc_msgSend)(layer, sel_registerName("release"));
+				if (context != nil) {
+					((void (*)(id, SEL))objc_msgSend)(context, sel_registerName("release"));
+				}
 			});
 		}
 	}
@@ -5968,6 +5979,9 @@ my_dealloc(id self, SEL selector)
 {
 	struct objc_super super = { self, class_getSuperclass(objc_getClass("EAGLContext")) };
 	struct eagl *e = context_of(self);
+	/* (this thread's current context, if another: put back after -- a context let go of by a block on the main queue,
+	   app_present()'s, must not leave the application's main thread with none) */
+	struct eagl *before = current;
 
 	if (e != NULL) {
 		say("hakios-gl: the context goes\n");
@@ -5998,6 +6012,9 @@ my_dealloc(id self, SEL selector)
 			current = NULL;
 		}
 		hakios_gl_destroy(e->gl);
+		if (before != NULL && before != e && hakios_gl_make_current(before->gl)) {
+			current = before;
+		}
 		if (e->sharegroup != nil) {
 			((void (*)(id, SEL))objc_msgSend)(e->sharegroup, sel_registerName("release"));
 		}
