@@ -4547,6 +4547,8 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, unsigne
             unsigned *max_out)
 {
    unsigned min = UINT32_MAX, max = 0;
+   /* (the K40's) the restart index is no vertex (rwa_render_draw: Metal restarts at the type's largest value) */
+   const unsigned restart = index_size == 2 ? 0xffffu : 0xffffffffu;
    for (unsigned i = 0; i < count; i++) {
       unsigned v;
       if (index_size == 2) {
@@ -4558,11 +4560,15 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, unsigne
          memcpy(&u, indices + (size_t)i * 4, sizeof(u));
          v = u;
       }
+      if (v == restart)
+         continue;
       if (v < min)
          min = v;
       if (v > max)
          max = v;
    }
+   if (min > max)
+      min = max = 0;    /* (nothing but restarts: no vertex is read) */
    *min_out = min;
    *max_out = max;
 }
@@ -7628,9 +7634,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * buffer's base), and `index_bias` is the base vertex. Nothing below is
        * conditional except what the index buffer itself provides.
        *
-       * primitive_restart stays off, and that is a decision: Metal has no restart index
-       * anywhere in MTLRenderCommandEncoder, so 0xFFFF is an ordinary index and a strip
-       * drawn with one would break into two primitives for nobody's reason.
+       * (the K40's) primitive_restart is ON for every indexed draw, at the index type's largest
+       * value: Metal's -drawIndexedPrimitives: enables restart "with the largest unsigned
+       * integer index value, relative to indexType" (0xFFFF / 0xFFFFFFFF), and has no switch
+       * for it. This said the opposite until 11-10, when Flutter's Impeller -- whose tessellated
+       * paths are strips joined by restarts -- had its clip draws refused for a vertex
+       * 4294967295 (index_range now skips the restart index too).
        *
        * take_index_buffer_ownership stays off as well: the reference belongs to the
        * caller's rwa_buffer, which outlives this draw and may be drawn with again.
@@ -7641,6 +7650,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .min_index = indirect ? 0 : min_index, .max_index = indirect ? ~0u : max_index,
          .instance_count = instances,
          .start_instance = draw->base_instance,
+         .primitive_restart = index_size != 0,
+         .restart_index = index_size == 2 ? 0xffffu : 0xffffffffu,
       };
       if (index_size)
          info.index.resource = draw->index_buffer->res;
