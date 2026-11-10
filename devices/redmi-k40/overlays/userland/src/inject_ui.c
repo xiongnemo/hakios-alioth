@@ -1734,7 +1734,23 @@ metal_for_allowed(void)
 		say("metal: no bundle ID to look up in the allow-list; not allowed\n");
 		return;
 	}
-	if (!metal_listed(bundle_id, apps, ',') && !metal_listed(bundle_id, file, '\n')) {
+	/*
+	 * (the K40's) "*" in the list: every application of the owner's, the owner's choice for the release (2026-11-11).
+	 * Still never a program of the system's nor an app extension (third_party() and the .appex test above): only what
+	 * IPAs installed. An application that would draw better through OpenGL ES can be left out of it by naming it
+	 * in /redwood/etc/metal-apps as "-ID".
+	 */
+	bool everyone = metal_listed("*", apps, ',') || metal_listed("*", file, '\n');
+	char refused[260];
+
+	snprintf(refused, sizeof(refused), "-%s", bundle_id);
+	if (everyone && (metal_listed(refused, apps, ',') || metal_listed(refused, file, '\n'))) {
+		say("metal: %s is left out of metal_apps=* (\"-%s\"); not allowed\n", bundle_id, bundle_id);
+		return;
+	}
+	if (everyone) {
+		say("metal: %s, an application of the owner's (metal_apps=*): allowed\n", bundle_id);
+	} else if (!metal_listed(bundle_id, apps, ',') && !metal_listed(bundle_id, file, '\n')) {
 		if (!flutter) {
 			say("metal: %s is not on the allow-list (metal_apps=, %s); not allowed\n", bundle_id, METAL_APPS_FILE);
 			return;
