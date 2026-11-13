@@ -83,15 +83,21 @@ qrtr_parse(const uint8_t *p, size_t length, struct qrtr_packet *out)
 		if (length < QRTR_V2_HEADER) {
 			return false;
 		}
+		/*
+		 * Linux's struct qrtr_hdr_v2: version, type, flags, optlen (u8 each), size (le32), then src_node, src_port,
+		 * dst_node, dst_port (le16 each). (Until 2026-11-14 size was read as 16 bits and every field after it two
+		 * bytes early: the SDX55's HELLOs came "from node 0" -- size's high half -- and its TFTP requests "to port
+		 * 1", which was our node.)
+		 */
 		header = QRTR_V2_HEADER + 4 * (size_t)p[3];         /* optlen: words of options */
 		out->version = 2;
 		out->type = p[1];
 		out->confirm_rx = p[2] & 1;
-		out->size = qrtr_le16(p + 4);
-		out->src_node = qrtr_le16(p + 6);
-		out->src_port = qrtr_le16(p + 8);
-		out->dst_node = qrtr_le16(p + 10);
-		out->dst_port = qrtr_le16(p + 12);
+		out->size = qrtr_le32(p + 4);
+		out->src_node = qrtr_le16(p + 8);
+		out->src_port = qrtr_le16(p + 10);
+		out->dst_node = qrtr_le16(p + 12);
+		out->dst_port = qrtr_le16(p + 14);
 		/* (16-bit ports: the control port is 0xfffe there) */
 		if (out->src_port == 0xfffe) {
 			out->src_port = QRTR_PORT_CTRL;

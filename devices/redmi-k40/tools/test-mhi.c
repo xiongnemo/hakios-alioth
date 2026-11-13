@@ -734,6 +734,22 @@ main(void)
 	struct alioth_mhi host;
 	int error;
 
+	/* a QRTR version 2 packet as the SDX55 sends one: its HELLO, 36 bytes (dekefake/hackios-op8pro modem-sdx55.md:
+	 * "03 02 00 00 | size 20 | node 2 port 0xfffe -> 0xffff 0xfffe | cmd 2, 0x1ee3, 0xa"), and a data packet of the
+	 * kind its TFTP client sends (node 3 port 0x4e21 -> node 1 port 0x4002, 73 bytes) */
+	{
+		uint8_t hello[36] = { 3, 2, 0, 0, 20, 0, 0, 0, 2, 0, 0xfe, 0xff, 0xff, 0xff, 0xfe, 0xff, 2, 0, 0, 0, 0xe3, 0x1e, 0, 0, 0xa };
+		uint8_t data[16 + 73] = { 3, 1, 1, 0, 73, 0, 0, 0, 3, 0, 0x21, 0x4e, 1, 0, 0x02, 0x40, 0, 1 };
+		struct qrtr_packet p;
+
+		CHECK(qrtr_parse(hello, sizeof(hello), &p) && p.version == 2 && p.type == QRTR_TYPE_HELLO && p.size == 20 &&
+		    p.src_node == 2 && p.src_port == QRTR_PORT_CTRL && p.dst_node == QRTR_NODE_BCAST && p.dst_port == QRTR_PORT_CTRL &&
+		    qrtr_le32(p.payload) == QRTR_TYPE_HELLO, "QRTR v2 HELLO: node %u port %#x -> %#x %#x, size %u", p.src_node,
+		    p.src_port, p.dst_node, p.dst_port, p.size);
+		CHECK(qrtr_parse(data, sizeof(data), &p) && p.type == QRTR_TYPE_DATA && p.confirm_rx && p.size == 73 &&
+		    p.src_node == 3 && p.src_port == 0x4e21 && p.dst_node == 1 && p.dst_port == 0x4002,
+		    "QRTR v2 data: %u:%#x -> %u:%#x, %u bytes", p.src_node, p.src_port, p.dst_node, p.dst_port, p.size);
+	}
 	arena = aligned_alloc(4096, ARENA);
 	dev.transfer = malloc(8u << 20);
 	image13 = malloc(IMAGE13_SIZE);
@@ -778,10 +794,11 @@ main(void)
 	printf("run 1: %u events, %zu KB of host memory, %llu ms pretend, %u QRTR packets to the modem\n", dev.events,
 	    arena_used >> 10, (unsigned long long)(dev.us / 1000), dev.qrtr_packets);
 
-	/* a version 2 header, as Linux's router also sends: HELLO from node 3's control port, broadcast */
+	/* a version 2 header, as Linux's router also sends: HELLO from node 3's control port, broadcast (size is 32 bits:
+	 * this test had it as 16, the same mistake as the parser, until 2026-11-14) */
 	{
-		uint8_t v2[16 + QRTR_CONTROL_SIZE] = { 3, QRTR_TYPE_HELLO, 0, 0, QRTR_CONTROL_SIZE, 0, 3, 0, 0xfe, 0xff, 0xff, 0xff,
-			                               0xfe, 0xff, 0, 0, QRTR_TYPE_HELLO };
+		uint8_t v2[16 + QRTR_CONTROL_SIZE] = { 3, QRTR_TYPE_HELLO, 0, 0, QRTR_CONTROL_SIZE, 0, 0, 0, 3, 0, 0xfe, 0xff, 0xff, 0xff,
+			                               0xfe, 0xff, QRTR_TYPE_HELLO };
 		struct qrtr_packet p;
 
 		CHECK(qrtr_parse(v2, sizeof(v2), &p) && p.version == 2 && p.type == QRTR_TYPE_HELLO && p.src_node == 3 &&
