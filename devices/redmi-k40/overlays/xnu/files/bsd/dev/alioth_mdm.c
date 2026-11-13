@@ -1493,6 +1493,97 @@ tftp_announce(void)
 	return error;
 }
 
+/*
+ * (2026-11-14) /readwrite/ kept in memory: the modem WRITES /readwrite/mcfg.tmp and server_check.txt and READS them
+ * back (the first rounds threw writes away, so its reads found nothing -- a candidate for its "not ready"). As
+ * Android's tftp_server keeps them (/data/vendor/rfs), here in RAM only: TFTP_STORE in all, TFTP_FILE_MAX a file,
+ * gone at the run's end, never written anywhere, their contents never said. Writes elsewhere are taken and thrown
+ * away as before; reads elsewhere (/readonly/firmware/image/...: the firmware partition's files) are "not found"
+ * until those files are in the image. A read is served as RFC 1350 with blksize/tsize/timeoutms/wsize (1)/seek/rsize.
+ */
+#define TFTP_FILES              16
+#define TFTP_STORE              (512u * 1024)
+#define TFTP_FILE_MAX           (128u * 1024)
+#define TFTP_SESSIONS           8
+
+static struct { bool used; char name[96]; uint32_t at, length; } tftp_files[TFTP_FILES];
+static uint8_t tftp_store[TFTP_STORE];
+static uint32_t tftp_store_used;
+static struct {
+	bool used, writing, done_last;
+	uint32_t node, port, blksize, size, base, block, at_ms;
+	int file;
+} tftp_sessions[TFTP_SESSIONS];
+static unsigned tftp_served, tftp_kept;
+
+static int
+tftp_file(const char *name, bool make)
+{
+	int free_slot = -1;
+
+	for (int i = 0; i < TFTP_FILES; i++) {
+		if (tftp_files[i].used && strcmp(tftp_files[i].name, name) == 0) {
+			return i;
+		}
+		if (!tftp_files[i].used && free_slot < 0) {
+			free_slot = i;
+		}
+	}
+	if (!make || free_slot < 0 || tftp_store_used + TFTP_FILE_MAX > TFTP_STORE) {
+		return -1;
+	}
+	tftp_files[free_slot].used = true;
+	strlcpy(tftp_files[free_slot].name, name, sizeof(tftp_files[free_slot].name));
+	tftp_files[free_slot].at = tftp_store_used;
+	tftp_files[free_slot].length = 0;
+	tftp_store_used += TFTP_FILE_MAX;
+	return free_slot;
+}
+
+static int
+tftp_session(uint32_t node, uint32_t port, bool make)
+{
+	int free_slot = -1;
+
+	for (int i = 0; i < TFTP_SESSIONS; i++) {
+		if (tftp_sessions[i].used && tftp_sessions[i].node == node && tftp_sessions[i].port == port) {
+			return i;
+		}
+		if (!tftp_sessions[i].used && free_slot < 0) {
+			free_slot = i;
+		}
+	}
+	if (!make) {
+		return -1;
+	}
+	free_slot = free_slot < 0 ? 0 : free_slot;     /* (the oldest overwritten) */
+	memset(&tftp_sessions[free_slot], 0, sizeof(tftp_sessions[free_slot]));
+	tftp_sessions[free_slot].used = true;
+	tftp_sessions[free_slot].node = node;
+	tftp_sessions[free_slot].port = port;
+	tftp_sessions[free_slot].file = -1;
+	return free_slot;
+}
+
+/* block `block` of a read session: DATA with the bytes from base + (block - 1) * blksize */
+static int
+tftp_data(int s)
+{
+	static uint8_t pkt[4 + TFTP_BLOCK_MAX], out[QRTR_V1_HEADER + 4 + TFTP_BLOCK_MAX + 8];
+	uint32_t offset = (tftp_sessions[s].block - 1) * tftp_sessions[s].blksize, n = 0;
+	const uint8_t *data = tftp_store + tftp_files[tftp_sessions[s].file].at + tftp_sessions[s].base;
+
+	if (offset < tftp_sessions[s].size) {
+		n = tftp_sessions[s].size - offset;
+		n = n > tftp_sessions[s].blksize ? tftp_sessions[s].blksize : n;
+		memcpy(pkt + 4, data + offset, n);
+	}
+	pkt[0] = 0, pkt[1] = 3, pkt[2] = (uint8_t)(tftp_sessions[s].block >> 8), pkt[3] = (uint8_t)tftp_sessions[s].block;
+	tftp_sessions[s].done_last = n < tftp_sessions[s].blksize;
+	return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_DATA, QRTR_OUR_NODE, TFTP_PORT, tftp_sessions[s].node,
+	    tftp_sessions[s].port, pkt, 4 + n, false));
+}
+
 static int
 tftp_packet(const struct qrtr_packet *p)
 {
@@ -1502,9 +1593,10 @@ tftp_packet(const struct qrtr_packet *p)
 	if (opcode == 1 || opcode == 2) {
 		/* a request: file name, mode, then option/value pairs, each ended by a zero */
 		const char *name = (const char *)d + 2, *end = (const char *)d + p->size, *at;
-		char opts[120] = "";
-		uint32_t blksize = 512;
-		bool oack = false, wsize = false;
+		char opts[120] = "", path[96];
+		uint32_t blksize = 512, timeoutms = 0, seek = 0, rsize = UINT32_MAX, tsize_value = 0;
+		bool oack = false, wsize = false, tsize = false, timeout = false;
+		int s, f;
 
 		at = name + strnlen(name, (size_t)(end - name)) + 1;
 		at += at < end ? strnlen(at, (size_t)(end - at)) + 1 : 0;
@@ -1520,8 +1612,16 @@ tftp_packet(const struct qrtr_packet *p)
 				oack = true;
 			} else if (strncmp(at, "wsize", 6) == 0) {
 				wsize = oack = true;
-			} else if (strncmp(at, "tsize", 6) == 0 || strncmp(at, "timeout", 8) == 0 || strncmp(at, "timeoutms", 10) == 0) {
-				oack = true;
+			} else if (strncmp(at, "tsize", 6) == 0) {
+				tsize = oack = true;
+				tsize_value = (uint32_t)strtoul(value, NULL, 10);
+			} else if (strncmp(at, "timeoutms", 10) == 0) {
+				timeoutms = (uint32_t)strtoul(value, NULL, 10);
+				timeout = oack = true;
+			} else if (strncmp(at, "seek", 5) == 0) {
+				seek = (uint32_t)strtoul(value, NULL, 10);
+			} else if (strncmp(at, "rsize", 6) == 0) {
+				rsize = (uint32_t)strtoul(value, NULL, 10);
 			}
 			strlcat(opts, at, sizeof(opts));
 			strlcat(opts, "=", sizeof(opts));
@@ -1529,43 +1629,118 @@ tftp_packet(const struct qrtr_packet *p)
 			strlcat(opts, " ", sizeof(opts));
 			at = value + strnlen(value, (size_t)(end - value)) + 1;
 		}
-		if (tftp_said++ < 80) {
-			say("mdm: 6: tftp: %s \"%.*s\" from %u:%u, options %s\n", opcode == 1 ? "READ" : "WRITE",
-			    (int)strnlen(name, (size_t)(end - name)), name, p->src_node, p->src_port, opts[0] ? opts : "none");
+		strlcpy(path, name, sizeof(path) < (size_t)(end - name) + 1 ? sizeof(path) : (size_t)(end - name) + 1);
+		if (tftp_said++ < 120) {
+			say("mdm: 6: tftp: %s \"%s\" from %u:%u, options %s\n", opcode == 1 ? "READ" : "WRITE", path, p->src_node,
+			    p->src_port, opts[0] ? opts : "none");
 		}
+		f = strncmp(path, "/readwrite/", 11) == 0 ? tftp_file(path, opcode == 2) : -1;
 		if (opcode == 1) {
 			tftp_reads++;
-			return tftp_error(p->src_node, p->src_port, 1, "File not found");
+			if (f < 0) {
+				return tftp_error(p->src_node, p->src_port, 1, "File not found");
+			}
+			s = tftp_session(p->src_node, p->src_port, true);
+			tftp_sessions[s].writing = false;
+			tftp_sessions[s].file = f;
+			tftp_sessions[s].blksize = blksize;
+			seek = seek < tftp_files[f].length ? seek : tftp_files[f].length;
+			tftp_sessions[s].base = seek;
+			tftp_sessions[s].size = tftp_files[f].length - seek < rsize ? tftp_files[f].length - seek : rsize;
+			tftp_sessions[s].block = 1;
+			tftp_served++;
+			say("mdm: 6: tftp: \"%s\": %u bytes served from memory (blksize %u)\n", path, tftp_sessions[s].size, blksize);
+			if (!oack) {
+				return tftp_data(s);
+			}
+			tftp_sessions[s].block = 0;             /* (the client's ACK 0 to the OACK asks for block 1) */
+		} else {
+			tftp_writes++;
+			s = tftp_session(p->src_node, p->src_port, true);
+			tftp_sessions[s].writing = true;
+			tftp_sessions[s].file = f;
+			tftp_sessions[s].blksize = blksize;
+			if (f >= 0) {
+				tftp_files[f].length = 0;       /* (a write replaces the file) */
+			}
 		}
-		tftp_writes++;
-		if (oack) {
+		{
 			/* the options taken (blksize at most ours; wsize must be answered, 1, or the client waits for ten blocks) */
-			uint8_t o[64];
-			int n;
+			uint8_t o[128];
+			int n = 2;
 
+			if (!oack) {
+				const uint8_t ack[4] = { 0, 4, 0, 0 };
+
+				return tftp_reply(p->src_node, p->src_port, ack, 4);
+			}
 			o[0] = 0, o[1] = 6;
-			n = snprintf((char *)o + 2, sizeof(o) - 2, "blksize%c%u%c%s", 0, blksize, 0, wsize ? "wsize" : "");
-			n += 2;
+			n += snprintf((char *)o + n, sizeof(o) - (size_t)n, "blksize%c%u%c", 0, blksize, 0);
+			if (tsize) {
+				/* (a read: the size served; a write: the client's own, echoed -- RFC 2349) */
+				n += snprintf((char *)o + n, sizeof(o) - (size_t)n, "tsize%c%u%c", 0,
+				    opcode == 1 ? tftp_sessions[s].size : tsize_value, 0);
+			}
+			if (timeout) {
+				n += snprintf((char *)o + n, sizeof(o) - (size_t)n, "timeoutms%c%u%c", 0, timeoutms, 0);
+			}
 			if (wsize) {
-				o[n++] = 0, o[n++] = '1', o[n++] = 0;
+				n += snprintf((char *)o + n, sizeof(o) - (size_t)n, "wsize%c1%c", 0, 0);
 			}
 			return tftp_reply(p->src_node, p->src_port, o, (uint32_t)n);
 		}
-		{
-			const uint8_t ack[4] = { 0, 4, 0, 0 };
-
-			return tftp_reply(p->src_node, p->src_port, ack, 4);
-		}
 	}
 	if (opcode == 3 && p->size >= 4) {
-		/* a block of a write: acknowledged, and thrown away */
+		/* a block of a write: kept when the file is /readwrite/'s, thrown away otherwise; acknowledged either way */
 		const uint8_t ack[4] = { 0, 4, d[2], d[3] };
+		int s = tftp_session(p->src_node, p->src_port, false);
+		uint32_t block = (uint32_t)(d[2] << 8 | d[3]), n = p->size - 4;
 
 		tftp_blocks++;
-		tftp_written += p->size - 4;
+		tftp_written += n;
+		if (s >= 0 && tftp_sessions[s].writing && tftp_sessions[s].file >= 0 && block >= 1) {
+			int f = tftp_sessions[s].file;
+			uint32_t offset = (block - 1) * tftp_sessions[s].blksize;
+
+			if (offset + n <= TFTP_FILE_MAX) {
+				memcpy(tftp_store + tftp_files[f].at + offset, d + 4, n);
+				tftp_files[f].length = offset + n > tftp_files[f].length ? offset + n : tftp_files[f].length;
+				tftp_kept += n;
+			}
+		}
+		if (s >= 0 && n < tftp_sessions[s].blksize) {
+			if (tftp_sessions[s].file >= 0) {
+				say("mdm: 6: tftp: \"%s\" written: %u bytes kept in memory\n", tftp_files[tftp_sessions[s].file].name,
+				    tftp_files[tftp_sessions[s].file].length);
+			}
+			tftp_sessions[s].used = false;
+		}
 		return tftp_reply(p->src_node, p->src_port, ack, 4);
 	}
-	if (tftp_said++ < 80) {
+	if (opcode == 4 && p->size >= 4) {
+		/* an ACK of a read: the next block, or the end */
+		int s = tftp_session(p->src_node, p->src_port, false);
+		uint32_t block = (uint32_t)(d[2] << 8 | d[3]);
+
+		if (s < 0 || tftp_sessions[s].writing || tftp_sessions[s].file < 0) {
+			return 0;
+		}
+		if (block >= 1 && block == tftp_sessions[s].block && tftp_sessions[s].done_last) {
+			tftp_sessions[s].used = false;
+			return 0;
+		}
+		tftp_sessions[s].block = block + 1;
+		return tftp_data(s);
+	}
+	if (opcode == 5) {
+		/* an ERROR from the client ends its session (ERROR 9 after a STAT read is normal) */
+		int s = tftp_session(p->src_node, p->src_port, false);
+
+		if (s >= 0) {
+			tftp_sessions[s].used = false;
+		}
+	}
+	if (tftp_said++ < 120) {
 		say("mdm: 6: tftp: opcode %u (%u bytes) from %u:%u%s\n", opcode, p->size, p->src_node, p->src_port,
 		    opcode == 5 ? ": an ERROR from the client" : "");
 	}
@@ -2448,9 +2623,9 @@ step_qrtr(void)
 		locations += servers[i].service == QRTR_SERVICE_LOC;
 	}
 	say("mdm: 6: %s (%d): %u services of the modem's; location (QMI LOC, 0x10) %s; %u packets dropped; tftp: %u reads "
-	    "(all \"not found\"), %u writes, %u blocks, %llu bytes thrown away\n",
+	    "(%u served from memory), %u writes, %u blocks, %llu bytes written (%u kept in memory)\n",
 	    error ? "QRTR STOPPED" : "listened", error, server_count, locations ? "IS THERE" : "not seen", ipcr.dropped,
-	    tftp_reads, tftp_writes, tftp_blocks, tftp_written);
+	    tftp_reads, tftp_served, tftp_writes, tftp_blocks, tftp_written, tftp_kept);
 	say("mdm: 6: efs: %u memory debug sessions, %u regions, %llu bytes thrown away, %u packets dropped, state %d\n",
 	    efs.sessions, efs.regions, efs.bytes, efsq.dropped, efs.state);
 	if (loc.wanted) {
