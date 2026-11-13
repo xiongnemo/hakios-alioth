@@ -224,7 +224,13 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'soft
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
-        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
+        # (the K40's, owner 2026-11-13: "把 Game Center 给杀了") Game Center's daemon: with it, every game that uses
+        # GameKit (Terraria, logs/210543-play-app8.png) puts up "Welcome to Game Center" and an Apple ID sign-in at
+        # every boot -- the data volume is in RAM, so nothing is remembered, and the sign-in cannot succeed on a phone
+        # the account layer calls unactivated. Without it GameKit's authenticate handler gets an error, which games
+        # take as "Game Center is not available" and go on. ALLOW=gamed brings it back.
+        'com.apple.gamed')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
