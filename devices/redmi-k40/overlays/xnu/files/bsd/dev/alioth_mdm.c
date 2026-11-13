@@ -41,6 +41,7 @@
 #include <sys/alioth_qrtr.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
+#include <stdarg.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 #include "alioth_pcie2_phy.h"
@@ -56,7 +57,40 @@ extern int umi_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y);
 extern kern_return_t thread_terminate(thread_t thread);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern lck_mtx_t hakios_smmu_lock;      /* (bsd/dev/hakios.wifi.c: the SMMU's global registers are shared) */
-#define say hakios_tl
+/*
+ * Every line said to the console AND kept here, all of them said again on the way back to the loader
+ * (alioth_mdm_quiesce(), as hakios.mic.c does): the loader's log keeps the boot's first 256 KB and the last 1 MB,
+ * and iOS's own boot fills the first ~6 s after the modem's reset -- 2026-11-13, step 6's lines after that fell into
+ * the middle that is not kept, and the modem only looked silent.
+ */
+extern void loader_log_putc(char c);
+#define MDM_KEPT                (48 * 1024)
+static char mdm_kept[MDM_KEPT];
+static uint32_t mdm_kept_len;
+static bool mdm_kept_full;
+
+static void mdm_say(const char *format, ...) __printflike(1, 2);
+
+static void
+mdm_say(const char *format, ...)
+{
+	char line[192];
+	va_list list;
+	size_t n;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	hakios_tl("%s", line);
+	n = strlen(line);
+	if (mdm_kept_len + n < MDM_KEPT) {
+		memcpy(mdm_kept + mdm_kept_len, line, n);
+		mdm_kept_len += (uint32_t)n;
+	} else {
+		mdm_kept_full = true;
+	}
+}
+#define say mdm_say
 
 /* ---- registers --------------------------------------------------------------------------------------- */
 
@@ -1520,6 +1554,26 @@ alioth_mdm_quiesce(void)
 {
 	if (dma_on || smmu_match != ~0u) {
 		mdm_stop(true);
+	}
+	if (mdm_kept_len != 0) {
+		for (const char *c = "mdm: what happened in this run, again (the log's middle is not kept):\n"; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+		for (uint32_t i = 0; i < mdm_kept_len; i++) {
+			if (i == 0 || mdm_kept[i - 1] == '\n') {
+				loader_log_putc('>');
+				loader_log_putc(' ');
+			}
+			loader_log_putc(mdm_kept[i]);
+		}
+		if (mdm_kept[mdm_kept_len - 1] != '\n') {
+			loader_log_putc('\n');
+		}
+		if (mdm_kept_full) {
+			for (const char *c = "> (and more: the kept lines filled their 48 KB)\n"; *c != 0; c++) {
+				loader_log_putc(*c);
+			}
+		}
 	}
 }
 
