@@ -1829,6 +1829,23 @@ enum {
 		if (_mesa != NULL && deferred != NULL) {
 			deferred(_mesa, 1);
 		}
+		/* (the K40's, 11-13) indexed draws' indices no longer walked on the processor (the library's
+		 * index_range: a write-combined read of every index, the larger part of a draw's cost);
+		 * boot-arg metal_index_walk=1 walks them all again, for comparisons */
+		void (*index_walk)(struct rwa_device *, unsigned) =
+		    (void (*)(struct rwa_device *, unsigned))dlsym(mesa.handle, "rwa_device_set_index_walk");
+
+		if (_mesa != NULL && index_walk != NULL) {
+			char args[1024] = "";
+			size_t len = sizeof(args) - 1;
+			unsigned walk = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 &&
+			                strstr(args, "metal_index_walk=1") != NULL;
+
+			index_walk(_mesa, walk);
+			if (walk) {
+				rw_print("indexed draws: every index walked on the processor (metal_index_walk=1)\n");
+			}
+		}
 	}
 	alioth_stats_setup();
 	alioth_listener_fix();

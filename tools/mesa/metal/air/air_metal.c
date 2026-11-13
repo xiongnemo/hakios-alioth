@@ -94,6 +94,11 @@ struct rwa_device {
     */
    bool deferred;
 
+   /* (the K40's) rwa_device_set_index_walk: an indexed draw's indices walked on the processor
+    * for their smallest and largest (index_range) -- off by default since 2026-11-13, see there
+    */
+   bool index_walk;
+
    /* (the K40's) the blend colour last given to the context: set again only when a draw's
     * differs, since freedreno builds a state object for every change (fd6 build_blend_color)
     */
@@ -4361,6 +4366,13 @@ rwa_device_set_deferred(struct rwa_device *device, unsigned deferred)
       device->deferred = deferred != 0;
 }
 
+void
+rwa_device_set_index_walk(struct rwa_device *device, unsigned walk)
+{
+   if (device)
+      device->index_walk = walk != 0;
+}
+
 int
 rwa_finish(struct rwa_device *device, char *why, size_t why_size)
 {
@@ -4538,9 +4550,19 @@ index_type_name(unsigned type)
  *
  * The cost is honest and it is O(count) on the processor at every draw: an application
  * drawing a hundred thousand indices pays for a hundred thousand loads here. Mesa pays
- * the same cost in u_vbuf and caches it per buffer; nothing is cached here yet, and the
- * draw already waits for the GPU on this thread (rwa_render_draw's fence), which is the
- * larger of the two by far.
+ * the same cost in u_vbuf and caches it per buffer; nothing is cached here.
+ *
+ * (the K40's, 2026-11-13) And it is the LARGEST cost of a draw now, not a small one: the
+ * draws no longer wait for the GPU (rwa_draw.keep_bound since 11-09), and the indices are
+ * read through the buffer's only mapping, which is write combined (rwa_buffer_create):
+ * every load is a trip to memory with no cache of this processor. Map 2.0's -commit was
+ * 23.4 ms with its line indices walked three times a frame and 13.4 ms with them walked
+ * once -- the time followed the indices read, not the draws. So the walk is made only
+ * where its answer is needed (rwa_render_draw): the generated quad, whose four corners
+ * an index must not pass, and rwa_device_set_index_walk(1) for a comparison. Every other
+ * indexed draw goes to Gallium with index_bounds_valid false (util_draw_elements' own
+ * form), and the hardware bounds the fetch: a6xx gives each vertex buffer a fetch size
+ * from the resource (VFD_FETCH_SIZE), past which an attribute reads as zero.
  */
 static void
 index_range(const uint8_t *indices, unsigned count, unsigned index_size, unsigned *min_out,
@@ -7096,6 +7118,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    unsigned index_size = 0, index_start = 0;
    unsigned min_index = draw->vertex_start;
    unsigned max_index = draw->vertex_start + draw->vertex_count - 1;
+   /* (the K40's) min_index/max_index are what the draw reads: true for a non-indexed draw,
+    * and for an indexed one only when its indices were walked (index_range) */
+   bool index_bounds = true;
    if (!draw->index_buffer) {
       /* Metal's non-indexed forms have no baseVertex and no index type or offset to
        * give. A caller that filled one in asked for something -drawPrimitives: cannot
@@ -7153,9 +7178,19 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          return -1;
       }
       index_start = (unsigned)(draw->index_buffer_offset / index_size);
-      index_range((const uint8_t *)rwa_buffer_map(draw->index_buffer) +
-                  draw->index_buffer_offset, draw->vertex_count, index_size, &min_index,
-                  &max_index);
+      /* (the K40's) walked only where the answer is used (index_range says why): otherwise
+       * the bounds are unknown, Gallium is told so, and the vertex streams' end checks below
+       * are left to the hardware's fetch size */
+      if (render->generated_vertex || device->index_walk) {
+         index_range((const uint8_t *)rwa_buffer_map(draw->index_buffer) +
+                     draw->index_buffer_offset, draw->vertex_count, index_size, &min_index,
+                     &max_index);
+         index_bounds = true;
+      } else {
+         min_index = 0;
+         max_index = ~0u;
+         index_bounds = false;
+      }
       /* The generated vertex stage's own quad has four corners and this library owns the
        * buffer they are in, so an index past it is not the application's mistake to make
        * -- it is a fetch outside a resource of ours, and both back ends answer one with
@@ -7215,8 +7250,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * reads is the hardware's arithmetic over the base instance and the divisor, and a
        * bound computed from the wrong formula would refuse legal draws (air_metal.h).
        */
-      /* (and not for an indirect draw, whose vertex range only the GPU knows) */
-      if (indirect || !(vst->per_vertex & (1u << k)))
+      /* (and not for an indirect draw, whose vertex range only the GPU knows, nor -- the
+       * K40's, 11-13 -- an indexed draw whose indices were not walked: index_range) */
+      if (indirect || !index_bounds || !(vst->per_vertex & (1u << k)))
          continue;
       int64_t first = (int64_t)s->offset + (int64_t)vst->stride[k] * low_vertex;
       if (first < 0) {
@@ -7653,7 +7689,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * caller's rwa_buffer, which outlives this draw and may be drawn with again.
        */
       struct pipe_draw_info info = {
-         .mode = prim, .index_bounds_valid = !indirect,
+         .mode = prim, .index_bounds_valid = !indirect && index_bounds,
          .index_size = (uint16_t)index_size,
          .min_index = indirect ? 0 : min_index, .max_index = indirect ? ~0u : max_index,
          .instance_count = instances,
