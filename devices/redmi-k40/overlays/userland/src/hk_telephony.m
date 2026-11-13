@@ -45,7 +45,7 @@ mach_listener(NSString *name)
 
 static Protocol *service;
 static NSMutableDictionary<NSString *, NSNumber *> *asked;
-static unsigned identities_given, refused_identity;
+static unsigned identities_given, refused_identity, slot_given;
 
 static void say(const char *format, ...) __printflike(1, 2);
 
@@ -68,6 +68,54 @@ say(const char *format, ...)
 		fprintf(f, "%s %s", when, line);
 		fclose(f);
 	}
+}
+
+/*
+ * The phone's one SIM slot, EMPTY -- what CommCenter says of an iPhone with no SIM in it (round 42: with no
+ * subscription at all, About has no SIM section and so no IMEI row, though the IMEI was given). Slot 1, SIM not
+ * present, not good; the preferred one for data and voice as the only one. The UUID is a constant of ours, nothing of
+ * the phone's. Boot-arg tel_noslot=1: none (round 42's behaviour).
+ */
+static BOOL no_slot;
+
+static id
+slot_context(void)
+{
+	static id context;
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		Class c = NSClassFromString(@"CTXPCServiceSubscriptionContext");
+		NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:@"6B40A11D-0000-4000-8000-000000000001"];
+		SEL init = sel_registerName("initWithUUID:andSlot:");
+
+		if (c == Nil || ![c instancesRespondToSelector:init]) {
+			return;
+		}
+		context = ((id (*)(id, SEL, id, long long))objc_msgSend)([c alloc], init, uuid, 1);
+		((void (*)(id, SEL, BOOL))objc_msgSend)(context, sel_registerName("setIsSimPresent:"), NO);
+		((void (*)(id, SEL, BOOL))objc_msgSend)(context, sel_registerName("setIsSimGood:"), NO);
+		((void (*)(id, SEL, id))objc_msgSend)(context, sel_registerName("setUserDataPreferred:"), @YES);
+		((void (*)(id, SEL, id))objc_msgSend)(context, sel_registerName("setUserDefaultVoice:"), @YES);
+	});
+	return context;
+}
+
+static id
+slot_info(void)
+{
+	static id info;
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		id context = slot_context();
+
+		info = context ? [NSClassFromString(@"CTXPCServiceSubscriptionInfo") new] : nil;
+		((void (*)(id, SEL, id))objc_msgSend)(info, sel_registerName("setSubscriptions:"), @[ context ]);
+		((void (*)(id, SEL, id))objc_msgSend)(info, sel_registerName("setSubscriptionsInUse:"), @[ context ]);
+		((void (*)(id, SEL, id))objc_msgSend)(info, sel_registerName("setSubscriptionsValid:"), @[ context ]);
+	});
+	return info;
 }
 
 /* the IMEI the modem gave the kernel, or nil (no modem session, not read yet) */
@@ -243,7 +291,7 @@ block_classes(SEL selector, unsigned which, const char **whole)
 	const char *signature = _Block_signature((__bridge void *)block);
 	NSMethodSignature *s;
 	NSInvocation *call;
-	BOOL gave = NO;
+	BOOL gave = NO, gave_slot = NO;
 	NSString *imei = nil;
 	NSError *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENXIO userInfo:nil];
 
@@ -285,7 +333,15 @@ block_classes(SEL selector, unsigned which, const char **whole)
 			[call retainArguments];
 			gave = value != nil;
 			[call setArgument:&value atIndex:(NSInteger)i];
-		} else if ([cls isEqualToString:@"NSError"] && !gave) {
+		} else if (!no_slot && ([cls isEqualToString:@"CTXPCServiceSubscriptionContext"] ||
+		    [cls isEqualToString:@"CTXPCServiceSubscriptionInfo"])) {
+			keep = [cls isEqualToString:@"CTXPCServiceSubscriptionInfo"] ? slot_info() : slot_context();
+			value = keep;
+			[call retainArguments];
+			[call setArgument:&value atIndex:(NSInteger)i];
+			slot_given += keep != nil;
+			gave_slot = keep != nil;
+		} else if ([cls isEqualToString:@"NSError"] && !gave && !gave_slot) {
 			value = error;
 			[call setArgument:&value atIndex:(NSInteger)i];
 		}
@@ -300,6 +356,9 @@ block_classes(SEL selector, unsigned which, const char **whole)
 			    self.client.UTF8String, whole ?: "(none)", [classes componentsJoinedByString:@","].UTF8String ?: "(none)",
 			    gave ? "GIVEN" : self.identity ? "not given" : "not for this client");
 		}
+	}
+	if (gave_slot && slot_given <= 15) {
+		say("hk_telephony: %s: the empty SIM slot given to %s\n", name.UTF8String, self.client.UTF8String);
 	}
 	if (gave) {
 		identities_given++;
@@ -418,6 +477,13 @@ main(void)
 			return 1;
 		}
 		asked = [NSMutableDictionary new];
+		{
+			char args[1024] = "";
+			size_t n = sizeof(args) - 1;
+
+			no_slot = sysctlbyname("kern.bootargs", args, &n, NULL, 0) == 0 && strstr(args, "tel_noslot=1") != NULL;
+		}
+		say("hk_telephony: the SIM slot: %s\n", no_slot ? "none said (tel_noslot=1)" : "one, slot 1, EMPTY (no SIM)");
 		listener = mach_listener(@"com.apple.commcenter.coretelephony.xpc");
 		if (listener == nil) {
 			say("hk_telephony: NSXPCListener has no initWithMachServiceName: here\n");
