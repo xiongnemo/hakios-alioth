@@ -269,6 +269,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/loc_enable src/loc_enable.m &&
 			{ ${LDID:-ldid} -Ssrc/loc_enable.entitlements obj/loc_enable 2>/dev/null ||
 			  echo "build.sh: no ldid: loc_enable is unsigned, and locationd will not take the switch from it"; }
+		# the SDX55 modem's GNSS fixes (kern.hakios.gnss) into location services through CoreLocation's location
+		# simulation (src/gnss_feed.m, the job com.hakios.gnss); locationd takes them only with its entitlement
+		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnss_feed src/gnss_feed.m &&
+			{ ${LDID:-ldid} -Ssrc/gnss_feed.entitlements obj/gnss_feed 2>/dev/null ||
+			  echo "build.sh: no ldid: gnss_feed is unsigned, and locationd will not take its locations"; }
 		# and its face on the phone, the application IPA 安装 (src/installer: it asks, the service does)
 		$DYN -fobjc-arc -framework UIKit -framework Foundation -framework UniformTypeIdentifiers \
 			-o obj/IPAInstaller src/installer/main.m
@@ -373,6 +378,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/record_test ] && cp obj/record_test root/bin/
 	[ -f obj/ipainstall ] && cp obj/ipainstall root/bin/
 	[ -f obj/loc_enable ] && cp obj/loc_enable root/bin/
+	[ -f obj/gnss_feed ] && cp obj/gnss_feed root/bin/
 	# (the applications that come with this image, unpacked from ../apps/*.ipa: the job com.hakios.apps
 	# registers them at boot; those of the release's apps\ folder come from the computer instead)
 	mkdir -p root/apps
@@ -500,6 +506,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f com.hakios.usbmux.plist ] && cp com.hakios.usbmux.plist root/LaunchDaemons/
 	[ -f root/bin/ipainstall ] && cp com.hakios.apps.plist root/LaunchDaemons/
 	[ -f root/bin/loc_enable ] && cp com.hakios.location.plist root/LaunchDaemons/
+	[ -f root/bin/gnss_feed ] && cp com.hakios.gnss.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} python3 mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS

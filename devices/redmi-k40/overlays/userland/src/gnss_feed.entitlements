@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- locationd's (iOS 16.5 /usr/libexec/locationd: CLSimulatedLocationProvider, "unentitled client attempting to
+	     simulate location" without it): CLSimulationManager's locations are taken from a client with this -->
+	<key>com.apple.locationd.simulation</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The SDX55 modem's GNSS fixes (kern.hakios.gnss, boot-arg mdm_loc=1) into location services (src/gnss_feed.m):
+	     ends at once when there is no session; brought back only if it fails -->
+	<key>Label</key>
+	<string>com.hakios.gnss</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/gnss_feed</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>
