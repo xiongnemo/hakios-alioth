@@ -126,7 +126,7 @@ main(void)
 	{ uint32_t w[] = { SAHARA_MODE_PENDING }; CHECK(chip(&s, SAHARA_DONE_RESP, SAHARA_DONE_RESP_LENGTH, w, 1) == 0, "done resp"); }
 	CHECK(s.state != SAHARA_FINISHED, "not finished after a pending DONE_RESP");
 
-	/* image 5 in 64-bit reads, one of 200000 bytes: more than a packet, so 4 packets */
+	/* image 5 in 64-bit reads, one of 200000 bytes: more than a packet (0x8000), so 7 packets, each a transfer */
 	memset(p, 0, sizeof(p));
 	put32(p, SAHARA_READ_DATA64);
 	put32(p + 4, SAHARA_READ64_LENGTH);
@@ -137,7 +137,7 @@ main(void)
 	sends = lasts = 0;
 	CHECK(sahara_input(&s, p, SAHARA_READ64_LENGTH) == 0, "read64");
 	CHECK(sent_length == 200000 && memcmp(sent, image5 + 1000, 200000) == 0, "image 5 bytes");
-	CHECK(sends == 4 && lasts == 1, "200000 bytes in %u packets (%u ending a transfer), not 4 (1)", sends, lasts);
+	CHECK(sends == 7 && lasts == 7, "200000 bytes in %u packets (%u ending a transfer), not 7 (7)", sends, lasts);
 
 	/* a missing image: RESET (after closing 5) */
 	{ uint32_t w[] = { 5, 0 }; chip(&s, SAHARA_END_OF_IMAGE, SAHARA_EOI_LENGTH, w, 2); }

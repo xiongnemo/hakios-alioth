@@ -835,6 +835,10 @@ alioth_mhi_send(struct alioth_mhi *host, unsigned number, const void *bytes, uin
 				host->poisoned = true;
 				return ETIMEDOUT;
 			}
+			/* (2026-11-13: a ring that stays full this long is the device not completing; said once a wait) */
+			if (ms == 500) {
+				say(host, "MHI: the device has given no element back for ms: channel, ms, done", number, ms, c->done);
+			}
 			host->io->delay_us(host->io->context, 1000);
 		}
 		index = ring_index(&c->ring, c->ring.wp);

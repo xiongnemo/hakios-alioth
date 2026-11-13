@@ -53,7 +53,13 @@
 #define SAHARA_MODE_PENDING     0               /* images to transfer */
 #define SAHARA_MODE_COMPLETE    1               /* all transferred */
 #define SAHARA_MODE_COMMAND     3               /* the chip wants commands first: switched back to PENDING */
-#define SAHARA_PACKET_MAX       0xffffu         /* what one MHI transfer carries */
+/* what one packet of an image's bytes carries -- each packet is a transfer of its own (`last` true: MHI's IEOT), one
+ * element of the SDX55's Sahara channel (alioth_mhi.c SAHARA_SLOT 0x8000). 2026-11-13: with 0xffff-byte packets
+ * chained (CHAIN, IEOT only at the read's end or a full ring) the SBL took ten images and then stopped receiving
+ * qdsp6sw.mbn's 84 MB (read in one request) for minutes; the OnePlus 8 Pro port, the same SDX55, sends 8 KB
+ * elements each with IEOT and moves 88 MB in ~30 s (dekefake/hackios-op8pro hk_mhi_send). */
+#define SAHARA_PACKET_MAX       0x8000u
+#define SAHARA_PROGRESS         (8u << 20)      /* a line every this many bytes of one read */
 /* the most one READ_DATA may ask for: the SDX55's SBL asks for the rest of qdsp6sw.mbn in ONE read (0x501e08c bytes
  * at 0x3000, 2026-11-13; 8 MB here reset the session at image 8) -- the bytes still go out in SAHARA_PACKET_MAX
  * pieces, and the image's own size bounds the read (sahara_read) */
@@ -154,6 +160,8 @@ sahara_reset(struct sahara *s, const char *why, uint64_t a, uint64_t b)
 static inline int
 sahara_read(struct sahara *s, uint64_t id, uint64_t offset, uint64_t length)
 {
+	uint64_t sent = 0;
+
 	if (id != s->active) {
 		uint64_t size = 0;
 		const uint8_t *data;
@@ -175,9 +183,10 @@ sahara_read(struct sahara *s, uint64_t id, uint64_t offset, uint64_t length)
 	s->state = SAHARA_TRANSFERRING;
 	while (length > 0) {
 		uint32_t n = length > SAHARA_PACKET_MAX ? SAHARA_PACKET_MAX : (uint32_t)length;
-		int error = s->ops->send(s->ops->context, s->data + offset, n, n == length);
+		int error = s->ops->send(s->ops->context, s->data + offset, n, true);
 
 		if (error != 0) {
+			sahara_say(s, "sahara: a send failed: image, bytes of this read sent, error", id, sent, (uint64_t)error);
 			s->state = SAHARA_FAILED;
 			return error;
 		}
@@ -185,6 +194,10 @@ sahara_read(struct sahara *s, uint64_t id, uint64_t offset, uint64_t length)
 		s->bytes_sent += n;
 		offset += n;
 		length -= n;
+		sent += n;
+		if (length > 0 && sent % SAHARA_PROGRESS < n) {
+			sahara_say(s, "sahara: a long read: image, bytes sent, bytes left", id, sent, length);
+		}
 	}
 	return 0;
 }
