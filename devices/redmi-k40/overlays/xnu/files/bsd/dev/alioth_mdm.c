@@ -1595,16 +1595,27 @@ tftp_packet(const struct qrtr_packet *p)
 #define LOC_SET_OPERATION_MODE  0x004a
 #define LOC_EVENTS              (0x1ull | 0x2ull | 0x80ull | 0x100ull)    /* position, SV info, engine state, fix session */
 
+/*
+ * (2026-11-14, the first session: every request accepted, the ENGINE STATE indication said 2 = off and no satellite
+ * was ever reported.) The OnePlus 8 Pro port's modem had 20+ satellites in view at a window -- but its driver had put
+ * the modem online with DMS first; the SDX55 comes up OFFLINE (3), RF dark. So the sequence now begins on DMS
+ * (service 2): GET_OPERATING_MODE, and SET_OPERATING_MODE to boot-arg mdm_opmode (default 1 = LOW POWER: Android's
+ * airplane mode, GNSS allowed and the cellular radio off; 0 = online) when it is not that already.
+ */
+#define DMS_SERVICE             2u
+#define DMS_GET_OPERATING_MODE  0x002d
+#define DMS_SET_OPERATING_MODE  0x002e
+
 static struct {
-	bool wanted, found;
-	uint32_t node, port;
+	bool wanted, found, dms_found;
+	uint32_t node, port, dms_node, dms_port, opmode_wanted, opmode;
 	uint16_t txn, waiting;          /* the request whose response is awaited (0: none) */
-	unsigned step;                  /* 0 revision, 1 events, 2 mode, 3 lock, 4 start, 5 running */
+	unsigned step;                  /* 0 DMS mode?, 1 DMS set, 2 revision, 3 events, 4 mode, 5 lock, 6 start, 7 running */
 	uint64_t sent_at;
 	unsigned responses, reports, fixes, sv_infos, said;
 	uint32_t best_m, last_status, most_sats;
 	uint64_t lat_bits, lon_bits;    /* (the last fix's, never said) */
-} loc = { .best_m = UINT32_MAX };
+} loc = { .best_m = UINT32_MAX, .opmode = UINT32_MAX };
 
 static uint32_t
 loc_le32(const uint8_t *p)
@@ -1628,8 +1639,16 @@ loc_f32_metres(uint32_t bits)
 	return (uint32_t)(exponent >= 23 ? mantissa << (exponent - 23) : mantissa >> (23 - exponent));
 }
 
+static int loc_send_to(uint32_t node, uint32_t port, uint16_t message, const uint8_t *tlvs, uint16_t tlv_bytes);
+
 static int
 loc_send(uint16_t message, const uint8_t *tlvs, uint16_t tlv_bytes)
+{
+	return loc_send_to(loc.node, loc.port, message, tlvs, tlv_bytes);
+}
+
+static int
+loc_send_to(uint32_t node, uint32_t port, uint16_t message, const uint8_t *tlvs, uint16_t tlv_bytes)
 {
 	uint8_t q[7 + 64], out[QRTR_V1_HEADER + sizeof(q) + 4];
 
@@ -1644,7 +1663,7 @@ loc_send(uint16_t message, const uint8_t *tlvs, uint16_t tlv_bytes)
 	memcpy(q + 7, tlvs, tlv_bytes);
 	loc.waiting = message;
 	loc.sent_at = since_reset_ms();
-	return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_DATA, QRTR_OUR_NODE, LOC_PORT, loc.node, loc.port, q,
+	return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_DATA, QRTR_OUR_NODE, LOC_PORT, node, port, q,
 	    (uint32_t)(7 + tlv_bytes), false));
 }
 
@@ -1666,8 +1685,11 @@ loc_tick(void)
 	uint8_t t[64];
 	uint16_t n = 0;
 
-	if (!loc.wanted || !loc.found || loc.step >= 5 || (loc.waiting != 0 && since_reset_ms() - loc.sent_at < 2000)) {
+	if (!loc.wanted || !loc.found || loc.step >= 7 || (loc.waiting != 0 && since_reset_ms() - loc.sent_at < 2000)) {
 		return 0;
+	}
+	if (loc.step < 2 && !loc.dms_found) {
+		return 0;                                       /* (DMS is announced in the same list: wait for it) */
 	}
 	if (loc.waiting != 0) {
 		say("mdm: 7: loc: no response to %#x in 2 s: on to the next\n", loc.waiting);
@@ -1676,19 +1698,26 @@ loc_tick(void)
 	}
 	switch (loc.step) {
 	case 0:
+		say("mdm: 7: loc: DMS at node %u port %u: the modem's operating mode?\n", loc.dms_node, loc.dms_port);
+		return loc_send_to(loc.dms_node, loc.dms_port, DMS_GET_OPERATING_MODE, t, 0);
+	case 1:
+		n = loc_tlv(t, 0x01, loc.opmode_wanted, 1);
+		say("mdm: 7: loc: DMS: operating mode %u -> %u (0 online, 1 low power, 3 offline)\n", loc.opmode, loc.opmode_wanted);
+		return loc_send_to(loc.dms_node, loc.dms_port, DMS_SET_OPERATING_MODE, t, n);
+	case 2:
 		n = loc_tlv(t, 0x01, 2, 4);
 		say("mdm: 7: loc: the session begins (LOC at node %u port %u): INFORM_CLIENT_REVISION 2\n", loc.node, loc.port);
 		return loc_send(LOC_INFORM_REVISION, t, n);
-	case 1:
+	case 3:
 		n = loc_tlv(t, 0x01, LOC_EVENTS, 8);
 		return loc_send(LOC_REG_EVENTS, t, n);
-	case 2:
+	case 4:
 		n = loc_tlv(t, 0x01, 4, 4);                     /* STANDALONE */
 		return loc_send(LOC_SET_OPERATION_MODE, t, n);
-	case 3:
+	case 5:
 		n = loc_tlv(t, 0x01, 1, 4);                     /* LOCK_NONE */
 		return loc_send(LOC_SET_ENGINE_LOCK, t, n);
-	case 4:
+	case 6:
 		n = loc_tlv(t, 0x01, 1, 1);                     /* session id */
 		n += loc_tlv(t + n, 0x10, 1, 4);                /* fix recurrence: periodic */
 		n += loc_tlv(t + n, 0x11, 3, 4);                /* horizontal accuracy: high */
@@ -1723,6 +1752,8 @@ loc_packet(const struct qrtr_packet *p)
 		}
 		if (d[0] == QMI_RESPONSE && type == 0x02 && n >= 4) {
 			status = (uint32_t)(v[0] | v[1] << 8) << 16 | (uint32_t)(v[2] | v[3] << 8);   /* result << 16 | error */
+		} else if (d[0] == QMI_RESPONSE && message == DMS_GET_OPERATING_MODE && type == 0x01 && n >= 1) {
+			loc.opmode = v[0];
 		} else if (d[0] == QMI_INDICATION && type == 0x01 && n >= 4) {
 			status = loc_le32(v);
 		} else if (message == LOC_POSITION_REPORT && type == 0x10 && n == 8) {
@@ -1744,7 +1775,13 @@ loc_packet(const struct qrtr_packet *p)
 		if (message == loc.waiting) {
 			loc.waiting = 0;
 			loc.step++;
-			if (loc.step == 5) {
+			if (message == DMS_GET_OPERATING_MODE) {
+				say("mdm: 7: loc: DMS: the modem is in operating mode %u\n", loc.opmode);
+				if (loc.opmode == loc.opmode_wanted) {
+					loc.step++;                     /* (already as wanted: no SET) */
+				}
+			}
+			if (loc.step == 7) {
 				say("mdm: 7: loc: STARTED (%s)\n", status == 0 ? "accepted" : "REFUSED");
 			}
 		}
@@ -1830,6 +1867,11 @@ ipcr_handle(const uint8_t *bytes, uint32_t length)
 			loc.found = true;
 			loc.node = s.node;
 			loc.port = s.port;
+		}
+		if (p.type == QRTR_TYPE_NEW_SERVER && s.service == DMS_SERVICE && !loc.dms_found) {
+			loc.dms_found = true;
+			loc.dms_node = s.node;
+			loc.dms_port = s.port;
 		}
 		return 0;
 	case QRTR_TYPE_NEW_LOOKUP:
@@ -2072,6 +2114,8 @@ step_qrtr(void)
 		uint32_t want = 0;
 
 		loc.wanted = PE_parse_boot_argn("mdm_loc", &want, sizeof(want)) && want != 0;
+		loc.opmode_wanted = 1;                          /* low power (airplane): GNSS on, cellular radio off */
+		(void)PE_parse_boot_argn("mdm_opmode", &loc.opmode_wanted, sizeof(loc.opmode_wanted));
 		say("mdm: 7: loc: %s\n", loc.wanted ? "a GNSS session once LOC is there (mdm_loc=1), listened to for 240 s" :
 		    "not asked for (mdm_loc=1 starts a GNSS session)");
 	}
