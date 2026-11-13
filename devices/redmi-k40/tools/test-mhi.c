@@ -86,6 +86,7 @@ static struct {
 	bool event_doorbell[3];
 	struct ring ch[NCH];
 	unsigned events, resets;
+	uint64_t wake;                  /* channel doorbell 127: the host's device wake (Linux's wake_db) */
 	/* the transfer being received on channel 2 (or 20) */
 	uint8_t *transfer;
 	size_t transfer_length;
@@ -569,6 +570,8 @@ write32(void *context, uint32_t offset, uint32_t value)
 		} else {
 			command_doorbell();
 		}
+	} else if (offset == CHDB + 127 * 8) {
+		dev.wake = value;               /* (the device wake: not a channel's ring) */
 	} else if (offset >= CHDB && offset < CHDB + NCH * 8 && !(offset & 4)) {
 		unsigned ch = (offset - CHDB) / 8;
 		struct ring *r = &dev.ch[ch];
@@ -647,6 +650,7 @@ modem_reset(void)
 	dev.us = dev.ready_at = 0;
 	dev.m0 = false;
 	dev.events = dev.resets = 0;
+	dev.wake = 0;
 	dev.transfer_length = 0;
 	memset(dev.dl, 0, sizeof(dev.dl));
 	dev.qrtr_hello = dev.lookup_answered = false;
@@ -765,6 +769,7 @@ main(void)
 		}
 		CHECK(dev.resets == 0 && still == 0, "SBL's channels let go without a RESET (%u resets, %u still open)",
 		    dev.resets, still);
+		CHECK(dev.wake == 1, "device wake held at mission mode (%llu)", (unsigned long long)dev.wake);
 	}
 	CHECK(host.bandwidth_requests == 1, "the link speed request seen (%u)", host.bandwidth_requests);
 	/* mission mode: QRTR on IPCR, as alioth_mdm.c's step 6 */

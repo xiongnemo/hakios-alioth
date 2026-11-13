@@ -577,7 +577,8 @@ event(struct alioth_mhi *host, uint64_t pointer, uint32_t w0, uint32_t w1)
 		say(host, "MHI: the device is in state", host->state, 0, 0);
 		return 0;
 	case TYPE_EE:
-		host->ee = w0 >> 24;
+		host->ee = host->ee_event = w0 >> 24;
+		host->ee_events++;
 		say(host, "MHI: the device is in execution environment", host->ee, 0, 0);
 		return 0;
 	case TYPE_COMMAND_DONE:
@@ -705,6 +706,11 @@ command(struct alioth_mhi *host, unsigned type, unsigned number)
 				return EIO;
 			}
 			return 0;
+		}
+		/* (2026-11-13) rung again every 100 ms while unanswered: the same write pointer, so harmless -- a device
+		 * whose MHI came up after the first ring (AMSS just after the SBL) sees it then */
+		if (ms % 100 == 99) {
+			wr64(host, CRDB, after);
 		}
 		host->io->delay_us(host->io->context, 1000);
 	}
@@ -1037,6 +1043,36 @@ alioth_mhi_sahara(struct alioth_mhi *host, const uint8_t *(*image)(void *, uint6
 		return error;
 	}
 	say(host, "sahara: the modem is in mission mode", 0, 0, 0);
+	/*
+	 * (2026-11-13) The BHI register says AMSS before the device's EE event does, and AMSS's own MHI is not ready
+	 * until it has sent that event: a START_CHANNEL rung in between was never answered (the event came while it
+	 * waited). So, as the OnePlus 8 Pro port's hk_mhi_start_mission(): the event (1 s at most), then M0, then go on.
+	 */
+	{
+		unsigned ms = 0;
+
+		for (; ms < 1000 && host->ee_event != ALIOTH_MHI_EE_AMSS; ms++) {
+			if ((error = alioth_mhi_poll(host)) != 0) {
+				return error;
+			}
+			host->io->delay_us(host->io->context, 1000);
+		}
+		say(host, "sahara: the device's own word for its mission: EE event, ms waited, events of that kind", host->ee_event, ms,
+		    host->ee_events);
+		for (ms = 0; ms < 1000 && STATE_OF(rd(host, MHISTATUS)) != STATE_M0; ms++) {
+			if ((error = alioth_mhi_poll(host)) != 0) {
+				return error;
+			}
+			host->io->delay_us(host->io->context, 1000);
+		}
+		say(host, "sahara: the device's MHI state after its mission began: status, ms waited", rd(host, MHISTATUS), ms, 0);
+		host->ee = ALIOTH_MHI_EE_AMSS;
+		/* device wake held (channel doorbell 127 = 1, Linux's wake_db): in AMSS the modem goes to M1 when idle and
+		 * takes doorbells in M0 only (the OnePlus 8 Pro port holds it through its mission); never let go here */
+		write_barrier();
+		wr64(host, host->channel_db + 127 * 8, 1);
+		say(host, "sahara: device wake held (doorbell 127)", 0, 0, 0);
+	}
 	/*
 	 * SBL's channels let go on this side only. (2026-11-13, the first mission mode on the phone: a RESET_CHANNEL of
 	 * channel 2 sent as Linux's does it was never answered by the SDX55 in AMSS, and the unanswered command

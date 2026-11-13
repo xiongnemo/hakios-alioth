@@ -80,6 +80,7 @@ struct alioth_mhi {
 	const struct alioth_mhi_io *io;
 	uint32_t bhi, channel_db, event_db, channels;
 	uint32_t state, ee;                     /* as the device last said: MHI state, execution environment */
+	uint32_t ee_events, ee_event;           /* EE events seen, and the last one's environment (ee may come from BHI) */
 	bool poisoned, ready;
 	uint64_t command_pending;
 	int command_code;
