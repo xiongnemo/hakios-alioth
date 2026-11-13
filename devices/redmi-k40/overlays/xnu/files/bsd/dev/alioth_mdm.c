@@ -1911,7 +1911,15 @@ SYSCTL_OPAQUE(_kern_hakios, OID_AUTO, gnss, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss, 
  * next after the last one's response. Reading the sysctl gives the state: 0 not wanted, 1 waiting for the file,
  * 2 being given, 3 given, 4 refused by the modem.
  */
-#define LOC_INJECT_XTRA         0x0035
+/*
+ * (round 38, 11-14 08:15: every part of 0x35 refused, error 94 NOT_SUPPORTED and 3 INTERNAL -- the old message; newer
+ * Qualcomm location stacks inject XTRA with INJECT_XTRA_DATA, 0xA7, the same fields.) So the session first asks LOC
+ * which messages it has (GET_SUPPORTED_MSGS, 0x1E: a bit for each) and uses 0xA7 when it is there; boot-arg
+ * mdm_xtra_msg=0x35|0xa7 to choose.
+ */
+#define LOC_INJECT_PREDICTED    0x0035
+#define LOC_INJECT_XTRA_DATA    0x00a7
+#define LOC_GET_SUPPORTED_MSGS  0x001e
 #define XTRA_MAX                (256u * 1024)
 #define XTRA_PART_MAX           1024u
 
@@ -1919,8 +1927,24 @@ static struct {
 	uint32_t state;                 /* (the sysctl's value; written by both sides with __atomic) */
 	uint8_t *data;
 	uint32_t size, part_size, parts, sent, ok, refused, first_error;
+	uint16_t msg;                   /* the message the parts go in: 0xA7, or 0x35 (the old one) */
+	bool msg_forced;
 	uint64_t began_ms;
 } xtra;
+#define LOC_INJECT_XTRA         (xtra.msg)
+
+/* LOC's GET_SUPPORTED_MSGS answer: a bit for each message number (bit n of byte n / 8) */
+static struct {
+	bool asked, known;
+	uint16_t bytes;
+	uint8_t mask[64];
+} loc_msgs;
+
+static bool
+loc_supports(uint16_t message)
+{
+	return loc_msgs.known && message / 8 < loc_msgs.bytes && (loc_msgs.mask[message / 8] >> (message % 8) & 1);
+}
 
 static int
 gnss_xtra_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
@@ -2132,14 +2156,23 @@ loc_running(void)
 			return loc_send(LOC_INJECT_UTC_TIME, t, n);
 		}
 	}
+	if (!loc_msgs.asked) {
+		uint8_t none[1] = { 0 };
+
+		loc_msgs.asked = true;
+		return loc_send(LOC_GET_SUPPORTED_MSGS, none, 0);
+	}
 	if (__atomic_load_n(&xtra.state, __ATOMIC_ACQUIRE) == 2) {
 		/* (the file written by gnss_feed: given a part at a time, each after the last one's response or 2 s) */
 		if (xtra.sent == 0) {
 			xtra.part_size = xtra.part_size >= 64 && xtra.part_size <= XTRA_PART_MAX ? xtra.part_size : XTRA_PART_MAX;
 			xtra.parts = (xtra.size + xtra.part_size - 1) / xtra.part_size;
 			xtra.began_ms = now;
-			say("mdm: 7: loc: XTRA: %u bytes from userland, given in %u parts of %u (%llu ms after the reset)\n",
-			    xtra.size, xtra.parts, xtra.part_size, now);
+			if (!xtra.msg_forced) {
+				xtra.msg = !loc_msgs.known || loc_supports(LOC_INJECT_XTRA_DATA) ? LOC_INJECT_XTRA_DATA : LOC_INJECT_PREDICTED;
+			}
+			say("mdm: 7: loc: XTRA: %u bytes from userland, given in %u parts of %u with message %#x (%llu ms after the "
+			    "reset)\n", xtra.size, xtra.parts, xtra.part_size, xtra.msg, now);
 		}
 		if (xtra.sent < xtra.parts) {
 			return xtra_send_part();
@@ -2335,6 +2368,15 @@ loc_packet(const struct qrtr_packet *p)
 		}
 		if (d[0] == QMI_RESPONSE && type == 0x02 && n >= 4) {
 			status = (uint32_t)(v[0] | v[1] << 8) << 16 | (uint32_t)(v[2] | v[3] << 8);   /* result << 16 | error */
+		} else if (d[0] == QMI_RESPONSE && message == LOC_GET_SUPPORTED_MSGS && type == 0x10 && n >= 2) {
+			/* a 16-bit count of bytes, then the bit mask */
+			uint16_t bytes = (uint16_t)(v[0] | v[1] << 8);
+
+			bytes = bytes <= n - 2 ? bytes : (uint16_t)(n - 2);
+			bytes = bytes <= sizeof(loc_msgs.mask) ? bytes : (uint16_t)sizeof(loc_msgs.mask);
+			memcpy(loc_msgs.mask, v + 2, bytes);
+			loc_msgs.bytes = bytes;
+			loc_msgs.known = true;
 		} else if (d[0] == QMI_RESPONSE && message == DMS_GET_OPERATING_MODE && type == 0x01 && n >= 1) {
 			loc.opmode = v[0];
 		} else if (d[0] == QMI_RESPONSE && message == DMS_GET_SERIAL_NUMBERS && type == 0x11 && n >= 1) {
@@ -2380,13 +2422,25 @@ loc_packet(const struct qrtr_packet *p)
 				xtra.first_error = status & 0xffff;
 			}
 		}
-		/* (XTRA's parts: the first, the last and any refused said, not the 40 between) */
-		if (message != LOC_INJECT_XTRA || status != 0 || xtra.sent <= 1 || xtra.sent == xtra.parts) {
+		/* (XTRA's parts: the first, the last and the first three refusals said, not the 40 between) */
+		if (message != LOC_INJECT_XTRA || xtra.sent <= 1 || xtra.sent == xtra.parts || (status != 0 && xtra.refused <= 3)) {
 			say("mdm: 7: loc: response to %#x: result %u error %u\n", message, status >> 16, status & 0xffff);
 		}
 		if (message == loc.waiting && loc.step >= 7) {
 			/* (the running session's own requests: no step to move on) */
 			loc.waiting = 0;
+			if (message == LOC_GET_SUPPORTED_MSGS) {
+				unsigned count = 0;
+
+				for (unsigned i = 0; i < (unsigned)loc_msgs.bytes * 8; i++) {
+					count += loc_msgs.mask[i / 8] >> (i % 8) & 1;
+				}
+				say("mdm: 7: loc: LOC has %u messages (%u bytes of bits): INJECT_PREDICTED_ORBITS 0x35 %s, INJECT_XTRA_DATA "
+				    "0xa7 %s, INJECT_UTC_TIME 0x38 %s, INJECT_POSITION 0x39 %s\n", count, loc_msgs.bytes,
+				    loc_supports(LOC_INJECT_PREDICTED) ? "yes" : "NO", loc_supports(LOC_INJECT_XTRA_DATA) ? "yes" : "NO",
+				    loc_supports(LOC_INJECT_UTC_TIME) ? "yes" : "NO", loc_supports(0x39) ? "yes" : "NO");
+				return 0;
+			}
 			if (message == DMS_GET_SERIAL_NUMBERS) {
 				say("mdm: 7: dms: serial numbers: result %u error %u; IMEI %s: %u characters, Luhn check digit %s "
 				    "(the number itself is not said)\n", status >> 16, status & 0xffff, loc.imei_len ? "READ" : "not given",
@@ -2807,6 +2861,12 @@ step_qrtr(void)
 			if (loc.wanted && PE_parse_boot_argn("mdm_xtra", &time_arg, sizeof(time_arg)) && time_arg != 0) {
 				xtra.part_size = XTRA_PART_MAX;
 				(void)PE_parse_boot_argn("mdm_xtra_part", &xtra.part_size, sizeof(xtra.part_size));
+				time_arg = 0;
+				if (PE_parse_boot_argn("mdm_xtra_msg", &time_arg, sizeof(time_arg)) &&
+				    (time_arg == LOC_INJECT_PREDICTED || time_arg == LOC_INJECT_XTRA_DATA)) {
+					xtra.msg = (uint16_t)time_arg;
+					xtra.msg_forced = true;
+				}
 				__atomic_store_n(&xtra.state, 1, __ATOMIC_RELEASE);
 			}
 		}
