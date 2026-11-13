@@ -1851,6 +1851,7 @@ tftp_packet(const struct qrtr_packet *p)
 #define LOC_START               0x0022
 #define LOC_POSITION_REPORT     0x0024
 #define LOC_SV_INFO             0x0025
+#define LOC_INJECT_UTC_TIME     0x0038
 #define LOC_SET_ENGINE_LOCK     0x003a
 #define LOC_SET_OPERATION_MODE  0x004a
 #define LOC_EVENTS              (0x1ull | 0x2ull | 0x80ull | 0x100ull)    /* position, SV info, engine state, fix session */
@@ -1939,6 +1940,7 @@ static struct {
 	 */
 	unsigned done_fixes, most_heard, most_tracked;
 	uint32_t best_done_m, best_snr, first_done_ms, said_m;
+	bool time_wanted, time_sent;    /* (boot-arg mdm_time=1: INJECT_UTC_TIME once the session runs) */
 } loc = { .best_m = UINT32_MAX, .best_done_m = UINT32_MAX, .said_m = UINT32_MAX, .opmode = UINT32_MAX };
 
 static uint32_t
@@ -2033,6 +2035,26 @@ loc_running(void)
 
 		loc.imei_asked = true;
 		return loc_send_to(loc.dms_node, loc.dms_port, DMS_GET_SERIAL_NUMBERS, none, 0);
+	}
+	if (loc.time_wanted && !loc.time_sent) {
+		/*
+		 * (boot-arg mdm_time=1) INJECT_UTC_TIME (0x38): the time of day, which an engine with no network and no SIM
+		 * must otherwise take from the satellites themselves: the calendar's (the loader's epoch= and the time
+		 * since), ms since 1970, its uncertainty 3 s. Once, when the calendar is past 2025 (not before it is set).
+		 */
+		clock_sec_t secs = 0;
+		clock_usec_t usecs = 0;
+
+		clock_get_calendar_microtime(&secs, &usecs);
+		if (secs > 1735689600) {
+			uint8_t t[24];
+			uint16_t n = loc_tlv(t, 0x01, (uint64_t)secs * 1000 + usecs / 1000, 8);
+
+			n += loc_tlv(t + n, 0x02, 3000, 4);
+			loc.time_sent = true;
+			say("mdm: 7: loc: INJECT_UTC_TIME: the calendar's time, +-3 s (%llu ms after the reset)\n", now);
+			return loc_send(LOC_INJECT_UTC_TIME, t, n);
+		}
 	}
 	if (loc.restart_start) {
 		loc.restart_start = false;
@@ -2664,6 +2686,11 @@ step_qrtr(void)
 		loc.wanted = PE_parse_boot_argn("mdm_loc", &want, sizeof(want)) && want != 0;
 		loc.opmode_wanted = 1;                          /* low power (airplane): GNSS on, cellular radio off */
 		(void)PE_parse_boot_argn("mdm_opmode", &loc.opmode_wanted, sizeof(loc.opmode_wanted));
+		{
+			uint32_t time_arg = 0;
+
+			loc.time_wanted = PE_parse_boot_argn("mdm_time", &time_arg, sizeof(time_arg)) && time_arg != 0;
+		}
 		say("mdm: 7: loc: %s\n", loc.wanted ? "a GNSS session once LOC is there (mdm_loc=1), listened to for 240 s" :
 		    "not asked for (mdm_loc=1 starts a GNSS session)");
 	}
