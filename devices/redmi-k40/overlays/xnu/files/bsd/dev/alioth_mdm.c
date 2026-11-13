@@ -1872,6 +1872,192 @@ ipcr_handle(const uint8_t *bytes, uint32_t length)
 	}
 }
 
+/*
+ * ---- the EFS channels (10 to the modem, 11 from it): the SDX55's remote file system over Sahara ----
+ * (2026-11-14) 103 s into the first GNSS session every register read all ones: the modem had restarted. The OnePlus 8
+ * Pro port names the cause: the modem's application processor (remotefs_sahara.c) talks Sahara to the host on these
+ * channels about 75-100 s after the mission begins -- HELLO, then memory debug (the host is to read its EFS image and
+ * keep it: Qualcomm's ks -m) -- and with nobody answering it gives up with "ssr:AP:remotefs_sahara.c:850". So it is
+ * answered as theirs does: HELLO_RESP, the table read, each region read in 4 KB pieces and COUNTED AND THROWN AWAY
+ * (an EFS holds the IMEI: nothing of it is said or kept, nothing written anywhere), then RESET.
+ */
+#define EFS_TO_DEVICE           10
+#define EFS_FROM_DEVICE         11
+#define EFS_EVENT_RING          1               /* (step 4's known channels: 10/11 on event ring 1) */
+#define EFS_ELEMENTS            16
+#define EFS_SLOT                0x2000
+#define EFS_QUEUE               8
+#define EFS_PIECE               0x1000u
+
+static struct {
+	unsigned head, tail, dropped;
+	uint32_t length[EFS_QUEUE];
+	uint8_t packet[EFS_QUEUE][EFS_SLOT];
+} efsq;
+
+enum { EFS_IDLE, EFS_TABLE, EFS_REGION };
+static struct {
+	int state;
+	bool is64, open;
+	uint32_t want, got, table_length;
+	uint8_t table[1024];
+	uint64_t base[16], length[16], done, piece, bytes;
+	unsigned entries, entry, sessions, regions, said;
+} efs;
+
+static void
+efs_received(__unused void *context, __unused unsigned channel, const uint8_t *bytes, uint32_t length, __unused bool end)
+{
+	unsigned slot = efsq.tail % EFS_QUEUE;
+
+	if (efsq.tail - efsq.head == EFS_QUEUE || length > EFS_SLOT) {
+		efsq.dropped++;
+		return;
+	}
+	memcpy(efsq.packet[slot], bytes, length);
+	efsq.length[slot] = length;
+	efsq.tail++;
+}
+
+static int
+efs_send(const uint32_t *words, uint32_t length)
+{
+	uint8_t b[0x30];
+
+	for (uint32_t i = 0; i < length / 4; i++) {
+		qrtr_put32(b + 4 * i, words[i]);
+	}
+	return alioth_mhi_send(&mhi, EFS_TO_DEVICE, b, length, true, 2000);
+}
+
+static int
+efs_read(uint64_t address, uint64_t length)
+{
+	if (efs.is64) {
+		const uint32_t w[6] = { 0x11, 0x20, (uint32_t)address, (uint32_t)(address >> 32), (uint32_t)length,
+			                (uint32_t)(length >> 32) };   /* MEM_READ64 */
+		uint32_t padded[8] = { w[0], w[1], w[2], w[3], w[4], w[5], 0, 0 };
+
+		return efs_send(padded, 0x20);
+	} else {
+		const uint32_t w[4] = { 0x0a, 0x10, (uint32_t)address, (uint32_t)length };   /* MEM_READ */
+
+		return efs_send(w, 0x10);
+	}
+}
+
+/* the next piece of the region being read, or the next region, or the end of the session */
+static int
+efs_next(void)
+{
+	while (efs.entry < efs.entries) {
+		uint64_t left = efs.length[efs.entry] - efs.done;
+
+		if (left == 0) {
+			efs.entry++;
+			efs.done = 0;
+			continue;
+		}
+		efs.piece = left > EFS_PIECE ? EFS_PIECE : left;
+		efs.want = (uint32_t)efs.piece;
+		efs.got = 0;
+		efs.state = EFS_REGION;
+		return efs_read(efs.base[efs.entry] + efs.done, efs.piece);
+	}
+	{
+		const uint32_t reset[2] = { 0x07, 0x08 };     /* RESET */
+
+		say("mdm: 6: efs: memory debug %u done: %u regions, %llu bytes read and thrown away\n", efs.sessions, efs.regions,
+		    efs.bytes);
+		efs.state = EFS_IDLE;
+		return efs_send(reset, 8);
+	}
+}
+
+static int
+efs_packet(const uint8_t *p, uint32_t length)
+{
+	uint32_t cmd;
+
+	if (efs.state == EFS_TABLE || efs.state == EFS_REGION) {
+		uint32_t take = length < efs.want - efs.got ? length : efs.want - efs.got;
+
+		if (efs.state == EFS_TABLE && efs.got < sizeof(efs.table)) {
+			memcpy(efs.table + efs.got, p, take < sizeof(efs.table) - efs.got ? take : sizeof(efs.table) - efs.got);
+		}
+		efs.got += take;
+		if (efs.state == EFS_REGION) {
+			efs.bytes += take;
+		}
+		if (efs.got < efs.want) {
+			return 0;
+		}
+		if (efs.state == EFS_TABLE) {
+			uint32_t entry_size = efs.is64 ? 64 : 52;
+
+			efs.entries = efs.table_length / entry_size;
+			efs.entries = efs.entries > 16 ? 16 : efs.entries;
+			for (unsigned i = 0; i < efs.entries; i++) {
+				const uint8_t *e = efs.table + i * entry_size;
+
+				if (efs.is64) {
+					efs.base[i] = (uint64_t)loc_le32(e + 8) | (uint64_t)loc_le32(e + 12) << 32;
+					efs.length[i] = (uint64_t)loc_le32(e + 16) | (uint64_t)loc_le32(e + 20) << 32;
+				} else {
+					efs.base[i] = loc_le32(e + 4);
+					efs.length[i] = loc_le32(e + 8);
+				}
+				say("mdm: 6: efs: region %u: %llu bytes\n", i, efs.length[i]);
+			}
+			efs.regions = efs.entries;
+			efs.entry = 0;
+			efs.done = 0;
+		} else {
+			efs.done += efs.piece;
+		}
+		return efs_next();
+	}
+	if (length < 8) {
+		return 0;
+	}
+	cmd = loc_le32(p);
+	if (efs.said++ < 20) {
+		say("mdm: 6: efs: Sahara command %#x, %u bytes\n", cmd, length);
+	}
+	switch (cmd) {
+	case 0x01: {                                    /* HELLO: answered with its own mode */
+		const uint32_t reply[12] = { 0x02, 0x30, 2, 1, 0, length >= 24 ? loc_le32(p + 20) : 0, 0, 0, 0, 0, 0, 0 };
+
+		return efs_send(reply, 0x30);
+	}
+	case 0x09:                                      /* MEM_DEBUG: table address, length */
+	case 0x10: {                                    /* MEM_DEBUG64 */
+		uint64_t address, table_length;
+
+		efs.is64 = cmd == 0x10;
+		if (length < (efs.is64 ? 24u : 16u)) {
+			return 0;
+		}
+		address = efs.is64 ? ((uint64_t)loc_le32(p + 12) << 32 | loc_le32(p + 8)) : loc_le32(p + 8);
+		table_length = efs.is64 ? ((uint64_t)loc_le32(p + 20) << 32 | loc_le32(p + 16)) : loc_le32(p + 12);
+		efs.sessions++;
+		efs.table_length = table_length > sizeof(efs.table) ? (uint32_t)sizeof(efs.table) : (uint32_t)table_length;
+		efs.want = efs.table_length;
+		efs.got = 0;
+		efs.bytes = 0;
+		efs.state = EFS_TABLE;
+		say("mdm: 6: efs: memory debug %u (%s): a table of %llu bytes\n", efs.sessions, efs.is64 ? "64-bit" : "32-bit",
+		    table_length);
+		return efs_read(address, efs.table_length);
+	}
+	case 0x08:                                      /* RESET_RESP */
+		say("mdm: 6: efs: reset answered\n");
+		return 0;
+	default:
+		return 0;
+	}
+}
+
 static bool
 step_qrtr(void)
 {
@@ -1899,6 +2085,19 @@ step_qrtr(void)
 	}
 	if (error == 0) {
 		error = tftp_announce();
+	}
+	if (error == 0) {
+		/* the EFS channels for the modem's remote file system (see efs_packet); not fatal if they do not open */
+		int e;
+
+		memset(&efsq, 0, sizeof(efsq));
+		e = alioth_mhi_open(&mhi, EFS_TO_DEVICE, ALIOTH_MHI_TO_DEVICE, EFS_EVENT_RING, EFS_ELEMENTS, EFS_SLOT, NULL, NULL);
+		if (e == 0) {
+			e = alioth_mhi_open(&mhi, EFS_FROM_DEVICE, ALIOTH_MHI_FROM_DEVICE, EFS_EVENT_RING, EFS_ELEMENTS, EFS_SLOT,
+			    efs_received, NULL);
+		}
+		efs.open = e == 0;
+		say("mdm: 6: efs: channels 10/11 %s (%d)\n", efs.open ? "open" : "DID NOT OPEN", e);
 	}
 	/*
 	 * (2026-11-13) Listened to for IPCR_LISTEN_MS by the clock, with a line every second: the first listen on the phone
@@ -1934,6 +2133,11 @@ step_qrtr(void)
 				error = ipcr_handle(ipcr.packet[slot], ipcr.length[slot]);
 				handled++;
 			}
+			while (error == 0 && efsq.head != efsq.tail) {
+				unsigned slot = efsq.head++ % EFS_QUEUE;
+
+				error = efs_packet(efsq.packet[slot], efsq.length[slot]);
+			}
 			delay(1000);
 		}
 		if (error != 0) {
@@ -1948,6 +2152,8 @@ step_qrtr(void)
 	    "(all \"not found\"), %u writes, %u blocks, %llu bytes thrown away\n",
 	    error ? "QRTR STOPPED" : "listened", error, server_count, locations ? "IS THERE" : "not seen", ipcr.dropped,
 	    tftp_reads, tftp_writes, tftp_blocks, tftp_written);
+	say("mdm: 6: efs: %u memory debug sessions, %u regions, %llu bytes thrown away, %u packets dropped, state %d\n",
+	    efs.sessions, efs.regions, efs.bytes, efsq.dropped, efs.state);
 	if (loc.wanted) {
 		say("mdm: 7: loc: %s: step %u, %u responses, %u position reports (last status %u), %u FIXES, best accuracy %u m, "
 		    "%u satellites at most\n", loc.fixes ? "THE MODEM'S GNSS GAVE A POSITION" : "no position", loc.step,
