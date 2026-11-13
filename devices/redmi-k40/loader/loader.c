@@ -3616,6 +3616,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/hakios.camera.c) */
 	int camera_requested = 0;
+	/* "dt_baseband=1" there too: the tree says the phone has a modem (the SDX55, bsd/dev/alioth_mdm.c) -- see below */
+	int baseband_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
@@ -3631,6 +3633,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[9] == 0 || c[9] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
+		baseband_requested |= starts_with(c, "dt_baseband=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[13] == 0 || c[13] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
 		    (c[5] == 0 || c[5] == ' ')) {
@@ -4149,6 +4153,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u32(&w, "camera-rear", 1);
 		dt_end(&w);
 	}
+	/*
+	 * With dt_baseband=1 (2026-11-14, plan B4): the phone has a modem -- the SDX55 behind PCIe 2, which the kernel boots
+	 * (alioth_mdm.c) -- and iOS finds that out from the tree: MobileGestalt's HasBaseband / cellular-data, by which
+	 * Settings shows its Cellular pane, are false without a "baseband" node (the OnePlus 8 Pro port, the same modem,
+	 * found this; which name and place iOS matches is not known, so as there: here under arm-io and at the root).
+	 * Off by default: no CommCenter runs here (mkjobs DENY), so iOS would be told of a modem nothing speaks for.
+	 */
+	if (baseband_requested) {
+		dt_begin(&w, "baseband");
+		dt_prop_str(&w, "device_type", "baseband");
+		dt_prop_str(&w, "compatible", "baseband,sdx55");
+		dt_end(&w);
+	}
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
@@ -4167,6 +4184,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	dt_end(&w);
 
+	if (baseband_requested) {
+		dt_begin(&w, "baseband");               /* (and at the root: see arm-io's) */
+		dt_prop_str(&w, "device_type", "baseband");
+		dt_prop_str(&w, "compatible", "baseband,sdx55");
+		dt_end(&w);
+	}
 	dt_end(&w);
 
 	uint32_t dt_len = (uint32_t)(w.cur - w.base);
