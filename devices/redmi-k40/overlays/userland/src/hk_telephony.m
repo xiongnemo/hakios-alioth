@@ -143,9 +143,103 @@ types_for(SEL selector)
 	return info;
 }
 
-/* a reply block called with what its signature asks for */
-- (void)answer:(id)block for:(NSString *)name
+/*
+ * The class names of the arguments of the `which`-th block of a method, from the protocol's EXTENDED type encoding
+ * (round 40: a reply block's own signature has a bare "@" for each object, so the equipment list was never
+ * recognised): ... @?<v@?@"CTMobileEquipmentInfoList"@"NSError"> ... -> [CTMobileEquipmentInfoList, NSError];
+ * "" for an argument that is not a named object.
+ */
+extern const char *_protocol_getMethodTypeEncoding(Protocol *p, SEL selector, BOOL required, BOOL instance);
+
+static NSArray<NSString *> *
+block_classes(SEL selector, unsigned which, const char **whole)
 {
+	const char *ext = _protocol_getMethodTypeEncoding(service, selector, YES, YES), *p;
+	NSMutableArray<NSString *> *out = [NSMutableArray array];
+	int arg = -1;
+
+	if (ext == NULL) {
+		ext = _protocol_getMethodTypeEncoding(service, selector, NO, YES);
+	}
+	*whole = ext;
+	if (ext == NULL) {
+		return nil;
+	}
+	p = ext;
+	for (unsigned k = 0;; k++) {
+		p = strstr(p, "@?<");
+		if (p == NULL) {
+			return nil;
+		}
+		if (k == which) {
+			break;
+		}
+		p += 3;
+	}
+	p += 3;
+	while (*p != 0 && *p != '>') {
+		const char *q = p;
+		NSString *cls = @"";
+
+		while (*q != 0 && strchr("rnNoORVA", *q) != NULL) {
+			q++;
+		}
+		if (q[0] == '@' && q[1] == '"') {
+			const char *e = strchr(q + 2, '"'), *lt;
+
+			if (e == NULL) {
+				break;
+			}
+			lt = memchr(q + 2, '<', (size_t)(e - q - 2));
+			cls = [[NSString alloc] initWithBytes:q + 2 length:(NSUInteger)((lt ? lt : e) - q - 2)
+			    encoding:NSUTF8StringEncoding] ?: @"";
+			p = e + 1;
+		} else if (q[0] == '@' && q[1] == '?') {
+			p = q + 2;
+			if (*p == '<') {
+				int depth = 1;
+
+				for (p++; *p != 0 && depth > 0; p++) {
+					depth += *p == '<' ? 1 : *p == '>' ? -1 : 0;
+				}
+			}
+		} else if (*q == '{' || *q == '(' || *q == '[') {
+			char open = *q, close = open == '{' ? '}' : open == '(' ? ')' : ']';
+			int depth = 0;
+
+			p = q;
+			do {
+				depth += *p == open ? 1 : *p == close ? -1 : 0;
+				p++;
+			} while (*p != 0 && depth > 0);
+		} else if (*q == '^') {
+			p = q + 1;
+			if (p[0] == '@' && p[1] == '"') {
+				const char *e = strchr(p + 2, '"');
+
+				p = e ? e + 1 : p + 1;
+			} else if (*p != 0) {
+				p++;
+			}
+		} else {
+			p = *q ? q + 1 : q;
+		}
+		while (*p >= '0' && *p <= '9') {
+			p++;
+		}
+		if (arg >= 1) {
+			[out addObject:cls];
+		}
+		arg++;
+	}
+	return out;
+}
+
+/* a reply block called with what its signature asks for */
+- (void)answer:(id)block for:(NSString *)name which:(unsigned)which
+{
+	const char *whole = NULL;
+	NSArray<NSString *> *classes = block_classes(NSSelectorFromString(name), which, &whole);
 	const char *signature = _Block_signature((__bridge void *)block);
 	NSMethodSignature *s;
 	NSInvocation *call;
@@ -161,7 +255,8 @@ types_for(SEL selector)
 	/* (the arguments start zeroed; objects are set where a class is named) */
 	for (NSUInteger i = 1; i < s.numberOfArguments; i++) {
 		const char *type = [s getArgumentTypeAtIndex:i];
-		NSString *cls = type[0] == '@' ? class_named(type) : nil;
+		NSString *cls = type[0] != '@' ? nil : i - 1 < classes.count && classes[i - 1].length ? classes[i - 1] :
+		    class_named(type);
 		__unsafe_unretained id value = nil;
 
 		if ([cls isEqualToString:@"CTMobileEquipmentInfoList"] || [cls isEqualToString:@"CTMobileEquipmentInfo"]) {
@@ -171,6 +266,8 @@ types_for(SEL selector)
 			}
 			imei = imei ?: modem_imei();
 			if (imei == nil) {
+				say("hk_telephony: %s: %s asks the IMEI, and the kernel has none (yet)\n", name.UTF8String,
+				    self.client.UTF8String);
 				continue;
 			}
 			id info = [self equipmentInfo:imei];
@@ -194,6 +291,15 @@ types_for(SEL selector)
 	}
 	[call retainArguments];
 	[call invoke];
+	if ([name containsString:@"MobileEquipment"]) {
+		static unsigned told;
+
+		if (told++ < 6) {
+			say("hk_telephony: %s from %s: extended type %s; the reply's classes %s; IMEI %s\n", name.UTF8String,
+			    self.client.UTF8String, whole ?: "(none)", [classes componentsJoinedByString:@","].UTF8String ?: "(none)",
+			    gave ? "GIVEN" : self.identity ? "not given" : "not for this client");
+		}
+	}
 	if (gave) {
 		identities_given++;
 		say("hk_telephony: %s: the IMEI given to %s (%u times)\n", name.UTF8String, self.client.UTF8String, identities_given);
@@ -214,14 +320,15 @@ types_for(SEL selector)
 			say("hk_telephony: %s asks %s\n", self.client.UTF8String, name.UTF8String);
 		}
 	}
-	for (NSUInteger i = 2; i < s.numberOfArguments; i++) {
-		if (strcmp([s getArgumentTypeAtIndex:i], "@?") == 0) {
+	for (NSUInteger i = 2, blocks = 0; i < s.numberOfArguments; i++) {
+		if (strncmp([s getArgumentTypeAtIndex:i], "@?", 2) == 0) {
 			__unsafe_unretained id block = nil;
 
 			[invocation getArgument:&block atIndex:(NSInteger)i];
 			if (block != nil) {
-				[self answer:block for:name];
+				[self answer:block for:name which:(unsigned)blocks];
 			}
+			blocks++;
 		}
 	}
 }
