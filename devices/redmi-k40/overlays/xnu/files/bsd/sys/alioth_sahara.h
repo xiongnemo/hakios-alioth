@@ -54,7 +54,10 @@
 #define SAHARA_MODE_COMPLETE    1               /* all transferred */
 #define SAHARA_MODE_COMMAND     3               /* the chip wants commands first: switched back to PENDING */
 #define SAHARA_PACKET_MAX       0xffffu         /* what one MHI transfer carries */
-#define SAHARA_REQUEST_MAX      (8u << 20)      /* the most one READ_DATA may ask for */
+/* the most one READ_DATA may ask for: the SDX55's SBL asks for the rest of qdsp6sw.mbn in ONE read (0x501e08c bytes
+ * at 0x3000, 2026-11-13; 8 MB here reset the session at image 8) -- the bytes still go out in SAHARA_PACKET_MAX
+ * pieces, and the image's own size bounds the read (sahara_read) */
+#define SAHARA_REQUEST_MAX      (256u << 20)
 #define SAHARA_NO_IMAGE         UINT64_MAX
 
 enum sahara_state { SAHARA_WAITING, SAHARA_TRANSFERRING, SAHARA_FINISHED, SAHARA_FAILED };
