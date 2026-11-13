@@ -1432,8 +1432,24 @@ ipcr_handle(const uint8_t *bytes, uint32_t length)
 		return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_NEW_SERVER, QRTR_OUR_NODE, QRTR_PORT_CTRL, p.src_node,
 		    p.src_port, (const uint8_t[QRTR_CONTROL_SIZE]){ QRTR_TYPE_NEW_SERVER }, QRTR_CONTROL_SIZE, false));
 	case QRTR_TYPE_DATA:
-		say("mdm: 6: data from %u:%u to port %#x, %u bytes (nobody listens there yet)\n", p.src_node, p.src_port, p.dst_port,
-		    p.size);
+		say("mdm: 6: data from %u:%u to port %#x, %u bytes (nobody listens there yet)%s\n", p.src_node, p.src_port, p.dst_port,
+		    p.size, p.confirm_rx ? "; RESUME_TX sent" : "");
+		/*
+		 * (2026-11-13) A sender that asks for it (confirm_rx) waits for RESUME_TX once it has sent its flow limit (10
+		 * datagrams) to a port: Linux's qrtr_send_resume_tx(), from the port it reached, to the sender, a control
+		 * message of the whole 20 bytes (cmd 7, our node, the port, two zero words). The OnePlus 8 Pro port found the
+		 * SDX55 ignoring a 12-byte one ("control message too short") and every QMI reply and TFTP request stopping
+		 * after ~13 s (dekefake/hackios-op8pro, docs/research/modem-sdx55.md).
+		 */
+		if (p.confirm_rx) {
+			uint8_t resume[QRTR_CONTROL_SIZE] = { 0 };
+
+			qrtr_put32(resume, QRTR_TYPE_RESUME_TX);
+			qrtr_put32(resume + 4, QRTR_OUR_NODE);
+			qrtr_put32(resume + 8, p.dst_port);
+			return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_RESUME_TX, QRTR_OUR_NODE, p.dst_port, p.src_node,
+			    p.src_port, resume, QRTR_CONTROL_SIZE, false));
+		}
 		return 0;
 	default:
 		say("mdm: 6: control %u from %u:%u (%u bytes)\n", p.type, p.src_node, p.src_port, p.size);
