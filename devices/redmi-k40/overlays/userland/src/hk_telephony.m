@@ -258,6 +258,7 @@ block_classes(SEL selector, unsigned which, const char **whole)
 		NSString *cls = type[0] != '@' ? nil : i - 1 < classes.count && classes[i - 1].length ? classes[i - 1] :
 		    class_named(type);
 		__unsafe_unretained id value = nil;
+		id keep = nil;          /* (strong, to the end of this argument: round 41 crashed on a list freed too soon) */
 
 		if ([cls isEqualToString:@"CTMobileEquipmentInfoList"] || [cls isEqualToString:@"CTMobileEquipmentInfo"]) {
 			if (!self.identity) {
@@ -276,12 +277,12 @@ block_classes(SEL selector, unsigned which, const char **whole)
 				id list = [NSClassFromString(@"CTMobileEquipmentInfoList") new];
 
 				((void (*)(id, SEL, id))objc_msgSend)(list, sel_registerName("setMeInfoList:"), info ? @[ info ] : @[]);
-				value = list;
-				[call retainArguments];
+				keep = list;
 			} else {
-				value = info;
-				[call retainArguments];
+				keep = info;
 			}
+			value = keep;
+			[call retainArguments];
 			gave = value != nil;
 			[call setArgument:&value atIndex:(NSInteger)i];
 		} else if ([cls isEqualToString:@"NSError"] && !gave) {
