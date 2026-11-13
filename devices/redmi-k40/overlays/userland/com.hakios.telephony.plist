@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- CoreTelephony's service answered in CommCenter's place (src/hk_telephony.m): no SIM, no network, and the
+	     modem's IMEI for Settings' About. TEST IMAGES ONLY (work/wsl/mkroot-variant.sh TELEPHONY=1), with the loader's
+	     dt_baseband=1 and the modem's session (mdm_loc=1); started on demand -->
+	<key>Label</key>
+	<string>com.hakios.telephony</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/hk_telephony</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.commcenter.coretelephony.xpc</key>
+		<true/>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

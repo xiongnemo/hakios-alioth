@@ -274,6 +274,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnss_feed src/gnss_feed.m &&
 			{ ${LDID:-ldid} -Ssrc/gnss_feed.entitlements obj/gnss_feed 2>/dev/null ||
 			  echo "build.sh: no ldid: gnss_feed is unsigned, and locationd will not take its locations"; }
+		# CoreTelephony's service in CommCenter's place, for the modem's IMEI in Settings' About (src/hk_telephony.m);
+		# its job com.hakios.telephony goes only into test roots (work/wsl/mkroot-variant.sh TELEPHONY=1)
+		$DYN -fobjc-arc -framework Foundation -framework CoreTelephony -o obj/hk_telephony src/hk_telephony.m
 		# and its face on the phone, the application IPA 安装 (src/installer: it asks, the service does)
 		$DYN -fobjc-arc -framework UIKit -framework Foundation -framework UniformTypeIdentifiers \
 			-o obj/IPAInstaller src/installer/main.m
@@ -379,6 +382,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/ipainstall ] && cp obj/ipainstall root/bin/
 	[ -f obj/loc_enable ] && cp obj/loc_enable root/bin/
 	[ -f obj/gnss_feed ] && cp obj/gnss_feed root/bin/
+	[ -f obj/hk_telephony ] && cp obj/hk_telephony root/bin/
 	# (the applications that come with this image, unpacked from ../apps/*.ipa: the job com.hakios.apps
 	# registers them at boot; those of the release's apps\ folder come from the computer instead)
 	mkdir -p root/apps

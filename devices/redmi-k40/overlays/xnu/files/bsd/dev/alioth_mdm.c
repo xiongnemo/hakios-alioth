@@ -41,6 +41,7 @@
 #include <sys/alioth_mhi.h>
 #include <sys/alioth_qrtr.h>
 #include <sys/errno.h>
+#include <sys/kauth.h>
 #include <sys/systm.h>
 #include <sys/sysctl.h>
 #include <stdarg.h>
@@ -2022,6 +2023,28 @@ static struct {
 	uint32_t best_done_m, best_snr, first_done_ms, said_m;
 	bool time_wanted, time_sent;    /* (boot-arg mdm_time=1: INJECT_UTC_TIME once the session runs) */
 } loc = { .best_m = UINT32_MAX, .best_done_m = UINT32_MAX, .said_m = UINT32_MAX, .opmode = UINT32_MAX };
+
+/*
+ * (B4) sysctl kern.hakios.mdm_imei: the IMEI DMS gave, ROOT ONLY (an iPhone gives its IMEI only to the clients
+ * CommCenter allows), and only once it is whole (15 digits, Luhn right) -- for userland's hk_telephony, which answers
+ * CoreTelephony in CommCenter's place and gives it to Settings' About alone. Never said, never logged.
+ */
+static int
+mdm_imei_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	if (req->newptr != USER_ADDR_NULL) {
+		return EPERM;
+	}
+	if (!kauth_cred_issuser(kauth_cred_get())) {
+		return EPERM;
+	}
+	if (!loc.imei_luhn || loc.imei_len != 15) {
+		return ENOENT;
+	}
+	return SYSCTL_OUT(req, loc.imei, loc.imei_len);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, mdm_imei, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_MASKED, NULL, 0,
+    mdm_imei_sysctl, "A", "the modem's IMEI (root only; for hk_telephony)");
 
 static uint32_t
 loc_le32(const uint8_t *p)
