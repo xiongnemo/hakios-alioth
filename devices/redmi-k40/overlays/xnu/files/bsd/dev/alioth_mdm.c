@@ -64,7 +64,7 @@ extern lck_mtx_t hakios_smmu_lock;      /* (bsd/dev/hakios.wifi.c: the SMMU's gl
  * the middle that is not kept, and the modem only looked silent.
  */
 extern void loader_log_putc(char c);
-#define MDM_KEPT                (48 * 1024)
+#define MDM_KEPT                (128 * 1024)    /* (48 KB filled up with step 6's repeated service lists, 11-14) */
 static char mdm_kept[MDM_KEPT];
 static uint32_t mdm_kept_len;
 static bool mdm_kept_full;
@@ -1571,6 +1571,221 @@ tftp_packet(const struct qrtr_packet *p)
 	return 0;
 }
 
+/*
+ * ---- QMI LOC (service 0x10): a GNSS session of our own (boot-arg mdm_loc=1, with mdm_step=6) ----
+ * (2026-11-14) With the TFTP server answering, the SDX55's MPSS came all the way up: 64 services, LOC (0x10) on node 3
+ * among them. A client port of ours (node 1, LOC_PORT) asks, one after the other, waiting for each response (or 2 s):
+ * INFORM_CLIENT_REVISION 2, REG_EVENTS (position, satellites, engine state, fix session state), SET_OPERATION_MODE
+ * standalone (no SIM, no network: nothing to assist), SET_ENGINE_LOCK none (the OnePlus 8 Pro port saw every session
+ * end at once with status 7, "engine locked", until it sent this), then START: session 1, periodic, high accuracy,
+ * intermediate reports, 1 s. NO COORDINATE IS EVER SAID: the position report gives status, accuracy and the satellites'
+ * count to the log; latitude/longitude are kept as their raw bits for iOS later (the owner's location is private).
+ * Floating point is not used in the kernel: the accuracy is taken from its IEEE single's bits by integer arithmetic.
+ */
+#define LOC_PORT                0x4003u
+#define QMI_REQUEST             0x00
+#define QMI_RESPONSE            0x02
+#define QMI_INDICATION          0x04
+#define LOC_INFORM_REVISION     0x0020
+#define LOC_REG_EVENTS          0x0021
+#define LOC_START               0x0022
+#define LOC_POSITION_REPORT     0x0024
+#define LOC_SV_INFO             0x0025
+#define LOC_SET_ENGINE_LOCK     0x003a
+#define LOC_SET_OPERATION_MODE  0x004a
+#define LOC_EVENTS              (0x1ull | 0x2ull | 0x80ull | 0x100ull)    /* position, SV info, engine state, fix session */
+
+static struct {
+	bool wanted, found;
+	uint32_t node, port;
+	uint16_t txn, waiting;          /* the request whose response is awaited (0: none) */
+	unsigned step;                  /* 0 revision, 1 events, 2 mode, 3 lock, 4 start, 5 running */
+	uint64_t sent_at;
+	unsigned responses, reports, fixes, sv_infos, said;
+	uint32_t best_m, last_status, most_sats;
+	uint64_t lat_bits, lon_bits;    /* (the last fix's, never said) */
+} loc = { .best_m = UINT32_MAX };
+
+static uint32_t
+loc_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* an IEEE single's value, whole metres (truncated), from its bits */
+static uint32_t
+loc_f32_metres(uint32_t bits)
+{
+	int exponent = (int)((bits >> 23) & 0xff) - 127;
+	uint64_t mantissa = (bits & 0x7fffff) | 0x800000;
+
+	if ((bits >> 31) || exponent < 0) {
+		return 0;
+	}
+	if (exponent > 31) {
+		return UINT32_MAX;
+	}
+	return (uint32_t)(exponent >= 23 ? mantissa << (exponent - 23) : mantissa >> (23 - exponent));
+}
+
+static int
+loc_send(uint16_t message, const uint8_t *tlvs, uint16_t tlv_bytes)
+{
+	uint8_t q[7 + 64], out[QRTR_V1_HEADER + sizeof(q) + 4];
+
+	if (tlv_bytes > sizeof(q) - 7) {
+		return EMSGSIZE;
+	}
+	loc.txn++;
+	q[0] = QMI_REQUEST;
+	q[1] = (uint8_t)loc.txn, q[2] = (uint8_t)(loc.txn >> 8);
+	q[3] = (uint8_t)message, q[4] = (uint8_t)(message >> 8);
+	q[5] = (uint8_t)tlv_bytes, q[6] = (uint8_t)(tlv_bytes >> 8);
+	memcpy(q + 7, tlvs, tlv_bytes);
+	loc.waiting = message;
+	loc.sent_at = since_reset_ms();
+	return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_DATA, QRTR_OUR_NODE, LOC_PORT, loc.node, loc.port, q,
+	    (uint32_t)(7 + tlv_bytes), false));
+}
+
+/* a TLV of `n` bytes of `value` (little-endian) at t, its length */
+static uint16_t
+loc_tlv(uint8_t *t, uint8_t type, uint64_t value, uint16_t n)
+{
+	t[0] = type, t[1] = (uint8_t)n, t[2] = (uint8_t)(n >> 8);
+	for (uint16_t i = 0; i < n; i++) {
+		t[3 + i] = (uint8_t)(value >> (8 * i));
+	}
+	return (uint16_t)(3 + n);
+}
+
+/* the next request of the sequence, if the last one was answered or 2 s have gone by */
+static int
+loc_tick(void)
+{
+	uint8_t t[64];
+	uint16_t n = 0;
+
+	if (!loc.wanted || !loc.found || loc.step >= 5 || (loc.waiting != 0 && since_reset_ms() - loc.sent_at < 2000)) {
+		return 0;
+	}
+	if (loc.waiting != 0) {
+		say("mdm: 7: loc: no response to %#x in 2 s: on to the next\n", loc.waiting);
+		loc.waiting = 0;
+		loc.step++;
+	}
+	switch (loc.step) {
+	case 0:
+		n = loc_tlv(t, 0x01, 2, 4);
+		say("mdm: 7: loc: the session begins (LOC at node %u port %u): INFORM_CLIENT_REVISION 2\n", loc.node, loc.port);
+		return loc_send(LOC_INFORM_REVISION, t, n);
+	case 1:
+		n = loc_tlv(t, 0x01, LOC_EVENTS, 8);
+		return loc_send(LOC_REG_EVENTS, t, n);
+	case 2:
+		n = loc_tlv(t, 0x01, 4, 4);                     /* STANDALONE */
+		return loc_send(LOC_SET_OPERATION_MODE, t, n);
+	case 3:
+		n = loc_tlv(t, 0x01, 1, 4);                     /* LOCK_NONE */
+		return loc_send(LOC_SET_ENGINE_LOCK, t, n);
+	case 4:
+		n = loc_tlv(t, 0x01, 1, 1);                     /* session id */
+		n += loc_tlv(t + n, 0x10, 1, 4);                /* fix recurrence: periodic */
+		n += loc_tlv(t + n, 0x11, 3, 4);                /* horizontal accuracy: high */
+		n += loc_tlv(t + n, 0x12, 1, 4);                /* intermediate reports: on */
+		n += loc_tlv(t + n, 0x13, 1000, 4);             /* minimum interval, ms */
+		return loc_send(LOC_START, t, n);
+	}
+	return 0;
+}
+
+static int
+loc_packet(const struct qrtr_packet *p)
+{
+	const uint8_t *d = p->payload, *tlv, *end;
+	uint16_t message, length;
+	uint32_t status = UINT32_MAX, unc_bits = 0, sats = 0;
+	bool have_unc = false, have_lat = false;
+
+	if (p->size < 7) {
+		return 0;
+	}
+	message = (uint16_t)(d[3] | d[4] << 8);
+	length = (uint16_t)(d[5] | d[6] << 8);
+	end = d + 7 + (length < p->size - 7 ? length : p->size - 7);
+	for (tlv = d + 7; tlv + 3 <= end;) {
+		uint8_t type = tlv[0];
+		uint16_t n = (uint16_t)(tlv[1] | tlv[2] << 8);
+		const uint8_t *v = tlv + 3;
+
+		if (v + n > end) {
+			break;
+		}
+		if (d[0] == QMI_RESPONSE && type == 0x02 && n >= 4) {
+			status = (uint32_t)(v[0] | v[1] << 8) << 16 | (uint32_t)(v[2] | v[3] << 8);   /* result << 16 | error */
+		} else if (d[0] == QMI_INDICATION && type == 0x01 && n >= 4) {
+			status = loc_le32(v);
+		} else if (message == LOC_POSITION_REPORT && type == 0x10 && n == 8) {
+			memcpy(&loc.lat_bits, v, 8);
+			have_lat = true;
+		} else if (message == LOC_POSITION_REPORT && type == 0x11 && n == 8) {
+			memcpy(&loc.lon_bits, v, 8);
+		} else if (message == LOC_POSITION_REPORT && type == 0x12 && n == 4) {
+			unc_bits = loc_le32(v);
+			have_unc = true;
+		} else if (message == LOC_SV_INFO && type == 0x10 && n >= 1) {
+			sats = v[0];
+		}
+		tlv = v + n;
+	}
+	if (d[0] == QMI_RESPONSE) {
+		loc.responses++;
+		say("mdm: 7: loc: response to %#x: result %u error %u\n", message, status >> 16, status & 0xffff);
+		if (message == loc.waiting) {
+			loc.waiting = 0;
+			loc.step++;
+			if (loc.step == 5) {
+				say("mdm: 7: loc: STARTED (%s)\n", status == 0 ? "accepted" : "REFUSED");
+			}
+		}
+		return 0;
+	}
+	if (message == LOC_POSITION_REPORT) {
+		loc.reports++;
+		loc.last_status = status;
+		if (have_lat && have_unc && (status == 0 || status == 1)) {
+			uint32_t m = loc_f32_metres(unc_bits);
+
+			loc.fixes++;
+			if (m < loc.best_m) {
+				loc.best_m = m;
+			}
+			if (loc.fixes <= 5 || loc.fixes % 30 == 0) {
+				say("mdm: 7: loc: A FIX (%u so far): status %u, accuracy %u m (the position itself is not said)\n",
+				    loc.fixes, status, m);
+			}
+		} else if (loc.reports <= 10 || loc.reports % 30 == 0) {
+			say("mdm: 7: loc: position report %u: status %u (0 done, 1 in progress, 3 timeout, 7 engine locked), no fix\n",
+			    loc.reports, status);
+		}
+		return 0;
+	}
+	if (message == LOC_SV_INFO) {
+		loc.sv_infos++;
+		if (sats > loc.most_sats) {
+			loc.most_sats = sats;
+		}
+		if (loc.sv_infos <= 3 || loc.sv_infos % 30 == 0) {
+			say("mdm: 7: loc: satellites in view: %u (most so far %u)\n", sats, loc.most_sats);
+		}
+		return 0;
+	}
+	if (loc.said++ < 40) {
+		say("mdm: 7: loc: indication %#x, status %u, %u bytes\n", message, status, length);
+	}
+	return 0;
+}
+
 static int
 ipcr_handle(const uint8_t *bytes, uint32_t length)
 {
@@ -1596,11 +1811,25 @@ ipcr_handle(const uint8_t *bytes, uint32_t length)
 			say("mdm: 6: (the end of a list of servers)\n");
 			return 0;
 		}
+		/* (the router sends its whole list again and again: each service said and kept once) */
+		if (p.type == QRTR_TYPE_NEW_SERVER) {
+			for (unsigned i = 0; i < server_count; i++) {
+				if (servers[i].service == s.service && servers[i].instance == s.instance && servers[i].node == s.node &&
+				    servers[i].port == s.port) {
+					return 0;
+				}
+			}
+		}
 		say("mdm: 6: %s service %u (%#x) version %u instance %u at node %u port %u%s\n",
 		    p.type == QRTR_TYPE_NEW_SERVER ? "NEW" : "GONE:", s.service, s.service, s.version, s.instance, s.node, s.port,
 		    s.service == QRTR_SERVICE_LOC ? ": LOCATION (QMI LOC)" : "");
 		if (p.type == QRTR_TYPE_NEW_SERVER && server_count < MDM_SERVERS) {
 			servers[server_count++] = s;
+		}
+		if (p.type == QRTR_TYPE_NEW_SERVER && s.service == QRTR_SERVICE_LOC && !loc.found) {
+			loc.found = true;
+			loc.node = s.node;
+			loc.port = s.port;
 		}
 		return 0;
 	case QRTR_TYPE_NEW_LOOKUP:
@@ -1610,8 +1839,8 @@ ipcr_handle(const uint8_t *bytes, uint32_t length)
 		return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_NEW_SERVER, QRTR_OUR_NODE, QRTR_PORT_CTRL, p.src_node,
 		    p.src_port, (const uint8_t[QRTR_CONTROL_SIZE]){ QRTR_TYPE_NEW_SERVER }, QRTR_CONTROL_SIZE, false));
 	case QRTR_TYPE_DATA:
-		if (p.dst_port == TFTP_PORT) {
-			int error = tftp_packet(&p);
+		if (p.dst_port == TFTP_PORT || p.dst_port == LOC_PORT) {
+			int error = p.dst_port == TFTP_PORT ? tftp_packet(&p) : loc_packet(&p);
 
 			if (error != 0 || !p.confirm_rx) {
 				return error;
@@ -1653,6 +1882,13 @@ step_qrtr(void)
 	say("mdm: 6: QRTR on the IPCR channels: our HELLO, then what the modem tells of its services\n");
 	memset(&ipcr, 0, sizeof(ipcr));
 	server_count = 0;
+	{
+		uint32_t want = 0;
+
+		loc.wanted = PE_parse_boot_argn("mdm_loc", &want, sizeof(want)) && want != 0;
+		say("mdm: 7: loc: %s\n", loc.wanted ? "a GNSS session once LOC is there (mdm_loc=1), listened to for 240 s" :
+		    "not asked for (mdm_loc=1 starts a GNSS session)");
+	}
 	error = alioth_mhi_open(&mhi, IPCR_TO_DEVICE, ALIOTH_MHI_TO_DEVICE, IPCR_EVENT_RING, IPCR_ELEMENTS, IPCR_SLOT, NULL, NULL);
 	if (error == 0) {
 		error = alioth_mhi_open(&mhi, IPCR_FROM_DEVICE, ALIOTH_MHI_FROM_DEVICE, IPCR_EVENT_RING, IPCR_ELEMENTS, IPCR_SLOT,
@@ -1670,14 +1906,20 @@ step_qrtr(void)
 	 */
 	{
 		uint64_t start = since_reset_ms(), beat = start + 1000, hello_at = start + 5000, now;
+		uint64_t listen_ms = loc.wanted ? 240000 : IPCR_LISTEN_MS;      /* (a GNSS cold start with no help: minutes) */
 		unsigned handled = 0;
 
-		while (error == 0 && (now = since_reset_ms()) - start < IPCR_LISTEN_MS) {
+		while (error == 0 && (now = since_reset_ms()) - start < listen_ms) {
+			/* (a line a second for the first 20 s, then every 10 s: the kept lines have room for the GNSS session) */
 			if (now >= beat) {
 				say("mdm: 6: listening, %llu ms after the reset: %u packets handled, %u services, %u dropped, %u partial bytes, "
-				    "%u events in all; tftp %u reads, %u writes, %u blocks\n", now, handled, server_count, ipcr.dropped,
-				    ipcr.partial, mhi.events, tftp_reads, tftp_writes, tftp_blocks);
-				beat += 1000;
+				    "%u events in all; tftp %u reads, %u writes, %u blocks; loc step %u, %u reports, %u fixes, best %u m, "
+				    "%u satellites at most\n", now, handled, server_count, ipcr.dropped, ipcr.partial, mhi.events, tftp_reads,
+				    tftp_writes, tftp_blocks, loc.step, loc.reports, loc.fixes, loc.best_m, loc.most_sats);
+				beat += now - start < 20000 ? 1000 : 10000;
+			}
+			if (error == 0) {
+				error = loc_tick();
 			}
 			/* (our HELLO again every 5 s: does the router's answer -- its list of services -- grow?) */
 			if (now >= hello_at) {
@@ -1706,6 +1948,11 @@ step_qrtr(void)
 	    "(all \"not found\"), %u writes, %u blocks, %llu bytes thrown away\n",
 	    error ? "QRTR STOPPED" : "listened", error, server_count, locations ? "IS THERE" : "not seen", ipcr.dropped,
 	    tftp_reads, tftp_writes, tftp_blocks, tftp_written);
+	if (loc.wanted) {
+		say("mdm: 7: loc: %s: step %u, %u responses, %u position reports (last status %u), %u FIXES, best accuracy %u m, "
+		    "%u satellites at most\n", loc.fixes ? "THE MODEM'S GNSS GAVE A POSITION" : "no position", loc.step,
+		    loc.responses, loc.reports, loc.last_status, loc.fixes, loc.best_m, loc.most_sats);
+	}
 	return error == 0 && server_count > 0;
 }
 
