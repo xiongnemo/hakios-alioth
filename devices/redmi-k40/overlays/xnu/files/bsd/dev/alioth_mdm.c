@@ -1613,6 +1613,11 @@ static struct {
 	unsigned step;                  /* 0 DMS mode?, 1 DMS set, 2 revision, 3 events, 4 mode, 5 lock, 6 start, 7 running */
 	uint64_t sent_at;
 	unsigned responses, reports, fixes, sv_infos, said;
+	/* (11-14, the session running: DMS said "not ready" (52) to online; asked again every 20 s, and START sent again
+	 * when a session ends in a timeout (status 3), as the OnePlus 8 Pro port does after ~255 s) */
+	uint64_t again_at;
+	bool restart_start;
+	unsigned retries, restarts;
 	uint32_t best_m, last_status, most_sats;
 	uint64_t lat_bits, lon_bits;    /* (the last fix's, never said) */
 } loc = { .best_m = UINT32_MAX, .opmode = UINT32_MAX };
@@ -1678,6 +1683,48 @@ loc_tlv(uint8_t *t, uint8_t type, uint64_t value, uint16_t n)
 	return (uint16_t)(3 + n);
 }
 
+static int
+loc_start_send(void)
+{
+	uint8_t t[64];
+	uint16_t n;
+
+	n = loc_tlv(t, 0x01, 1, 1);                     /* session id */
+	n += loc_tlv(t + n, 0x10, 1, 4);                /* fix recurrence: periodic */
+	n += loc_tlv(t + n, 0x11, 3, 4);                /* horizontal accuracy: high */
+	n += loc_tlv(t + n, 0x12, 1, 4);                /* intermediate reports: on */
+	n += loc_tlv(t + n, 0x13, 1000, 4);             /* minimum interval, ms */
+	return loc_send(LOC_START, t, n);
+}
+
+/* the session running: a START again after a timeout, DMS asked again every 20 s while not in the wanted mode */
+static int
+loc_running(void)
+{
+	uint64_t now = since_reset_ms();
+
+	if (loc.waiting != 0) {
+		if (now - loc.sent_at < 2000) {
+			return 0;
+		}
+		loc.waiting = 0;
+	}
+	if (loc.restart_start) {
+		loc.restart_start = false;
+		loc.restarts++;
+		say("mdm: 7: loc: the session ended in a timeout: START again (%u)\n", loc.restarts);
+		return loc_start_send();
+	}
+	if (loc.dms_found && loc.opmode != loc.opmode_wanted && now >= loc.again_at) {
+		uint8_t none[1] = { 0 };
+
+		loc.again_at = now + 20000;
+		loc.retries++;
+		return loc_send_to(loc.dms_node, loc.dms_port, DMS_GET_OPERATING_MODE, none, 0);
+	}
+	return 0;
+}
+
 /* the next request of the sequence, if the last one was answered or 2 s have gone by */
 static int
 loc_tick(void)
@@ -1685,7 +1732,10 @@ loc_tick(void)
 	uint8_t t[64];
 	uint16_t n = 0;
 
-	if (!loc.wanted || !loc.found || loc.step >= 7 || (loc.waiting != 0 && since_reset_ms() - loc.sent_at < 2000)) {
+	if (loc.wanted && loc.found && loc.step >= 7) {
+		return loc_running();
+	}
+	if (!loc.wanted || !loc.found || (loc.waiting != 0 && since_reset_ms() - loc.sent_at < 2000)) {
 		return 0;
 	}
 	if (loc.step < 2 && !loc.dms_found) {
@@ -1718,12 +1768,8 @@ loc_tick(void)
 		n = loc_tlv(t, 0x01, 1, 4);                     /* LOCK_NONE */
 		return loc_send(LOC_SET_ENGINE_LOCK, t, n);
 	case 6:
-		n = loc_tlv(t, 0x01, 1, 1);                     /* session id */
-		n += loc_tlv(t + n, 0x10, 1, 4);                /* fix recurrence: periodic */
-		n += loc_tlv(t + n, 0x11, 3, 4);                /* horizontal accuracy: high */
-		n += loc_tlv(t + n, 0x12, 1, 4);                /* intermediate reports: on */
-		n += loc_tlv(t + n, 0x13, 1000, 4);             /* minimum interval, ms */
-		return loc_send(LOC_START, t, n);
+		loc.again_at = since_reset_ms() + 20000;
+		return loc_start_send();
 	}
 	return 0;
 }
@@ -1772,6 +1818,24 @@ loc_packet(const struct qrtr_packet *p)
 	if (d[0] == QMI_RESPONSE) {
 		loc.responses++;
 		say("mdm: 7: loc: response to %#x: result %u error %u\n", message, status >> 16, status & 0xffff);
+		if (message == loc.waiting && loc.step >= 7) {
+			/* (the running session's own requests: no step to move on) */
+			loc.waiting = 0;
+			if (message == DMS_GET_OPERATING_MODE) {
+				if (loc.retries <= 3 || loc.retries % 5 == 0) {
+					say("mdm: 7: loc: DMS (again, %u): operating mode %u\n", loc.retries, loc.opmode);
+				}
+				if (loc.opmode != loc.opmode_wanted) {
+					uint8_t t[8];
+
+					return loc_send_to(loc.dms_node, loc.dms_port, DMS_SET_OPERATING_MODE, t, loc_tlv(t, 0x01, loc.opmode_wanted, 1));
+				}
+				say("mdm: 7: loc: DMS: THE MODEM IS IN OPERATING MODE %u NOW (after %u tries)\n", loc.opmode, loc.retries);
+			} else if (message == DMS_SET_OPERATING_MODE && (loc.retries <= 3 || loc.retries % 5 == 0 || status == 0)) {
+				say("mdm: 7: loc: DMS set mode %u (again): result %u error %u\n", loc.opmode_wanted, status >> 16, status & 0xffff);
+			}
+			return 0;
+		}
 		if (message == loc.waiting) {
 			loc.waiting = 0;
 			loc.step++;
@@ -1790,6 +1854,9 @@ loc_packet(const struct qrtr_packet *p)
 	if (message == LOC_POSITION_REPORT) {
 		loc.reports++;
 		loc.last_status = status;
+		if (status == 3 && loc.step >= 7) {
+			loc.restart_start = true;               /* (a timeout ends the session: loc_running starts another) */
+		}
 		if (have_lat && have_unc && (status == 0 || status == 1)) {
 			uint32_t m = loc_f32_metres(unc_bits);
 
@@ -2150,7 +2217,14 @@ step_qrtr(void)
 	{
 		uint64_t start = since_reset_ms(), beat = start + 1000, hello_at = start + 5000, now;
 		uint64_t listen_ms = loc.wanted ? 240000 : IPCR_LISTEN_MS;      /* (a GNSS cold start with no help: minutes) */
+		uint32_t listen_s = 0;
 		unsigned handled = 0;
+
+		/* boot-arg mdm_listen=S: listened to for S seconds (run the kernel longer than that: loader_return_after) */
+		if (PE_parse_boot_argn("mdm_listen", &listen_s, sizeof(listen_s)) && listen_s != 0) {
+			listen_ms = (uint64_t)listen_s * 1000;
+		}
+		say("mdm: 6: listening for %llu s\n", listen_ms / 1000);
 
 		while (error == 0 && (now = since_reset_ms()) - start < listen_ms) {
 			/* (a line a second for the first 20 s, then every 10 s: the kept lines have room for the GNSS session) */
@@ -2200,8 +2274,10 @@ step_qrtr(void)
 	    efs.sessions, efs.regions, efs.bytes, efsq.dropped, efs.state);
 	if (loc.wanted) {
 		say("mdm: 7: loc: %s: step %u, %u responses, %u position reports (last status %u), %u FIXES, best accuracy %u m, "
-		    "%u satellites at most\n", loc.fixes ? "THE MODEM'S GNSS GAVE A POSITION" : "no position", loc.step,
-		    loc.responses, loc.reports, loc.last_status, loc.fixes, loc.best_m, loc.most_sats);
+		    "%u satellites at most; operating mode %u (wanted %u, asked %u times), %u restarts\n",
+		    loc.fixes ? "THE MODEM'S GNSS GAVE A POSITION" : "no position", loc.step, loc.responses, loc.reports,
+		    loc.last_status, loc.fixes, loc.best_m, loc.most_sats, loc.opmode, loc.opmode_wanted, loc.retries,
+		    loc.restarts);
 	}
 	return error == 0 && server_count > 0;
 }
