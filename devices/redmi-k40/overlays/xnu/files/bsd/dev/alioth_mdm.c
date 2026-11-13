@@ -41,6 +41,7 @@
 #include <sys/alioth_qrtr.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <stdarg.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
@@ -1594,6 +1595,51 @@ tftp_packet(const struct qrtr_packet *p)
 #define LOC_SET_ENGINE_LOCK     0x003a
 #define LOC_SET_OPERATION_MODE  0x004a
 #define LOC_EVENTS              (0x1ull | 0x2ull | 0x80ull | 0x100ull)    /* position, SV info, engine state, fix session */
+#define LOC_ENGINE_STATE        0x002b
+
+/*
+ * sysctl kern.hakios.gnss (read-only, binary, version 1; the owner's 2026-11-14 ask: a GPS tab in System Check like the
+ * GPS Status app): the modem's GNSS as LOC last told it -- the session's state, the latest position report's fields as
+ * they came (doubles and floats as their IEEE bits: no floating point in the kernel; the application turns them into
+ * numbers) and up to 64 satellites. The position is the owner's and is shown on the phone only: nothing here says it.
+ */
+#define GNSS_SATS               64
+struct alioth_gnss_sat {
+	uint32_t system;                /* QMI LOC: 1 GPS, 2 Galileo, 3 SBAS, 4 BeiDou (COMPASS), 5 GLONASS, 6 BDS, 7 QZSS */
+	uint16_t prn;
+	uint8_t status;                 /* 1 idle, 2 searched for, 3 tracked */
+	uint8_t used;                   /* in the last fix (the position report's used list) */
+	uint32_t elevation_bits, azimuth_bits, snr_bits;        /* degrees, degrees, dB-Hz: IEEE singles */
+};
+struct alioth_gnss {
+	uint32_t version, size;         /* 1, sizeof(struct alioth_gnss) */
+	uint64_t updated_ms;            /* since the modem's reset, of the last report of either kind; 0 none yet */
+	uint32_t state;                 /* 0 not asked (no mdm_loc=1), 1 LOC not seen yet, 2 starting, 3 running */
+	uint32_t engine_state;          /* LOC's last ENGINE_STATE: 1 on, 2 off, 0 not said */
+	uint32_t session_status;        /* the last position report's: 0 success, 1 in progress, 3 timeout, 7 locked */
+	uint32_t opmode;                /* DMS operating mode: 0 online, 1 low power, 3 offline; ~0 not asked */
+	uint32_t reports, fixes, sv_reports;
+	uint32_t valid;                 /* which fields below the last position report had: GNSS_V_... */
+	uint64_t latitude_bits, longitude_bits;                 /* degrees: IEEE doubles */
+	uint32_t accuracy_bits, altitude_ellipsoid_bits, altitude_msl_bits, speed_bits, heading_bits, vertical_bits;
+	uint64_t utc_ms;
+	uint32_t sat_count;
+	struct alioth_gnss_sat sat[GNSS_SATS];
+};
+#define GNSS_V_POSITION         (1u << 0)
+#define GNSS_V_ACCURACY         (1u << 1)
+#define GNSS_V_ALTITUDE_ELL     (1u << 2)
+#define GNSS_V_ALTITUDE_MSL     (1u << 3)
+#define GNSS_V_SPEED            (1u << 4)
+#define GNSS_V_HEADING          (1u << 5)
+#define GNSS_V_VERTICAL         (1u << 6)
+#define GNSS_V_UTC              (1u << 7)
+#define GNSS_V_USED_LIST        (1u << 8)
+
+static struct alioth_gnss gnss = { .version = 1, .size = sizeof(struct alioth_gnss), .opmode = UINT32_MAX };
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_OPAQUE(_kern_hakios, OID_AUTO, gnss, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss, sizeof(gnss), "S,alioth_gnss",
+    "the modem's GNSS: LOC's session, its last position report (raw IEEE bits) and satellites");
 
 /*
  * (2026-11-14, the first session: every request accepted, the ENGINE STATE indication said 2 = off and no satellite
@@ -1744,6 +1790,11 @@ loc_tick(void)
 	uint8_t t[64];
 	uint16_t n = 0;
 
+	/* (kern.hakios.gnss's counts and state, kept up with the session) */
+	gnss.state = !loc.wanted ? 0 : !loc.found ? 1 : loc.step < 7 ? 2 : 3;
+	gnss.opmode = loc.opmode;
+	gnss.reports = loc.reports;
+	gnss.fixes = loc.fixes;
 	if (loc.wanted && loc.found && loc.step >= 7) {
 		return loc_running();
 	}
@@ -1784,6 +1835,98 @@ loc_tick(void)
 		return loc_start_send();
 	}
 	return 0;
+}
+
+/* kern.hakios.gnss from an indication of LOC's: its TLVs [tlv, end) as they came (see struct alioth_gnss) */
+static void
+gnss_update(uint16_t message, const uint8_t *tlv, const uint8_t *end, uint32_t status)
+{
+	if (message == LOC_ENGINE_STATE) {
+		gnss.engine_state = status;
+		return;
+	}
+	if (message == LOC_POSITION_REPORT) {
+		uint32_t valid = 0;
+		const uint8_t *used = NULL;
+		unsigned used_n = 0;
+
+		while (tlv + 3 <= end) {
+			uint8_t type = tlv[0];
+			uint16_t n = (uint16_t)(tlv[1] | tlv[2] << 8);
+			const uint8_t *v = tlv + 3;
+
+			if (v + n > end) {
+				break;
+			}
+			switch (type) {
+			case 0x10: if (n == 8) { memcpy(&gnss.latitude_bits, v, 8); valid |= GNSS_V_POSITION; } break;
+			case 0x11: if (n == 8) { memcpy(&gnss.longitude_bits, v, 8); } break;
+			case 0x12: if (n == 4) { gnss.accuracy_bits = loc_le32(v); valid |= GNSS_V_ACCURACY; } break;
+			case 0x18: if (n == 4) { gnss.speed_bits = loc_le32(v); valid |= GNSS_V_SPEED; } break;
+			case 0x1a: if (n == 4) { gnss.altitude_ellipsoid_bits = loc_le32(v); valid |= GNSS_V_ALTITUDE_ELL; } break;
+			case 0x1b: if (n == 4) { gnss.altitude_msl_bits = loc_le32(v); valid |= GNSS_V_ALTITUDE_MSL; } break;
+			case 0x1c: if (n == 4) { gnss.vertical_bits = loc_le32(v); valid |= GNSS_V_VERTICAL; } break;
+			case 0x20: if (n == 4) { gnss.heading_bits = loc_le32(v); valid |= GNSS_V_HEADING; } break;
+			case 0x25: if (n == 8) { memcpy(&gnss.utc_ms, v, 8); valid |= GNSS_V_UTC; } break;
+			case 0x2c:                      /* the satellites used: a count, then 16-bit ids */
+				if (n >= 1) {
+					used = v + 1;
+					used_n = v[0] <= (unsigned)(n - 1) / 2 ? v[0] : (unsigned)(n - 1) / 2;
+					valid |= GNSS_V_USED_LIST;
+				}
+				break;
+			default:
+				break;
+			}
+			tlv = v + n;
+		}
+		gnss.valid = valid;
+		gnss.session_status = status;
+		for (unsigned i = 0; i < gnss.sat_count; i++) {
+			bool in = false;
+
+			for (unsigned k = 0; used != NULL && k < used_n && !in; k++) {
+				in = (uint16_t)(used[2 * k] | used[2 * k + 1] << 8) == gnss.sat[i].prn;
+			}
+			gnss.sat[i].used = in;
+		}
+		gnss.updated_ms = since_reset_ms();
+		return;
+	}
+	if (message == LOC_SV_INFO) {
+		while (tlv + 3 <= end) {
+			uint8_t type = tlv[0];
+			uint16_t n = (uint16_t)(tlv[1] | tlv[2] << 8);
+			const uint8_t *v = tlv + 3;
+
+			if (v + n > end) {
+				break;
+			}
+			if (type == 0x10 && n >= 1) {
+				/* qmiLocSvInfoStructT_v02, packed: valid mask 4, system 4, id 2, health 1, status 4, info mask 1,
+				 * elevation 4, azimuth 4, SNR 4 = 28 bytes */
+				unsigned count = v[0];
+
+				count = count <= (unsigned)(n - 1) / 28 ? count : (unsigned)(n - 1) / 28;
+				count = count <= GNSS_SATS ? count : GNSS_SATS;
+				for (unsigned i = 0; i < count; i++) {
+					const uint8_t *e = v + 1 + 28 * i;
+
+					gnss.sat[i].system = loc_le32(e + 4);
+					gnss.sat[i].prn = (uint16_t)(e[8] | e[9] << 8);
+					gnss.sat[i].status = (uint8_t)loc_le32(e + 11);
+					gnss.sat[i].used = 0;
+					gnss.sat[i].elevation_bits = loc_le32(e + 16);
+					gnss.sat[i].azimuth_bits = loc_le32(e + 20);
+					gnss.sat[i].snr_bits = loc_le32(e + 24);
+				}
+				gnss.sat_count = count;
+			}
+			tlv = v + n;
+		}
+		gnss.sv_reports++;
+		gnss.updated_ms = since_reset_ms();
+	}
 }
 
 static int
@@ -1888,6 +2031,7 @@ loc_packet(const struct qrtr_packet *p)
 		}
 		return 0;
 	}
+	gnss_update(message, d + 7, end, status);       /* (indications only: the responses returned above) */
 	if (message == LOC_POSITION_REPORT) {
 		loc.reports++;
 		loc.last_status = status;
