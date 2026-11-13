@@ -755,7 +755,17 @@ main(void)
 	    chip.step);
 	CHECK(chip.most_transfers >= 2, "the 5 MB read came in %u transfer(s), should be split", chip.most_transfers);
 	CHECK(host.ee == ALIOTH_MHI_EE_AMSS, "mission mode");
-	CHECK(dev.resets == 2 && !dev.ch[2].running && !dev.ch[3].running, "SBL's channels reset (%u)", dev.resets);
+	/* (2026-11-13: the real SDX55 in AMSS never answers a RESET of SBL's channels, so none is sent; they are let go on
+	 * the host's side only) */
+	{
+		unsigned still = 0;
+
+		for (unsigned i = 0; i < ALIOTH_MHI_OPEN; i++) {
+			still += host.open[i].open && (host.open[i].number == 2 || host.open[i].number == 3);
+		}
+		CHECK(dev.resets == 0 && still == 0, "SBL's channels let go without a RESET (%u resets, %u still open)",
+		    dev.resets, still);
+	}
 	CHECK(host.bandwidth_requests == 1, "the link speed request seen (%u)", host.bandwidth_requests);
 	/* mission mode: QRTR on IPCR, as alioth_mdm.c's step 6 */
 	host_qrtr(&host);

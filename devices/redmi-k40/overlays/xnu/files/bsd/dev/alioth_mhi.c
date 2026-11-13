@@ -782,24 +782,37 @@ alioth_mhi_open(struct alioth_mhi *host, unsigned number, unsigned direction, un
 	return 0;
 }
 
+/* A channel let go on this side: its context disabled (direction and event ring stay) and no longer ours to use.
+ * Nothing is said to the device -- alioth_mhi_close() sends RESET_CHANNEL first. */
+static void
+channel_forget(struct alioth_mhi *host, unsigned number)
+{
+	struct alioth_mhi_channel *c = channel_of(host, number);
+	volatile uint32_t *context;
+
+	if (c == NULL) {
+		return;
+	}
+	context = context_of(&host->channel_contexts, number);
+	context[0] = CHANNEL_BURST_OFF;
+	for (unsigned i = 3; i < CONTEXT_WORDS; i++) {
+		context[i] = 0;
+	}
+	write_barrier();
+	c->open = false;                        /* (its memory stays the device's until the endpoint is reset) */
+}
+
 int
 alioth_mhi_close(struct alioth_mhi *host, unsigned number)
 {
 	struct alioth_mhi_channel *c;
-	volatile uint32_t *context;
 	int error;
 
 	if (host == NULL || host->io == NULL || (c = channel_of(host, number)) == NULL) {
 		return EINVAL;
 	}
 	error = command(host, TYPE_RESET_CHANNEL, number);
-	context = context_of(&host->channel_contexts, number);
-	context[0] = CHANNEL_BURST_OFF;         /* disabled; its direction and event ring stay */
-	for (unsigned i = 3; i < CONTEXT_WORDS; i++) {
-		context[i] = 0;
-	}
-	write_barrier();
-	c->open = false;                        /* (its memory stays the device's until the endpoint is reset) */
+	channel_forget(host, number);
 	return error;
 }
 
@@ -1024,10 +1037,14 @@ alioth_mhi_sahara(struct alioth_mhi *host, const uint8_t *(*image)(void *, uint6
 		return error;
 	}
 	say(host, "sahara: the modem is in mission mode", 0, 0, 0);
-	/* as Linux when SBL gives way to AMSS: SBL's channels are reset */
-	error = alioth_mhi_close(host, SAHARA_TO_DEVICE);
-	if (error == 0) {
-		error = alioth_mhi_close(host, SAHARA_FROM_DEVICE);
-	}
-	return error;
+	/*
+	 * SBL's channels let go on this side only. (2026-11-13, the first mission mode on the phone: a RESET_CHANNEL of
+	 * channel 2 sent as Linux's does it was never answered by the SDX55 in AMSS, and the unanswered command
+	 * poisoned the host before QRTR could start. The OnePlus 8 Pro port, the same modem, sends none: it starts the
+	 * mission's channels straight away.)
+	 */
+	channel_forget(host, SAHARA_TO_DEVICE);
+	channel_forget(host, SAHARA_FROM_DEVICE);
+	say(host, "sahara: SBL's channels 2/3 let go here (no RESET sent: AMSS does not answer it)", 0, 0, 0);
+	return 0;
 }
