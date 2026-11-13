@@ -845,6 +845,13 @@ elif [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		cp ../devices/redmi-k40/sdx55m-sahara.txt sysroot/fw/sdx55m/sahara.txt
 		chmod -R u+rw,go+r sysroot/fw/sdx55m
 		echo "  the SDX55's images and partition copies: $(du -sh sysroot/fw/sdx55m | cut -f1) in /fw/sdx55m"
+		# ... and what it reads over TFTP as /readonly/firmware/image/... (its modem_pr: hardware and carrier
+		# configurations), staged by work/wsl/stage-modem-ro.py under the names alioth_mdm.c's tftp_image() looks for
+		if [ -d ../fw-modem/ro ]; then
+			rm -rf sysroot/fw/mdm && cp -R ../fw-modem/ro sysroot/fw/mdm
+			chmod -R u+rw,go+r sysroot/fw/mdm
+			echo "  the SDX55's /readonly/ files: $(find sysroot/fw/mdm -type f | wc -l) files, $(du -sh sysroot/fw/mdm | cut -f1) in /fw/mdm"
+		fi
 	elif [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
 		../devices/poco-x5-pro/tools/modem_firmware.py --dtb ../devices/poco-x5-pro/prebuilt/device-tree.dtb --firmware-dir ../fw-modem \
@@ -902,10 +909,11 @@ elif [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
-	# (fw/sdx55m, MODEM=1's, as it is: the kernel uses the modem's 84 MB image where it lies, hakios.image.c)
+	# (fw/sdx55m and fw/mdm, MODEM=1's, as they are: the kernel uses the modem's 84 MB image and the files it reads over
+	# TFTP where they lie, hakios.image.c -- a compressed one would be copied, and only 64 copies are kept)
 	# (MKAPFS_JOBS=N: that many compressing processes, at a low priority, for a computer that is in use; and a failure
 	# is one -- through "| tail -1" it went unnoticed, and the old image stayed, 2026-11-09)
-	nice -n 10 python3 ../tools/apfs/mkapfs.py -z --plain fw/sdx55m -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	nice -n 10 python3 ../tools/apfs/mkapfs.py -z --plain fw/sdx55m --plain fw/mdm -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
 	if [ "${PIPESTATUS[0]}" -ne 0 ]; then
 		echo "build.sh: mkapfs.py failed: no system.apfs made" >&2
 		rm -f system.apfs system.apfs.spool

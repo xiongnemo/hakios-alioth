@@ -1440,7 +1440,7 @@ ipcr_send(const uint8_t *packet, size_t length)
  */
 #define TFTP_SERVICE            4096u
 #define TFTP_PORT               0x4002u
-#define TFTP_BLOCK_MAX          1024u
+#define TFTP_BLOCK_MAX          7680u           /* (what the SDX55 asks: blksize=7680; one 8 KB IPCR element with QRTR's header) */
 
 static unsigned tftp_reads, tftp_writes, tftp_blocks, tftp_said;
 static uint64_t tftp_written;
@@ -1498,13 +1498,22 @@ tftp_announce(void)
  * back (the first rounds threw writes away, so its reads found nothing -- a candidate for its "not ready"). As
  * Android's tftp_server keeps them (/data/vendor/rfs), here in RAM only: TFTP_STORE in all, TFTP_FILE_MAX a file,
  * gone at the run's end, never written anywhere, their contents never said. Writes elsewhere are taken and thrown
- * away as before; reads elsewhere (/readonly/firmware/image/...: the firmware partition's files) are "not found"
- * until those files are in the image. A read is served as RFC 1350 with blksize/tsize/timeoutms/wsize (1)/seek/rsize.
+ * away as before. A read is served as RFC 1350 with blksize/tsize/timeoutms/wsize (1)/seek/rsize.
+ *
+ * (2026-11-14, later) /readonly/firmware/image/... served from the system image: the modem then asked
+ * modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig, mcfg_sw/mbn_sw.dig and (14 times) modem_pr/so/563_0_0.mbn and stayed "not
+ * ready". The firmware partition's image/modem_pr -- the hardware and carrier configurations, public files of Xiaomi's
+ * ROM (work/wsl/miui-pick.py takes NON-HLOS.bin out of it), nothing of this phone's -- is in /fw/mdm (userland/build.sh,
+ * MODEM=1 with ../fw-modem/ro, staged by work/wsl/stage-modem-ro.py), stored plain: a file is used where it lies in the
+ * RAM disk (hakios.image.c), no copy. A path after the prefix of at most TFTP_RO_DIRECT characters is fw/mdm/PATH; a
+ * longer one (hakios.image.c's paths are 96) is fw/mdm/h/XXXXXXXX, the FNV-1a (32 bits) of PATH -- the staging script
+ * uses the same rule and refuses two paths of one hash.
  */
 #define TFTP_FILES              16
-#define TFTP_STORE              (512u * 1024)
+#define TFTP_STORE              (TFTP_FILES * TFTP_FILE_MAX)
 #define TFTP_FILE_MAX           (128u * 1024)
 #define TFTP_SESSIONS           8
+#define TFTP_RO_DIRECT          80
 
 static struct { bool used; char name[96]; uint32_t at, length; } tftp_files[TFTP_FILES];
 static uint8_t tftp_store[TFTP_STORE];
@@ -1512,9 +1521,63 @@ static uint32_t tftp_store_used;
 static struct {
 	bool used, writing, done_last;
 	uint32_t node, port, blksize, size, base, block, at_ms;
-	int file;
+	int file;                       /* a /readwrite/ file's (tftp_files), -1 for one of the image's */
+	const uint8_t *data;            /* a read's file, whole: tftp_store's or the RAM disk's */
 } tftp_sessions[TFTP_SESSIONS];
-static unsigned tftp_served, tftp_kept;
+static unsigned tftp_served, tftp_kept, tftp_from_image, tftp_missing;
+static uint64_t tftp_image_bytes;
+
+/* the part of a /readonly/ path below the firmware partition's image/, or NULL */
+static const char *
+tftp_readonly(const char *path)
+{
+	static const char *const prefixes[] = { "/readonly/firmware/image/", "/readonly/vendor/firmware_mnt/image/" };
+
+	for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+		size_t n = strlen(prefixes[i]);
+
+		if (strncmp(path, prefixes[i], n) == 0 && path[n] != 0 && strnstr(path + n, "..", strlen(path + n)) == NULL) {
+			return path + n;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * that file of the system image's /fw/mdm (the rule above), where it lies; in lower case, as the staging script keeps
+ * them -- Android's partition is vfat, where a name's case does not matter
+ */
+static const uint8_t *
+tftp_image(const char *rel, uint32_t *size)
+{
+	char name[96], lower[192];
+	uint64_t length = 0;
+	const uint8_t *data;
+	size_t n = strlcpy(lower, rel, sizeof(lower));
+
+	if (n >= sizeof(lower)) {
+		return NULL;
+	}
+	for (size_t i = 0; i < n; i++) {
+		lower[i] = lower[i] >= 'A' && lower[i] <= 'Z' ? (char)(lower[i] + 32) : lower[i];
+	}
+	if (n <= TFTP_RO_DIRECT) {
+		snprintf(name, sizeof(name), "mdm/%s", lower);
+	} else {
+		uint32_t h = 2166136261u;
+
+		for (size_t i = 0; i < n; i++) {
+			h = (h ^ (uint8_t)lower[i]) * 16777619u;
+		}
+		snprintf(name, sizeof(name), "mdm/h/%08x", h);
+	}
+	data = hakios_image_file("fw", name, &length, NULL);
+	if (data == NULL || length > UINT32_MAX) {
+		return NULL;
+	}
+	*size = (uint32_t)length;
+	return data;
+}
 
 static int
 tftp_file(const char *name, bool make)
@@ -1571,7 +1634,7 @@ tftp_data(int s)
 {
 	static uint8_t pkt[4 + TFTP_BLOCK_MAX], out[QRTR_V1_HEADER + 4 + TFTP_BLOCK_MAX + 8];
 	uint32_t offset = (tftp_sessions[s].block - 1) * tftp_sessions[s].blksize, n = 0;
-	const uint8_t *data = tftp_store + tftp_files[tftp_sessions[s].file].at + tftp_sessions[s].base;
+	const uint8_t *data = tftp_sessions[s].data + tftp_sessions[s].base;
 
 	if (offset < tftp_sessions[s].size) {
 		n = tftp_sessions[s].size - offset;
@@ -1593,7 +1656,7 @@ tftp_packet(const struct qrtr_packet *p)
 	if (opcode == 1 || opcode == 2) {
 		/* a request: file name, mode, then option/value pairs, each ended by a zero */
 		const char *name = (const char *)d + 2, *end = (const char *)d + p->size, *at;
-		char opts[120] = "", path[96];
+		char opts[120] = "", path[192];
 		uint32_t blksize = 512, timeoutms = 0, seek = 0, rsize = UINT32_MAX, tsize_value = 0;
 		bool oack = false, wsize = false, tsize = false, timeout = false;
 		int s, f;
@@ -1634,22 +1697,43 @@ tftp_packet(const struct qrtr_packet *p)
 			say("mdm: 6: tftp: %s \"%s\" from %u:%u, options %s\n", opcode == 1 ? "READ" : "WRITE", path, p->src_node,
 			    p->src_port, opts[0] ? opts : "none");
 		}
-		f = strncmp(path, "/readwrite/", 11) == 0 ? tftp_file(path, opcode == 2) : -1;
+		f = strncmp(path, "/readwrite/", 11) == 0 && strlen(path) < sizeof(tftp_files[0].name) ?
+		    tftp_file(path, opcode == 2) : -1;
 		if (opcode == 1) {
+			/* (a name longer than path[] is not looked up cut short) */
+			const char *rel = f < 0 && strnlen(name, (size_t)(end - name)) < sizeof(path) ? tftp_readonly(path) : NULL;
+			const uint8_t *data = NULL;
+			uint32_t length = 0;
+
 			tftp_reads++;
-			if (f < 0) {
+			if (f >= 0) {
+				data = tftp_store + tftp_files[f].at;
+				length = tftp_files[f].length;
+			} else if (rel != NULL) {
+				data = tftp_image(rel, &length);
+				if (data == NULL && tftp_missing++ < 40) {
+					say("mdm: 6: tftp: \"%s\": NOT IN the system image's /fw/mdm\n", path);
+				}
+			}
+			if (data == NULL) {
 				return tftp_error(p->src_node, p->src_port, 1, "File not found");
 			}
 			s = tftp_session(p->src_node, p->src_port, true);
 			tftp_sessions[s].writing = false;
 			tftp_sessions[s].file = f;
+			tftp_sessions[s].data = data;
 			tftp_sessions[s].blksize = blksize;
-			seek = seek < tftp_files[f].length ? seek : tftp_files[f].length;
+			seek = seek < length ? seek : length;
 			tftp_sessions[s].base = seek;
-			tftp_sessions[s].size = tftp_files[f].length - seek < rsize ? tftp_files[f].length - seek : rsize;
+			tftp_sessions[s].size = length - seek < rsize ? length - seek : rsize;
 			tftp_sessions[s].block = 1;
 			tftp_served++;
-			say("mdm: 6: tftp: \"%s\": %u bytes served from memory (blksize %u)\n", path, tftp_sessions[s].size, blksize);
+			if (f < 0) {
+				tftp_from_image++;
+				tftp_image_bytes += tftp_sessions[s].size;
+			}
+			say("mdm: 6: tftp: \"%s\": %u bytes (of %u) served from %s (blksize %u)\n", path, tftp_sessions[s].size, length,
+			    f >= 0 ? "memory" : "the image", blksize);
 			if (!oack) {
 				return tftp_data(s);
 			}
@@ -1722,7 +1806,7 @@ tftp_packet(const struct qrtr_packet *p)
 		int s = tftp_session(p->src_node, p->src_port, false);
 		uint32_t block = (uint32_t)(d[2] << 8 | d[3]);
 
-		if (s < 0 || tftp_sessions[s].writing || tftp_sessions[s].file < 0) {
+		if (s < 0 || tftp_sessions[s].writing || tftp_sessions[s].data == NULL) {
 			return 0;
 		}
 		if (block >= 1 && block == tftp_sessions[s].block && tftp_sessions[s].done_last) {
@@ -2623,9 +2707,11 @@ step_qrtr(void)
 		locations += servers[i].service == QRTR_SERVICE_LOC;
 	}
 	say("mdm: 6: %s (%d): %u services of the modem's; location (QMI LOC, 0x10) %s; %u packets dropped; tftp: %u reads "
-	    "(%u served from memory), %u writes, %u blocks, %llu bytes written (%u kept in memory)\n",
+	    "(%u served, %u of them from the image, %llu bytes; %u not in it), %u writes, %u blocks, %llu bytes written "
+	    "(%u kept in memory)\n",
 	    error ? "QRTR STOPPED" : "listened", error, server_count, locations ? "IS THERE" : "not seen", ipcr.dropped,
-	    tftp_reads, tftp_served, tftp_writes, tftp_blocks, tftp_written, tftp_kept);
+	    tftp_reads, tftp_served, tftp_from_image, tftp_image_bytes, tftp_missing, tftp_writes, tftp_blocks, tftp_written,
+	    tftp_kept);
 	say("mdm: 6: efs: %u memory debug sessions, %u regions, %llu bytes thrown away, %u packets dropped, state %d\n",
 	    efs.sessions, efs.regions, efs.bytes, efsq.dropped, efs.state);
 	if (loc.wanted) {
