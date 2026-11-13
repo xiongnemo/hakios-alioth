@@ -1346,7 +1346,7 @@ step_sahara(void)
 #define IPCR_QUEUE              8
 #define IPCR_PACKET_MAX         0x4000
 #define QRTR_OUR_NODE           1               /* the application processor's, as Linux numbers it */
-#define IPCR_LISTEN_MS          10000
+#define IPCR_LISTEN_MS          30000           /* (11-13: the first 15 services came at once; LOC/DMS/NAS may come later) */
 #define MDM_SERVERS             64
 
 static struct {
@@ -1475,14 +1475,33 @@ step_qrtr(void)
 	if (error == 0) {
 		error = ipcr_send(hello, qrtr_make_control(hello, sizeof(hello), QRTR_TYPE_HELLO, QRTR_OUR_NODE, QRTR_NODE_BCAST, NULL));
 	}
-	for (unsigned ms = 0; error == 0 && ms < IPCR_LISTEN_MS; ms++) {
-		error = alioth_mhi_poll(&mhi);
-		while (error == 0 && ipcr.head != ipcr.tail) {
-			unsigned slot = ipcr.head++ % IPCR_QUEUE;
+	/*
+	 * (2026-11-13) Listened to for IPCR_LISTEN_MS by the clock, with a line every second: the first listen on the phone
+	 * went silent for good after the modem's second HELLO (15 services in), with no line to say where it was.
+	 */
+	{
+		uint64_t start = since_reset_ms(), beat = start + 1000, now;
+		unsigned handled = 0;
 
-			error = ipcr_handle(ipcr.packet[slot], ipcr.length[slot]);
+		while (error == 0 && (now = since_reset_ms()) - start < IPCR_LISTEN_MS) {
+			if (now >= beat) {
+				say("mdm: 6: listening, %llu ms after the reset: %u packets handled, %u services, %u dropped, %u partial bytes, "
+				    "%u events in all\n", now, handled, server_count, ipcr.dropped, ipcr.partial, mhi.events);
+				beat += 1000;
+			}
+			error = alioth_mhi_poll(&mhi);
+			while (error == 0 && ipcr.head != ipcr.tail) {
+				unsigned slot = ipcr.head++ % IPCR_QUEUE;
+
+				error = ipcr_handle(ipcr.packet[slot], ipcr.length[slot]);
+				handled++;
+			}
+			delay(1000);
 		}
-		delay(1000);
+		if (error != 0) {
+			say("mdm: 6: the listen stopped on an error (%d) after %llu ms, %u packets handled\n", error,
+			    since_reset_ms() - start, handled);
+		}
 	}
 	for (unsigned i = 0; i < server_count; i++) {
 		locations += servers[i].service == QRTR_SERVICE_LOC;
