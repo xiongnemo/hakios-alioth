@@ -1931,7 +1931,15 @@ static struct {
 	unsigned imei_len;
 	uint32_t best_m, last_status, most_sats;
 	uint64_t lat_bits, lon_bits;    /* (the last fix's, never said) */
-} loc = { .best_m = UINT32_MAX, .opmode = UINT32_MAX };
+	/*
+	 * (11-14 round 34: online with modem_pr, the engine on, 66 satellites "in view", 415 positions of status 1 -- IN
+	 * PROGRESS, 1168 km down to 8.5 km: a seed, not a fix.) A fix is a report of status 0; the satellites' own
+	 * reports say whether any is heard at all: how many with a signal (SNR >= 1 dB-Hz), tracked (status 3), the best
+	 * SNR -- an antenna path that hears nothing shows "in view" (the almanac's) and no signal.
+	 */
+	unsigned done_fixes, most_heard, most_tracked;
+	uint32_t best_done_m, best_snr, first_done_ms, said_m;
+} loc = { .best_m = UINT32_MAX, .best_done_m = UINT32_MAX, .said_m = UINT32_MAX, .opmode = UINT32_MAX };
 
 static uint32_t
 loc_le32(const uint8_t *p)
@@ -2297,16 +2305,34 @@ loc_packet(const struct qrtr_packet *p)
 		if (status == 3 && loc.step >= 7) {
 			loc.restart_start = true;               /* (a timeout ends the session: loc_running starts another) */
 		}
-		if (have_lat && have_unc && (status == 0 || status == 1)) {
+		if (have_lat && have_unc && status == 0) {
 			uint32_t m = loc_f32_metres(unc_bits);
 
 			loc.fixes++;
-			if (m < loc.best_m) {
-				loc.best_m = m;
+			loc.done_fixes++;
+			loc.best_m = m < loc.best_m ? m : loc.best_m;
+			loc.best_done_m = m < loc.best_done_m ? m : loc.best_done_m;
+			if (loc.done_fixes == 1) {
+				loc.first_done_ms = (uint32_t)since_reset_ms();
 			}
-			if (loc.fixes <= 5 || loc.fixes % 30 == 0) {
-				say("mdm: 7: loc: A FIX (%u so far): status %u, accuracy %u m (the position itself is not said)\n",
-				    loc.fixes, status, m);
+			if (loc.done_fixes <= 5 || loc.done_fixes % 30 == 0) {
+				say("mdm: 7: loc: A FIX (%u so far, status 0): accuracy %u m, %llu ms after the reset (the position itself "
+				    "is not said)\n", loc.done_fixes, m, since_reset_ms());
+			}
+		} else if (have_lat && have_unc && status == 1) {
+			uint32_t m = loc_f32_metres(unc_bits);
+
+			loc.fixes++;                            /* (positions of either kind, as kern.hakios.gnss counts them) */
+			if (m < loc.best_m) {
+				/* (said when a quarter better: an estimate closing in second by second would fill the log) */
+				if (loc.said_m == UINT32_MAX || m < loc.said_m / 4 * 3) {
+					loc.said_m = m;
+					say("mdm: 7: loc: a position IN PROGRESS (status 1), accuracy %u m now, report %u, %llu ms after the "
+					    "reset\n", m, loc.reports, since_reset_ms());
+				}
+				loc.best_m = m;
+			} else if (loc.fixes <= 3 || loc.fixes % 60 == 0) {
+				say("mdm: 7: loc: positions in progress: %u, this one %u m (best %u m)\n", loc.fixes, m, loc.best_m);
 			}
 		} else if (loc.reports <= 10 || loc.reports % 30 == 0) {
 			say("mdm: 7: loc: position report %u: status %u (0 done, 1 in progress, 3 timeout, 7 engine locked), no fix\n",
@@ -2315,12 +2341,27 @@ loc_packet(const struct qrtr_packet *p)
 		return 0;
 	}
 	if (message == LOC_SV_INFO) {
+		unsigned heard = 0, tracked = 0, strong = 0;
+		uint32_t best = 0;
+
 		loc.sv_infos++;
 		if (sats > loc.most_sats) {
 			loc.most_sats = sats;
 		}
+		for (unsigned i = 0; i < gnss.sat_count; i++) {
+			uint32_t snr = loc_f32_metres(gnss.sat[i].snr_bits);     /* (whole dB-Hz) */
+
+			heard += snr >= 1;
+			strong += snr >= 25;
+			tracked += gnss.sat[i].status == 3;
+			best = snr > best ? snr : best;
+		}
+		loc.most_heard = heard > loc.most_heard ? heard : loc.most_heard;
+		loc.most_tracked = tracked > loc.most_tracked ? tracked : loc.most_tracked;
+		loc.best_snr = best > loc.best_snr ? best : loc.best_snr;
 		if (loc.sv_infos <= 3 || loc.sv_infos % 30 == 0) {
-			say("mdm: 7: loc: satellites in view: %u (most so far %u)\n", sats, loc.most_sats);
+			say("mdm: 7: loc: satellites in view: %u (most so far %u); with a signal %u, of them >= 25 dB-Hz %u, tracked "
+			    "%u; best SNR %u dB-Hz (best so far %u)\n", sats, loc.most_sats, heard, strong, tracked, best, loc.best_snr);
 		}
 		return 0;
 	}
@@ -2715,11 +2756,13 @@ step_qrtr(void)
 	say("mdm: 6: efs: %u memory debug sessions, %u regions, %llu bytes thrown away, %u packets dropped, state %d\n",
 	    efs.sessions, efs.regions, efs.bytes, efsq.dropped, efs.state);
 	if (loc.wanted) {
-		say("mdm: 7: loc: %s: step %u, %u responses, %u position reports (last status %u), %u FIXES, best accuracy %u m, "
-		    "%u satellites at most; operating mode %u (wanted %u, asked %u times), %u restarts\n",
-		    loc.fixes ? "THE MODEM'S GNSS GAVE A POSITION" : "no position", loc.step, loc.responses, loc.reports,
-		    loc.last_status, loc.fixes, loc.best_m, loc.most_sats, loc.opmode, loc.opmode_wanted, loc.retries,
-		    loc.restarts);
+		say("mdm: 7: loc: %s: step %u, %u responses, %u position reports (last status %u), %u FIXES (status 0; best %u m, "
+		    "the first %u ms after the reset), %u positions of either kind (best %u m); %u satellites in view at most, %u "
+		    "with a signal, %u tracked, best SNR %u dB-Hz; operating mode %u (wanted %u, asked %u times), %u restarts\n",
+		    loc.done_fixes ? "A GNSS FIX" : loc.fixes ? "positions in progress only, NO FIX" : "no position", loc.step,
+		    loc.responses, loc.reports, loc.last_status, loc.done_fixes, loc.best_done_m, loc.first_done_ms, loc.fixes,
+		    loc.best_m, loc.most_sats, loc.most_heard, loc.most_tracked, loc.best_snr, loc.opmode, loc.opmode_wanted,
+		    loc.retries, loc.restarts);
 	}
 	return error == 0 && server_count > 0;
 }
