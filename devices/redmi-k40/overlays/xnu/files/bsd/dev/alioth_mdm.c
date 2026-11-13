@@ -31,6 +31,7 @@
  * The SDX55's pins are all in the TLMM's SOUTH tile (Linux pinctrl-sm8250.c), the Wi-Fi's in the NORTH one.
  */
 #include <kern/clock.h>
+#include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -1902,6 +1903,61 @@ SYSCTL_OPAQUE(_kern_hakios, OID_AUTO, gnss, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss, 
     "the modem's GNSS: LOC's session, its last position report (raw IEEE bits) and satellites");
 
 /*
+ * (2026-11-14, boot-arg mdm_xtra=1) XTRA, Qualcomm's predicted orbits: unassisted, the first fix took 370-771 s
+ * indoors (rounds 35-37); the OnePlus 8 Pro port's came ~2 min after XTRA. The file is the one Android's xtra-daemon
+ * fetches (xtrapath1..3.izatcloud.net/xtra3grcej.bin, ~48 KB, a few days' orbits); userland's gnss_feed fetches it over
+ * Wi-Fi and writes it to kern.hakios.gnss_xtra (root only); the session then gives it to the engine with
+ * INJECT_PREDICTED_ORBITS_DATA (0x35), a part at a time (mdm_xtra_part bytes, 1024 at most, QMI LOC's limit), the
+ * next after the last one's response. Reading the sysctl gives the state: 0 not wanted, 1 waiting for the file,
+ * 2 being given, 3 given, 4 refused by the modem.
+ */
+#define LOC_INJECT_XTRA         0x0035
+#define XTRA_MAX                (256u * 1024)
+#define XTRA_PART_MAX           1024u
+
+static struct {
+	uint32_t state;                 /* (the sysctl's value; written by both sides with __atomic) */
+	uint8_t *data;
+	uint32_t size, part_size, parts, sent, ok, refused, first_error;
+	uint64_t began_ms;
+} xtra;
+
+static int
+gnss_xtra_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	uint32_t state = __atomic_load_n(&xtra.state, __ATOMIC_ACQUIRE);
+	uint8_t *b;
+	size_t n = req->newlen;
+	int error = SYSCTL_OUT(req, &state, sizeof(state));
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (state != 1) {
+		return state == 0 ? ENOTSUP : EBUSY;
+	}
+	if (n < 64 || n > XTRA_MAX) {
+		return EINVAL;
+	}
+	b = kalloc_data(n, Z_WAITOK);
+	if (b == NULL) {
+		return ENOMEM;
+	}
+	error = SYSCTL_IN(req, b, n);
+	if (error != 0) {
+		kfree_data(b, n);
+		return error;
+	}
+	xtra.data = b;
+	xtra.size = (uint32_t)n;
+	__atomic_store_n(&xtra.state, 2, __ATOMIC_RELEASE);  /* (last: the modem's thread sees the file whole or not at all) */
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gnss_xtra, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, gnss_xtra_sysctl,
+    "I", "XTRA predicted orbits for the modem's GNSS: read the state (0 off, 1 waiting, 2 giving, 3 given, 4 refused); "
+    "root writes the file");
+
+/*
  * (2026-11-14, the first session: every request accepted, the ENGINE STATE indication said 2 = off and no satellite
  * was ever reported.) The OnePlus 8 Pro port's modem had 20+ satellites in view at a window -- but its driver had put
  * the modem online with DMS first; the SDX55 comes up OFFLINE (3), RF dark. So the sequence now begins on DMS
@@ -1976,7 +2032,7 @@ loc_send(uint16_t message, const uint8_t *tlvs, uint16_t tlv_bytes)
 static int
 loc_send_to(uint32_t node, uint32_t port, uint16_t message, const uint8_t *tlvs, uint16_t tlv_bytes)
 {
-	uint8_t q[7 + 64], out[QRTR_V1_HEADER + sizeof(q) + 4];
+	uint8_t q[7 + 64 + XTRA_PART_MAX], out[QRTR_V1_HEADER + sizeof(q) + 4];      /* (an XTRA part the biggest) */
 
 	if (tlv_bytes > sizeof(q) - 7) {
 		return EMSGSIZE;
@@ -2018,6 +2074,26 @@ loc_start_send(void)
 	return loc_send(LOC_START, t, n);
 }
 
+/* XTRA part `xtra.sent + 1`: total size, parts, its number, its bytes (a 16-bit count, then them), format 0 (XTRA) */
+static int
+xtra_send_part(void)
+{
+	uint8_t t[64 + XTRA_PART_MAX];          /* (the TLVs: 7 + 5 + 5 + 5 + part + 7 bytes) */
+	uint32_t at = xtra.sent * xtra.part_size, n = xtra.size - at < xtra.part_size ? xtra.size - at : xtra.part_size;
+	uint16_t k;
+
+	k = loc_tlv(t, 0x01, xtra.size, 4);
+	k += loc_tlv(t + k, 0x02, xtra.parts, 2);
+	k += loc_tlv(t + k, 0x03, xtra.sent + 1, 2);
+	t[k] = 0x04, t[k + 1] = (uint8_t)(n + 2), t[k + 2] = (uint8_t)((n + 2) >> 8);
+	t[k + 3] = (uint8_t)n, t[k + 4] = (uint8_t)(n >> 8);
+	memcpy(t + k + 5, xtra.data + at, n);
+	k += (uint16_t)(5 + n);
+	k += loc_tlv(t + k, 0x10, 0, 4);
+	xtra.sent++;
+	return loc_send(LOC_INJECT_XTRA, t, k);
+}
+
 /* the session running: a START again after a timeout, DMS asked again every 20 s while not in the wanted mode */
 static int
 loc_running(void)
@@ -2055,6 +2131,23 @@ loc_running(void)
 			say("mdm: 7: loc: INJECT_UTC_TIME: the calendar's time, +-3 s (%llu ms after the reset)\n", now);
 			return loc_send(LOC_INJECT_UTC_TIME, t, n);
 		}
+	}
+	if (__atomic_load_n(&xtra.state, __ATOMIC_ACQUIRE) == 2) {
+		/* (the file written by gnss_feed: given a part at a time, each after the last one's response or 2 s) */
+		if (xtra.sent == 0) {
+			xtra.part_size = xtra.part_size >= 64 && xtra.part_size <= XTRA_PART_MAX ? xtra.part_size : XTRA_PART_MAX;
+			xtra.parts = (xtra.size + xtra.part_size - 1) / xtra.part_size;
+			xtra.began_ms = now;
+			say("mdm: 7: loc: XTRA: %u bytes from userland, given in %u parts of %u (%llu ms after the reset)\n",
+			    xtra.size, xtra.parts, xtra.part_size, now);
+		}
+		if (xtra.sent < xtra.parts) {
+			return xtra_send_part();
+		}
+		__atomic_store_n(&xtra.state, xtra.refused ? 4 : 3, __ATOMIC_RELEASE);
+		say("mdm: 7: loc: XTRA %s: %u parts in %llu ms, %u taken, %u refused (the first refusal: error %u)\n",
+		    xtra.refused ? "PARTLY REFUSED" : "GIVEN", xtra.parts, now - xtra.began_ms, xtra.ok, xtra.refused,
+		    xtra.first_error);
 	}
 	if (loc.restart_start) {
 		loc.restart_start = false;
@@ -2280,7 +2373,17 @@ loc_packet(const struct qrtr_packet *p)
 	}
 	if (d[0] == QMI_RESPONSE) {
 		loc.responses++;
-		say("mdm: 7: loc: response to %#x: result %u error %u\n", message, status >> 16, status & 0xffff);
+		if (message == LOC_INJECT_XTRA) {
+			if (status == 0) {
+				xtra.ok++;
+			} else if (xtra.refused++ == 0) {
+				xtra.first_error = status & 0xffff;
+			}
+		}
+		/* (XTRA's parts: the first, the last and any refused said, not the 40 between) */
+		if (message != LOC_INJECT_XTRA || status != 0 || xtra.sent <= 1 || xtra.sent == xtra.parts) {
+			say("mdm: 7: loc: response to %#x: result %u error %u\n", message, status >> 16, status & 0xffff);
+		}
 		if (message == loc.waiting && loc.step >= 7) {
 			/* (the running session's own requests: no step to move on) */
 			loc.waiting = 0;
@@ -2384,6 +2487,15 @@ loc_packet(const struct qrtr_packet *p)
 		if (loc.sv_infos <= 3 || loc.sv_infos % 30 == 0) {
 			say("mdm: 7: loc: satellites in view: %u (most so far %u); with a signal %u, of them >= 25 dB-Hz %u, tracked "
 			    "%u; best SNR %u dB-Hz (best so far %u)\n", sats, loc.most_sats, heard, strong, tracked, best, loc.best_snr);
+		}
+		return 0;
+	}
+	if (message == LOC_INJECT_XTRA) {
+		/* (a part's own indication: only a status other than 0 said, five at most) */
+		static unsigned bad;
+
+		if (status != 0 && bad++ < 5) {
+			say("mdm: 7: loc: XTRA part's indication: status %u\n", status);
 		}
 		return 0;
 	}
@@ -2690,6 +2802,13 @@ step_qrtr(void)
 			uint32_t time_arg = 0;
 
 			loc.time_wanted = PE_parse_boot_argn("mdm_time", &time_arg, sizeof(time_arg)) && time_arg != 0;
+			/* (mdm_xtra=1: kern.hakios.gnss_xtra waits for the file from userland; mdm_xtra_part=N bytes a part) */
+			time_arg = 0;
+			if (loc.wanted && PE_parse_boot_argn("mdm_xtra", &time_arg, sizeof(time_arg)) && time_arg != 0) {
+				xtra.part_size = XTRA_PART_MAX;
+				(void)PE_parse_boot_argn("mdm_xtra_part", &xtra.part_size, sizeof(xtra.part_size));
+				__atomic_store_n(&xtra.state, 1, __ATOMIC_RELEASE);
+			}
 		}
 		say("mdm: 7: loc: %s\n", loc.wanted ? "a GNSS session once LOC is there (mdm_loc=1), listened to for 240 s" :
 		    "not asked for (mdm_loc=1 starts a GNSS session)");

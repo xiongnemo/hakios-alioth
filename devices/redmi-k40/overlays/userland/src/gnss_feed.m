@@ -13,11 +13,12 @@
  *
  * PRIVACY: the position is the owner's. Nothing here prints it: only counts and accuracy.
  *
- * usage: gnss_feed [-d DELIVERY] [-r REPEAT]   (CLSimulationManager's behaviours; not set unless given)
+ * usage: gnss_feed [-d DELIVERY] [-r REPEAT] [-x XTRA_FILE]   (CLSimulationManager's behaviours, not set unless\n *        given; XTRA's file on Qualcomm's servers, xtra3grcej.bin: GPS, GLONASS, BeiDou, Galileo, QZSS)
  * The job com.hakios.gnss runs it at boot; with no kern.hakios.gnss, or no session asked for, it ends at once.
  */
 #import <CoreLocation/CoreLocation.h>
 #import <Foundation/Foundation.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -136,6 +137,65 @@ f64(uint64_t bits)
 	return d;
 }
 
+/*
+ * XTRA (boot-arg mdm_xtra=1: kern.hakios.gnss_xtra reads 1): Qualcomm's predicted orbits, the file Android's
+ * xtra-daemon fetches, from its servers over Wi-Fi, written to the kernel, which gives it to the modem's engine (QMI LOC
+ * 0x35): a first fix in minutes instead of 6-13 (rounds 35-37). Tried every 15 s while the network comes up.
+ */
+static void
+xtra_fetch(const char *name)
+{
+	uint32_t state = 0;
+	size_t n = sizeof(state);
+	NSString *file = [NSString stringWithUTF8String:name];
+
+	if (sysctlbyname("kern.hakios.gnss_xtra", &state, &n, NULL, 0) != 0 || state != 1) {
+		say("gnss_feed: XTRA not asked for by the kernel (state %u; boot-arg mdm_xtra=1 asks)\n", state);
+		return;
+	}
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		NSArray<NSString *> *hosts = @[ @"xtrapath1", @"xtrapath2", @"xtrapath3" ];
+
+		for (int attempt = 0; attempt < 60; attempt++) {
+			NSString *host = hosts[(NSUInteger)attempt % hosts.count];
+			NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@.izatcloud.net/%@", host, file]];
+			NSURLSessionConfiguration *c = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+			dispatch_semaphore_t done = dispatch_semaphore_create(0);
+			__block NSData *body = nil;
+			__block NSInteger code = 0;
+			__block NSString *failure = nil;
+			NSURLSession *s;
+
+			c.timeoutIntervalForRequest = 20;
+			s = [NSURLSession sessionWithConfiguration:c];
+			[[s dataTaskWithURL:url completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+				body = d;
+				code = [r isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)r).statusCode : 0;
+				failure = e.localizedDescription;
+				dispatch_semaphore_signal(done);
+			}] resume];
+			dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * (int64_t)NSEC_PER_SEC));
+			[s invalidateAndCancel];
+			if (code == 200 && body.length >= 1024 && body.length <= 256 * 1024) {
+				if (sysctlbyname("kern.hakios.gnss_xtra", NULL, NULL, (void *)body.bytes, body.length) == 0) {
+					say("gnss_feed: XTRA: %lu bytes of %s from %s given to the kernel (try %d)\n",
+					    (unsigned long)body.length, name, host.UTF8String, attempt + 1);
+				} else {
+					say("gnss_feed: XTRA: the kernel did not take it (%s)\n", strerror(errno));
+				}
+				return;
+			}
+			if (attempt < 3 || attempt % 10 == 0) {
+				say("gnss_feed: XTRA: %s: %s (try %d; again in 15 s)\n", host.UTF8String,
+				    failure ? failure.UTF8String : [NSString stringWithFormat:@"HTTP %ld, %lu bytes", (long)code,
+				    (unsigned long)body.length].UTF8String, attempt + 1);
+			}
+			sleep(15);
+		}
+		say("gnss_feed: XTRA: not fetched; the engine goes on without it\n");
+	});
+}
+
 static void
 let_go(id<HKLocationSimulation> sim)
 {
@@ -152,6 +212,7 @@ main(int argc, char **argv)
 	@autoreleasepool {
 		struct alioth_gnss g;
 		int delivery = -1, repeat = -1, opt;
+		const char *xtra_name = "xtra3grcej.bin";
 		bool active = false;
 		uint32_t last_reports;
 		unsigned fed = 0, sessions = 0, waited = 0;
@@ -161,13 +222,15 @@ main(int argc, char **argv)
 		id<HKLocationSimulation> sim;
 
 		setvbuf(stdout, NULL, _IOLBF, 0);
-		while ((opt = getopt(argc, argv, "d:r:")) != -1) {
+		while ((opt = getopt(argc, argv, "d:r:x:")) != -1) {
 			if (opt == 'd') {
 				delivery = atoi(optarg);
 			} else if (opt == 'r') {
 				repeat = atoi(optarg);
+			} else if (opt == 'x') {
+				xtra_name = optarg;
 			} else {
-				fprintf(stderr, "usage: gnss_feed [-d DELIVERY] [-r REPEAT]\n");
+				fprintf(stderr, "usage: gnss_feed [-d DELIVERY] [-r REPEAT] [-x XTRA_FILE]\n");
 				return 64;
 			}
 		}
@@ -203,6 +266,7 @@ main(int argc, char **argv)
 		signal(SIGINT, on_signal);
 		last_reports = g.reports;
 		say("gnss_feed: watching kern.hakios.gnss (session state %u): the modem's fixes go to locationd\n", g.state);
+		xtra_fetch(xtra_name);
 		while (!stopping) {
 			time_t now;
 
