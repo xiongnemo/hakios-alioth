@@ -150,6 +150,20 @@ main(void)
 	{ uint8_t q[4] = { 1, 0, 0, 0 }; sent_length = 0; sahara_input(&s, q, 4); CHECK(last_cmd == SAHARA_RESET, "short -> reset"); }
 	{ CHECK(chip(&s, 0x55, 8, NULL, 0) == 0 && last_cmd == SAHARA_RESET, "unknown -> reset"); }
 
+	/* the SDX55's command-mode HELLO in the middle (after mdmddr): HELLO_RESP with mode 3, then CMD_READY ->
+	 * CMD_SWITCH_MODE to 0, and image transfer goes on */
+	{ uint32_t w[] = { 2, 1, 0x400, SAHARA_MODE_COMMAND }; CHECK(chip(&s, SAHARA_HELLO, SAHARA_HELLO_LENGTH, w, 4) == 0, "command hello"); }
+	CHECK(sent_length == SAHARA_HELLO_LENGTH && sahara_le32(sent) == SAHARA_HELLO_RESP && sahara_le32(sent + 12) == 1 &&
+	    sahara_le32(sent + 20) == SAHARA_MODE_COMMAND, "command hello resp (compatible 1, mode 3)");
+	{ CHECK(chip(&s, SAHARA_CMD_READY, SAHARA_CMD_READY_LENGTH, NULL, 0) == 0, "cmd ready"); }
+	CHECK(sent_length == SAHARA_SWITCH_LENGTH && sahara_le32(sent) == SAHARA_CMD_SWITCH_MODE && sahara_le32(sent + 4) == 0x0c &&
+	    sahara_le32(sent + 8) == SAHARA_MODE_PENDING && s.mode == SAHARA_MODE_PENDING, "cmd ready -> switch mode 0");
+	{ uint32_t w[] = { 1, 0, 16 }; CHECK(chip(&s, SAHARA_READ_DATA, SAHARA_READ_LENGTH, w, 3) == 0, "read after switch"); }
+	CHECK(sent_length == 16 && memcmp(sent, image1, 16) == 0, "image 1 after the switch");
+	{ uint32_t w[] = { 1, 0 }; chip(&s, SAHARA_END_OF_IMAGE, SAHARA_EOI_LENGTH, w, 2); }
+	/* a crash dump offered (MEM_DEBUG): RESET */
+	{ uint32_t w[] = { 0x1000, 0x40 }; chip(&s, SAHARA_MEM_DEBUG, 0x10, w, 2); CHECK(last_cmd == SAHARA_RESET, "mem debug -> reset"); }
+
 	/* a HELLO asking for a version we do not speak: RESET */
 	{ uint32_t w[] = { 3, 3, 0x400, 0 }; chip(&s, SAHARA_HELLO, SAHARA_HELLO_LENGTH, w, 4); CHECK(last_cmd == SAHARA_RESET, "version 3 -> reset"); }
 

@@ -14,6 +14,10 @@
  *   END_OF_IMAGE (4)      DONE (5) if the chip says it went well; the image is let go either way
  *   DONE_RESP (6)         its mode: 1 (image transfer complete) ends the session, 0 means more images follow
  *   RESET_RESP (8)        nothing
+ *   CMD_READY (0x0b)      CMD_SWITCH_MODE (0x0c) to mode 0, image transfer: the SDX55's SBL says HELLO in command
+ *                         mode (3) once in the middle of its images, after mdmddr (the OnePlus 8 Pro port's
+ *                         sahara_packet, github.com/dekefake/hackios-op8pro, which boots the same SDX55)
+ *   MEM_DEBUG (9, 0x10)   RESET: the modem crashed and offers its memory; not taken, it starts again
  */
 #ifndef _SYS_ALIOTH_SAHARA_H_
 #define _SYS_ALIOTH_SAHARA_H_
@@ -30,6 +34,10 @@
 #define SAHARA_DONE_RESP        0x06
 #define SAHARA_RESET            0x07
 #define SAHARA_RESET_RESP       0x08
+#define SAHARA_MEM_DEBUG        0x09
+#define SAHARA_CMD_READY        0x0b
+#define SAHARA_CMD_SWITCH_MODE  0x0c
+#define SAHARA_MEM_DEBUG64      0x10
 #define SAHARA_READ_DATA64      0x12
 
 #define SAHARA_VERSION          2
@@ -40,8 +48,11 @@
 #define SAHARA_DONE_LENGTH      0x08
 #define SAHARA_DONE_RESP_LENGTH 0x0c
 #define SAHARA_RESET_LENGTH     0x08
+#define SAHARA_CMD_READY_LENGTH 0x08
+#define SAHARA_SWITCH_LENGTH    0x0c
 #define SAHARA_MODE_PENDING     0               /* images to transfer */
 #define SAHARA_MODE_COMPLETE    1               /* all transferred */
+#define SAHARA_MODE_COMMAND     3               /* the chip wants commands first: switched back to PENDING */
 #define SAHARA_PACKET_MAX       0xffffu         /* what one MHI transfer carries */
 #define SAHARA_REQUEST_MAX      (8u << 20)      /* the most one READ_DATA may ask for */
 #define SAHARA_NO_IMAGE         UINT64_MAX
@@ -118,9 +129,11 @@ sahara_send_short(struct sahara *s, uint32_t cmd, uint32_t length)
 	sahara_put32(s->out + 4, length);
 	if (cmd == SAHARA_HELLO_RESP) {
 		sahara_put32(s->out + 8, SAHARA_VERSION);
-		sahara_put32(s->out + 12, SAHARA_VERSION);  /* version_compat */
+		sahara_put32(s->out + 12, 1);               /* version_compat: 1, as the OnePlus 8 Pro port answers its SDX55 */
 		sahara_put32(s->out + 16, 0);               /* status: success */
 		sahara_put32(s->out + 20, s->mode);
+	} else if (cmd == SAHARA_CMD_SWITCH_MODE) {
+		sahara_put32(s->out + 8, SAHARA_MODE_PENDING);
 	}
 	s->packets++;
 	return s->ops->send(s->ops->context, s->out, length, true);
@@ -194,7 +207,8 @@ sahara_input(struct sahara *s, const uint8_t *p, uint32_t length)
 		}
 		s->mode = sahara_le32(p + 20);
 		sahara_say(s, "sahara: HELLO: version, compatible, mode", sahara_le32(p + 8), sahara_le32(p + 12), s->mode);
-		if (sahara_le32(p + 12) > SAHARA_VERSION || (s->mode != SAHARA_MODE_PENDING && s->mode != SAHARA_MODE_COMPLETE)) {
+		if (sahara_le32(p + 12) > SAHARA_VERSION || (s->mode != SAHARA_MODE_PENDING && s->mode != SAHARA_MODE_COMPLETE &&
+		    s->mode != SAHARA_MODE_COMMAND)) {
 			return sahara_reset(s, "sahara: a HELLO we cannot answer (version, mode)", sahara_le32(p + 12), s->mode);
 		}
 		s->state = SAHARA_TRANSFERRING;
@@ -242,6 +256,14 @@ sahara_input(struct sahara *s, const uint8_t *p, uint32_t length)
 		return 0;
 	case SAHARA_RESET_RESP:
 		return 0;
+	case SAHARA_CMD_READY:
+		/* (a chip that said HELLO in command mode: no commands are sent, it is switched to image transfer) */
+		sahara_say(s, "sahara: CMD_READY: switched to image transfer", s->mode, 0, 0);
+		s->mode = SAHARA_MODE_PENDING;
+		return sahara_send_short(s, SAHARA_CMD_SWITCH_MODE, SAHARA_SWITCH_LENGTH);
+	case SAHARA_MEM_DEBUG:
+	case SAHARA_MEM_DEBUG64:
+		return sahara_reset(s, "sahara: the modem crashed and offers its memory: not taken, reset", cmd, length);
 	default:
 		return sahara_reset(s, "sahara: a command we do not know", cmd, length);
 	}
