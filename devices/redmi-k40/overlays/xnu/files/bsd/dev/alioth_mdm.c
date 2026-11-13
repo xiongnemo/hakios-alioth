@@ -1603,6 +1603,7 @@ tftp_packet(const struct qrtr_packet *p)
  * airplane mode, GNSS allowed and the cellular radio off; 0 = online) when it is not that already.
  */
 #define DMS_SERVICE             2u
+#define DMS_GET_SERIAL_NUMBERS  0x0025
 #define DMS_GET_OPERATING_MODE  0x002d
 #define DMS_SET_OPERATING_MODE  0x002e
 
@@ -1618,6 +1619,11 @@ static struct {
 	uint64_t again_at;
 	bool restart_start;
 	unsigned retries, restarts;
+	/* (B4) DMS GET_DEVICE_SERIAL_NUMBERS once the session runs: the IMEI kept here, NEVER said -- only its length and
+	 * whether its Luhn check digit is right (the proof it was read whole); for iOS's About page later */
+	bool imei_asked, imei_luhn;
+	char imei[20];
+	unsigned imei_len;
 	uint32_t best_m, last_status, most_sats;
 	uint64_t lat_bits, lon_bits;    /* (the last fix's, never said) */
 } loc = { .best_m = UINT32_MAX, .opmode = UINT32_MAX };
@@ -1708,6 +1714,12 @@ loc_running(void)
 			return 0;
 		}
 		loc.waiting = 0;
+	}
+	if (loc.dms_found && !loc.imei_asked) {
+		uint8_t none[1] = { 0 };
+
+		loc.imei_asked = true;
+		return loc_send_to(loc.dms_node, loc.dms_port, DMS_GET_SERIAL_NUMBERS, none, 0);
 	}
 	if (loc.restart_start) {
 		loc.restart_start = false;
@@ -1800,6 +1812,25 @@ loc_packet(const struct qrtr_packet *p)
 			status = (uint32_t)(v[0] | v[1] << 8) << 16 | (uint32_t)(v[2] | v[3] << 8);   /* result << 16 | error */
 		} else if (d[0] == QMI_RESPONSE && message == DMS_GET_OPERATING_MODE && type == 0x01 && n >= 1) {
 			loc.opmode = v[0];
+		} else if (d[0] == QMI_RESPONSE && message == DMS_GET_SERIAL_NUMBERS && type == 0x11 && n >= 1) {
+			/* the IMEI, ASCII digits: kept, never said */
+			unsigned len = n < sizeof(loc.imei) - 1 ? n : (unsigned)sizeof(loc.imei) - 1, sum = 0;
+			bool digits = true;
+
+			memcpy(loc.imei, v, len);
+			loc.imei[len] = 0;
+			loc.imei_len = len;
+			for (unsigned i = 0; i < len; i++) {
+				unsigned dgt = (unsigned)(loc.imei[len - 1 - i] - '0');
+
+				digits = digits && loc.imei[len - 1 - i] >= '0' && loc.imei[len - 1 - i] <= '9';
+				if (i % 2 == 1) {
+					dgt *= 2;
+					dgt = dgt > 9 ? dgt - 9 : dgt;
+				}
+				sum += dgt;
+			}
+			loc.imei_luhn = digits && len == 15 && sum % 10 == 0;
 		} else if (d[0] == QMI_INDICATION && type == 0x01 && n >= 4) {
 			status = loc_le32(v);
 		} else if (message == LOC_POSITION_REPORT && type == 0x10 && n == 8) {
@@ -1821,6 +1852,12 @@ loc_packet(const struct qrtr_packet *p)
 		if (message == loc.waiting && loc.step >= 7) {
 			/* (the running session's own requests: no step to move on) */
 			loc.waiting = 0;
+			if (message == DMS_GET_SERIAL_NUMBERS) {
+				say("mdm: 7: dms: serial numbers: result %u error %u; IMEI %s: %u characters, Luhn check digit %s "
+				    "(the number itself is not said)\n", status >> 16, status & 0xffff, loc.imei_len ? "READ" : "not given",
+				    loc.imei_len, loc.imei_luhn ? "RIGHT" : "wrong or absent");
+				return 0;
+			}
 			if (message == DMS_GET_OPERATING_MODE) {
 				if (loc.retries <= 3 || loc.retries % 5 == 0) {
 					say("mdm: 7: loc: DMS (again, %u): operating mode %u\n", loc.retries, loc.opmode);
