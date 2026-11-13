@@ -1380,7 +1380,7 @@ step_sahara(void)
 #define IPCR_QUEUE              8
 #define IPCR_PACKET_MAX         0x4000
 #define QRTR_OUR_NODE           1               /* the application processor's, as Linux numbers it */
-#define IPCR_LISTEN_MS          30000           /* (11-13: the first 15 services came at once; LOC/DMS/NAS may come later) */
+#define IPCR_LISTEN_MS          60000           /* (11-13: the first 15 services came at once, then 30 s of nothing) */
 #define MDM_SERVERS             64
 
 static struct {
@@ -1427,6 +1427,150 @@ ipcr_send(const uint8_t *packet, size_t length)
 	return length == 0 ? EMSGSIZE : alioth_mhi_send(&mhi, IPCR_TO_DEVICE, packet, (uint32_t)length, true, 2000);
 }
 
+/*
+ * ---- the AP's TFTP server over QRTR (service 4096, port 0x4002), as Android's tftp_server ----
+ * (2026-11-14) In mission mode the SDX55 announced 15 services and then waited, silent, for 30 s: no DMS, NAS or LOC.
+ * The OnePlus 8 Pro port (dekefake/hackios-op8pro docs/research/modem-sdx55.md, "TFTP service") found its MPSS and
+ * application processor looking up [service 4096, instance 3] -- the AP's TFTP server, where they read their carrier
+ * configs and keep their EFS -- "could not resolve remote host". So the server is announced to nodes 2 and 3 with
+ * the instance words they tried (0..5 raw and 1|i<<8). FIRST STEP, nothing of the phone's storage is involved:
+ * every read is logged and answered "File not found" (the modem partition's files are not in the system image yet
+ * -- this says which ones it wants), every write is taken and thrown away (an EFS sync: never written anywhere).
+ */
+#define TFTP_SERVICE            4096u
+#define TFTP_PORT               0x4002u
+#define TFTP_BLOCK_MAX          1024u
+
+static unsigned tftp_reads, tftp_writes, tftp_blocks, tftp_said;
+static uint64_t tftp_written;
+
+static int
+tftp_reply(uint32_t node, uint32_t port, const uint8_t *payload, uint32_t size)
+{
+	uint8_t out[QRTR_V1_HEADER + 160];
+
+	return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_DATA, QRTR_OUR_NODE, TFTP_PORT, node, port, payload, size,
+	    false));
+}
+
+static int
+tftp_error(uint32_t node, uint32_t port, uint16_t code, const char *text)
+{
+	uint8_t p[64];
+	size_t n = strlen(text);
+
+	if (n > sizeof(p) - 5) {
+		n = sizeof(p) - 5;
+	}
+	p[0] = 0, p[1] = 5, p[2] = (uint8_t)(code >> 8), p[3] = (uint8_t)code;
+	memcpy(p + 4, text, n);
+	p[4 + n] = 0;
+	return tftp_reply(node, port, p, (uint32_t)(5 + n));
+}
+
+static int
+tftp_announce(void)
+{
+	static const uint32_t nodes[] = { 2, 3 };
+	uint8_t out[64];
+	int error = 0;
+
+	for (unsigned n = 0; n < 2 && error == 0; n++) {
+		for (uint32_t i = 0; i <= 5 && error == 0; i++) {
+			const uint32_t raw[4] = { TFTP_SERVICE, i, QRTR_OUR_NODE, TFTP_PORT };
+			const uint32_t shifted[4] = { TFTP_SERVICE, 1u | i << 8, QRTR_OUR_NODE, TFTP_PORT };
+
+			error = ipcr_send(out, qrtr_make_control(out, sizeof(out), QRTR_TYPE_NEW_SERVER, QRTR_OUR_NODE, nodes[n], raw));
+			if (error == 0 && i != 0) {
+				error = ipcr_send(out, qrtr_make_control(out, sizeof(out), QRTR_TYPE_NEW_SERVER, QRTR_OUR_NODE, nodes[n],
+				    shifted));
+			}
+		}
+	}
+	say("mdm: 6: tftp: service %u at node %u port %#x announced to nodes 2 and 3 (%d)\n", TFTP_SERVICE, QRTR_OUR_NODE,
+	    TFTP_PORT, error);
+	return error;
+}
+
+static int
+tftp_packet(const struct qrtr_packet *p)
+{
+	const uint8_t *d = p->payload;
+	uint32_t opcode = p->size >= 2 ? (uint32_t)(d[0] << 8 | d[1]) : 0;
+
+	if (opcode == 1 || opcode == 2) {
+		/* a request: file name, mode, then option/value pairs, each ended by a zero */
+		const char *name = (const char *)d + 2, *end = (const char *)d + p->size, *at;
+		char opts[120] = "";
+		uint32_t blksize = 512;
+		bool oack = false, wsize = false;
+
+		at = name + strnlen(name, (size_t)(end - name)) + 1;
+		at += at < end ? strnlen(at, (size_t)(end - at)) + 1 : 0;
+		while (at < end) {
+			const char *value = at + strnlen(at, (size_t)(end - at)) + 1;
+
+			if (value >= end) {
+				break;
+			}
+			if (strncmp(at, "blksize", 8) == 0) {
+				blksize = (uint32_t)strtoul(value, NULL, 10);
+				blksize = blksize < 8 ? 8 : blksize > TFTP_BLOCK_MAX ? TFTP_BLOCK_MAX : blksize;
+				oack = true;
+			} else if (strncmp(at, "wsize", 6) == 0) {
+				wsize = oack = true;
+			} else if (strncmp(at, "tsize", 6) == 0 || strncmp(at, "timeout", 8) == 0 || strncmp(at, "timeoutms", 10) == 0) {
+				oack = true;
+			}
+			strlcat(opts, at, sizeof(opts));
+			strlcat(opts, "=", sizeof(opts));
+			strlcat(opts, value, sizeof(opts));
+			strlcat(opts, " ", sizeof(opts));
+			at = value + strnlen(value, (size_t)(end - value)) + 1;
+		}
+		if (tftp_said++ < 80) {
+			say("mdm: 6: tftp: %s \"%.*s\" from %u:%u, options %s\n", opcode == 1 ? "READ" : "WRITE",
+			    (int)strnlen(name, (size_t)(end - name)), name, p->src_node, p->src_port, opts[0] ? opts : "none");
+		}
+		if (opcode == 1) {
+			tftp_reads++;
+			return tftp_error(p->src_node, p->src_port, 1, "File not found");
+		}
+		tftp_writes++;
+		if (oack) {
+			/* the options taken (blksize at most ours; wsize must be answered, 1, or the client waits for ten blocks) */
+			uint8_t o[64];
+			int n;
+
+			o[0] = 0, o[1] = 6;
+			n = snprintf((char *)o + 2, sizeof(o) - 2, "blksize%c%u%c%s", 0, blksize, 0, wsize ? "wsize" : "");
+			n += 2;
+			if (wsize) {
+				o[n++] = 0, o[n++] = '1', o[n++] = 0;
+			}
+			return tftp_reply(p->src_node, p->src_port, o, (uint32_t)n);
+		}
+		{
+			const uint8_t ack[4] = { 0, 4, 0, 0 };
+
+			return tftp_reply(p->src_node, p->src_port, ack, 4);
+		}
+	}
+	if (opcode == 3 && p->size >= 4) {
+		/* a block of a write: acknowledged, and thrown away */
+		const uint8_t ack[4] = { 0, 4, d[2], d[3] };
+
+		tftp_blocks++;
+		tftp_written += p->size - 4;
+		return tftp_reply(p->src_node, p->src_port, ack, 4);
+	}
+	if (tftp_said++ < 80) {
+		say("mdm: 6: tftp: opcode %u (%u bytes) from %u:%u%s\n", opcode, p->size, p->src_node, p->src_port,
+		    opcode == 5 ? ": an ERROR from the client" : "");
+	}
+	return 0;
+}
+
 static int
 ipcr_handle(const uint8_t *bytes, uint32_t length)
 {
@@ -1442,7 +1586,7 @@ ipcr_handle(const uint8_t *bytes, uint32_t length)
 	switch (p.type) {
 	case QRTR_TYPE_HELLO:
 		say("mdm: 6: HELLO from node %u (QRTR version %u)\n", p.src_node, p.version);
-		return 0;
+		return tftp_announce();         /* (our one service, told again to a router that has just said hello) */
 	case QRTR_TYPE_NEW_SERVER:
 	case QRTR_TYPE_DEL_SERVER:
 		if (!qrtr_server_of(&p, &s)) {
@@ -1466,8 +1610,16 @@ ipcr_handle(const uint8_t *bytes, uint32_t length)
 		return ipcr_send(out, qrtr_make(out, sizeof(out), QRTR_TYPE_NEW_SERVER, QRTR_OUR_NODE, QRTR_PORT_CTRL, p.src_node,
 		    p.src_port, (const uint8_t[QRTR_CONTROL_SIZE]){ QRTR_TYPE_NEW_SERVER }, QRTR_CONTROL_SIZE, false));
 	case QRTR_TYPE_DATA:
-		say("mdm: 6: data from %u:%u to port %#x, %u bytes (nobody listens there yet)%s\n", p.src_node, p.src_port, p.dst_port,
-		    p.size, p.confirm_rx ? "; RESUME_TX sent" : "");
+		if (p.dst_port == TFTP_PORT) {
+			int error = tftp_packet(&p);
+
+			if (error != 0 || !p.confirm_rx) {
+				return error;
+			}
+		} else {
+			say("mdm: 6: data from %u:%u to port %#x, %u bytes (nobody listens there yet)%s\n", p.src_node, p.src_port,
+			    p.dst_port, p.size, p.confirm_rx ? "; RESUME_TX sent" : "");
+		}
 		/*
 		 * (2026-11-13) A sender that asks for it (confirm_rx) waits for RESUME_TX once it has sent its flow limit (10
 		 * datagrams) to a port: Linux's qrtr_send_resume_tx(), from the port it reached, to the sender, a control
@@ -1509,19 +1661,29 @@ step_qrtr(void)
 	if (error == 0) {
 		error = ipcr_send(hello, qrtr_make_control(hello, sizeof(hello), QRTR_TYPE_HELLO, QRTR_OUR_NODE, QRTR_NODE_BCAST, NULL));
 	}
+	if (error == 0) {
+		error = tftp_announce();
+	}
 	/*
 	 * (2026-11-13) Listened to for IPCR_LISTEN_MS by the clock, with a line every second: the first listen on the phone
 	 * went silent for good after the modem's second HELLO (15 services in), with no line to say where it was.
 	 */
 	{
-		uint64_t start = since_reset_ms(), beat = start + 1000, now;
+		uint64_t start = since_reset_ms(), beat = start + 1000, hello_at = start + 5000, now;
 		unsigned handled = 0;
 
 		while (error == 0 && (now = since_reset_ms()) - start < IPCR_LISTEN_MS) {
 			if (now >= beat) {
 				say("mdm: 6: listening, %llu ms after the reset: %u packets handled, %u services, %u dropped, %u partial bytes, "
-				    "%u events in all\n", now, handled, server_count, ipcr.dropped, ipcr.partial, mhi.events);
+				    "%u events in all; tftp %u reads, %u writes, %u blocks\n", now, handled, server_count, ipcr.dropped,
+				    ipcr.partial, mhi.events, tftp_reads, tftp_writes, tftp_blocks);
 				beat += 1000;
+			}
+			/* (our HELLO again every 5 s: does the router's answer -- its list of services -- grow?) */
+			if (now >= hello_at) {
+				error = ipcr_send(hello, qrtr_make_control(hello, sizeof(hello), QRTR_TYPE_HELLO, QRTR_OUR_NODE,
+				    QRTR_NODE_BCAST, NULL));
+				hello_at += 5000;
 			}
 			error = alioth_mhi_poll(&mhi);
 			while (error == 0 && ipcr.head != ipcr.tail) {
@@ -1540,8 +1702,10 @@ step_qrtr(void)
 	for (unsigned i = 0; i < server_count; i++) {
 		locations += servers[i].service == QRTR_SERVICE_LOC;
 	}
-	say("mdm: 6: %s (%d): %u services of the modem's; location (QMI LOC, 0x10) %s; %u packets dropped\n",
-	    error ? "QRTR STOPPED" : "listened", error, server_count, locations ? "IS THERE" : "not seen", ipcr.dropped);
+	say("mdm: 6: %s (%d): %u services of the modem's; location (QMI LOC, 0x10) %s; %u packets dropped; tftp: %u reads "
+	    "(all \"not found\"), %u writes, %u blocks, %llu bytes thrown away\n",
+	    error ? "QRTR STOPPED" : "listened", error, server_count, locations ? "IS THERE" : "not seen", ipcr.dropped,
+	    tftp_reads, tftp_writes, tftp_blocks, tftp_written);
 	return error == 0 && server_count > 0;
 }
 
