@@ -559,14 +559,26 @@ step_pcie2(void)
 /* boot-arg mdm_dma_cached=1: write-back cacheable (MAIR entry 1), inner shareable -- what Linux's io-pgtable makes
  * for a dma-coherent device (pcie2 is, and kona-mhi.dtsi asks for coherent page tables) */
 #define MDM_PTE_CACHED          (3ull | 1ull << 2 | 1ull << 6 | 3ull << 8 | 1ull << 10 | 1ull << 11)
+/*
+ * boot-arg mdm_msi=1 (2026-11-13): the modem's MSI capability switched on before BHI, its writes going to the GIC's
+ * register that raises an SPI, shown to the modem as a device's page at the last page of the window. The OnePlus 8 Pro's
+ * port (github.com/dekefake/hackios-op8pro, docs/research/modem-sdx55.md step 4, the same SM8250 + SDX55 on PCIe 2) had
+ * this PBL's 0xef0e0003 for the whole sbl1.mbn and then success with this and the cacheable mapping (our
+ * mdm_dma_cached=1) changed at once; mdm_dma_cached=1 alone did not do it here (10-31). SPIs 960..991: nothing enables
+ * them, so a write only makes one pending (the Wi-Fi's are 800..831, hakios.wifi.c RADIO_FIRST_SPI + 32).
+ */
+#define MDM_MSI_REGISTER        0x17a10040ull
+#define MDM_MSI_SPI             960u
+#define MDM_PTE_DEVICE          (MDM_PTE | 2ull << 2 | 1ull << 53 | 1ull << 54)   /* MAIR entry 2 (Device-nGnRE), never executed */
 #define MDM_STREAM              0x1d01u         /* kona-pcie.dtsi pcie2: iommu-map <0x100 &apps_smmu 0x1d01 1> */
 #define MDM_WINDOW              0x20000000ull   /* kona-mhi.dtsi: qcom,iommu-dma-addr-pool <0x20000000 ...> */
 #define MDM_WINDOW_SIZE         (64ull << 20)
 #define MDM_THIRDS              ((uint32_t)(MDM_WINDOW_SIZE >> 21))
+#define MDM_MSI_IOVA            (MDM_WINDOW + MDM_WINDOW_SIZE - 4096)   /* (mdm_msi=1: never handed out by mdm_allocate) */
 
 static vm_offset_t smmu, smmu_second, smmu_context, smmu_contexts[128], tables;
 static uint32_t smmu_match = ~0u, smmu_context_n, smmu_old_smr, smmu_old_s2cr;
-static bool smmu_on, dma_on, dma_cached;
+static bool smmu_on, dma_on, dma_cached, msi_page;
 static uint64_t window_next;
 /* what mdm_allocate() handed out: where the modem sees it and where it is (for smmu_translation_check()) */
 struct mdm_allocation { uint64_t iova, physical, size; };
@@ -772,7 +784,7 @@ mdm_allocate(__unused void *context, size_t size, struct alioth_mhi_dma *dma)
 	uint64_t physical;
 
 	size = round_page(size);
-	if (!smmu_on || window_next + size > MDM_WINDOW_SIZE) {
+	if (!smmu_on || window_next + size > MDM_WINDOW_SIZE - (msi_page ? 4096 : 0)) {
 		return ENOMEM;
 	}
 	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
@@ -1114,6 +1126,61 @@ pcie_errors(const char *when)
 	}
 }
 
+/*
+ * mdm_msi=1: the GIC's SETSPI page put at the window's last page (a device's page, MAIR entry 2), then the endpoint's
+ * MSI capability given that address and the data MDM_MSI_SPI, with every vector it offers, and switched on -- the
+ * OnePlus 8 Pro port's msi_enable() (see MDM_MSI_REGISTER). Before BHI: the PBL probably raises its completion
+ * interrupt and fails the transfer when it cannot. Returns whether the capability was there and is on.
+ */
+static bool
+msi_enable(void)
+{
+	uint32_t at = rd(conf + 0x34) & 0xfc;
+
+	if (!msi_page) {
+		uint64_t offset = MDM_MSI_IOVA - MDM_WINDOW;
+		uint64_t *third = (uint64_t *)(tables + (2 + (offset >> 21)) * 4096);
+
+		if (window_next > offset) {
+			say("mdm: 4: msi: the window's last page is already handed out: no MSI\n");
+			return false;
+		}
+		third[offset >> 12 & 0x1ff] = (MDM_MSI_REGISTER & ~0xfffull) | MDM_PTE_DEVICE;
+		__asm__ volatile ("dc civac, %0" : : "r" (&third[offset >> 12 & 0x1ff]));
+		__asm__ volatile ("dsb sy" ::: "memory");
+		smmu_forget();
+		msi_page = true;
+		say("mdm: 4: msi: THE MODEM'S SMMU CONTEXT GETS AN ENTRY for the GIC's SETSPI register (%#llx) at %#llx, as a "
+		    "device's page\n", MDM_MSI_REGISTER, MDM_MSI_IOVA);
+	}
+	for (unsigned n = 0; at >= 0x40 && at < 0x100 && n < 32; n++) {
+		uint32_t head = rd(conf + at);
+
+		if ((head & 0xff) == 0x05) {
+			uint32_t control = head >> 16;
+			bool wide = (control & 0x80) != 0;
+			uint64_t address = MDM_MSI_IOVA + (MDM_MSI_REGISTER & 0xfff);
+			uint32_t on = (control & ~0x70u) | (control >> 1 & 7u) << 4 | 1u;   /* MME = MMC: all it offers; enable */
+
+			wr(conf + at + 4, (uint32_t)address);
+			if (wide) {
+				wr(conf + at + 8, (uint32_t)(address >> 32));
+				wr(conf + at + 12, MDM_MSI_SPI);
+			} else {
+				wr(conf + at + 8, MDM_MSI_SPI);
+			}
+			wr(conf + at, (head & 0xffffu) | on << 16);
+			say("mdm: 4: msi: capability at %#x (control %#x -> %#x, %s, %u vector%s): address %#llx, data %u\n", at,
+			    control, rd(conf + at) >> 16, wide ? "64-bit" : "32-bit", 1u << (control >> 1 & 7),
+			    (control >> 1 & 7) ? "s" : "", address, MDM_MSI_SPI);
+			return (rd(conf + at) >> 16 & 1) != 0;
+		}
+		at = (head >> 8) & 0xfc;
+	}
+	say("mdm: 4: msi: the endpoint has no MSI capability\n");
+	return false;
+}
+
 static const uint8_t *sbl;
 static uint64_t sbl_size;
 
@@ -1166,6 +1233,15 @@ step_mhi(void)
 	}
 	if (!smmu_up() || !dma_route()) {
 		return false;
+	}
+	{
+		uint32_t want_msi = 0;
+
+		if (PE_parse_boot_argn("mdm_msi", &want_msi, sizeof(want_msi)) && want_msi != 0) {
+			(void)msi_enable();
+		} else {
+			say("mdm: 4: msi: left off (mdm_msi=1 switches it on before BHI)\n");
+		}
 	}
 	/* (in the structure's order: "say" is this file's macro for hakios_tl, so no designators) */
 	mhi_io = (struct alioth_mhi_io){ NULL, bar_size, MDM_WINDOW, MDM_WINDOW + MDM_WINDOW_SIZE - 1, mhi_read, mhi_write,
