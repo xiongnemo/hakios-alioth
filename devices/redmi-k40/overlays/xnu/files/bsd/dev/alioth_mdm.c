@@ -1854,6 +1854,7 @@ tftp_packet(const struct qrtr_packet *p)
 #define LOC_POSITION_REPORT     0x0024
 #define LOC_SV_INFO             0x0025
 #define LOC_INJECT_UTC_TIME     0x0038
+#define LOC_INJECT_POSITION     0x0039
 #define LOC_SET_ENGINE_LOCK     0x003a
 #define LOC_SET_OPERATION_MODE  0x004a
 #define LOC_EVENTS              (0x1ull | 0x2ull | 0x80ull | 0x100ull)    /* position, SV info, engine state, fix session */
@@ -1978,6 +1979,65 @@ gnss_xtra_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused
 	__atomic_store_n(&xtra.state, 2, __ATOMIC_RELEASE);  /* (last: the modem's thread sees the file whole or not at all) */
 	return 0;
 }
+/*
+ * (2026-11-14, every assistance) A SEED POSITION and a PRECISE TIME from userland (gnss_feed): root writes
+ * kern.hakios.gnss_seed -- a coarse position (iOS's Wi-Fi location, never logged) given to the engine with QMI LOC
+ * INJECT_POSITION (0x39) while it has no fix of its own -- and kern.hakios.gnss_time -- the time measured over the
+ * network (SNTP) with its uncertainty, given with INJECT_UTC_TIME (0x38) again. Numbers as IEEE bits, as elsewhere.
+ */
+struct alioth_gnss_seed {
+	uint64_t latitude_bits, longitude_bits;         /* degrees: doubles */
+	uint32_t accuracy_bits, source;                 /* metres: a float; QMI LOC's position source (3 Wi-Fi) */
+	uint64_t utc_ms;                                /* when it was measured */
+};
+struct alioth_gnss_time {
+	uint64_t utc_ms;
+	uint32_t uncertainty_ms, reserved;
+};
+static struct alioth_gnss_seed gnss_seed;
+static struct alioth_gnss_time gnss_time;
+static uint32_t gnss_seed_new, gnss_time_new;          /* (set by the sysctls, taken by the session; __atomic) */
+static uint64_t gnss_time_at;                          /* (since_reset_ms() when the time was written)*/
+static unsigned gnss_seeds_given, gnss_times_given;
+
+static int
+gnss_seed_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, int arg2, struct sysctl_req *req)
+{
+	int error;
+
+	if (req->newptr == USER_ADDR_NULL) {
+		uint32_t given = arg2 ? gnss_times_given : gnss_seeds_given;
+
+		return SYSCTL_OUT(req, &given, sizeof(given));
+	}
+	if (!kauth_cred_issuser(kauth_cred_get())) {
+		return EPERM;
+	}
+	if (arg2) {
+		struct alioth_gnss_time t;
+
+		if (req->newlen != sizeof(t) || (error = SYSCTL_IN(req, &t, sizeof(t))) != 0) {
+			return req->newlen != sizeof(t) ? EINVAL : error;
+		}
+		gnss_time = t;
+		gnss_time_at = since_reset_ms();
+		__atomic_store_n(&gnss_time_new, 1, __ATOMIC_RELEASE);
+	} else {
+		struct alioth_gnss_seed s;
+
+		if (req->newlen != sizeof(s) || (error = SYSCTL_IN(req, &s, sizeof(s))) != 0) {
+			return req->newlen != sizeof(s) ? EINVAL : error;
+		}
+		gnss_seed = s;
+		__atomic_store_n(&gnss_seed_new, 1, __ATOMIC_RELEASE);
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gnss_seed, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    gnss_seed_sysctl, "I", "a seed position for the modem's GNSS (root writes; read: how many were given)");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gnss_time, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 1,
+    gnss_seed_sysctl, "I", "the network's time for the modem's GNSS (root writes; read: how many were given)");
+
 SYSCTL_PROC(_kern_hakios, OID_AUTO, gnss_xtra, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, gnss_xtra_sysctl,
     "I", "XTRA predicted orbits for the modem's GNSS: read the state (0 off, 1 waiting, 2 giving, 3 given, 4 refused); "
     "root writes the file");
@@ -2204,6 +2264,37 @@ loc_running(void)
 		say("mdm: 7: loc: XTRA %s: %u parts in %llu ms, %u taken, %u refused (the first refusal: error %u)\n",
 		    xtra.refused ? "PARTLY REFUSED" : "GIVEN", xtra.parts, now - xtra.began_ms, xtra.ok, xtra.refused,
 		    xtra.first_error);
+	}
+	if (__atomic_exchange_n(&gnss_time_new, 0, __ATOMIC_ACQUIRE)) {
+		/* the network's time (gnss_feed's SNTP), moved on by the time since it was written, with its uncertainty */
+		uint8_t t[24];
+		uint16_t n = loc_tlv(t, 0x01, gnss_time.utc_ms + (now - gnss_time_at), 8);
+
+		n += loc_tlv(t + n, 0x02, gnss_time.uncertainty_ms ? gnss_time.uncertainty_ms : 1000, 4);
+		gnss_times_given++;
+		say("mdm: 7: loc: INJECT_UTC_TIME from the network: +-%u ms (%llu ms after the reset)\n", gnss_time.uncertainty_ms,
+		    now);
+		return loc_send(LOC_INJECT_UTC_TIME, t, n);
+	}
+	if (__atomic_exchange_n(&gnss_seed_new, 0, __ATOMIC_ACQUIRE) && loc.done_fixes == 0) {
+		/*
+		 * the seed position (iOS's Wi-Fi location), while the engine has no fix of its own: latitude, longitude, the
+		 * circular uncertainty, 68% confidence, LOW reliability, its time, its source -- the position itself never said
+		 */
+		uint8_t t[64];
+		uint16_t n = loc_tlv(t, 0x10, gnss_seed.latitude_bits, 8);
+
+		n += loc_tlv(t + n, 0x11, gnss_seed.longitude_bits, 8);
+		n += loc_tlv(t + n, 0x12, gnss_seed.accuracy_bits, 4);
+		n += loc_tlv(t + n, 0x13, 68, 1);
+		n += loc_tlv(t + n, 0x14, 2, 4);
+		n += loc_tlv(t + n, 0x1b, gnss_seed.utc_ms, 8);
+		n += loc_tlv(t + n, 0x1d, gnss_seed.source ? gnss_seed.source : 3, 4);
+		gnss_seeds_given++;
+		say("mdm: 7: loc: INJECT_POSITION: a seed of +-%u m from userland, source %u (%llu ms after the reset; the "
+		    "position itself is not said)\n", loc_f32_metres(gnss_seed.accuracy_bits), gnss_seed.source ? gnss_seed.source : 3,
+		    now);
+		return loc_send(LOC_INJECT_POSITION, t, n);
 	}
 	if (loc.restart_start) {
 		loc.restart_start = false;
@@ -2878,10 +2969,18 @@ step_qrtr(void)
 		{
 			uint32_t time_arg = 0;
 
-			loc.time_wanted = PE_parse_boot_argn("mdm_time", &time_arg, sizeof(time_arg)) && time_arg != 0;
-			/* (mdm_xtra=1: kern.hakios.gnss_xtra waits for the file from userland; mdm_xtra_part=N bytes a part) */
-			time_arg = 0;
-			if (loc.wanted && PE_parse_boot_argn("mdm_xtra", &time_arg, sizeof(time_arg)) && time_arg != 0) {
+			/*
+			 * (2026-11-14, the owner: "能加的辅助就都要给") every assistance ON with the session: the time (mdm_time=0
+			 * leaves it out), XTRA (mdm_xtra=0), and the seed position and precise time from userland
+			 * (kern.hakios.gnss_seed / gnss_time, always taken when written)
+			 */
+			time_arg = 1;
+			(void)PE_parse_boot_argn("mdm_time", &time_arg, sizeof(time_arg));
+			loc.time_wanted = loc.wanted && time_arg != 0;
+			/* (kern.hakios.gnss_xtra waits for the file from userland; mdm_xtra_part=N bytes a part) */
+			time_arg = 1;
+			(void)PE_parse_boot_argn("mdm_xtra", &time_arg, sizeof(time_arg));
+			if (loc.wanted && time_arg != 0) {
 				xtra.part_size = XTRA_PART_MAX;
 				(void)PE_parse_boot_argn("mdm_xtra_part", &xtra.part_size, sizeof(xtra.part_size));
 				time_arg = 0;

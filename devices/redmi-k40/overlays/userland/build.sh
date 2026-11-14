@@ -511,6 +511,26 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f root/bin/ipainstall ] && cp com.hakios.apps.plist root/LaunchDaemons/
 	[ -f root/bin/loc_enable ] && cp com.hakios.location.plist root/LaunchDaemons/
 	[ -f root/bin/gnss_feed ] && cp com.hakios.gnss.plist root/LaunchDaemons/
+	# (gnss_feed asks iOS's Wi-Fi location for the modem's seed position as this location bundle of ours: src/gnss_feed.m)
+	if [ -f root/bin/gnss_feed ]; then
+		mkdir -p root/LocationBundles/HakiosGNSS.bundle
+		cat > root/LocationBundles/HakiosGNSS.bundle/Info.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.hakios.gnss</string>
+	<key>CFBundleName</key>
+	<string>GNSS assistance</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleDisplayName</key>
+	<string>GNSS assistance (the modem's seed position)</string>
+</dict>
+</plist>
+PLIST
+	fi
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} python3 mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS

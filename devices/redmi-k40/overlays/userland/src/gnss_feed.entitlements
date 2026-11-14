@@ -6,5 +6,10 @@
 	     simulate location" without it): CLSimulationManager's locations are taken from a client with this -->
 	<key>com.apple.locationd.simulation</key>
 	<true/>
+	<!-- the seed position: our own location bundle authorized by us (authorizeapplications) and asked as it (effective_bundle) -->
+	<key>com.apple.locationd.authorizeapplications</key>
+	<true/>
+	<key>com.apple.locationd.effective_bundle</key>
+	<true/>
 </dict>
 </plist>

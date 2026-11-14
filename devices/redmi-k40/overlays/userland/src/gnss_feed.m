@@ -18,7 +18,11 @@
  */
 #import <CoreLocation/CoreLocation.h>
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 #include <errno.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -196,6 +200,180 @@ xtra_fetch(const char *name)
 	});
 }
 
+/*
+ * (2026-11-14, the owner: every assistance there is) THE SEED POSITION: iOS's own Wi-Fi location (Apple's service) --
+ * asked as a location bundle of ours, /redwood/LocationBundles/HakiosGNSS.bundle, which this program authorizes itself
+ * (entitlements com.apple.locationd.authorizeapplications and .effective_bundle) -- handed to the kernel
+ * (kern.hakios.gnss_seed), which gives it to the modem's engine with QMI LOC INJECT_POSITION while it has no fix.
+ * Our own (simulated) locations are not taken. Stops once the modem has a fix. The position is never written anywhere.
+ */
+#define SEED_BUNDLE "/redwood/LocationBundles/HakiosGNSS.bundle"
+
+struct hk_gnss_seed {
+	uint64_t latitude_bits, longitude_bits;
+	uint32_t accuracy_bits, source;
+	uint64_t utc_ms;
+};
+struct hk_gnss_time {
+	uint64_t utc_ms;
+	uint32_t uncertainty_ms, reserved;
+};
+
+@interface HKSeed : NSObject <CLLocationManagerDelegate>
+@property (nonatomic) CLLocationManager *manager;
+@property (nonatomic) double given;          /* the accuracy of the last seed given (0: none) */
+@end
+
+@implementation HKSeed
+
+- (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations
+{
+	(void)manager;
+	for (CLLocation *l in locations) {
+		BOOL simulated = NO;
+		struct hk_gnss_seed seed;
+		double acc = l.horizontalAccuracy;
+		float accf = (float)acc;
+		double lat = l.coordinate.latitude, lon = l.coordinate.longitude;
+
+		if (@available(iOS 15.0, *)) {
+			simulated = l.sourceInformation.isSimulatedBySoftware;
+		}
+		/* (a first one, or one at least twice as good; never our own) */
+		if (simulated || acc <= 0 || acc > 5000 || (self.given > 0 && acc > self.given / 2)) {
+			continue;
+		}
+		memset(&seed, 0, sizeof(seed));
+		memcpy(&seed.latitude_bits, &lat, 8);
+		memcpy(&seed.longitude_bits, &lon, 8);
+		memcpy(&seed.accuracy_bits, &accf, 4);
+		seed.source = 3;                        /* (QMI LOC: Wi-Fi) */
+		seed.utc_ms = (uint64_t)(l.timestamp.timeIntervalSince1970 * 1000);
+		if (sysctlbyname("kern.hakios.gnss_seed", NULL, NULL, &seed, sizeof(seed)) == 0) {
+			self.given = acc;
+			say("gnss_feed: seed: iOS's Wi-Fi location, +-%.0f m, given to the modem (the position is not written)\n", acc);
+		} else {
+			say("gnss_feed: seed: the kernel did not take it (%s)\n", strerror(errno));
+		}
+	}
+}
+
+- (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error
+{
+	(void)manager;
+	say("gnss_feed: seed: no Wi-Fi location yet (%s)\n", error.localizedDescription.UTF8String ?: "?");
+}
+
+@end
+
+static HKSeed *seed_source;
+
+static void
+seed_start(void)
+{
+	NSString *path = @SEED_BUNDLE;
+	Class cl = [CLLocationManager class];
+	SEL authorize = sel_registerName("setAuthorizationStatus:forBundlePath:");
+	SEL init = sel_registerName("initWithEffectiveBundlePath:delegate:onQueue:");
+	dispatch_queue_t queue = dispatch_queue_create("gnss_feed.seed", DISPATCH_QUEUE_SERIAL);
+
+	if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+		say("gnss_feed: seed: no %s: no seed position\n", SEED_BUNDLE);
+		return;
+	}
+	if ([cl respondsToSelector:authorize]) {
+		((void (*)(id, SEL, BOOL, id))objc_msgSend)(cl, authorize, YES, path);
+	}
+	if (![cl instancesRespondToSelector:init]) {
+		say("gnss_feed: seed: CoreLocation has no initWithEffectiveBundlePath:delegate:onQueue: here\n");
+		return;
+	}
+	seed_source = [HKSeed new];
+	dispatch_async(queue, ^{
+		CLLocationManager *m = ((id (*)(id, SEL, id, id, id))objc_msgSend)([CLLocationManager alloc], init, path,
+		    seed_source, queue);
+
+		seed_source.manager = m;
+		m.desiredAccuracy = kCLLocationAccuracyHundredMeters;
+		[m startUpdatingLocation];
+		say("gnss_feed: seed: asking iOS for its Wi-Fi location (as %s)\n", SEED_BUNDLE);
+	});
+}
+
+static void
+seed_stop(void)
+{
+	if (seed_source.manager != nil) {
+		CLLocationManager *m = seed_source.manager;
+
+		seed_source.manager = nil;
+		[m stopUpdatingLocation];
+		say("gnss_feed: seed: the modem has its own fix: no more Wi-Fi locations asked\n");
+	}
+}
+
+/*
+ * THE PRECISE TIME: SNTP to time.apple.com once the network is up -- the server's transmit time plus half the round
+ * trip, the round trip's half (and 20 ms) as the uncertainty -- handed to the kernel (kern.hakios.gnss_time), which
+ * gives it to the engine with INJECT_UTC_TIME. (The calendar the kernel injects first came from the loader's epoch=,
+ * +-3 s.)
+ */
+static bool
+sntp_once(const char *host, struct hk_gnss_time *out)
+{
+	struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *ai = NULL;
+	uint8_t packet[48] = { 0x23 };          /* (LI 0, version 4, client) */
+	struct timeval tv = { 2, 0 }, t1, t4;
+	int s;
+	bool ok = false;
+
+	if (getaddrinfo(host, "123", &hints, &ai) != 0 || ai == NULL) {
+		return false;
+	}
+	s = socket(ai->ai_family, ai->ai_socktype, 0);
+	if (s >= 0) {
+		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		gettimeofday(&t1, NULL);
+		if (sendto(s, packet, sizeof(packet), 0, ai->ai_addr, ai->ai_addrlen) == sizeof(packet) &&
+		    recv(s, packet, sizeof(packet), 0) == sizeof(packet)) {
+			uint32_t secs = (uint32_t)packet[40] << 24 | (uint32_t)packet[41] << 16 | (uint32_t)packet[42] << 8 | packet[43];
+			uint32_t frac = (uint32_t)packet[44] << 24 | (uint32_t)packet[45] << 16 | (uint32_t)packet[46] << 8 | packet[47];
+			uint64_t rtt_ms;
+
+			gettimeofday(&t4, NULL);
+			rtt_ms = (uint64_t)((t4.tv_sec - t1.tv_sec) * 1000 + (t4.tv_usec - t1.tv_usec) / 1000);
+			if (secs > 2208988800u && rtt_ms < 3000) {
+				out->utc_ms = (uint64_t)(secs - 2208988800u) * 1000 + ((uint64_t)frac * 1000 >> 32) + rtt_ms / 2;
+				out->uncertainty_ms = (uint32_t)(rtt_ms / 2 + 20);
+				ok = true;
+			}
+		}
+		close(s);
+	}
+	freeaddrinfo(ai);
+	return ok;
+}
+
+static void
+time_fetch(void)
+{
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		for (int attempt = 0; attempt < 40; attempt++) {
+			struct hk_gnss_time t = { 0 };
+
+			if (sntp_once("time.apple.com", &t)) {
+				if (sysctlbyname("kern.hakios.gnss_time", NULL, NULL, &t, sizeof(t)) == 0) {
+					say("gnss_feed: time: from time.apple.com, +-%u ms, given to the modem (try %d)\n", t.uncertainty_ms,
+					    attempt + 1);
+				}
+				return;
+			}
+			sleep(15);
+		}
+		say("gnss_feed: time: no answer from time.apple.com\n");
+	});
+}
+
 static void
 let_go(id<HKLocationSimulation> sim)
 {
@@ -267,6 +445,8 @@ main(int argc, char **argv)
 		last_reports = g.reports;
 		say("gnss_feed: watching kern.hakios.gnss (session state %u): the modem's fixes go to locationd\n", g.state);
 		xtra_fetch(xtra_name);
+		time_fetch();
+		seed_start();
 		while (!stopping) {
 			time_t now;
 
@@ -302,6 +482,7 @@ main(int argc, char **argv)
 						if ([(id)sim respondsToSelector:@selector(flush)]) {
 							[sim flush];
 						}
+						seed_stop();
 						if (!active) {
 							[sim startLocationSimulation];
 							active = true;
