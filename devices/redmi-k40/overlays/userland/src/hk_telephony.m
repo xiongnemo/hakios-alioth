@@ -481,7 +481,7 @@ name_of(pid_t pid)
  * connection", _updateLocale) and Settings' Cellular pane asks it too; nothing answered (369 failed lookups a session).
  * Here it is answered: every request gets an EMPTY reply (no value: nothing made up), and the requests' key names,
  * value types and integer values are logged (never strings: the protocol, not anyone's data), to learn what is asked.
- * Boot-arg tel_noold=1: not served. (No xpc/xpc.h in this SDK: declared as umi_bluetool.c does.)
+ * OPT-IN, boot-arg tel_old=1: round 59 with it served (empty replies) never got iOS's picture on the screen -- the\n * loader's stayed, while the kernel, the modem and the daemons ran: something on the display's way up waits for\n * a real answer. Off unless asked. (No xpc/xpc.h in this SDK: declared as umi_bluetool.c does.)
  */
 typedef void *hk_xpc_t;
 extern const char _xpc_type_dictionary, _xpc_type_connection, _xpc_type_int64, _xpc_type_uint64, _xpc_type_string,
@@ -603,7 +603,7 @@ main(void)
 			size_t n = sizeof(args) - 1;
 
 			no_slot = sysctlbyname("kern.bootargs", args, &n, NULL, 0) == 0 && strstr(args, "tel_noslot=1") != NULL;
-			if (strstr(args, "tel_noold=1") == NULL) {
+			if (strstr(args, "tel_old=1") != NULL) {
 				old_service();
 			}
 		}
