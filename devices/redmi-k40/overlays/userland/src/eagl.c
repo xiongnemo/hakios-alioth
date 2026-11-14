@@ -4797,6 +4797,8 @@ my_getMacroContextPrivate(id self, SEL selector)
 	return e ? e->table : NULL;
 }
 
+static void gl_check(struct image *image);
+
 /* (the types are the method's own: the last three arrive on the stack, where sizes matter) */
 static BOOL
 tex_image_now(id self, SEL selector, IOSurfaceRef surface, unsigned long target, unsigned long internal,
@@ -4878,7 +4880,7 @@ gl_check(struct image *image)
 		return;
 	}
 	said++;
-	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &before);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &before);    /* (= GL_FRAMEBUFFER_BINDING, 0x8ca6) */
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
