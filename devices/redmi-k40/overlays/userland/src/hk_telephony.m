@@ -118,6 +118,36 @@ slot_info(void)
 	return info;
 }
 
+/*
+ * (round 43: About showed the IMEI; the Cellular pane stayed empty -- Settings asked getActiveContexts:, answered
+ * nil.) The active contexts: the one slot as a context too (CTXPCContextInfo: our UUID, no account, slot 1), the
+ * preferred one for data and voice. And getSIMStatus:'s answer is iOS's own kCTSIMSupportSIMStatusNotInserted.
+ */
+static id
+slot_contexts(void)
+{
+	static id contexts;
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		Class ci = NSClassFromString(@"CTXPCContextInfo"), cs = NSClassFromString(@"CTXPCContexts");
+		SEL init = sel_registerName("initWithUUID:andAccountID:andSlot:");
+		id context = slot_context();
+		NSUUID *uuid = context ? ((NSUUID * (*)(id, SEL))objc_msgSend)(context, sel_registerName("uuid")) : nil;
+		id info;
+
+		if (ci == Nil || cs == Nil || uuid == nil || ![ci instancesRespondToSelector:init]) {
+			return;
+		}
+		info = ((id (*)(id, SEL, id, id, long long))objc_msgSend)([ci alloc], init, uuid, @"", 1);
+		contexts = [cs new];
+		((void (*)(id, SEL, id))objc_msgSend)(contexts, sel_registerName("setSubscriptions:"), info ? @[ info ] : @[]);
+		((void (*)(id, SEL, id))objc_msgSend)(contexts, sel_registerName("setDataPreferred:"), uuid);
+		((void (*)(id, SEL, id))objc_msgSend)(contexts, sel_registerName("setVoicePreferred:"), uuid);
+	});
+	return contexts;
+}
+
 /* the IMEI the modem gave the kernel, or nil (no modem session, not read yet) */
 static NSString *
 modem_imei(void)
@@ -334,8 +364,11 @@ block_classes(SEL selector, unsigned which, const char **whole)
 			gave = value != nil;
 			[call setArgument:&value atIndex:(NSInteger)i];
 		} else if (!no_slot && ([cls isEqualToString:@"CTXPCServiceSubscriptionContext"] ||
-		    [cls isEqualToString:@"CTXPCServiceSubscriptionInfo"])) {
-			keep = [cls isEqualToString:@"CTXPCServiceSubscriptionInfo"] ? slot_info() : slot_context();
+		    [cls isEqualToString:@"CTXPCServiceSubscriptionInfo"] || [cls isEqualToString:@"CTXPCContexts"] ||
+		    ([cls isEqualToString:@"NSString"] && [name hasPrefix:@"getSIMStatus:"]))) {
+			keep = [cls isEqualToString:@"CTXPCServiceSubscriptionInfo"] ? slot_info() :
+			    [cls isEqualToString:@"CTXPCContexts"] ? slot_contexts() :
+			    [cls isEqualToString:@"NSString"] ? @"kCTSIMSupportSIMStatusNotInserted" : slot_context();
 			value = keep;
 			[call retainArguments];
 			[call setArgument:&value atIndex:(NSInteger)i];
