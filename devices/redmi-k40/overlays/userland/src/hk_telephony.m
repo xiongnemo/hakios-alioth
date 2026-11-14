@@ -28,6 +28,7 @@
 #include <time.h>
 
 extern const char *_Block_signature(void *block);
+extern int proc_name(int pid, void *buffer, uint32_t size);
 
 /* (in Foundation on iOS too, only not in the SDK's headers: what system daemons serve their services with) */
 @interface NSXPCConnection (HKPrivate)
@@ -443,8 +444,6 @@ has_identity(NSXPCConnection *c)
 	    ([get isKindOfClass:NSNumber.class] && [get boolValue]);
 }
 
-extern int proc_name(int pid, void *buffer, uint32_t size);
-
 static NSString *
 name_of(pid_t pid)
 {
@@ -475,6 +474,95 @@ name_of(pid_t pid)
 }
 
 @end
+
+/*
+ * (2026-11-14, round 58) The OLDER service, com.apple.commcenter.xpc -- CTServerConnection's C XPC: SpringBoard's main
+ * thread asks it once a second for the whole session ("CTServerConnection returned error: (2, 5). Destroying
+ * connection", _updateLocale) and Settings' Cellular pane asks it too; nothing answered (369 failed lookups a session).
+ * Here it is answered: every request gets an EMPTY reply (no value: nothing made up), and the requests' key names,
+ * value types and integer values are logged (never strings: the protocol, not anyone's data), to learn what is asked.
+ * Boot-arg tel_noold=1: not served. (No xpc/xpc.h in this SDK: declared as umi_bluetool.c does.)
+ */
+typedef void *hk_xpc_t;
+extern const char _xpc_type_dictionary, _xpc_type_connection, _xpc_type_int64, _xpc_type_uint64, _xpc_type_string,
+    _xpc_type_bool, _xpc_type_data, _xpc_type_array;
+extern const void *xpc_get_type(hk_xpc_t);
+extern hk_xpc_t xpc_connection_create_mach_service(const char *, dispatch_queue_t, uint64_t);
+extern void xpc_connection_set_event_handler(hk_xpc_t, void (^)(hk_xpc_t));
+extern void xpc_connection_resume(hk_xpc_t);
+extern void xpc_connection_send_message(hk_xpc_t, hk_xpc_t);
+extern pid_t xpc_connection_get_pid(hk_xpc_t);
+extern hk_xpc_t xpc_dictionary_create_reply(hk_xpc_t);
+extern bool xpc_dictionary_apply(hk_xpc_t, bool (^)(const char *, hk_xpc_t));
+extern int64_t xpc_int64_get_value(hk_xpc_t);
+extern uint64_t xpc_uint64_get_value(hk_xpc_t);
+extern void xpc_release(hk_xpc_t);
+extern void *xpc_retain(hk_xpc_t);
+
+static unsigned old_requests, old_said;
+
+static void
+old_request(hk_xpc_t peer, hk_xpc_t message)
+{
+	hk_xpc_t reply;
+
+	if (xpc_get_type(message) != &_xpc_type_dictionary) {
+		return;
+	}
+	old_requests++;
+	if (old_said < 150) {
+		char who[64] = "?", keys[400] = "";
+		__block size_t used = 0;
+		__block char *k = keys;
+
+		proc_name(xpc_connection_get_pid(peer), who, sizeof(who));
+		xpc_dictionary_apply(message, ^bool(const char *key, hk_xpc_t value) {
+			const void *t = xpc_get_type(value);
+			char one[96];
+
+			if (t == &_xpc_type_int64) {
+				snprintf(one, sizeof(one), "%s=%lld ", key, (long long)xpc_int64_get_value(value));
+			} else if (t == &_xpc_type_uint64) {
+				snprintf(one, sizeof(one), "%s=%llu ", key, (unsigned long long)xpc_uint64_get_value(value));
+			} else {
+				snprintf(one, sizeof(one), "%s:%s ", key, t == &_xpc_type_string ? "string" : t == &_xpc_type_bool ? "bool" :
+				    t == &_xpc_type_data ? "data" : t == &_xpc_type_dictionary ? "dict" : t == &_xpc_type_array ? "array" : "other");
+			}
+			used += strlcpy(k + used, one, sizeof(keys) - used);
+			return used < sizeof(keys) - 1;
+		});
+		old_said++;
+		say("hk_telephony: commcenter.xpc request %u from %s: %s\n", old_requests, who, keys);
+	}
+	reply = xpc_dictionary_create_reply(message);
+	if (reply != NULL) {
+		xpc_connection_send_message(peer, reply);
+		xpc_release(reply);
+	}
+}
+
+static void
+old_service(void)
+{
+	hk_xpc_t listener = xpc_connection_create_mach_service("com.apple.commcenter.xpc", dispatch_get_main_queue(), 1);
+
+	if (listener == NULL) {
+		say("hk_telephony: com.apple.commcenter.xpc could not be served\n");
+		return;
+	}
+	xpc_connection_set_event_handler(listener, ^(hk_xpc_t peer) {
+		if (xpc_get_type(peer) != &_xpc_type_connection) {
+			return;
+		}
+		xpc_retain(peer);
+		xpc_connection_set_event_handler(peer, ^(hk_xpc_t message) {
+			old_request(peer, message);
+		});
+		xpc_connection_resume(peer);
+	});
+	xpc_connection_resume(listener);
+	say("hk_telephony: com.apple.commcenter.xpc answered too (empty replies)\n");
+}
 
 /* the instance methods of a protocol and of those it takes in */
 static unsigned
@@ -515,6 +603,9 @@ main(void)
 			size_t n = sizeof(args) - 1;
 
 			no_slot = sysctlbyname("kern.bootargs", args, &n, NULL, 0) == 0 && strstr(args, "tel_noslot=1") != NULL;
+			if (strstr(args, "tel_noold=1") == NULL) {
+				old_service();
+			}
 		}
 		say("hk_telephony: the SIM slot: %s\n", no_slot ? "none said (tel_noslot=1)" : "one, slot 1, EMPTY (no SIM)");
 		listener = mach_listener(@"com.apple.commcenter.coretelephony.xpc");
