@@ -8,8 +8,11 @@
  * there is one GPU and one connection to it in a process.
  */
 #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <IOKit/IOKitLib.h>
@@ -75,10 +78,45 @@ call(unsigned number, void *data, size_t size)
 	}
 }
 
+/*
+ * (2026-11-14, Flutter Check's intermittent black launch: the render server's texture of the app's surfaces is black
+ * for the whole launch) Every surface made a buffer (its handle) and every buffer closed, this process's, appended to
+ * /var/tmp/hkdrm.log with boot-arg hkdrm=1 (test rounds): a handle given again for a new surface
+ * while freedreno still holds the old one under it would make the new texture the old buffer.
+ */
+static void
+trace(const char *format, unsigned a, unsigned b)
+{
+	static int on = -1;
+	char line[160];
+	int fd, n;
+
+	if (on < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "hkdrm=1") != NULL;
+	}
+	if (!on) {
+		return;
+	}
+	n = snprintf(line, sizeof(line), "%s[%d] ", getprogname(), (int)getpid());
+	n += snprintf(line + n, sizeof(line) - (size_t)n, format, a, b);
+	if ((fd = open("/var/tmp/hkdrm.log", O_WRONLY | O_CREAT | O_APPEND, 0666)) >= 0) {
+		(void)write(fd, line, (size_t)n);
+		close(fd);
+	}
+}
+
 int
 drmIoctl(int fd, unsigned long request, void *arg)
 {
-	int error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
+	int error;
+
+	if ((request & 0xff) == 0x09 && arg != NULL) {       /* DRM_IOCTL_GEM_CLOSE: { u32 handle; u32 pad; } */
+		trace("close handle %u%.0u\n", *(uint32_t *)arg, 0);
+	}
+	error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
 
 	(void)fd;
 	if (error != 0) {
@@ -197,6 +235,7 @@ drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 		return -1;
 	}
 	*handle = request.handle;
+	trace("surface %u -> handle %u\n", (unsigned)surface, request.handle);
 	return 0;
 }
 
