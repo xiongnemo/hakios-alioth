@@ -1490,6 +1490,118 @@ fr_hook(Class cls, const char *name, IMP imp)
 	return m != NULL ? method_setImplementation(m, imp) : NULL;
 }
 
+/*
+ * (2026-11-14, boot-arg layercheck=NAME: programs whose name begins with NAME) Flutter Check's intermittent black
+ * launch, everything above the pixels found as in a drawn one (rounds 53-66): what the application gives Core
+ * Animation as a layer's contents -- an IOSurface -- read back on this processor a second later: of a sample of its
+ * pixels, how many are not 0. A black launch whose surfaces hold pixels: the render server shows them wrong; one whose
+ * surfaces are empty: the frame was never stored into them (the Metal driver's pass into the drawable).
+ */
+static IMP lc_set_contents_original;
+static unsigned lc_seen;
+
+static void
+lc_check(const void *surface)
+{
+	static unsigned long (*type_id)(void);
+	static int (*lock)(const void *, uint32_t, uint32_t *), (*unlock)(const void *, uint32_t, uint32_t *);
+	static void *(*base)(const void *);
+	static size_t (*alloc_size)(const void *), (*row)(const void *), (*height)(const void *), (*width)(const void *);
+	static uint32_t (*sid)(const void *);
+	static void (*release)(const void *);
+	uint32_t nonzero = 0, samples = 0, first = 0, middle = 0;
+	const uint8_t *p;
+	size_t size;
+
+	if (lock == NULL) {
+		*(void **)&lock = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+		*(void **)&unlock = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+		*(void **)&base = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+		*(void **)&alloc_size = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+		*(void **)&row = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+		*(void **)&height = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
+		*(void **)&width = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidth");
+		*(void **)&sid = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+		*(void **)&release = dlsym(RTLD_DEFAULT, "CFRelease");
+		*(void **)&type_id = dlsym(RTLD_DEFAULT, "IOSurfaceGetTypeID");
+	}
+	if (lock == NULL || unlock == NULL || base == NULL || alloc_size == NULL || sid == NULL || release == NULL) {
+		return;
+	}
+	if (lock(surface, 1 /* read only */, NULL) == 0) {
+		p = base(surface);
+		size = alloc_size(surface);
+		for (size_t at = 0; p != NULL && at + 4 <= size; at += 4096) {
+			uint32_t v;
+
+			memcpy(&v, p + at, 4);
+			nonzero += v != 0;
+			samples++;
+		}
+		if (p != NULL && size >= 8) {
+			memcpy(&first, p, 4);
+			memcpy(&middle, p + (size / 2 & ~(size_t)3), 4);
+		}
+		unlock(surface, 1, NULL);
+		say("layercheck: surface %u (%zux%zu, %zu bytes a row): %u of %u samples not 0, the first %#010x, one in the "
+		    "middle %#010x (contents %u)\n", sid(surface), width ? width(surface) : 0, height ? height(surface) : 0,
+		    row ? row(surface) : 0, nonzero, samples, first, middle, lc_seen);
+	}
+	release(surface);
+}
+
+static void
+lc_set_contents(id self, SEL c, id contents)
+{
+	static unsigned long (*type_id)(void), (*get_type)(const void *);
+	static const void *(*retain)(const void *);
+
+	((void (*)(id, SEL, id))lc_set_contents_original)(self, c, contents);
+	if (type_id == NULL) {
+		*(void **)&type_id = dlsym(RTLD_DEFAULT, "IOSurfaceGetTypeID");
+		*(void **)&get_type = dlsym(RTLD_DEFAULT, "CFGetTypeID");
+		*(void **)&retain = dlsym(RTLD_DEFAULT, "CFRetain");
+	}
+	if (contents == nil || type_id == NULL || get_type == NULL || retain == NULL || get_type(contents) != type_id()) {
+		return;
+	}
+	/* (the first 8, then every 60th) */
+	if (lc_seen++ < 8 || lc_seen % 60 == 0) {
+		const void *surface = retain(contents);
+
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+			lc_check(surface);
+		});
+	}
+}
+
+static void
+lc_hooks(void)
+{
+	static bool done, checked, wanted;
+	Class layer = objc_getClass("CALayer");
+
+	if (!checked) {
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+		const char *at;
+
+		checked = true;
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && (at = strstr(args, "layercheck=")) != NULL) {
+			size_t n = strcspn(at + 11, " ");
+
+			wanted = getprogname() != NULL && n > 0 && strncmp(getprogname(), at + 11, n) == 0;
+		}
+	}
+	if (done || !wanted || layer == Nil) {
+		return;
+	}
+	done = true;
+	lc_set_contents_original = fr_hook(layer, "setContents:", (IMP)lc_set_contents);
+	say("layercheck: %s: -[CALayer setContents:] %s: IOSurface contents read back a second after\n", getprogname(),
+	    lc_set_contents_original ? "hooked" : "MISSING");
+}
+
 /* (once, when QuartzCore's classes are there) */
 static void
 fr_hooks(void)
@@ -1540,6 +1652,7 @@ compass_hooks(const struct mach_header *header, intptr_t image_slide)
 	(void)header;
 	(void)image_slide;
 	fr_hooks();
+	lc_hooks();
 	gl_lazy_hooks();
 	if (!notify_checked) {
 		char args[1024] = "";
