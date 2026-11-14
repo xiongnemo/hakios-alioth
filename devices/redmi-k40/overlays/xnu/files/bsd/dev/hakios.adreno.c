@@ -3973,7 +3973,14 @@ hakios_gpu_unmap_in(void *space, uint64_t address, uint64_t size)
 		space_map(s, address + offset, 0, 0);
 	}
 	space_commit(s);
-	wr(smmu.base + context + SMMU_CB_TLBIASID, core_space.context);
+	/*
+	 * (2026-11-14) The TLB entries of THIS space's ASID: it said core_space.context, so a client's own space kept the
+	 * translations of what it unmapped -- the render server makes and closes a buffer for an application's surface at
+	 * every frame, and a new buffer at an address used before was read through the old translation, the freed surface's
+	 * pages: Flutter Check came out black for a whole launch, about 1 in 4 (rounds 53-64: the app, UIKit, SpringBoard
+	 * and the render server's imports all as in a drawn launch).
+	 */
+	wr(smmu.base + context + SMMU_CB_TLBIASID, s->context);
 	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
 	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
 	}
