@@ -3,6 +3,10 @@
 // into a bundle directory of its own, make its data container, and register it with LaunchServices as a system
 // application. installd is not asked: it refuses whatever Apple has not signed ("No code signature found",
 // MICodeSigningVerifier), and the kernel runs such programs as they are (miniamfi: no signature policy).
+// But an application's entitlements live in its signature, and an unsigned or decrypted IPA has none the kernel
+// reads: so every Mach-O of the bundle is signed here, ad hoc (src/adhoc_sign.c) -- the application's and its
+// extensions' executables with their own entitlements, or with what an app expects of its signature when they have
+// none (its app group, keychain group, iCloud), everything else without (boot-arg ipa_sign=0: left as it comes).
 //   ipainstall PATH.ipa        install (again: the old bundle goes, the data container stays)
 //   ipainstall URL             the same with an IPA downloaded first (https://, or http:// from the computer)
 //   ipainstall -r PATH.app     register an application directory where it is (read-only images: /redwood/apps)
@@ -33,6 +37,7 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include <zlib.h>
+#include "adhoc_sign.h"
 
 @interface LSApplicationWorkspace : NSObject
 + (instancetype)defaultWorkspace;
@@ -493,6 +498,117 @@ download(NSString *url_string)
 	return path;
 }
 
+// ---------------------------------------------------------------- signing (src/adhoc_sign.c)
+
+static NSString *boot_arg(const char *name);
+
+/*
+ * What an application expects to find in its signature when it brings no entitlements of its own (an unsigned
+ * build): its identifier, its app group group.<main bundle id> (Telegram clients keep everything there and show a
+ * white window without it), a keychain group, iCloud's (CloudKit traps -- brk #1 -- in an app that makes a
+ * CKContainer without them) and push's. The team is made up; nothing checks it here. (work/wsl/resign-ipa.sh made
+ * the same set by hand, 2026-11-15.)
+ */
+static NSData *
+made_entitlements(NSString *bundle_id, NSString *main_id)
+{
+	NSString *team = @"HAKIOSSIDE";
+	NSDictionary *ents = @{
+		@"application-identifier": [NSString stringWithFormat:@"%@.%@", team, bundle_id],
+		@"com.apple.developer.team-identifier": team,
+		@"com.apple.security.application-groups": @[ [@"group." stringByAppendingString:main_id] ],
+		@"keychain-access-groups": @[ [NSString stringWithFormat:@"%@.%@", team, main_id] ],
+		@"com.apple.developer.icloud-container-identifiers": @[ [@"iCloud." stringByAppendingString:main_id] ],
+		@"com.apple.developer.icloud-services": @[ @"CloudKit", @"CloudDocuments" ],
+		@"com.apple.developer.icloud-container-environment": @"Production",
+		@"com.apple.developer.ubiquity-kvstore-identifier": [NSString stringWithFormat:@"%@.%@", team, main_id],
+		@"aps-environment": @"production",
+	};
+
+	return [NSPropertyListSerialization dataWithPropertyList:ents format:NSPropertyListXMLFormat_v1_0 options:0
+	    error:NULL];
+}
+
+/*
+ * Every Mach-O of the bundle APP signed ad hoc: first the executables of the application and of its PlugIns/NAME.appex
+ * with entitlements (their own signature's when they have one, else made_entitlements()), then every other Mach-O
+ * file (frameworks, dylibs, helpers) without. A file that cannot be signed (still encrypted, not arm64) is said and
+ * left as it is: the install goes on.
+ */
+static void
+sign_bundle(NSString *app)
+{
+	NSFileManager *fm = NSFileManager.defaultManager;
+	NSString *sign = boot_arg("ipa_sign");
+
+	if ([sign isEqualToString:@"0"]) {
+		say("ipainstall: not signed (ipa_sign=0)\n");
+		return;
+	}
+	NSString *main_id = [NSDictionary dictionaryWithContentsOfFile:
+	    [app stringByAppendingPathComponent:@"Info.plist"]][@"CFBundleIdentifier"];
+	NSMutableArray<NSString *> *bundles = [NSMutableArray arrayWithObject:app];
+	NSMutableSet<NSString *> *done = [NSMutableSet set];
+	unsigned signed_files = 0, failed = 0;
+	const char *how = "none";
+	char why[256];
+	NSDate *start = NSDate.date;
+
+	if (main_id == nil) {
+		return;
+	}
+	for (NSString *name in [fm contentsOfDirectoryAtPath:[app stringByAppendingPathComponent:@"PlugIns"] error:NULL]) {
+		if ([name.pathExtension isEqualToString:@"appex"]) {
+			[bundles addObject:[[app stringByAppendingPathComponent:@"PlugIns"] stringByAppendingPathComponent:name]];
+		}
+	}
+	for (NSString *bundle in bundles) {
+		NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+		    [bundle stringByAppendingPathComponent:@"Info.plist"]];
+		NSString *bid = info[@"CFBundleIdentifier"], *exe = info[@"CFBundleExecutable"];
+		NSString *path = exe ? [bundle stringByAppendingPathComponent:exe] : nil;
+		size_t len = 0;
+		char *own;
+		NSData *ents;
+
+		if (bid == nil || path == nil || !adhoc_is_macho(path.fileSystemRepresentation)) {
+			continue;
+		}
+		own = adhoc_entitlements(path.fileSystemRepresentation, &len);
+		ents = own ? [NSData dataWithBytesNoCopy:own length:len freeWhenDone:YES] : made_entitlements(bid, main_id);
+		if (bundle == app) {
+			how = own ? "its own" : "made";
+		}
+		if (adhoc_sign(path.fileSystemRepresentation, bid.UTF8String, ents.bytes, ents.length, why, sizeof(why)) == 0) {
+			signed_files++;
+		} else if (failed++ < 5) {
+			say("ipainstall: %s not signed: %s\n", path.lastPathComponent.UTF8String, why);
+		}
+		[done addObject:path];
+	}
+	NSDirectoryEnumerator *e = [fm enumeratorAtPath:app];
+
+	for (NSString *rel in e) {
+		NSString *path = [app stringByAppendingPathComponent:rel];
+
+		if ([done containsObject:path] || ![e.fileAttributes[NSFileType] isEqualToString:NSFileTypeRegular] ||
+		    [e.fileAttributes[NSFileSize] unsignedLongLongValue] < 4096 || !adhoc_is_macho(path.fileSystemRepresentation)) {
+			continue;
+		}
+		@autoreleasepool {
+			NSString *ident = rel.lastPathComponent.stringByDeletingPathExtension;
+
+			if (adhoc_sign(path.fileSystemRepresentation, ident.UTF8String, NULL, 0, why, sizeof(why)) == 0) {
+				signed_files++;
+			} else if (failed++ < 5) {
+				say("ipainstall: %s not signed: %s\n", rel.UTF8String, why);
+			}
+		}
+	}
+	say("ipainstall: signed %u files in %.1f s (the application's entitlements: %s)%s\n", signed_files,
+	    -start.timeIntervalSinceNow, how, failed ? [NSString stringWithFormat:@", %u not", failed].UTF8String : "");
+}
+
 static BOOL
 install_ipa_once(NSString *ipa)
 {
@@ -520,6 +636,7 @@ install_ipa_once(NSString *ipa)
 	    [app stringByAppendingPathComponent:@"Info.plist"]][@"CFBundleIdentifier"];
 	NSString *old = bundle_id ? our_bundle_dir(bundle_id) : nil;
 
+	sign_bundle(app);
 	if (!register_app(app)) {
 		[fm removeItemAtPath:dir error:NULL];
 		return NO;
@@ -794,7 +911,8 @@ restore_state(NSString *bundle_id, NSString *zip)
 	return ok;
 }
 
-// ---- a zip file, written as it goes (stored: no compression; sizes and offsets below 4 GB)
+// ---- a zip file, written as it goes (each file deflated when that makes it smaller -- a messenger's database to a
+// quarter, owner 11-15: "之后也压缩吧" -- else stored; sizes and offsets below 4 GB)
 
 static void
 put16(NSMutableData *d, uint16_t v)
@@ -817,26 +935,43 @@ zip_add(int fd, uint64_t *at, NSMutableData *cd, unsigned *count, NSString *name
 	NSData *n = [name dataUsingEncoding:NSUTF8StringEncoding];
 	uint32_t crc = (uint32_t)crc32(0, data.bytes, (uInt)data.length);
 	NSMutableData *h = [NSMutableData data];
+	NSData *body = data;
+	uint16_t method = 0;
 
-	if (*at + 30 + n.length + data.length >= 0xffffffffULL) {
+	if (data.length > 64 && data.length < 0xffffffffULL) {
+		z_stream z = { 0 };
+
+		if (deflateInit2(&z, 6, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK) {
+			NSMutableData *packed = [NSMutableData dataWithLength:deflateBound(&z, (uLong)data.length)];
+
+			z.next_in = (Bytef *)data.bytes, z.avail_in = (uInt)data.length;
+			z.next_out = packed.mutableBytes, z.avail_out = (uInt)packed.length;
+			if (deflate(&z, Z_FINISH) == Z_STREAM_END && z.total_out < data.length) {
+				packed.length = z.total_out;
+				body = packed, method = 8;
+			}
+			deflateEnd(&z);
+		}
+	}
+	if (*at + 30 + n.length + body.length >= 0xffffffffULL) {
 		say("ipainstall: the state is 4 GB or more: not saved\n");
 		return NO;
 	}
-	put32(h, 0x04034b50), put16(h, 20), put16(h, 0x0800), put16(h, 0), put16(h, 0), put16(h, 0x21);
-	put32(h, crc), put32(h, (uint32_t)data.length), put32(h, (uint32_t)data.length);
+	put32(h, 0x04034b50), put16(h, 20), put16(h, 0x0800), put16(h, method), put16(h, 0), put16(h, 0x21);
+	put32(h, crc), put32(h, (uint32_t)body.length), put32(h, (uint32_t)data.length);
 	put16(h, (uint16_t)n.length), put16(h, 0);
 	[h appendData:n];
 	if (write(fd, h.bytes, h.length) != (ssize_t)h.length ||
-	    (data.length > 0 && write(fd, data.bytes, data.length) != (ssize_t)data.length)) {
+	    (body.length > 0 && write(fd, body.bytes, body.length) != (ssize_t)body.length)) {
 		say("ipainstall: writing the state: %s\n", strerror(errno));
 		return NO;
 	}
-	put32(cd, 0x02014b50), put16(cd, 3 << 8 | 20), put16(cd, 20), put16(cd, 0x0800), put16(cd, 0);
-	put16(cd, 0), put16(cd, 0x21), put32(cd, crc), put32(cd, (uint32_t)data.length);
+	put32(cd, 0x02014b50), put16(cd, 3 << 8 | 20), put16(cd, 20), put16(cd, 0x0800), put16(cd, method);
+	put16(cd, 0), put16(cd, 0x21), put32(cd, crc), put32(cd, (uint32_t)body.length);
 	put32(cd, (uint32_t)data.length), put16(cd, (uint16_t)n.length), put16(cd, 0), put16(cd, 0), put16(cd, 0);
 	put16(cd, 0), put32(cd, (uint32_t)(S_IFREG | 0644) << 16), put32(cd, (uint32_t)*at);
 	[cd appendData:n];
-	*at += h.length + data.length;
+	*at += h.length + body.length;
 	(*count)++;
 	return YES;
 }

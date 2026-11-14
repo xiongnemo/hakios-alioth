@@ -258,9 +258,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# applications from IPAs, past installd (src/ipainstall.m; the job com.hakios.apps): lsd registers them only
-		# for a caller with its entitlements, and its Info.plist lets it fetch IPAs from the computer over http
+		# for a caller with its entitlements, and its Info.plist lets it fetch IPAs from the computer over http;
+		# src/adhoc_sign.c signs what it installs (an unsigned/decrypted app's entitlements, 2026-11-15)
 		$DYN -fobjc-arc -framework Foundation -framework MobileCoreServices -lz \
-			-sectcreate __TEXT __info_plist src/ipainstall-Info.plist -o obj/ipainstall src/ipainstall.m &&
+			-sectcreate __TEXT __info_plist src/ipainstall-Info.plist -o obj/ipainstall src/ipainstall.m \
+			src/adhoc_sign.c &&
 			{ ${LDID:-ldid} -Ssrc/ipainstall.entitlements obj/ipainstall 2>/dev/null ||
 			  echo "build.sh: no ldid: ipainstall is unsigned, and lsd will not register applications for it"; }
 		# Location Services' own switch on at every boot (src/loc_enable.m, the job com.hakios.location): nothing sets
