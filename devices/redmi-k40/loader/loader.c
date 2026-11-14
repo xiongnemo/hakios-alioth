@@ -1185,17 +1185,17 @@ panel_dcs_write(const uint8_t *buf, uint32_t len)
 	return done ? 0 : -3;
 }
 
-/* DBV 175 (DCS 0x51, two bytes high first), where iOS starts and where the kernel leaves it on its way back */
+/* DBV 78 (DCS 0x51, two bytes high first), where iOS starts and where the kernel leaves it on its way back */
 static void
 panel_dim_for_loader(void)
 {
-	static const uint8_t bctrl[2] = { 0x53, 0x20 }, dim[3] = { 0x51, 0x00, 0xaf };
+	static const uint8_t bctrl[2] = { 0x53, 0x20 }, dim[3] = { 0x51, 0x00, 0x4e };
 	int rc = panel_dcs_write(bctrl, 2);
 
 	if (rc == 0) {
 		rc = panel_dcs_write(dim, 3);
 	}
-	print(rc == 0 ? "display: the panel dimmed to DBV 175 for the loader's screen\n" :
+	print(rc == 0 ? "display: the panel dimmed to DBV 78 for the loader's screen\n" :
 	    "display: the panel's brightness left as the firmware set it (DSI0 said -%d)\n", (uint64_t)(-rc));
 }
 #endif

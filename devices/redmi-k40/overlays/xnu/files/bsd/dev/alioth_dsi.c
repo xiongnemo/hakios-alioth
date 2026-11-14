@@ -1060,7 +1060,7 @@ alioth_scan_source(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride)
  *
  * If the display was off when the run ended (the side button, then a test run's minutes up; or a panic meanwhile),
  * the panel is woken first and lit -- the display's off left 0 -- or nothing the loader draws is seen and the phone
- * looks dead in its loader (2026-11-02). Lit or awake, the panel is then set to DBV 175, where iOS starts (the
+ * looks dead in its loader (2026-11-02). Lit or awake, the panel is then set to DBV 78, where iOS starts (the
  * backlight's ALIOTH_BL_INIT): the loader's screen is still text that stays put for as long as nobody sends a
  * command, on an OLED, and iOS may have left the panel at any level (the owner, 2026-11-09: burn-in). One processor
  * is left, its interrupts off: no lock is taken and nothing printed (dsi_alone); the waits are loops; what happened
@@ -1073,7 +1073,7 @@ alioth_display_quiesce(void)
 {
 	if (mdss == 0) return;
 	if (dsi != NULL && !dsi_dead) {
-		static const uint8_t dim[] = { 0x51, 0x00, 0xaf };
+		static const uint8_t dim[] = { 0x51, 0x00, 0x4e };
 		const char *said = NULL;
 		int rc = 0;
 
@@ -1084,7 +1084,7 @@ alioth_display_quiesce(void)
 			    "alioth panel: THE PANEL DID NOT WAKE for the loader (the display was off at the run's end)\n";
 		}
 		if (rc == 0 && alioth_dsi_dcs_write(dim, 3, true, 0) != 0) {
-			said = "alioth panel: the loader's dim level (DBV 175) was not taken\n";
+			said = "alioth panel: the loader's dim level (DBV 78) was not taken\n";
 		}
 		for (; said != NULL && *said != 0; said++) {
 			loader_log_putc(*said);
