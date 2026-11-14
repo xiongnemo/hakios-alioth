@@ -260,8 +260,17 @@ struct hk_gnss_time {
 
 - (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error
 {
+	static unsigned said;
+
 	(void)manager;
-	say("gnss_feed: seed: no Wi-Fi location yet (%s)\n", error.localizedDescription.UTF8String ?: "?");
+	if (said++ < 6) {
+		say("gnss_feed: seed: no Wi-Fi location yet (%s %ld)\n", error.domain.UTF8String ?: "?", (long)error.code);
+	}
+}
+
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager
+{
+	say("gnss_feed: seed: the bundle's authorization is now %d\n", (int)manager.authorizationStatus);
 }
 
 @end
@@ -281,19 +290,34 @@ seed_start(void)
 		say("gnss_feed: seed: no %s: no seed position\n", SEED_BUNDLE);
 		return;
 	}
-	if ([cl respondsToSelector:authorize]) {
-		((void (*)(id, SEL, BOOL, id))objc_msgSend)(cl, authorize, YES, path);
-	}
 	if (![cl instancesRespondToSelector:init]) {
 		say("gnss_feed: seed: CoreLocation has no initWithEffectiveBundlePath:delegate:onQueue: here\n");
 		return;
 	}
 	seed_source = [HKSeed new];
 	dispatch_async(queue, ^{
+		/*
+		 * (round 70: authorized BEFORE the manager existed -> kCLErrorDomain 1, denied) The manager first -- locationd
+		 * knows the bundle as a client from then on -- then its authorization, "always" by type (3) and by the BOOL
+		 * call, then what locationd says it is, then the updates.
+		 */
 		CLLocationManager *m = ((id (*)(id, SEL, id, id, id))objc_msgSend)([CLLocationManager alloc], init, path,
 		    seed_source, queue);
+		SEL by_type = sel_registerName("setAuthorizationStatusByType:forBundlePath:");
+		SEL status_for = sel_registerName("authorizationStatusForBundlePath:");
 
 		seed_source.manager = m;
+		if ([cl respondsToSelector:by_type]) {
+			((void (*)(id, SEL, int, id))objc_msgSend)(cl, by_type, 3, path);
+		}
+		if ([cl respondsToSelector:authorize]) {
+			((void (*)(id, SEL, BOOL, id))objc_msgSend)(cl, authorize, YES, path);
+		}
+		usleep(500000);
+		if ([cl respondsToSelector:status_for]) {
+			say("gnss_feed: seed: locationd says the bundle's authorization is %d (3 always, 4 when in use)\n",
+			    ((int (*)(id, SEL, id))objc_msgSend)(cl, status_for, path));
+		}
 		m.desiredAccuracy = kCLLocationAccuracyHundredMeters;
 		[m startUpdatingLocation];
 		say("gnss_feed: seed: asking iOS for its Wi-Fi location (as %s)\n", SEED_BUNDLE);
