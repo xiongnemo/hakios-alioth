@@ -9,7 +9,10 @@
  * forBundleIdentifier:, the entitlement com.apple.locationd.authorizeapplications) -- so that an automated round
  * never meets the location alert, a SYSTEM alert that stays on top of every application until it is answered (it
  * covered the night round's screenshots and measurements). Waits up to 15 minutes for them to be installed.
- * usage: loc_enable [1|0] [BUNDLE-ID ...]   (no argument: 1)
+ * --tcc (test roots too): the same applications also get the privacy prompts a round meets answered yes -- camera,
+ * microphone, photos (read, add) -- through tccd as Settings' privacy switches do (TCCAccessSetForBundleId, the
+ * entitlement com.apple.private.tcc.manager): Nagram's photo picker, the round that measures it, asks for both.
+ * usage: loc_enable [1|0] [--tcc] [BUNDLE-ID ...]   (no argument: 1)
  */
 #import <CoreLocation/CoreLocation.h>
 #import <Foundation/Foundation.h>
@@ -31,9 +34,40 @@
 
 #define ALLOWED_WHEN_IN_USE 4           /* (kCLAuthorizationStatusAuthorizedWhenInUse) */
 
-/* each of IDS allowed location "while using" once it is installed; 0 when all are */
+/* camera, microphone, photos: TCC's answers for BID set to yes (TCC.framework, private; looked up at run time) */
+static void
+tcc_allow(NSString *bid)
+{
+	typedef Boolean (*set_fn)(CFStringRef service, CFStringRef bundle_id, Boolean granted);
+	static set_fn set;
+	static const char *services[] = { "kTCCServiceCamera", "kTCCServiceMicrophone", "kTCCServicePhotos",
+		"kTCCServicePhotosAdd" };
+	char said[256] = "";
+
+	if (set == NULL) {
+		void *tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_NOW);
+
+		set = tcc ? (set_fn)dlsym(tcc, "TCCAccessSetForBundleId") : NULL;
+		if (set == NULL) {
+			printf("loc_enable: no TCCAccessSetForBundleId here\n");
+			return;
+		}
+	}
+	for (size_t i = 0; i < sizeof(services) / sizeof(services[0]); i++) {
+		CFStringRef service = CFStringCreateWithCString(NULL, services[i], kCFStringEncodingUTF8);
+		Boolean ok = set(service, (__bridge CFStringRef)bid, true);
+
+		CFRelease(service);
+		snprintf(said + strlen(said), sizeof(said) - strlen(said), " %s %s", services[i] + 11, ok ? "yes" : "REFUSED");
+	}
+	printf("loc_enable: %s privacy:%s\n", bid.UTF8String, said);
+	fflush(stdout);
+}
+
+/* each of IDS allowed location "while using" once it is installed (and, with TCC, its privacy prompts answered);
+   0 when all are */
 static int
-allow(NSMutableArray<NSString *> *ids)
+allow(NSMutableArray<NSString *> *ids, BOOL tcc)
 {
 	Class proxy;
 
@@ -56,6 +90,9 @@ allow(NSMutableArray<NSString *> *ids)
 			printf("loc_enable: %s allowed location while in use (status now %d) after %d s\n", bid.UTF8String, now,
 			    waited);
 			fflush(stdout);
+			if (tcc) {
+				tcc_allow(bid);
+			}
 			[ids removeObject:bid];
 		}
 		if (ids.count > 0) {
@@ -96,11 +133,16 @@ main(int argc, char **argv)
 		}
 		if (want && argc > 2) {
 			NSMutableArray<NSString *> *ids = [NSMutableArray array];
+			BOOL tcc = NO;
 
 			for (int i = 2; i < argc; i++) {
-				[ids addObject:@(argv[i])];
+				if (strcmp(argv[i], "--tcc") == 0) {
+					tcc = YES;
+				} else {
+					[ids addObject:@(argv[i])];
+				}
 			}
-			return allow(ids);
+			return allow(ids, tcc);
 		}
 		return 0;
 	}

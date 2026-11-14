@@ -9,5 +9,8 @@
 	<true/>
 	<key>com.apple.locationd.authorizeapplications</key>
 	<true/>
+	<!-- tccd's: setting an application's privacy answers, as Settings does (loc_enable --tcc, test roots) -->
+	<key>com.apple.private.tcc.manager</key>
+	<true/>
 </dict>
 </plist>
