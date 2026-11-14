@@ -498,6 +498,8 @@ extern int64_t xpc_int64_get_value(hk_xpc_t);
 extern uint64_t xpc_uint64_get_value(hk_xpc_t);
 extern void xpc_release(hk_xpc_t);
 extern void *xpc_retain(hk_xpc_t);
+extern void xpc_connection_cancel(hk_xpc_t);
+extern const char *xpc_dictionary_get_string(hk_xpc_t, const char *);
 
 static unsigned old_requests, old_said;
 
@@ -516,6 +518,14 @@ old_request(hk_xpc_t peer, hk_xpc_t message)
 		__block char *k = keys;
 
 		proc_name(xpc_connection_get_pid(peer), who, sizeof(who));
+		{
+			/* (the request's NAME -- a protocol identifier, not anyone's data -- is the one string said) */
+			const char *request = xpc_dictionary_get_string(message, "kRequest");
+
+			if (request != NULL) {
+				used += (size_t)snprintf(k, sizeof(keys), "kRequest=%s ", request);
+			}
+		}
 		xpc_dictionary_apply(message, ^bool(const char *key, hk_xpc_t value) {
 			const void *t = xpc_get_type(value);
 			char one[96];
@@ -551,7 +561,23 @@ old_service(void)
 		return;
 	}
 	xpc_connection_set_event_handler(listener, ^(hk_xpc_t peer) {
+		char who[64] = "";
+
 		if (xpc_get_type(peer) != &_xpc_type_connection) {
+			return;
+		}
+		/*
+		 * (round 59: empty replies to EVERY client kept iOS's picture off the screen) Settings alone is answered, to learn
+		 * what its Cellular pane asks; anyone else's connection is cancelled at once -- an immediate error, as close to
+		 * "no such service" as a registered name allows.
+		 */
+		proc_name(xpc_connection_get_pid(peer), who, sizeof(who));
+		if (strcmp(who, "Preferences") != 0) {
+			xpc_connection_set_event_handler(peer, ^(hk_xpc_t event) {
+				(void)event;
+			});
+			xpc_connection_resume(peer);
+			xpc_connection_cancel(peer);
 			return;
 		}
 		xpc_retain(peer);
