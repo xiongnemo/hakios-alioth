@@ -12,6 +12,7 @@
  * "no SIM, no network", which is the truth. One thing more: the mobile equipment information (CTMobileEquipmentInfo:
  * the IMEI), from the kernel (root-only sysctl kern.hakios.mdm_imei: what the modem's DMS gave), for a client that
  * holds CommCenter's "identity" entitlement (Settings does) and no other -- as CommCenter itself does.
+ * And CTCellularPlanManager's service (com.apple.CellularPlanDaemon.xpc, CommCenter's too): no plans (plan_service).
  *
  * NOT DONE, ON PURPOSE: nothing about activation, the SIM, a network or a carrier is made up. The IMEI is never
  * written anywhere: /var/tmp/hk_telephony.log has which requests came and from whom, and whether the IMEI was given.
@@ -20,6 +21,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -172,27 +174,41 @@ class_named(const char *type)
 	return a && b ? [[NSString alloc] initWithBytes:a + 1 length:(NSUInteger)(b - a - 1) encoding:NSUTF8StringEncoding] : nil;
 }
 
+/*
+ * (2026-11-14, round 69: the Cellular pane stayed empty) Settings' last questions there, both answered ENXIO until
+ * now -- and SettingsCellularUI logs "Embedded SIM config error: %@" / "Error with checking setup eSIM: %@" / "No
+ * cellular plans shown". The true answers are a plain NO with no error: this phone has a SIM slot and no eSIM, and
+ * there is no eSIM to set up.
+ */
+static BOOL
+plain_no(NSString *name)
+{
+	return [name isEqualToString:@"isEmbeddedSIMOnlyConfig:"] || [name isEqualToString:@"needToLaunchSetUpeSIMWithCompletion:"];
+}
+
 @interface HKAnswer : NSObject
 @property (nonatomic) BOOL identity;    /* the client may have the IMEI */
+@property (nonatomic) BOOL plain;       /* the plan service: empty collections, NO, and no error */
 @property (nonatomic, copy) NSString *client;
+@property (nonatomic, unsafe_unretained) Protocol *proto;
 @end
 
 @implementation HKAnswer
 
 static const char *
-types_for(SEL selector)
+types_for(Protocol *p, SEL selector)
 {
-	struct objc_method_description d = protocol_getMethodDescription(service, selector, YES, YES);
+	struct objc_method_description d = protocol_getMethodDescription(p, selector, YES, YES);
 
 	if (d.types == NULL) {
-		d = protocol_getMethodDescription(service, selector, NO, YES);
+		d = protocol_getMethodDescription(p, selector, NO, YES);
 	}
 	return d.types;
 }
 
 - (BOOL)respondsToSelector:(SEL)selector
 {
-	return [super respondsToSelector:selector] || types_for(selector) != NULL;
+	return [super respondsToSelector:selector] || types_for(self.proto, selector) != NULL;
 }
 
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
@@ -203,7 +219,7 @@ types_for(SEL selector)
 	if (s != nil) {
 		return s;
 	}
-	types = types_for(selector);
+	types = types_for(self.proto, selector);
 	return types ? [NSMethodSignature signatureWithObjCTypes:types] : nil;
 }
 
@@ -231,14 +247,14 @@ types_for(SEL selector)
 extern const char *_protocol_getMethodTypeEncoding(Protocol *p, SEL selector, BOOL required, BOOL instance);
 
 static NSArray<NSString *> *
-block_classes(SEL selector, unsigned which, const char **whole)
+block_classes(Protocol *proto, SEL selector, unsigned which, const char **whole)
 {
-	const char *ext = _protocol_getMethodTypeEncoding(service, selector, YES, YES), *p;
+	const char *ext = _protocol_getMethodTypeEncoding(proto, selector, YES, YES), *p;
 	NSMutableArray<NSString *> *out = [NSMutableArray array];
 	int arg = -1;
 
 	if (ext == NULL) {
-		ext = _protocol_getMethodTypeEncoding(service, selector, NO, YES);
+		ext = _protocol_getMethodTypeEncoding(proto, selector, NO, YES);
 	}
 	*whole = ext;
 	if (ext == NULL) {
@@ -318,11 +334,11 @@ block_classes(SEL selector, unsigned which, const char **whole)
 - (void)answer:(id)block for:(NSString *)name which:(unsigned)which
 {
 	const char *whole = NULL;
-	NSArray<NSString *> *classes = block_classes(NSSelectorFromString(name), which, &whole);
+	NSArray<NSString *> *classes = block_classes(self.proto, NSSelectorFromString(name), which, &whole);
 	const char *signature = _Block_signature((__bridge void *)block);
 	NSMethodSignature *s;
 	NSInvocation *call;
-	BOOL gave = NO, gave_slot = NO;
+	BOOL gave = NO, gave_slot = NO, plain = self.plain || plain_no(name);
 	NSString *imei = nil;
 	NSError *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENXIO userInfo:nil];
 
@@ -375,13 +391,28 @@ block_classes(SEL selector, unsigned which, const char **whole)
 			[call setArgument:&value atIndex:(NSInteger)i];
 			slot_given += keep != nil;
 			gave_slot = keep != nil;
-		} else if ([cls isEqualToString:@"NSError"] && !gave && !gave_slot) {
+		} else if (self.plain && ([cls isEqualToString:@"NSArray"] || [cls isEqualToString:@"NSDictionary"] ||
+		    [cls isEqualToString:@"NSSet"])) {
+			/* (no plans: an empty list, not none) */
+			keep = [cls isEqualToString:@"NSArray"] ? @[] : [cls isEqualToString:@"NSDictionary"] ? @{} : [NSSet set];
+			value = keep;
+			[call retainArguments];
+			[call setArgument:&value atIndex:(NSInteger)i];
+		} else if ([cls isEqualToString:@"NSError"] && !gave && !gave_slot && !plain) {
 			value = error;
 			[call setArgument:&value atIndex:(NSInteger)i];
 		}
 	}
 	[call retainArguments];
 	[call invoke];
+	if (plain) {
+		static unsigned plain_said;
+
+		if (plain_said++ < 40) {
+			say("hk_telephony: %s from %s answered plainly (NO / empty, no error): %s\n", name.UTF8String,
+			    self.client.UTF8String, whole ?: "(no extended type)");
+		}
+	}
 	if ([name containsString:@"MobileEquipment"]) {
 		static unsigned told;
 
@@ -430,6 +461,9 @@ block_classes(SEL selector, unsigned which, const char **whole)
 @end
 
 @interface HKListener : NSObject <NSXPCListenerDelegate>
+@property (nonatomic, unsafe_unretained) Protocol *proto;
+@property (nonatomic) BOOL plain;
+@property (nonatomic, copy) NSString *what;
 @end
 
 @implementation HKListener
@@ -462,12 +496,19 @@ name_of(pid_t pid)
 
 	(void)listener;
 	answer.client = name_of(c.processIdentifier);
-	answer.identity = has_identity(c);
-	c.exportedInterface = [NSXPCInterface interfaceWithProtocol:service];
+	if (self.proto == nil) {
+		say("hk_telephony: %s: a connection from %s refused (no protocol to answer with)\n", self.what.UTF8String,
+		    answer.client.UTF8String);
+		return NO;
+	}
+	answer.identity = !self.plain && has_identity(c);
+	answer.proto = self.proto;
+	answer.plain = self.plain;
+	c.exportedInterface = [NSXPCInterface interfaceWithProtocol:self.proto];
 	c.exportedObject = answer;
 	[c resume];
 	if (++connections <= 60) {
-		say("hk_telephony: connection %u from %s%s\n", connections, answer.client.UTF8String,
+		say("hk_telephony: connection %u to %s from %s%s\n", connections, self.what.UTF8String, answer.client.UTF8String,
 		    answer.identity ? " (may have the IMEI)" : "");
 	}
 	return YES;
@@ -623,6 +664,48 @@ methods_in(Protocol *p)
 	return total;
 }
 
+/*
+ * (2026-11-14, round 69) com.apple.CellularPlanDaemon.xpc -- CTCellularPlanManager's service (CellularPlanManager.framework;
+ * CommCenter serves it on an iPhone): opening the Cellular pane, Settings looked it up three times and found nothing
+ * ("failed lookup ... error = 3"), and the pane builds its groups from the plan items. Answered here with its own
+ * protocol (CTCellularPlanClient, the manager's remote interface) and nothing in it: no plans (empty lists), NO, no
+ * error -- an iPhone with no SIM and no eSIM. In the default rounds nobody else looked it up (round 71); anyone who
+ * does is logged. The name is registered by the job (com.hakios.telephony.plist): served whatever happens, a
+ * connection refused only when the protocol is missing.
+ */
+static void
+plan_service(void)
+{
+	static NSXPCListener *listener;
+	static HKListener *delegate;
+	Protocol *plan;
+	unsigned count = 0;
+	struct objc_method_description *m;
+	char some[300] = "";
+
+	(void)dlopen("/System/Library/PrivateFrameworks/CellularPlanManager.framework/CellularPlanManager", RTLD_LAZY);
+	plan = NSProtocolFromString(@"CTCellularPlanClient");
+	delegate = [HKListener new];
+	delegate.proto = plan;
+	delegate.plain = YES;
+	delegate.what = @"CellularPlanDaemon.xpc";
+	listener = mach_listener(@"com.apple.CellularPlanDaemon.xpc");
+	listener.delegate = delegate;
+	[listener resume];
+	if (plan != nil) {
+		/* (some of its methods, to see it is the service's side: planItemsWithCompletion: and the like) */
+		m = protocol_copyMethodDescriptionList(plan, YES, YES, &count);
+		for (unsigned i = 0; i < count && strlen(some) < sizeof(some) - 60; i++) {
+			strlcat(some, sel_getName(m[i].name), sizeof(some));
+			strlcat(some, " ", sizeof(some));
+		}
+		free(m);
+	}
+	say("hk_telephony: answering com.apple.CellularPlanDaemon.xpc: %s (%u methods; %u required, some: %s)\n",
+	    plan ? "CTCellularPlanClient, no plans" : "NO CTCellularPlanClient protocol -- connections refused",
+	    plan ? methods_in(plan) : 0, count, some);
+}
+
 int
 main(void)
 {
@@ -652,10 +735,13 @@ main(void)
 			say("hk_telephony: NSXPCListener has no initWithMachServiceName: here\n");
 			return 1;
 		}
+		delegate.proto = service;
+		delegate.what = @"coretelephony.xpc";
 		listener.delegate = delegate;
 		[listener resume];
 		say("hk_telephony: answering com.apple.commcenter.coretelephony.xpc (%u methods in CTXPCServiceInterface and the "
 		    "protocols it takes in); the modem's IMEI %s\n", methods_in(service), modem_imei() ? "is there" : "is not there yet");
+		plan_service();
 		[NSRunLoop.mainRunLoop run];
 	}
 	return 0;

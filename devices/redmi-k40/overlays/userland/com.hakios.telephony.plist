@@ -15,6 +15,9 @@
 	<dict>
 		<key>com.apple.commcenter.coretelephony.xpc</key>
 		<true/>
+		<!-- CTCellularPlanManager's (round 69: the Cellular pane looked it up and found nothing): no plans -->
+		<key>com.apple.CellularPlanDaemon.xpc</key>
+		<true/>
 	</dict>
 	<key>StandardOutPath</key>
 	<string>/dev/console</string>
