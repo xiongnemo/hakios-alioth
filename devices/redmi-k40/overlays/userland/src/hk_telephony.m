@@ -500,6 +500,8 @@ extern void xpc_release(hk_xpc_t);
 extern void *xpc_retain(hk_xpc_t);
 extern void xpc_connection_cancel(hk_xpc_t);
 extern const char *xpc_dictionary_get_string(hk_xpc_t, const char *);
+extern hk_xpc_t xpc_dictionary_get_value(hk_xpc_t, const char *);
+extern void xpc_dictionary_set_bool(hk_xpc_t, const char *, bool);
 
 static unsigned old_requests, old_said;
 
@@ -546,6 +548,17 @@ old_request(hk_xpc_t peer, hk_xpc_t message)
 	}
 	reply = xpc_dictionary_create_reply(message);
 	if (reply != NULL) {
+		const char *request = xpc_dictionary_get_string(message, "kRequest");
+
+		/*
+		 * (round 68: opening the Cellular pane, Settings asked kRadioModuleGetProperty for kRadioModuleIsDead and the pane
+		 * stayed empty on an empty reply) The radio module -- the SDX55 -- is alive: kRadioModuleIsDead = false, the
+		 * property under its own key. The one real answer so far; everything else stays empty.
+		 */
+		if (request != NULL && strcmp(request, "kRadioModuleGetProperty") == 0 &&
+		    xpc_dictionary_get_value(message, "kRadioModuleIsDead") != NULL) {
+			xpc_dictionary_set_bool(reply, "kRadioModuleIsDead", false);
+		}
 		xpc_connection_send_message(peer, reply);
 		xpc_release(reply);
 	}
