@@ -2,6 +2,10 @@
 
 [English](README.md) · 中文
 
+> **欢迎提 issue，但不接受 PR。** 发现问题、有疑问，或者知道某处该怎么改，欢迎开
+> [issue](https://github.com/xiongnemo/hakios-alioth/issues)，也欢迎在 issue 里提出改法（文字描述或 diff 都行）。
+> 由于这个移植的开发方式，无法接受任何 PR，所以本仓库关闭了 PR 功能。
+
 在 Redmi K40 / POCO F3（`alioth`，骁龙 870）上运行原版 iOS 16.5（20F66）用户空间，底层是开源的 XNU 内核，
 配上我们自己的引导程序和驱动。这是 [HakiOS](https://github.com/oosexgang/hakios-os) 在这台手机上的移植，
 以同一 SoC 家族的小米 10 移植（[hackios-xnu-kernel-umi](https://github.com/JopangJovan/hackios-xnu-kernel-umi)）为基础。
