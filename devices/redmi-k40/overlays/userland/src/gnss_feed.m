@@ -144,7 +144,7 @@ f64(uint64_t bits)
 /*
  * XTRA (boot-arg mdm_xtra=1: kern.hakios.gnss_xtra reads 1): Qualcomm's predicted orbits, the file Android's
  * xtra-daemon fetches, from its servers over Wi-Fi, written to the kernel, which gives it to the modem's engine (QMI LOC
- * 0x35): a first fix in minutes instead of 6-13 (rounds 35-37). Tried every 15 s while the network comes up.
+ * 0x35): a first fix in minutes instead of 6-13 (rounds 35-37). Tried every 3 s while the network comes up (round 71:\n * with every assistance the fix came 1.6 s after the last of them -- the network coming up is what is waited for).
  */
 static void
 xtra_fetch(const char *name)
@@ -160,7 +160,7 @@ xtra_fetch(const char *name)
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		NSArray<NSString *> *hosts = @[ @"xtrapath1", @"xtrapath2", @"xtrapath3" ];
 
-		for (int attempt = 0; attempt < 60; attempt++) {
+		for (int attempt = 0; attempt < 300; attempt++) {
 			NSString *host = hosts[(NSUInteger)attempt % hosts.count];
 			NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@.izatcloud.net/%@", host, file]];
 			NSURLSessionConfiguration *c = NSURLSessionConfiguration.ephemeralSessionConfiguration;
@@ -190,11 +190,11 @@ xtra_fetch(const char *name)
 				return;
 			}
 			if (attempt < 3 || attempt % 10 == 0) {
-				say("gnss_feed: XTRA: %s: %s (try %d; again in 15 s)\n", host.UTF8String,
+				say("gnss_feed: XTRA: %s: %s (try %d; again in 3 s)\n", host.UTF8String,
 				    failure ? failure.UTF8String : [NSString stringWithFormat:@"HTTP %ld, %lu bytes", (long)code,
 				    (unsigned long)body.length].UTF8String, attempt + 1);
 			}
-			sleep(15);
+			sleep(3);
 		}
 		say("gnss_feed: XTRA: not fetched; the engine goes on without it\n");
 	});
@@ -382,7 +382,7 @@ static void
 time_fetch(void)
 {
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-		for (int attempt = 0; attempt < 40; attempt++) {
+		for (int attempt = 0; attempt < 200; attempt++) {
 			struct hk_gnss_time t = { 0 };
 
 			if (sntp_once("time.apple.com", &t)) {
@@ -392,7 +392,7 @@ time_fetch(void)
 				}
 				return;
 			}
-			sleep(15);
+			sleep(3);
 		}
 		say("gnss_feed: time: no answer from time.apple.com\n");
 	});
