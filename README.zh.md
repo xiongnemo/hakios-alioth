@@ -110,7 +110,9 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 |---|---|
 | 显示 | 120 Hz（面板 TE 每 8.2 ms 一次）；亮度；深色模式；自动旋转 |
 | 辅助功能 | 辅助触控（悬浮按钮、菜单、从菜单打开控制中心）；粗体文本；智能反转和经典反转；色彩滤镜（灰度、色盲滤镜、色调）；夜览；根据环境光的自动亮度。颜色效果由显示引擎的颜色校正实现，和真 iPhone 一样 |
-| 图形 | 系统合成和 App 都通过 Mesa（freedreno）在 Adreno 650 上渲染：OpenGL ES 1、2、3，GLKit、SceneKit、SpriteKit、Core Image；PVRTC 纹理由处理器解码；每个进程独立的 GPU 地址空间 |
+| 图形 | 系统合成和 App 都通过 Mesa（freedreno）在 Adreno 650 上渲染：OpenGL ES 1、2、3，GLKit、SceneKit、SpriteKit、Core Image；PVRTC 纹理由处理器解码；每个进程独立的 GPU 地址空间；GPU 卡死约 2 秒后自动复位 |
+| Metal | 自己装的 App 可以用 Metal（这个移植自己的驱动，跑在 Adreno 650 上）：Map 用 Metal 约 60 帧，SceneKit、SpriteKit、Core Image、Flutter 都能走 Metal；System Check 的 64 项 Metal 测试通过 61 项 |
+| 基带和 GPS | 外置的骁龙 X55 基带开机由内核通过 PCIe 启动（MHI、Sahara、QRTR、QMI）。GPS、北斗、GLONASS、Galileo、QZSS 定位交给 iOS 的定位服务，所有 App 都能用；辅助定位（网络时间、XTRA 星历、Wi-Fi 粗定位）下第一次定位 41–63 秒。「关于本机」显示 IMEI，设置里有「蜂窝网络」。不插 SIM 卡 |
 | 输入 | 多点触摸、电源键和音量键、振动 |
 | 声音 | 扬声器（CS35L41）、麦克风（语音备忘录能录音） |
 | Wi-Fi | 自动连接构建时写入的网络，优先 5 GHz |
@@ -119,23 +121,22 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 | 手电筒 | 从控制中心打开 |
 | 电源 | 电量显示和充电；处理器和 GPU 按负载调频；熄屏时面板睡眠 |
 | 传感器 | 通过传感器 DSP 提供环境光、加速度计、陀螺仪、姿态、指南针（有定位时为真北） |
-| 定位 | 通过苹果定位服务进行 Wi-Fi 定位 |
+| 定位 | 基带的 GPS（见上），以及通过苹果定位服务的 Wi-Fi 定位 |
 | USB | 电脑把手机识别为 iPhone：配对（「信任此电脑」）、通过 AFC 传文件 |
-| App | 未签名、已解密的 IPA 可以在启动时由电脑安装，或用手机上的安装器安装 |
+| App | 未签名、已解密的 IPA 可以在启动时由电脑安装，或用手机上的安装器安装；App 的数据（比如登录状态）可以存到电脑上，下次启动装好它以后放回去 |
 
-为这个移植写的 App：[GPU Check](https://github.com/xiongnemo/ios-gpu-check)、
-[Sensor Check](https://github.com/xiongnemo/ios-sensor-check)、[Motion Test](https://github.com/xiongnemo/ios-motion-test)
-和 [Map](https://github.com/xiongnemo/ios-map)（OpenStreetMap 地图；苹果地图需要 Metal）。IPA 在各个仓库的 Releases 页面。
+为这个移植写的 App：[System Check](https://github.com/xiongnemo/ios-system-check)（原来的 GPU Check、Sensor Check、
+Motion Test 合成一个，加上 Metal 和 GPS 页）和 [Map](https://github.com/xiongnemo/ios-map)（OpenStreetMap 地图）。
+IPA 在各个仓库的 Releases 页面。
 
 ## 还不能用的
 
-- **Metal**：需要 Metal 的 App 会打开就闪退（很多较新的 3D 游戏；需要 Metal 的苹果地图和测距仪已从系统镜像中去掉）。
-  OpenGL ES 可以用。
+- **Metal** 比 OpenGL ES 慢一些；系统自己的程序（桌面、合成）还用 OpenGL ES；Flutter 写的 App 偶尔打开后一直黑屏
+  （重开即可）；苹果地图和测距仪不在系统镜像里。
 - 辅助触控里的「主屏幕」点了还没反应（悬浮按钮、菜单、控制中心都能用）。
-- **数据保存**：iOS 在内存里运行，重启后设置、照片、装的 App 都会消失。
-- GPS、蜂窝网络、NFC、指纹、距离传感器。
-- GPU 卡死后的恢复：一个 App 让 GPU 卡住，整个屏幕都会停，只能重启手机。
-- 功耗：熄屏后面板会睡眠，但 GPU 和显示引擎还没有断电。
+- **数据保存**：iOS 在内存里运行，重启后设置、照片、装的 App 都会消失（App 自己的数据可以存到电脑上，见上）。
+- 蜂窝网络（插 SIM 卡的通话、短信、移动数据）、NFC、指纹、距离传感器。
+- 功耗：熄屏后面板睡眠、GPU 断电，但显示引擎还没有断电。
 
 各部分怎么实现、测到了什么、接下来做什么：[docs/alioth/status.zh.md](docs/alioth/status.zh.md)。
 

@@ -36,8 +36,9 @@ The one-click release does all of this from a PC script; development runs do it 
 | Battery | The fuel gauge: level and charging state | Works |
 | USB | DWC3 in device mode: a serial port for development, or an iPhone with Apple's usbmux for the PC (pairing, AFC) | Works, the cable pulled and put back too |
 | CPU | Frequency scaling by load (every 20 ms, full speed at a touch) and thermal limits on seven cores | Works |
-| Modem | The external SDX55 over PCIe: its boot loader refuses the image after authentication | Not working |
-| GPS, NFC, fingerprint, proximity | — | Not started |
+| Modem | The external SDX55 over PCIe: powered on from the PMIC and GPIOs, its boot loader fed over MHI's BHI (MSI on first, or its PBL refuses the image), then Sahara (12 images), mission mode, QRTR (64 services), the AP's TFTP server for its configuration files, DMS (the IMEI, kept off every log) and online. A launchd job answers CoreTelephony in CommCenter's place, so About shows the IMEI and Settings its Cellular row. Boot-args `dt_baseband=1 mdm_step=6 mdm_msi=1 mdm_loc=1 mdm_opmode=0 mdm_listen=86400`; it needs the phone's modem partitions and the modem configuration from Xiaomi's ROM, which a kit package does not copy yet | Works without a SIM |
+| GPS | QMI LOC: a GNSS session of our own (GPS, BeiDou, GLONASS, Galileo, QZSS), with the time, XTRA predicted orbits and a Wi-Fi position injected; the fixes go to iOS's location services (CoreLocation's simulation path), the satellites to apps through `sysctl kern.hakios.gnss`. First fix: 716 s with no help, 41–63 s with all of it | Works |
+| NFC, fingerprint, proximity | — | Not started |
 
 ## User space
 

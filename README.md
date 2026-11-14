@@ -115,7 +115,9 @@ Each item has been checked on the phone.
 |---|---|
 | Display | 120 Hz (the panel's TE every 8.2 ms); brightness; dark mode; rotation |
 | Accessibility | AssistiveTouch (the button, its menu, Control Center from it); Bold Text; Smart and Classic Invert; Color Filters (grayscale, the colour-blindness filters, tint); Night Shift; Auto-Brightness from the ambient light sensor. The colour effects are made by the display engine's colour correction, as on an iPhone |
-| Graphics | The compositor and applications on the Adreno 650 through Mesa (freedreno): OpenGL ES 1, 2 and 3, GLKit, SceneKit, SpriteKit, Core Image; PVRTC textures decoded on the CPU; a GPU address space per process |
+| Graphics | The compositor and applications on the Adreno 650 through Mesa (freedreno): OpenGL ES 1, 2 and 3, GLKit, SceneKit, SpriteKit, Core Image; PVRTC textures decoded on the CPU; a GPU address space per process; a hung GPU is reset after about 2 s |
+| Metal | Installed apps get a Metal device (this port's own driver, on the Adreno 650): Map draws with Metal at about 60 fps; SceneKit, SpriteKit, Core Image and Flutter run on it; System Check passes 61 of its 64 Metal tests |
+| Modem and GPS | The external Snapdragon X55 modem is booted by the kernel over PCIe (MHI, Sahara, QRTR, QMI). GPS, BeiDou, GLONASS, Galileo and QZSS fixes go into iOS's location services, for every app; with assistance (network time, XTRA orbits, a Wi-Fi position) the first fix comes in 41–63 s. About shows the IMEI; Settings has its Cellular row. No SIM |
 | Input | Touch screen with multitouch, power and volume buttons, vibration |
 | Sound | Speakers (CS35L41), microphone (Voice Memos records) |
 | Wi-Fi | Joins the network configured at build time, 5 GHz preferred |
@@ -124,24 +126,24 @@ Each item has been checked on the phone.
 | Flashlight | From Control Center |
 | Power | Battery level and charging; the cores' and the GPU's speed follow the load; the panel sleeps with the screen off |
 | Sensors | Ambient light, accelerometer, gyroscope, device motion, compass (true north with location) through the sensor DSP |
-| Location | Wi-Fi positioning through Apple's location service |
+| Location | The modem's GPS (above), and Wi-Fi positioning through Apple's location service |
 | USB | The PC sees an iPhone: pairing ("Trust This Computer"), files over AFC |
-| Apps | Unsigned, decrypted IPAs install from the PC at boot or with the on-phone installer |
+| Apps | Unsigned, decrypted IPAs install from the PC at boot or with the on-phone installer; an app's data (a login, say) can be saved to the PC and is put back when it is installed at the next boot |
 
-Apps written for this port: [GPU Check](https://github.com/xiongnemo/ios-gpu-check),
-[Sensor Check](https://github.com/xiongnemo/ios-sensor-check), [Motion Test](https://github.com/xiongnemo/ios-motion-test)
-and [Map](https://github.com/xiongnemo/ios-map) (OpenStreetMap; Apple Maps needs Metal). Their IPAs are on each repository's
-Releases page.
+Apps written for this port: [System Check](https://github.com/xiongnemo/ios-system-check) (GPU Check, Sensor Check and
+Motion Test in one, with Metal and GPS tabs) and [Map](https://github.com/xiongnemo/ios-map) (OpenStreetMap). Their IPAs
+are on each repository's Releases page.
 
 ## Not yet
 
-- **Metal**: apps that need it close at once (many newer 3D games; Apple's Maps and Measure, which need it, are left out
-  of the system image). OpenGL ES works.
+- **Metal** is slower than OpenGL ES; the system's own programs (the home screen, the compositor) still use OpenGL ES;
+  a Flutter app now and then stays black when opened (opening it again helps); Apple's Maps and Measure are left out
+  of the system image.
 - AssistiveTouch's Home action does nothing yet (its button, menu and Control Center work).
-- **Persistence**: iOS runs from RAM, so settings, photos and installed apps are gone after a reboot.
-- GPS, cellular, NFC, fingerprint, the proximity sensor.
-- Recovery from a GPU hang: an app that hangs the GPU stops the whole screen until the phone is restarted.
-- Power: with the screen off the panel sleeps, but the GPU and the display engine stay powered.
+- **Persistence**: iOS runs from RAM, so settings, photos and installed apps are gone after a reboot (an app's own data
+  can be kept on the PC, above).
+- Cellular with a SIM (calls, SMS, mobile data), NFC, fingerprint, the proximity sensor.
+- Power: with the screen off the panel sleeps and the GPU is powered off, but the display engine stays powered.
 
 How each part works, what was measured and what comes next: [docs/alioth/status.md](docs/alioth/status.md).
 

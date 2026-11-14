@@ -35,8 +35,9 @@ Redmi K40 / POCO F3（`alioth`，骁龙 870 / SM8250）移植在 2026 年 11 月
 | 电池 | 电量计：电量和充电状态 | 能用 |
 | USB | 设备模式的 DWC3：开发用串口，或者带苹果 usbmux 的 iPhone（配对、AFC） | 能用，运行中拔插数据线也能恢复 |
 | CPU | 7 个核心按负载调频（每 20 ms 一次，触摸时立刻升满）和温控 | 能用 |
-| 基带 | 外置的 SDX55，走 PCIe：它的引导程序在校验之后拒绝镜像 | 不能用 |
-| GPS、NFC、指纹、距离传感器 | — | 还没开始 |
+| 基带 | 外置的 SDX55，走 PCIe：通过 PMIC 和 GPIO 上电，经 MHI 的 BHI 送入引导程序（要先打开 MSI，否则它的 PBL 拒绝镜像），然后 Sahara（12 个镜像）、进入 mission mode、QRTR（64 个服务）、应答它向 AP 要配置文件的 TFTP、DMS（读 IMEI，不进任何日志）、上线。一个 launchd 服务代替 CommCenter 回答 CoreTelephony，所以「关于本机」显示 IMEI，设置里有「蜂窝网络」。启动参数 `dt_baseband=1 mdm_step=6 mdm_msi=1 mdm_loc=1 mdm_opmode=0 mdm_listen=86400`；需要这台手机的基带分区和小米 ROM 里的基带配置，kit 打包时还不会复制它们 | 不插 SIM 卡时能用 |
+| GPS | QMI LOC：自己开一个 GNSS 会话（GPS、北斗、GLONASS、Galileo、QZSS），注入时间、XTRA 星历和 Wi-Fi 粗定位；定位结果交给 iOS 的定位服务（CoreLocation 的模拟定位通道），卫星数据通过 `sysctl kern.hakios.gnss` 给 App。第一次定位：没有辅助 716 秒，全部辅助 41–63 秒 | 能用 |
+| NFC、指纹、距离传感器 | — | 还没开始 |
 
 ## 用户空间
 
