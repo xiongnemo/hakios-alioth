@@ -4840,10 +4840,64 @@ tex_image_now(id self, SEL selector, IOSurfaceRef surface, unsigned long target,
 	if (!surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
+	} else {
+		gl_check(image);                        /* (glcheck=1 only) */
 	}
 	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
 	return YES;
+}
+
+/*
+ * (2026-11-14, boot-arg glcheck=1) Flutter Check's intermittent black launch: everything outside the GPU is as in a
+ * drawn launch (rounds 53-67). Here the render server's OWN GPU reads nine pixels (a 3 x 3 grid) of an application's
+ * full-screen surface texture just made in place -- through a framebuffer of its own, the bindings put back after --
+ * so a black launch shows whether the GPU sees the application's pixels at all. The first 12, then every 30th.
+ */
+static void
+gl_check(struct image *image)
+{
+	static int wanted = -1;
+	static unsigned seen, said;
+	GLint before = 0, texture = 0;
+	GLuint fbo = 0;
+	GLenum status;
+	unsigned nonzero = 0;
+	uint32_t middle = 0;
+
+	if (wanted < 0) {
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		wanted = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "glcheck=1") != NULL;
+	}
+	if (!wanted || image->width < 1000 || image->height < 2000 || image->target || said >= 80) {
+		return;
+	}
+	if (seen++ >= 12 && seen % 30 != 0) {
+		return;
+	}
+	said++;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &before);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, (GLuint)texture, 0);
+	status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	for (int i = 0; i < 9 && status == GL_FRAMEBUFFER_COMPLETE; i++) {
+		uint8_t px[4] = { 0 };
+
+		glReadPixels(image->width * (1 + i % 3) / 4, image->height * (1 + i / 3) / 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+		nonzero += (px[0] | px[1] | px[2] | px[3]) != 0;
+		if (i == 4) {
+			memcpy(&middle, px, 4);
+		}
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)before);
+	glDeleteFramebuffers(1, &fbo);
+	say("hakios-gl: glcheck: surface %u (%d x %d) as texture %d: the GPU reads %u of 9 pixels not 0, the middle %#010x "
+	    "(framebuffer %#x)\n", IOSurfaceGetID(image->surface), image->width, image->height, texture, nonzero, middle,
+	    status);
 }
 
 static BOOL
