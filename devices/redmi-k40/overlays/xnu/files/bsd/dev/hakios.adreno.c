@@ -3960,18 +3960,8 @@ hakios_gpu_map_in(void *space, uint64_t address, uint64_t phys, bool read_only)
 void
 hakios_gpu_mapped_in(void *space)
 {
-	struct gpu_space *s = space != NULL ? space : &core_space;
-	uint32_t context = smmu_context(&core_space);
-
-	space_commit(s);
-	/*
-	 * (2026-11-14, round 66) and after MAPPING too: the SMMU may hold a walk or an entry of an earlier mapping at that
-	 * address (Flutter Check's black launch was not cured by the unmap side alone: round 65, 3 of 8)
-	 */
-	wr(smmu.base + context + SMMU_CB_TLBIASID, s->context);
-	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
-	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
-	}
+	/* (an invalidate after mapping as well was tried, 2026-11-14 round 66: Flutter Check still black 1 in 8 -- not it) */
+	space_commit(space != NULL ? space : &core_space);
 }
 
 void
