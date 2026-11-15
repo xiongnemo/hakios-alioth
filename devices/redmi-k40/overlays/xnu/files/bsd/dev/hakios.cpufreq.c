@@ -614,7 +614,9 @@ ddr_look(void)
 			char name[9] = { 0 };
 
 			memcpy(name, entry[i].id, 8);
-			if (entry[i].length >= sizeof(aux) && slave->data_offset + entry[i].offset + sizeof(aux) < CMD_DB_SIZE - 0x40) {
+			/* (11-16, oosexgang 5429d38: the data starts after the header, so the header counts) */
+			if (entry[i].length >= sizeof(aux) &&
+			    sizeof(*db) + slave->data_offset + entry[i].offset + sizeof(aux) <= CMD_DB_SIZE) {
 				memcpy(&aux, db->data + slave->data_offset + entry[i].offset, sizeof(aux));
 			}
 			tell("ddr: BCM %-8s at %#x: unit %u, width %u, vcd %u (aux %u bytes)\n", name, entry[i].address, aux.unit,

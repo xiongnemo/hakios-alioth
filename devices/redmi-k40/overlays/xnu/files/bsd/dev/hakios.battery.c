@@ -75,12 +75,14 @@ extern void HakiosBatteryReport(const void *state, unsigned size);     /* iokit/
 void
 hakios_battery_report(const struct hakios_battery_state *b)
 {
-	int percent = (b->percent_hundredths + 50) / 100;
+	/* (11-16, oosexgang 5429d38: rounded in 64 bits -- a DSP value near INT32_MAX plus 50 would overflow an int, and a
+	 * full battery read 0%, a hot one cold) */
+	int percent = (int)(((int64_t)b->percent_hundredths + 50) / 100);
 
 	battery_soc_percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
 	battery_voltage_mv = b->voltage_uv / 1000;
 	battery_current_ma = b->current_ua / 1000;
-	battery_temperature_c = (b->temperature_hundredths + 50) / 100;
+	battery_temperature_c = (int)(((int64_t)b->temperature_hundredths + 50) / 100);
 	battery_present = b->present != 0;
 	battery_charger_present = b->external != 0;
 	battery_charging = b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */

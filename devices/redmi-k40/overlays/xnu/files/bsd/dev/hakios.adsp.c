@@ -404,6 +404,15 @@ smem_items(uint32_t partition, uint32_t cacheline, struct smem_item *found, unsi
 		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size) {
 			break;
 		}
+		/*
+		 * (11-16, oosexgang 5429d38) The DSP can write this header: padding larger than the item would make the size
+		 * below wrap to about 4 GB, and an item ending beyond its partition would send the readers out of the shared
+		 * memory. Stop at it.
+		 */
+		if (entry.padding_data > entry.size ||
+		    (uint64_t)at + sizeof(entry) + entry.padding_header + entry.size > header.size) {
+			break;
+		}
 		if (count < max) {
 			found[count].item = entry.item;
 			found[count].offset = partition + at + sizeof(entry) + entry.padding_header;
@@ -417,7 +426,9 @@ smem_items(uint32_t partition, uint32_t cacheline, struct smem_item *found, unsi
 	}
 	step_back = ((uint32_t)sizeof(entry) + cacheline - 1) & ~(cacheline - 1);
 	for (at = header.size - step_back; at > header.free_cached && at < header.size;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > at) {
+		/* (padding larger than the item would make the size below wrap to about 4 GB) */
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > at ||
+		    entry.padding_data > entry.size) {
 			break;
 		}
 		if (count < max) {
@@ -685,7 +696,8 @@ mailbox_open(void)
 	}
 	box = get(&aoss, "our mailbox", QMP_OUR_BOX);
 	size = get(&aoss, "our mailbox's size", QMP_OUR_BOX_SIZE);
-	if (size < QMP_MESSAGE + 4 || box < 0x3c || box + size > aoss.size || (box & 3)) {
+	/* (11-16, oosexgang 5429d38: box and size come from the always-on processor; "box + size" could wrap and pass) */
+	if (size < QMP_MESSAGE + 4 || box < 0x3c || box >= aoss.size || size > aoss.size - box || (box & 3)) {
 		printf("adsp: %u: our mailbox is not where a message fits\n", step);
 		return false;
 	}
@@ -899,12 +911,18 @@ rails(uint32_t level)
 		values[r] = (uint32_t)position;
 	}
 	need(&rsc);
-	lck_mtx_lock(&hakios_rsc_lock);
+	/* (11-16, oosexgang 5429d38) on a panic's way back to the loader no lock is taken: the other processors are stopped,
+	 * and one of them may hold this one for good -- the phone would hang instead of going back */
+	if (!leaving) {
+		lck_mtx_lock(&hakios_rsc_lock);
+	}
 	/* (the boot loader leaves the trigger set after its last request, done: idle is what the status says) */
 	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
 		printf("adsp: %u: TCS %u of the sequencer is busy (status %#x, control %#x): the rails are not asked\n", step, RPMH_TCS,
 		    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS), rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL));
-		lck_mtx_unlock(&hakios_rsc_lock);
+		if (!leaving) {
+			lck_mtx_unlock(&hakios_rsc_lock);
+		}
 		return false;
 	}
 	printf("adsp: %u: about to ask RPMh, through TCS %u, for lcx.lvl (%#x) = %u and lmx.lvl (%#x) = %u (level %u%s)\n", step,
@@ -937,7 +955,9 @@ rails(uint32_t level)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
-	lck_mtx_unlock(&hakios_rsc_lock);
+	if (!leaving) {
+		lck_mtx_unlock(&hakios_rsc_lock);
+	}
 	return done != 0;
 }
 
@@ -1131,9 +1151,13 @@ step_firmware(void)
 	image.header = header;
 	image.header_size = size;
 	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
-	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
-		printf("adsp: %u: fw/adsp.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, header[0],
-		    header[1], header[2], header[3], count, size);
+	/* (11-16, oosexgang 5429d38: a file of 1 to 4 bytes is shorter than what is compared and printed) */
+	uint8_t first[4] = { 0 };
+	memcpy(first, header, size < sizeof(first) ? size : sizeof(first));
+	if (size < 5 || memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size ||
+	    size > PAGE_SIZE) {
+		printf("adsp: %u: fw/adsp.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, first[0],
+		    first[1], first[2], first[3], count, size);
 		goto fail;
 	}
 	/* Qualcomm's relocatable MDTs use segment addresses relative to their lowest segment. PAS
@@ -1295,7 +1319,8 @@ our_item_find(void)
 {
 	uint32_t size = 0, at = smem_item(ITEM_SMP2P_OURS, &size);
 
-	return at != 0 && size >= sizeof(struct smp2p) ? at : 0;
+	/* (11-16, oosexgang 5429d38: the whole struct is written there unchecked -- it has to lie inside the SMEM window) */
+	return at != 0 && size >= sizeof(struct smp2p) && (uint64_t)at + sizeof(struct smp2p) <= SMEM_SIZE ? at : 0;
 }
 
 /* What Linux does when the DSP rings for SMP2P: agree on the features once, and answer a restart. */
@@ -2023,13 +2048,15 @@ glink_find(void)
 	uint32_t size = 0;
 
 	glink.descriptor = smem_item(ITEM_GLINK_DESCRIPTOR, &size);
-	if (glink.descriptor == 0 || size != 32) {
+	/* (11-16, oosexgang 5429d38: the descriptor and both queues are used unchecked: inside the SMEM window, all three) */
+	if (glink.descriptor == 0 || size != 32 || (uint64_t)glink.descriptor + size > SMEM_SIZE) {
 		return false;
 	}
 	glink.ours = smem_item(ITEM_GLINK_OUR_QUEUE, &glink.ours_size);
 	glink.theirs = smem_item(ITEM_GLINK_THEIR_QUEUE, &glink.theirs_size);
 	return glink.ours != 0 && glink.theirs != 0 && glink.ours_size >= 1024 && glink.theirs_size >= 1024 &&
-	       !(glink.ours_size & 7) && !(glink.theirs_size & 7);
+	       !(glink.ours_size & 7) && !(glink.theirs_size & 7) &&
+	       (uint64_t)glink.ours + glink.ours_size <= SMEM_SIZE && (uint64_t)glink.theirs + glink.theirs_size <= SMEM_SIZE;
 }
 
 static void
@@ -2037,7 +2064,7 @@ glink_reset(void)
 {
 	uint32_t size = 0, descriptor = smem_item(ITEM_GLINK_DESCRIPTOR, &size);
 
-	if (descriptor == 0 || size != 32) {
+	if (descriptor == 0 || size != 32 || (uint64_t)descriptor + size > SMEM_SIZE) {
 		printf("adsp: %u: GLINK's descriptor (item %u) is not there: nothing to reset\n", step, ITEM_GLINK_DESCRIPTOR);
 		return;
 	}
@@ -2145,6 +2172,11 @@ glink_offer(struct glink_channel *channel, uint32_t size)
 		return false;
 	}
 	if (channel->our_intents[i].data == NULL || channel->our_intents[i].size != size) {
+		/* (11-16, oosexgang 5429d38: a buffer of another size from an earlier run is given back first, not leaked) */
+		if (channel->our_intents[i].data != NULL) {
+			kfree_data(channel->our_intents[i].data, channel->our_intents[i].size);
+			channel->our_intents[i].data = NULL;
+		}
 		channel->our_intents[i].data = kalloc_data(size, Z_WAITOK | Z_ZERO);
 	}
 	if (channel->our_intents[i].data == NULL) {
@@ -2167,30 +2199,37 @@ glink_pump(void)
 	char name[33];
 
 	while (glink.up && !glink.broken) {
-		uint32_t waiting = glink_waiting(), length = sizeof(message);
+		uint32_t waiting = glink_waiting(), length;
+		/*
+		 * (11-16, oosexgang 5429d38) The length is worked out in 64 bits: the DSP writes the fields it comes from, and in
+		 * 32 bits a value such as 0xfffffff8 wrapped it to 0 -- the message was never taken out and this loop never ended
+		 * (with glink_lock held).
+		 */
+		uint64_t wide = sizeof(message);
 
 		if (waiting < sizeof(message)) {
 			return;
 		}
 		glink_peek(&message, 0, sizeof(message));
 		if (message.command == GLINK_OPEN) {
-			length += message.param2;
+			wide += message.param2;
 		} else if (message.command == GLINK_INTENT) {
-			length += 8 * message.param2;
+			wide += 8ull * message.param2;
 		} else if (message.command == GLINK_DATA || message.command == GLINK_DATA_MORE) {
 			if (waiting < 16) {
 				return;
 			}
 			glink_peek(words, 8, 8);
-			length = 16 + words[0];
+			wide = 16ull + words[0];
 		}
-		length = (length + 7) & ~7u;
-		if (length > glink.theirs_size - 8) {
-			printf("adsp: glink: A MESSAGE OF %u BYTES (%s %u %#x): not believed, and nothing more is read\n", length,
+		wide = (wide + 7) & ~7ull;
+		if (wide > glink.theirs_size - 8) {
+			printf("adsp: glink: A MESSAGE OF %llu BYTES (%s %u %#x): not believed, and nothing more is read\n", wide,
 			    glink_name(message.command), message.param1, message.param2);
 			glink.broken = true;
 			return;
 		}
+		length = (uint32_t)wide;
 		if (waiting < length) {
 			return;
 		}
@@ -2562,7 +2601,8 @@ qrtr_input(const uint8_t *data, uint32_t length)
 		printf("adsp: qrtr: %u bytes that are no datagram (they begin %#x)\n", length, length ? data[0] : 0);
 		return;
 	}
-	if (header.size == 0 || at + header.size > length) {
+	/* (11-16, oosexgang 5429d38: the datagram's size is the DSP's word -- compared as a difference, it cannot wrap) */
+	if (header.size == 0 || at > length || header.size > length - at) {
 		printf("adsp: qrtr: a datagram of %u bytes in a message of %u: dropped\n", header.size, length);
 		return;
 	}
@@ -2648,6 +2688,12 @@ apr_input(const uint8_t *data, uint32_t length)
 	header_length = ((header.field >> 4) & 0xf) * 4;
 	if (header_length < sizeof(header) || header_length > length) {
 		printf("adsp: apr: a header of %u bytes in a packet of %u: dropped\n", header_length, length);
+		return;
+	}
+	/* (11-16, oosexgang 5429d38) the packet's own size below its header would make the payload wrap to about 4 GB */
+	if ((header.size < length ? header.size : length) < header_length) {
+		printf("adsp: apr: a packet of %u bytes with a header of %u: dropped\n", header.size < length ? header.size : length,
+		    header_length);
 		return;
 	}
 	payload = (header.size < length ? header.size : length) - header_length;
