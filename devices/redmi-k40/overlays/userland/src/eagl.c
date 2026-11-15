@@ -821,7 +821,11 @@ surface_changed(struct eagl *e, struct image *image)
 	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
 	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
-	uint64_t lane[4] = { size, 0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull }, sum, word[4];
+	/* (the K40's, 11-16) four lanes as four scalars: as arrays (lane[4], word[4]) the -O1 build kept them on the stack
+	 * and every 8-byte word went through memory twice -- this loop was 12% of CoreAnimation's display thread in home
+	 * flicks (psample, round b7) once IOSurfaceWrapClientImage made CA's images surfaces copied here */
+	uint64_t l0 = size, l1 = 0x9e3779b97f4a7c15ull, l2 = 0xc2b2ae3d27d4eb4full, l3 = 0x165667b19e3779f9ull, sum;
+	uint64_t w0, w1, w2, w3;
 	size_t at;
 
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
@@ -833,18 +837,25 @@ surface_changed(struct eagl *e, struct image *image)
 	image->looked = e->frames + 1;
 	/* four sums side by side: one chain of multiplications held the loop to a third of the memory's speed */
 	for (at = 0; at + 32 <= size; at += 32) {
-		memcpy(word, base + at, 32);
-		for (unsigned k = 0; k < 4; k++) {
-			lane[k] = (lane[k] ^ word[k]) * 0x9e3779b97f4a7c15ull;
-			lane[k] ^= lane[k] >> 29;
-		}
+		memcpy(&w0, base + at, 8);
+		memcpy(&w1, base + at + 8, 8);
+		memcpy(&w2, base + at + 16, 8);
+		memcpy(&w3, base + at + 24, 8);
+		l0 = (l0 ^ w0) * 0x9e3779b97f4a7c15ull;
+		l1 = (l1 ^ w1) * 0x9e3779b97f4a7c15ull;
+		l2 = (l2 ^ w2) * 0x9e3779b97f4a7c15ull;
+		l3 = (l3 ^ w3) * 0x9e3779b97f4a7c15ull;
+		l0 ^= l0 >> 29;
+		l1 ^= l1 >> 29;
+		l2 ^= l2 >> 29;
+		l3 ^= l3 >> 29;
 	}
 	for (; at + 8 <= size; at += 8) {
-		memcpy(word, base + at, 8);
-		lane[0] = (lane[0] ^ word[0]) * 0x9e3779b97f4a7c15ull;
-		lane[0] ^= lane[0] >> 29;
+		memcpy(&w0, base + at, 8);
+		l0 = (l0 ^ w0) * 0x9e3779b97f4a7c15ull;
+		l0 ^= l0 >> 29;
 	}
-	sum = lane[0] ^ (lane[1] * 3) ^ (lane[2] * 5) ^ (lane[3] * 7);
+	sum = l0 ^ (l1 * 3) ^ (l2 * 5) ^ (l3 * 7);
 	if (sum == image->sum) {
 		return false;
 	}
