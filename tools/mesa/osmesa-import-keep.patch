@@ -1,0 +1,100 @@
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -71,6 +71,85 @@
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
+ 
++#ifdef GALLIUM_FREEDRENO
++#include <pthread.h>
++#include <string.h>
++#include <sys/sysctl.h>
++#include "util/os_time.h"
++#include "util/u_inlines.h"
++
++/*
++ * (the K40's, 11-16) The render server imports an application's surface at every frame (-texImageIOSurface: ->
++ * glEGLImageTargetTexture2DOES) and lets the texture -- and the buffer with it -- go before the next one: so the
++ * kernel made a new buffer of the surface every frame, entered its pages into the GPU's address space and took them
++ * out again (~115 a second a surface, TODO round 63). Keeping a reference to each surface's last import for a moment
++ * keeps its buffer open, and the next import gets the SAME handle from the kernel -- a surface that is a buffer of
++ * the client's already is that buffer again (hakios.gpu.cpp surfaceBuffer), decided by the surface object and not
++ * its ID -- which freedreno's handle table finds: nothing made, nothing mapped. An import not asked for again in
++ * KEEP_NS is let go (a dead surface, and a scan-out slot with it, is held no longer than that). Boot-arg
++ * gl_import_keep=1; off by default until measured.
++ */
++#define KEEP_MAX 32
++#define KEEP_NS 100000000ull
++static struct {
++   uint32_t surface;
++   struct pipe_resource *res;
++   uint64_t when;
++} kept[KEEP_MAX];
++static pthread_mutex_t kept_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static int
++import_keep_on(void)
++{
++   static int on = -1;
++
++   if (on < 0) {
++      char args[1024] = "";
++      size_t len = sizeof(args) - 1;
++
++      on = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "gl_import_keep=1") != NULL;
++   }
++   return on;
++}
++
++static void
++import_keep(struct pipe_resource *res, uint32_t surface)
++{
++   struct pipe_resource *gone[KEEP_MAX] = { NULL };
++   unsigned ngone = 0;
++   uint64_t now = os_time_get_nano();
++   int slot = -1, free_slot = -1, oldest = 0;
++
++   pthread_mutex_lock(&kept_lock);
++   for (int i = 0; i < KEEP_MAX; i++) {
++      if (kept[i].res && now - kept[i].when > KEEP_NS) {
++         gone[ngone++] = kept[i].res;
++         kept[i].res = NULL;
++      }
++      if (kept[i].res && kept[i].surface == surface)
++         slot = i;
++      else if (!kept[i].res && free_slot < 0)
++         free_slot = i;
++      if (kept[i].res && kept[oldest].res && kept[i].when < kept[oldest].when)
++         oldest = i;
++   }
++   if (slot < 0)
++      slot = free_slot >= 0 ? free_slot : oldest;
++   if (kept[slot].res != res) {
++      if (kept[slot].res)
++         gone[ngone++] = kept[slot].res;
++      kept[slot].res = NULL;
++      pipe_resource_reference(&kept[slot].res, res);
++   }
++   kept[slot].surface = surface;
++   kept[slot].when = now;
++   pthread_mutex_unlock(&kept_lock);
++   /* (let go outside the lock: the last reference closes a buffer, a call into the kernel) */
++   for (unsigned i = 0; i < ngone; i++)
++      pipe_resource_reference(&gone[i], NULL);
++}
++#endif
++
+ /*
+  * The memory of an IOSurface as a texture, to draw into and to draw with (Darwin on redwood):
+  * the kernel's GPU driver makes a buffer of the surface. NULL: the screen is not the GPU's, or
+@@ -101,7 +180,10 @@
+    handle.stride = s.row_bytes;
+    handle.offset = s.offset;
+    handle.size = s.size;
+-   return screen->resource_from_handle(screen, &templ, &handle, 0);
++   struct pipe_resource *res = screen->resource_from_handle(screen, &templ, &handle, 0);
++   if (res && import_keep_on())
++      import_keep(res, surface);
++   return res;
+ #else
+    return NULL;
+ #endif
