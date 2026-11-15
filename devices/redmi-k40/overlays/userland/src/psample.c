@@ -8,7 +8,8 @@
  *       report starts with the kernel's uptime ("@ 1234.5", as dmesg's stamps) for lining up with other logs
  *   psample threads PID|NAME [-t SECONDS]
  *       the same for the threads of one process, with their names
- *   psample stacks PID|NAME [-t SECONDS] [-i MICROSECONDS] [-d DEPTH] [-a] [-T WORD] [-o FILE]
+ *   psample stacks PID|NAME [-t SECONDS] [-i MICROSECONDS] [-d DEPTH] [-a] [-T WORD] [-o FILE] [-x PROGRAM ARG...]
+ *       (-x, last: a program started as the sampling starts and waited for -- rwtouch's taps driving the application)
  *       every -i (default 2000) for -t (default 10): the main thread (-a: every thread; -T: the threads whose name
  *       has WORD) held, its registers and its frame-pointer chain read, let go. Lines (to FILE, default stdout):
  *         psample 2 pid P name N interval I depth D uptime U timebase NUMER/DENOM
@@ -415,11 +416,66 @@ images(task_t task, FILE *out)
 	free(infos);
 }
 
+/*
+ * -x PROGRAM ARG...: started as the sampling starts (posix_spawn, the arguments as given), waited for at its end -- what
+ * an unattended round needs to drive the application while it is sampled (rwtouch's taps), because usbsh runs one
+ * command at a time and has no shell to put one in the background (11-16). Its pid and start are written into the
+ * file; a program still running 30 s after the sampling is asked to stop (SIGTERM).
+ */
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+extern char **environ;
+
+static pid_t
+start_alongside(char **xargv, FILE *out, double at_s)
+{
+	pid_t child = -1;
+	int e;
+
+	if (xargv == NULL || xargv[0] == NULL) {
+		return -1;
+	}
+	if ((e = posix_spawn(&child, xargv[0], NULL, NULL, xargv, environ)) != 0) {
+		fprintf(out, "# -x %s: %s\n", xargv[0], strerror(e));
+		fprintf(stderr, "psample: -x %s: %s\n", xargv[0], strerror(e));
+		return -1;
+	}
+	fprintf(out, "# -x started pid %d at %.3f s:", child, at_s);
+	for (char **a = xargv; *a; a++) {
+		fprintf(out, " %s", *a);
+	}
+	fputc('\n', out);
+	return child;
+}
+
+static void
+end_alongside(pid_t child, FILE *out)
+{
+	int status = 0;
+
+	if (child <= 0) {
+		return;
+	}
+	for (int waited = 0; waited < 300; waited++) {
+		if (waitpid(child, &status, WNOHANG) == child) {
+			fprintf(out, "# -x pid %d ended: %s %d\n", child, WIFEXITED(status) ? "exit" : "signal",
+			    WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
+			return;
+		}
+		usleep(100000);
+	}
+	kill(child, SIGTERM);
+	waitpid(child, &status, 0);
+	fprintf(out, "# -x pid %d still running 30 s after the sampling: stopped\n", child);
+}
+
 struct seen { uint64_t tid; bool picked; };
 
 static int
-stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char *word, FILE *out)
+stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char *word, char **xargv, FILE *out)
 {
+	pid_t alongside;
 	task_t task = task_of(pid);
 	static struct seen seen[MAX_THREADS];
 	static uint64_t pcs[MAX_DEPTH + 2];
@@ -437,6 +493,7 @@ stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char 
 	t0 = mach_absolute_time();
 	end = t0 + (uint64_t)((double)seconds * 1e9 * tb.denom / tb.numer);
 	next = t0;
+	alongside = start_alongside(xargv, out, 0);
 	while (mach_absolute_time() < end) {
 		thread_act_array_t list;
 		mach_msg_type_number_t n;
@@ -522,6 +579,7 @@ stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char 
 		}
 	}
 	images(task, out);
+	end_alongside(alongside, out);
 	fprintf(out, "end %u %.0f %.0f\n", stops, abs_to_s(held) * 1e6, abs_to_s(mach_absolute_time() - t0) * 1e6);
 	fprintf(stderr, "psample: %s (%d): %u stops in %.1f s, threads held %.1f ms in all\n", pname, pid, stops,
 	    abs_to_s(mach_absolute_time() - t0), abs_to_s(held) * 1e3);
@@ -533,7 +591,8 @@ usage(void)
 {
 	fprintf(stderr, "usage: psample top [-t SECONDS] [-r COUNT] [-n LINES]\n"
 	    "       psample threads PID|NAME [-t SECONDS]\n"
-	    "       psample stacks PID|NAME [-t SECONDS] [-i MICROSECONDS] [-d DEPTH] [-a] [-T WORD] [-o FILE]\n");
+	    "       psample stacks PID|NAME [-t SECONDS] [-i MICROSECONDS] [-d DEPTH] [-a] [-T WORD] [-o FILE]\n"
+	    "                      [-x PROGRAM ARG...]   (-x last: the program started as the sampling starts)\n");
 	return 2;
 }
 
@@ -543,6 +602,7 @@ main(int argc, char **argv)
 	int seconds = -1, count = 1, lines = 25, interval = 2000, depth = 64;
 	bool all = false;
 	const char *word = NULL, *file = NULL, *what = NULL, *cmd;
+	char **xargv = NULL;
 	pid_t pid = -1;
 	FILE *out = stdout;
 	int rc;
@@ -563,6 +623,7 @@ main(int argc, char **argv)
 		else if (strcmp(a, "-d") == 0 && v) depth = atoi(v), i++;
 		else if (strcmp(a, "-T") == 0 && v) word = v, i++;
 		else if (strcmp(a, "-o") == 0 && v) file = v, i++;
+		else if (strcmp(a, "-x") == 0 && v) { xargv = &argv[i + 1]; break; }
 		else if (a[0] != '-' && what == NULL) what = a;
 		else return usage();
 	}
@@ -586,7 +647,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "psample: %s: %s\n", file, strerror(errno));
 		return 1;
 	}
-	rc = stacks(pid, seconds > 0 ? seconds : 10, interval, depth, all, word, out);
+	rc = stacks(pid, seconds > 0 ? seconds : 10, interval, depth, all, word, xargv, out);
 	if (out != stdout) fclose(out);
 	return rc;
 }
