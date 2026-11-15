@@ -13,8 +13,9 @@
  * microphone, photos (read, add) -- through tccd as Settings' privacy switches do (TCCAccessSetForBundleId, the
  * entitlement com.apple.private.tcc.manager): Nagram's photo picker, the round that measures it, asks for both.
  * --all (test roots, the owner 11-15: "in development every permission allowed"): EVERY application -- the system's
- * own (Camera asked for location in a round and its alert stayed up) and every one installed later, looked for every
- * 10 seconds for as long as the system runs -- gets location "always" and every privacy service below answered yes.
+ * own (Camera asked for location in a round and its alert stayed up) and every one installed later, as LaunchServices
+ * says it is installed (and looked for every 10 seconds besides) for as long as the system runs -- gets location
+ * "always" and every privacy service below answered yes.
  * usage: loc_enable [1|0] [--tcc] [--all] [BUNDLE-ID ...]   (no argument: 1)
  */
 #import <CoreLocation/CoreLocation.h>
@@ -22,6 +23,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 @interface CLLocationManager (HakiosPrivate)
@@ -39,6 +41,31 @@
 @interface LSApplicationWorkspace : NSObject
 + (instancetype)defaultWorkspace;
 - (NSArray<LSApplicationProxy *> *)allApplications;
+- (void)addObserver:(id)observer;
+@end
+
+/*
+ * --all: an application is granted the moment LaunchServices says it is installed, not up to 10 s later: iOS ends a
+ * running application whose privacy answers change (exit reason namespace 11, TCC), and 11-16 System Check -- opened
+ * 10 s after its install -- was killed in its Metal tab by this program's grants. LSApplicationWorkspace tells its
+ * observers -applicationsDidInstall: (the protocol is LSApplicationWorkspaceObserverProtocol); the look every 10 s
+ * stays, for whatever comes without it.
+ */
+@interface HKInstallWatch : NSObject
+@property (atomic) BOOL installed;
+@end
+
+@implementation HKInstallWatch
+- (void)applicationsDidInstall:(NSArray *)applications
+{
+	(void)applications;
+	self.installed = YES;
+	CFRunLoopStop(CFRunLoopGetMain());
+}
+- (void)applicationsDidUninstall:(NSArray *)applications
+{
+	(void)applications;
+}
 @end
 
 #define ALLOWED_WHEN_IN_USE 4           /* (kCLAuthorizationStatusAuthorizedWhenInUse) */
@@ -187,6 +214,11 @@ allow_all(void)
 		return 1;
 	}
 	tcc_everything = YES;
+	HKInstallWatch *watch = [HKInstallWatch new];
+
+	if ([[workspace defaultWorkspace] respondsToSelector:@selector(addObserver:)]) {
+		[[workspace defaultWorkspace] addObserver:watch];
+	}
 	for (unsigned round = 0;; round++) {
 		@autoreleasepool {
 			unsigned added = 0;
@@ -210,7 +242,14 @@ allow_all(void)
 				photos_version_two();
 			}
 		}
-		sleep(10);
+		/* (10 s, or until LaunchServices says something was installed: HKInstallWatch stops the run loop) */
+		watch.installed = NO;
+		uint64_t before = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+
+		if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 10.0, false) == kCFRunLoopRunFinished ||
+		    (!watch.installed && clock_gettime_nsec_np(CLOCK_MONOTONIC) - before < 1000000000ull)) {
+			sleep(10);      /* (a run loop with nothing in it returns at once: no busy looking) */
+		}
 	}
 	return 0;
 }
