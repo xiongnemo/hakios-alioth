@@ -982,6 +982,15 @@ frame_metadata(const struct isp *isp, const struct hakios_camera_frame *f, const
 	return m;
 }
 
+/*
+ * The pieces' class of service: USER_INITIATED, under the user interface's (11-15: at USER_INTERACTIVE, the class of
+ * an application's main thread, eight render workers took the big cores in turn with Nagram's main thread right when
+ * its photo picker opened -- the picker that opens our camera). The scheduler now runs the interface's threads first;
+ * a busy moment costs the preview a late frame, not the screen. While /var/tmp/hakios-isp-urgent is there (usbsh
+ * "fill /var/tmp/hakios-isp-urgent 1"; looked at every 30 frames) it is USER_INTERACTIVE again, to compare.
+ */
+static qos_class_t render_qos = QOS_CLASS_USER_INITIATED;
+
 static void
 deliver(struct stream *s, struct output *out, const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw,
     CFDictionaryRef metadata)
@@ -1010,7 +1019,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
 	uint64_t began = mach_absolute_time();
 
-	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	dispatch_apply_f(job.pieces, dispatch_get_global_queue(render_qos, 0), &job, render_piece);
 	if (job.still) {
 		static mach_timebase_info_data_t tb;
 
@@ -1401,6 +1410,18 @@ worker(void *context)
 			if (plain != isp.plain_preview) {
 				isp.plain_preview = plain;
 				say("the preview's pixels: %s", plain ? "the old way (one at a time)" : "in runs (the new way)");
+			}
+
+			qos_class_t qos = access("/var/tmp/hakios-isp-urgent", F_OK) == 0 ? QOS_CLASS_USER_INTERACTIVE :
+			    QOS_CLASS_USER_INITIATED;
+			static bool said_qos;
+
+			if (qos != render_qos || !said_qos) {
+				render_qos = qos;
+				said_qos = true;
+				say("the preview's render workers: %s", qos == QOS_CLASS_USER_INTERACTIVE ?
+				    "USER_INTERACTIVE (as urgent as the interface: /var/tmp/hakios-isp-urgent)" :
+				    "USER_INITIATED (under the interface)");
 			}
 		}
 		n = read(device, buffer, bytes);

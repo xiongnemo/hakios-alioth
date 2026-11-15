@@ -11,9 +11,11 @@
  *   psample stacks PID|NAME [-t SECONDS] [-i MICROSECONDS] [-d DEPTH] [-a] [-T WORD] [-o FILE]
  *       every -i (default 2000) for -t (default 10): the main thread (-a: every thread; -T: the threads whose name
  *       has WORD) held, its registers and its frame-pointer chain read, let go. Lines (to FILE, default stdout):
- *         psample 1 pid P name N interval I depth D uptime U timebase NUMER/DENOM
+ *         psample 2 pid P name N interval I depth D uptime U timebase NUMER/DENOM
  *         thread TID NAME                       (once, when first seen)
- *         s MICROSECONDS TID R|W PC PC ...      (R: was running or runnable, W: waiting; PC first, then callers)
+ *         s MICROSECONDS TID R|W:CPU:PRI PC PC ...
+ *             (R: was running or runnable, W: waiting; CPU: the thread's processor time so far in us -- of a "running"
+ *             thread it says whether it had a core or waited for one; PRI: its priority then; PC first, then callers)
  *         cache SLIDE BASE                      (the shared cache's slide and where it is)
  *         image LOAD SLIDE PATH                 (every loaded image, read at the end: what loaded meanwhile too)
  *         end STOPS HELD_US ELAPSED_US
@@ -429,7 +431,7 @@ stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char 
 		return 1;
 	}
 	proc_name(pid, pname, sizeof(pname));
-	fprintf(out, "psample 1 pid %d name %s interval %d depth %d uptime %.3f timebase %u/%u port %s\n", pid, pname,
+	fprintf(out, "psample 2 pid %d name %s interval %d depth %d uptime %.3f timebase %u/%u port %s\n", pid, pname,
 	    interval_us, depth, uptime_s(), tb.numer, tb.denom, task_is_control ? "control" : "read");
 	t0 = mach_absolute_time();
 	end = t0 + (uint64_t)((double)seconds * 1e9 * tb.denom / tb.numer);
@@ -488,8 +490,18 @@ stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char 
 			}
 			b = mach_absolute_time();
 			held += b - a;
-			fprintf(out, "s %llu %llu %c", (unsigned long long)now_us, (unsigned long long)tid,
-			    bi.run_state == TH_STATE_RUNNING ? 'R' : 'W');
+			/* (R|W:the thread's processor time so far, us:its priority now -- a "running" thread may be one
+			   waiting for a core: the time it got says which) */
+			struct policy_timeshare_info ts = { 0 };
+			mach_msg_type_number_t tn = POLICY_TIMESHARE_INFO_COUNT;
+
+			if (thread_info(th, THREAD_SCHED_TIMESHARE_INFO, (thread_info_t)&ts, &tn) != KERN_SUCCESS) {
+				ts.cur_priority = -1;   /* (a fixed-priority thread, say) */
+			}
+			fprintf(out, "s %llu %llu %c:%llu:%d", (unsigned long long)now_us, (unsigned long long)tid,
+			    bi.run_state == TH_STATE_RUNNING ? 'R' : 'W',
+			    (unsigned long long)(bi.user_time.seconds + bi.system_time.seconds) * 1000000ull +
+			    (unsigned long long)(bi.user_time.microseconds + bi.system_time.microseconds), ts.cur_priority);
 			for (int j = 0; j < k; j++) {
 				fprintf(out, " %llx", (unsigned long long)pcs[j]);
 			}
