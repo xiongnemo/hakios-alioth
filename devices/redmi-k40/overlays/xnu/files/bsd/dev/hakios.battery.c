@@ -18,6 +18,8 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
+extern bool alioth_panel_is_asleep(void);       /* alioth_dsi.c */
+extern void loader_log_putc(char c);
 
 static int battery_soc_percent = -1, battery_voltage_mv = -1, battery_current_ma;
 static int battery_temperature_c = -273, battery_present, battery_charger_present;
@@ -267,6 +269,22 @@ battery_gauge_poll(bool say)
 	if (say) {
 		printf("battery: PM8150B fg-gen4: %d%% (raw %#x, shadow %#x), %d mV, %d mA, battery %d, charger %d, status %d\n",
 		    percent, soc[0], soc[1], uv / 1000, ua / 1000, present, external, status);
+	}
+	/*
+	 * While the panel sleeps with the display (the side button), each reading into the loader's log too: the
+	 * screen-off current of a run without Wi-Fi (wifi=0) can be read after it, as tools/power-screenoff.ps1 reads
+	 * the sysctl over Wi-Fi in the others (2026-11-15, the screen-off breakdown). Discharge positive, as the gauge has it.
+	 */
+	if (alioth_panel_is_asleep()) {
+		char line[96];
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		snprintf(line, sizeof(line), "battery: screen off: %d mA (%d mV, charger %d) at %llu s\n", ua / 1000, uv / 1000,
+		    external, ns / NSEC_PER_SEC);
+		for (const char *c = line; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
 	}
 }
 

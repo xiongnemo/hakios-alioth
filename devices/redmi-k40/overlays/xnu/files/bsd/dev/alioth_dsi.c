@@ -531,6 +531,14 @@ alioth_panel_set_rate(uint32_t hz)
  * own risks -- a rate's gamma, three failures turning every DCS off -- and is left for later.)
  */
 static bool panel_asleep;               /* the panel was put to sleep with the display (alioth_panel_power) */
+
+/* (for others in the kernel: the battery's screen-off lines, hakios.battery.c) */
+bool
+alioth_panel_is_asleep(void)
+{
+	return panel_asleep;
+}
+
 static thread_call_t refresh_call;
 static volatile uint64_t refresh_activity_at;   /* mach time of the last swap or touch */
 static volatile bool refresh_slow;      /* a frame every second TE, for a still screen */
