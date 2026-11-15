@@ -1,0 +1,1518 @@
+/*
+ * The cameras' frames made into pictures by the processor (see camera_isp.h): one pixel per 2x2
+ * cell, the nearest cell for each pixel of the picture (previews), or every pixel by bilinear
+ * demosaic (stills); per pixel, in this order: the black level off, lens shading (a grid of gains per
+ * colour, when there is one), the white balance's and AE's gains, the colour matrix (identity until
+ * one is set), sRGB's curve. Grey-world white balance; no noise reduction yet. The colour matrix and
+ * the lens shading can come from the camera's own tuning (isp_load_tuning(), isp_tune()).
+ */
+#include <fcntl.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include "camera_isp.h"
+
+#define WHITE           959             /* 1023 less the black level of 64 */
+#define LUT_WHITE       3836            /* WHITE in the gamma table's steps */
+
+void
+isp_init(struct isp *isp)
+{
+	memset(isp, 0, sizeof(*isp));
+	isp->wb[0] = isp->wb[1] = isp->wb[2] = 1;
+	isp->digital = 1;
+	isp->zoom = 1;
+	for (int i = 0; i < 3; i++) {
+		isp->ccm[i][i] = 1;
+	}
+	for (int i = 0; i < 4096; i++) {
+		double v = i >= LUT_WHITE ? 1 : (double)i / LUT_WHITE;
+
+		v = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055;
+		isp->gamma[i] = (uint8_t)(v * 255 + 0.5);
+	}
+}
+
+/* where red and blue are in a cell (0 top left, 1 top right, 2 bottom left, 3 bottom right) */
+static void
+cell_places(uint32_t bayer, int *r, int *b)
+{
+	static const int red[4] = { 0, 1, 2, 3 }, blue[4] = { 3, 2, 1, 0 };
+
+	*r = red[bayer & 3];
+	*b = blue[bayer & 3];
+}
+
+/* the four values of the cell at cx of the pair of lines from `top' (above black, 0 and up) */
+static inline void
+cell(const uint8_t *top, size_t stride, uint32_t cx, int v[4])
+{
+	const uint8_t *g0 = top + (size_t)(cx >> 1) * 5, *g1 = g0 + stride;
+	unsigned o = (cx & 1) * 2;
+
+	v[0] = (g0[o] << 2 | (g0[4] >> (o * 2) & 3)) - 64;
+	v[1] = (g0[o + 1] << 2 | (g0[4] >> (o * 2 + 2) & 3)) - 64;
+	v[2] = (g1[o] << 2 | (g1[4] >> (o * 2) & 3)) - 64;
+	v[3] = (g1[o + 1] << 2 | (g1[4] >> (o * 2 + 2) & 3)) - 64;
+	for (int i = 0; i < 4; i++) {
+		v[i] = v[i] < 0 ? 0 : v[i];
+	}
+}
+
+float
+isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0, float y0, float x1, float y1, float *level)
+{
+	enum { BLOCK = 4, MAX_BLOCKS = 512 };
+	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
+	uint32_t cx0 = (uint32_t)(x0 * cells_w), cx1 = (uint32_t)(x1 * cells_w), cy0 = (uint32_t)(y0 * cells_h),
+	    cy1 = (uint32_t)(y1 * cells_h);
+	float above[MAX_BLOCKS], here[MAX_BLOCKS];
+	double steps = 0, sum = 0;
+	uint32_t blocks_w, rows = 0, n = 0;
+	int r, b;
+
+	cell_places(f->bayer, &r, &b);
+	cx1 = cx1 > cells_w ? cells_w : cx1;
+	cy1 = cy1 > cells_h ? cells_h : cy1;
+	blocks_w = cx1 > cx0 ? (cx1 - cx0) / BLOCK : 0;
+	blocks_w = blocks_w > MAX_BLOCKS ? MAX_BLOCKS : blocks_w;
+	/*
+	 * Green's mean over blocks of 4x4 cells, and the squares of the steps between neighbouring
+	 * blocks: a cell's own noise is a quarter of itself in a block's mean, and the picture's edges are
+	 * not -- in the dark, at 32x and more, the steps from cell to cell were the noise's alone and the
+	 * focus went wherever it liked.
+	 */
+	for (uint32_t by = cy0; by + BLOCK <= cy1; by += BLOCK, rows++) {
+		for (uint32_t bx = 0; bx < blocks_w; bx++) {
+			uint32_t g = 0;
+
+			for (uint32_t cy = by; cy < by + BLOCK; cy++) {
+				const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+
+				for (uint32_t cx = cx0 + bx * BLOCK; cx < cx0 + bx * BLOCK + BLOCK; cx++) {
+					int v[4];
+
+					cell(top, f->stride, cx, v);
+					for (int i = 0; i < 4; i++) {
+						g += i != r && i != b ? (uint32_t)v[i] : 0;
+					}
+				}
+			}
+			here[bx] = g / (2.0f * BLOCK * BLOCK);
+			sum += here[bx];
+			n++;
+			if (bx > 0) {
+				steps += (here[bx] - here[bx - 1]) * (here[bx] - here[bx - 1]);
+			}
+			if (rows > 0) {
+				steps += (here[bx] - above[bx]) * (here[bx] - above[bx]);
+			}
+		}
+		memcpy(above, here, sizeof(float) * blocks_w);
+	}
+	double mean = n ? sum / n : 0;
+
+	if (level != NULL) {
+		*level = (float)mean;
+	}
+	return mean > 0 ? (float)(steps / n / (mean * mean)) : 0;
+}
+
+static inline void lsc_at(const struct isp *isp, float u, float v, float g[3]);
+
+void
+isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, struct isp_stats *s)
+{
+	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
+	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 };
+	float gains[3] = { 1, 1, 1 };
+	int r, b;
+
+	memset(s, 0, sizeof(*s));
+	cell_places(f->bayer, &r, &b);
+	for (uint32_t cy = 0; cy < cells_h; cy += 4) {
+		const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+		float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
+
+		for (uint32_t cx = 0; cx < cells_w; cx += 4) {
+			int v[4], g = 0, top_v = 0;
+
+			cell(top, f->stride, cx, v);
+			for (int i = 0; i < 4; i++) {
+				g += i != r && i != b ? v[i] : 0;
+				top_v = v[i] > top_v ? v[i] : top_v;
+			}
+			g /= 2;
+			sum[0] += v[r];
+			sum[1] += g;
+			sum[2] += v[b];
+			/*
+			 * The white balance leaves out a cell with a colour near white -- a lamp, a screen:
+			 * green, the most sensitive, stops there first and the cell would count as magenta --
+			 * and one near black, where noise cut off at the black level is all there is.
+			 */
+			if (top_v < WHITE * 9 / 10 && g >= 24) {
+				float cr = (float)v[r], cg = (float)g, cb = (float)v[b];
+
+				/*
+				 * As the picture will have it: the lens shading raises the corners several times, and
+				 * the light there counts for that much more than in the frame as it comes.
+				 */
+				if (isp != NULL && isp->lsc.on) {
+					lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+					cr *= gains[0];
+					cg *= gains[1];
+					cb *= gains[2];
+				}
+				/*
+				 * Each cell's colour, not its light: summed, a lamp or a screen in the picture -- tens of
+				 * times brighter than the room it is in -- would have the white balance to itself, and
+				 * the room would be left the colour of its light.
+				 */
+				grey[0] += cr / cg;
+				grey[1] += cb / cg;
+				s->grey_cells++;
+				/*
+				 * Grey, or within a third of it in red and blue, with the white balance as it is: what
+				 * the white balance should make grey, without the coloured things around it (the
+				 * colour matrix makes any mistake in it twice as plain).
+				 */
+				if (isp != NULL) {
+					float wr = cr * isp->wb[0] / cg, wb = cb * isp->wb[2] / cg;
+
+					if (wr > 0.75f && wr < 1.33f && wb > 0.75f && wb < 1.33f) {
+						neutral[0] += cr / cg;
+						neutral[1] += cb / cg;
+						s->neutral_cells++;
+					}
+				}
+			}
+			s->hist[g >> 4 > 63 ? 63 : g >> 4]++;
+			s->cells++;
+		}
+	}
+	for (int c = 0; c < 3; c++) {
+		s->mean[c] = s->cells ? sum[c] / s->cells : 0;
+	}
+	for (int c = 0; c < 2; c++) {
+		s->grey[c] = s->grey_cells ? grey[c] / s->grey_cells : 0;
+		s->neutral[c] = s->neutral_cells ? neutral[c] / s->neutral_cells : 0;
+	}
+	for (int i = 63, above = 0; i >= 0; i--) {
+		above += s->hist[i];
+		if (above * 100 >= (int)s->cells) {
+			s->bright = i * 16 + 8;
+			break;
+		}
+	}
+}
+
+/*
+ * Green's mean towards 15 % of white, unless that would put 1 % of the picture into white. The
+ * exposure, longest first: the frame's lines at the shortest frame, then gain to 16x, then frames up
+ * to max_frame_lines, then gain to the most; beyond that, digital gain (up to 4x).
+ */
+bool
+isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c)
+{
+	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
+	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
+	double bright = s->bright * isp->digital;
+	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
+	uint32_t lines, gain, frame_lines = 0;
+	double digital = 1;
+
+	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
+		return false;                   /* (the last change not in the frames yet) */
+	}
+	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
+	ratio = target / mean;
+	if (bright * ratio > 0.9 * WHITE && bright > 0) {
+		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
+	}
+	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
+	if (ratio > 0.94 && ratio < 1.06) {
+		return false;
+	}
+	want = now * pow(ratio, 0.7);
+	if (want <= fast) {
+		lines = want < 4 ? 4 : (uint32_t)want;
+		gain = f->gain_unity;
+	} else if (want <= (double)fast * 16) {
+		lines = fast;
+		gain = (uint32_t)(want / fast * f->gain_unity);
+	} else {
+		lines = (uint32_t)(want / 16);
+		lines = lines > longest - f->margin ? longest - f->margin : lines < fast ? fast : lines;
+		frame_lines = lines + f->margin;
+		double g = want / lines;
+
+		if (g > (double)f->gain_max / f->gain_unity) {
+			digital = g / ((double)f->gain_max / f->gain_unity);
+			digital = digital > 4 ? 4 : digital;
+			g = (double)f->gain_max / f->gain_unity;
+		}
+		gain = (uint32_t)(g * f->gain_unity);
+	}
+	isp->digital = (float)digital;
+	isp->asked_lines = lines;
+	isp->asked_gain = gain;
+	isp->asked_frame_lines = frame_lines;
+	isp->asked = true;
+	memset(c, 0, sizeof(*c));
+	c->command = HAKIOS_CAMERA_EXPOSURE;
+	c->a = lines;
+	c->b = gain;
+	c->c = frame_lines;
+	return true;
+}
+
+/*
+ * The point of the reference lights' line nearest a light seen as red over green rg and blue over
+ * green bg, on their logarithms: where along it (segment i and how far into it, 0 to 1).
+ */
+static void
+on_reference_line(const struct isp_tuning *t, float rg, float bg, uint32_t *segment, float *along)
+{
+	float x = logf(rg), y = logf(bg), best = INFINITY;
+
+	*segment = 0;
+	*along = 0;
+	for (uint32_t i = 0; i + 1 < t->refs; i++) {
+		float x0 = logf(t->ref[i][0]), y0 = logf(t->ref[i][1]), dx = logf(t->ref[i + 1][0]) - x0,
+		    dy = logf(t->ref[i + 1][1]) - y0, length = dx * dx + dy * dy;
+		float u = length > 0 ? ((x - x0) * dx + (y - y0) * dy) / length : 0, d;
+
+		u = u < 0 ? 0 : u > 1 ? 1 : u;
+		d = (x0 + u * dx - x) * (x0 + u * dx - x) + (y0 + u * dy - y) * (y0 + u * dy - y);
+		if (d < best) {
+			best = d;
+			*segment = i;
+			*along = u;
+		}
+	}
+}
+
+float
+isp_cct(const struct isp *isp)
+{
+	const struct isp_tuning *t = isp->tuning;
+	uint32_t i;
+	float u;
+
+	if (t == NULL || t->refs < 2 || isp->wb[0] <= 0 || isp->wb[2] <= 0) {
+		return 0;
+	}
+	on_reference_line(t, 1 / isp->wb[0], 1 / isp->wb[2], &i, &u);
+	return t->ref[i][2] + u * (t->ref[i + 1][2] - t->ref[i][2]);
+}
+
+void
+isp_awb(struct isp *isp, const struct isp_stats *s)
+{
+	/*
+	 * The nearly grey cells, when there are enough of them (1 in 32); else every cell neither near
+	 * white nor near black, when there are enough of those (1 in 16); else every cell's light.
+	 */
+	float r, b;
+
+	if (s->neutral_cells * 32 >= s->cells && s->neutral[0] > 0.01 && s->neutral[1] > 0.01) {
+		r = (float)(1 / s->neutral[0]);
+		b = (float)(1 / s->neutral[1]);
+	} else if (s->grey_cells * 16 >= s->cells && s->grey[0] > 0.01 && s->grey[1] > 0.01) {
+		r = (float)(1 / s->grey[0]);
+		b = (float)(1 / s->grey[1]);
+	} else if (s->mean[0] >= 2 && s->mean[1] >= 2 && s->mean[2] >= 2) {
+		r = (float)(s->mean[1] / s->mean[0]);
+		b = (float)(s->mean[1] / s->mean[2]);
+	} else {
+		return;
+	}
+
+	/*
+	 * Onto the line of the reference lights: a scene's own colours pull grey world off it -- a pink
+	 * screen, a green wall -- and off it is what shows as green or magenta, while along it is a
+	 * warmer or colder white. (The wide camera under a warm white LED: grey world of the room with a
+	 * screen in it 15 % short in both red and blue, the light measured on a white sheet; kept to the
+	 * line, 2 % off.)
+	 */
+	if (isp->tuning != NULL && isp->tuning->refs >= 2) {
+		const struct isp_tuning *t = isp->tuning;
+		uint32_t i;
+		float u;
+
+		on_reference_line(t, 1 / r, 1 / b, &i, &u);
+		r = 1 / expf(logf(t->ref[i][0]) + u * (logf(t->ref[i + 1][0]) - logf(t->ref[i][0])));
+		b = 1 / expf(logf(t->ref[i][1]) + u * (logf(t->ref[i + 1][1]) - logf(t->ref[i][1])));
+	}
+	r = r < 0.5f ? 0.5f : r > 4 ? 4 : r;
+	b = b < 0.5f ? 0.5f : b > 4 ? 4 : b;
+	isp->wb[0] = isp->wb[0] * 0.9f + r * 0.1f;
+	isp->wb[2] = isp->wb[2] * 0.9f + b * 0.1f;
+}
+
+/* the part of the sensor's cells the picture shows: its middle, in the picture's proportions, 1/zoom of it each way */
+static void
+crop(const struct isp *isp, const struct hakios_camera_frame *f, uint32_t width, uint32_t height, uint32_t *x0, uint32_t *y0,
+    uint32_t *cw, uint32_t *ch)
+{
+	uint32_t w = f->width / 2, h = f->height / 2;
+	float zoom = isp->zoom < 1 ? 1 : isp->zoom;
+
+	if ((uint64_t)width * h > (uint64_t)height * w) {
+		*cw = w;
+		*ch = (uint32_t)((uint64_t)w * height / width);
+	} else {
+		*ch = h;
+		*cw = (uint32_t)((uint64_t)h * width / height);
+	}
+	*cw = (uint32_t)(*cw / zoom) < 2 ? 2 : (uint32_t)(*cw / zoom);
+	*ch = (uint32_t)(*ch / zoom) < 2 ? 2 : (uint32_t)(*ch / zoom);
+	*x0 = (w - *cw) / 2;
+	*y0 = (h - *ch) / 2;
+}
+
+void
+isp_set_ccm(struct isp *isp, const float m[9])
+{
+	for (int i = 0; i < 9; i++) {
+		isp->ccm[i / 3][i % 3] = m[i];
+	}
+}
+
+/*
+ * The colour matrix with the white balance's and AE's gains folded in, in the gamma table's steps
+ * (per 10-bit step above black): out[c] = sum over j of m[c][j] * value[j] (each value lens-shaded).
+ */
+struct pipe {
+	float           m[3][3];
+	bool            identity;
+};
+
+static void
+pipe_init(const struct isp *isp, struct pipe *p)
+{
+	p->identity = true;
+	for (int c = 0; c < 3; c++) {
+		for (int j = 0; j < 3; j++) {
+			p->m[c][j] = isp->ccm[c][j] * isp->wb[j] * isp->digital * (LUT_WHITE / (float)WHITE);
+			p->identity = p->identity && (c == j ? isp->ccm[c][j] == 1 : isp->ccm[c][j] == 0);
+		}
+	}
+}
+
+static inline uint8_t
+curve(const struct isp *isp, float v)
+{
+	int i = (int)(v + 0.5f);
+
+	return isp->gamma[i < 0 ? 0 : i > 4095 ? 4095 : i];
+}
+
+static inline void
+pixel(const struct isp *isp, const struct pipe *p, float r, float g, float b, uint8_t *rgb)
+{
+	if (p->identity) {
+		rgb[0] = curve(isp, r * p->m[0][0]);
+		rgb[1] = curve(isp, g * p->m[1][1]);
+		rgb[2] = curve(isp, b * p->m[2][2]);
+		return;
+	}
+	rgb[0] = curve(isp, p->m[0][0] * r + p->m[0][1] * g + p->m[0][2] * b);
+	rgb[1] = curve(isp, p->m[1][0] * r + p->m[1][1] * g + p->m[1][2] * b);
+	rgb[2] = curve(isp, p->m[2][0] * r + p->m[2][1] * g + p->m[2][2] * b);
+}
+
+/* the lens shading's gains at (u, v), 0 to 1 across the sensor */
+static inline void
+lsc_at(const struct isp *isp, float u, float v, float g[3])
+{
+	float gx = u * (LSC_W - 1), gy = v * (LSC_H - 1);
+	int x = (int)gx, y = (int)gy;
+
+	x = x < 0 ? 0 : x > LSC_W - 2 ? LSC_W - 2 : x;
+	y = y < 0 ? 0 : y > LSC_H - 2 ? LSC_H - 2 : y;
+	float fx = gx - x, fy = gy - y;
+
+	for (int c = 0; c < 3; c++) {
+		const float (*t)[LSC_W] = isp->lsc.gain[c];
+
+		g[c] = (t[y][x] * (1 - fx) + t[y][x + 1] * fx) * (1 - fy) + (t[y + 1][x] * (1 - fx) + t[y + 1][x + 1] * fx) * fy;
+	}
+}
+
+/* one line of the picture as 8-bit R, G, B */
+static void
+render_line(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint32_t width, uint32_t height,
+    uint32_t row, uint8_t *rgb)
+{
+	uint32_t x0, y0, cw, ch, cells_w = f->width / 2, cells_h = f->height / 2;
+	int r, b;
+	struct pipe p;
+
+	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
+	cell_places(f->bayer, &r, &b);
+	pipe_init(isp, &p);
+	if (isp->turned) {
+		row = height - 1 - row;         /* (and each line from its end, below) */
+	}
+	if (cw < width && ch < height) {
+		/*
+		 * Magnified (the zoom): each pixel between the four cells around it. The nearest cell blown up
+		 * to a square of pixels showed every cell's own colour, its noise and the colours a 2x2 cell
+		 * gets wrong at an edge, as coloured dots.
+		 */
+		float fy = y0 + (row + 0.5f) * ch / height - 0.5f, ty, v_at;
+		uint32_t cy0 = fy < 0 ? 0 : (uint32_t)fy, cy1;
+
+		cy0 = cy0 > cells_h - 1 ? cells_h - 1 : cy0;
+		cy1 = cy0 + 1 > cells_h - 1 ? cells_h - 1 : cy0 + 1;
+		ty = fy < (float)cy0 ? 0 : fy - cy0;
+		v_at = cells_h > 1 ? (float)cy0 / (cells_h - 1) : 0;
+		const uint8_t *t0 = raw + (size_t)cy0 * 2 * f->stride, *t1 = raw + (size_t)cy1 * 2 * f->stride;
+		float gains[3] = { 1, 1, 1 };
+
+		for (uint32_t x = 0; x < width; x++) {
+			float fx = x0 + (x + 0.5f) * cw / width - 0.5f, tx, c[3] = { 0, 0, 0 };
+			uint32_t cx0 = fx < 0 ? 0 : (uint32_t)fx, cx1;
+
+			cx0 = cx0 > cells_w - 1 ? cells_w - 1 : cx0;
+			cx1 = cx0 + 1 > cells_w - 1 ? cells_w - 1 : cx0 + 1;
+			tx = fx < (float)cx0 ? 0 : fx - cx0;
+			for (int k = 0; k < 4; k++) {
+				int v[4];
+				float w = (k & 1 ? tx : 1 - tx) * (k & 2 ? ty : 1 - ty);
+
+				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, v);
+				c[0] += w * v[r];
+				c[2] += w * v[b];
+				for (int j = 0; j < 4; j++) {
+					c[1] += j != r && j != b ? w * v[j] * 0.5f : 0;
+				}
+			}
+			if (isp->lsc.on) {
+				lsc_at(isp, cells_w > 1 ? (float)cx0 / (cells_w - 1) : 0, v_at, gains);
+			}
+			pixel(isp, &p, c[0] * gains[0], c[1] * gains[1], c[2] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
+		}
+		return;
+	}
+	uint32_t cy = y0 + (uint32_t)((uint64_t)row * ch / height);
+	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+	uint64_t step = ((uint64_t)cw << 16) / width, at = (uint64_t)x0 << 16;
+	float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
+
+	if (isp->plain_preview) {
+		/* (the way before 2026-11-15, kept to measure the other against: each pixel on its own) */
+		float gains[3] = { 1, 1, 1 };
+
+		for (uint32_t x = 0; x < width; x++, at += step) {
+			uint32_t cx = (uint32_t)(at >> 16);
+			int v[4], g = 0;
+
+			cell(top, f->stride, cx, v);
+			for (int j = 0; j < 4; j++) {
+				g += j != r && j != b ? v[j] : 0;
+			}
+			if (isp->lsc.on) {
+				lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+			}
+			pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
+		}
+		return;
+	}
+	/*
+	 * (this is the preview's road, every pixel of every frame -- 62 million a second for a 1920x1080 picture at 30 a
+	 * second, 11-15: mediaserverd at up to 1.5 cores. What does not change along the line is done once for it: the
+	 * lens shading's grid at this line's height, each column between its two rows -- a pixel then only goes between
+	 * two columns, without a division; the cell's two greens' places.)
+	 */
+	int g0 = -1, g1 = -1;
+	float col[3][LSC_W], to_grid = cells_w > 1 ? (float)(LSC_W - 1) / (cells_w - 1) : 0;
+	bool shade = isp->lsc.on;
+	uint8_t *o = rgb + (isp->turned ? 3 * (size_t)(width - 1) : 0);
+	ptrdiff_t next = isp->turned ? -3 : 3;
+
+	for (int j = 0; j < 4; j++) {
+		if (j != r && j != b) {
+			if (g0 < 0) {
+				g0 = j;
+			} else {
+				g1 = j;
+			}
+		}
+	}
+	if (shade) {
+		float gy = v_pos * (LSC_H - 1);
+		int ly = (int)gy;
+
+		ly = ly < 0 ? 0 : ly > LSC_H - 2 ? LSC_H - 2 : ly;
+		float fy = gy - ly;
+
+		for (int c = 0; c < 3; c++) {
+			for (int gx = 0; gx < LSC_W; gx++) {
+				col[c][gx] = isp->lsc.gain[c][ly][gx] * (1 - fy) + isp->lsc.gain[c][ly + 1][gx] * fy;
+			}
+		}
+	}
+	/*
+	 * In runs of RUN pixels, three passes: the cells' values (lens-shaded), then the colour matrix and the gamma table's
+	 * step for each -- plain arithmetic over arrays, which the compiler does with vector instructions (NEON) --, then
+	 * the table itself.
+	 */
+#define RUN 256
+	for (uint32_t x = 0; x < width; x += RUN) {
+		uint32_t n = width - x < RUN ? width - x : RUN;
+		float R[RUN], G[RUN], B[RUN];
+		int32_t step_r[RUN], step_g[RUN], step_b[RUN];
+
+		for (uint32_t i = 0; i < n; i++, at += step) {
+			uint32_t cx = (uint32_t)(at >> 16);
+			int v[4];
+
+			cell(top, f->stride, cx, v);
+			R[i] = (float)v[r];
+			G[i] = (float)(v[g0] + v[g1]) * 0.5f;
+			B[i] = (float)v[b];
+			if (shade) {
+				float gx = cx * to_grid;
+				int lx = (int)gx;
+
+				lx = lx > LSC_W - 2 ? LSC_W - 2 : lx;
+				float fx = gx - lx;
+
+				R[i] *= col[0][lx] + (col[0][lx + 1] - col[0][lx]) * fx;
+				G[i] *= col[1][lx] + (col[1][lx + 1] - col[1][lx]) * fx;
+				B[i] *= col[2][lx] + (col[2][lx + 1] - col[2][lx]) * fx;
+			}
+		}
+		if (p.identity) {
+			for (uint32_t i = 0; i < n; i++) {
+				float vr = R[i] * p.m[0][0] + 0.5f, vg = G[i] * p.m[1][1] + 0.5f, vb = B[i] * p.m[2][2] + 0.5f;
+
+				step_r[i] = (int32_t)(vr < 0 ? 0 : vr > 4095 ? 4095 : vr);
+				step_g[i] = (int32_t)(vg < 0 ? 0 : vg > 4095 ? 4095 : vg);
+				step_b[i] = (int32_t)(vb < 0 ? 0 : vb > 4095 ? 4095 : vb);
+			}
+		} else {
+			for (uint32_t i = 0; i < n; i++) {
+				float vr = p.m[0][0] * R[i] + p.m[0][1] * G[i] + p.m[0][2] * B[i] + 0.5f;
+				float vg = p.m[1][0] * R[i] + p.m[1][1] * G[i] + p.m[1][2] * B[i] + 0.5f;
+				float vb = p.m[2][0] * R[i] + p.m[2][1] * G[i] + p.m[2][2] * B[i] + 0.5f;
+
+				step_r[i] = (int32_t)(vr < 0 ? 0 : vr > 4095 ? 4095 : vr);
+				step_g[i] = (int32_t)(vg < 0 ? 0 : vg > 4095 ? 4095 : vg);
+				step_b[i] = (int32_t)(vb < 0 ? 0 : vb > 4095 ? 4095 : vb);
+			}
+		}
+		for (uint32_t i = 0; i < n; i++, o += next) {
+			o[0] = isp->gamma[step_r[i]];
+			o[1] = isp->gamma[step_g[i]];
+			o[2] = isp->gamma[step_b[i]];
+		}
+	}
+#undef RUN
+}
+
+/*
+ * Two lines of 8-bit R, G, B as NV12 (BT.601's matrix, which CoreVideo's 420f and 420v and
+ * tools/camraw.py take): each pixel's Y (y1 NULL: the second line has none, the picture's last of an
+ * odd height), each 2x2's Cb and Cr from the sum of its four. The coefficients in 1/65536ths, video
+ * range's scaled to its 219 steps of luma (16 to 235) and 224 of chroma (16 to 240); every value
+ * rounded to the nearest step, so that the primaries come back within one step of 0 and 255 (red's and
+ * blue's cannot be exact: no 8-bit Y, Cb, Cr is both).
+ */
+static void
+nv12_pair(const uint8_t *rgb0, const uint8_t *rgb1, uint32_t width, uint8_t *y0, uint8_t *y1, uint8_t *uv, bool video_range)
+{
+	static const int32_t full[9] = { 19595, 38470, 7471, -11058, -21710, 32768, 32768, -27439, -5329 };
+	static const int32_t video[9] = { 16829, 33039, 6416, -9714, -19070, 28784, 28784, -24103, -4681 };
+	const int32_t *k = video_range ? video : full;
+	int32_t oy = (video_range ? 16 << 16 : 0) + (1 << 15);
+
+	for (int l = 0; l < 2; l++) {
+		const uint8_t *p = l ? rgb1 : rgb0;
+		uint8_t *out = l ? y1 : y0;
+
+		for (uint32_t x = 0; out != NULL && x < width; x++, p += 3) {
+			out[x] = (uint8_t)((k[0] * p[0] + k[1] * p[1] + k[2] * p[2] + oy) >> 16);
+		}
+	}
+	for (uint32_t x = 0; x < width; x += 2) {
+		uint32_t x1 = x + 1 < width ? x + 1 : x;
+		int32_t R = rgb0[3 * x] + rgb0[3 * x1] + rgb1[3 * x] + rgb1[3 * x1];
+		int32_t G = rgb0[3 * x + 1] + rgb0[3 * x1 + 1] + rgb1[3 * x + 1] + rgb1[3 * x1 + 1];
+		int32_t B = rgb0[3 * x + 2] + rgb0[3 * x1 + 2] + rgb1[3 * x + 2] + rgb1[3 * x1 + 2];
+		/*
+		 * (the sums are four pixels': 18 bits off, with 128 added and just under half a step to round;
+		 * a tie goes down, so that chroma's -127.5, a full colour's, comes out 0 as its +127.5 does 255)
+		 */
+		int32_t cb = (k[3] * R + k[4] * G + k[5] * B + (128 << 18) + (1 << 17) - 1) >> 18;
+		int32_t cr = (k[6] * R + k[7] * G + k[8] * B + (128 << 18) + (1 << 17) - 1) >> 18;
+
+		uv[x] = (uint8_t)(cb < 0 ? 0 : cb > 255 ? 255 : cb);
+		uv[x + 1] = (uint8_t)(cr < 0 ? 0 : cr > 255 ? 255 : cr);
+	}
+}
+
+/* ---- the preview by cells, with NEON (2026-11-15) ------------------------------------------------------------ */
+/*
+ * The preview's road when the picture is about as wide as the sensor's part it shows (Nagram's camera cell: 1920x1080
+ * of 2000x1125 cells): each CELL of the line done once, in vectors -- the two RAW10 lines unpacked 16 pixels at a
+ * time (the black level off by a saturating subtract), a cell's four values by de-interleaving loads, lens shading
+ * (the grid's two columns around a cell picked by a table lookup), the colour matrix, the gamma table's step --,
+ * the gamma table itself one value at a time, then each pixel of the picture takes its nearest cell's colour as
+ * render_line() does; NV12 or BGRA from the three planes in vectors too. The same in plain C where there is no NEON
+ * (the computer: wsl/isp-bench.c). Pictures much narrower than their cells keep render_line().
+ */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define ISP_NEON        1
+#else
+#define ISP_NEON        0
+#endif
+
+#define PV_CELLS        4096            /* (8192 pixels across) */
+
+struct preview {
+	uint32_t        x0, y0, cw, ch;
+	int             r, b, g0, g1;
+	struct pipe     p;
+	float           to_grid;        /* a cell's index to the lens shading grid's column */
+	uint16_t        map[8192];      /* the picture's pixel -> its cell, from x0 */
+	uint16_t        l0[2 * PV_CELLS + 32], l1[2 * PV_CELLS + 32];  /* the two lines' values above black */
+	float           base[3][16], slope[3][16];                      /* the line's lens shading: column i and to i + 1 */
+	uint8_t         cr[PV_CELLS], cg[PV_CELLS], cb[PV_CELLS];       /* each cell's colour, through the gamma table */
+};
+
+static bool
+preview_setup(const struct isp *isp, const struct hakios_camera_frame *f, uint32_t width, uint32_t height, struct preview *pv)
+{
+	uint32_t cells_w = f->width / 2;
+
+	if (isp->plain_preview || f->format != 1 || width > 8192) {
+		return false;
+	}
+	crop(isp, f, width, height, &pv->x0, &pv->y0, &pv->cw, &pv->ch);
+	/* (magnified, or the picture well under its cells: render_line()) */
+	if (pv->cw < width || pv->ch < height || pv->cw > PV_CELLS || (uint64_t)pv->cw * 2 > (uint64_t)width * 3) {
+		return false;
+	}
+	cell_places(f->bayer, &pv->r, &pv->b);
+	pv->g0 = pv->g1 = -1;
+	for (int j = 0; j < 4; j++) {
+		if (j != pv->r && j != pv->b) {
+			if (pv->g0 < 0) {
+				pv->g0 = j;
+			} else {
+				pv->g1 = j;
+			}
+		}
+	}
+	pipe_init(isp, &pv->p);
+	pv->to_grid = cells_w > 1 ? (float)(LSC_W - 1) / (cells_w - 1) : 0;
+	uint64_t step = ((uint64_t)pv->cw << 16) / width, at = (uint64_t)pv->x0 << 16;
+
+	for (uint32_t x = 0; x < width; x++, at += step) {
+		pv->map[x] = (uint16_t)((at >> 16) - pv->x0);
+	}
+	return true;
+}
+
+/* pixels first .. first + n - 1 of a RAW10 line (four in five bytes), above black (64) and not below 0 */
+static void
+unpack_raw10(const uint8_t *line, size_t stride, uint32_t first, uint32_t n, uint16_t *out)
+{
+	uint32_t skip = first & 3, groups = (skip + n + 3) / 4;
+	const uint8_t *q = line + (size_t)(first / 4) * 5, *end = line + stride;
+	uint16_t *o = out - skip;       /* (the caller leaves room in front) */
+	uint32_t g = 0;
+
+#if ISP_NEON
+	static const uint8_t msb_at[16] = { 0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18 };
+	static const uint8_t lsb_at[16] = { 4, 4, 4, 4, 9, 9, 9, 9, 14, 14, 14, 14, 19, 19, 19, 19 };
+	static const int16_t lsb_shift[8] = { 0, -2, -4, -6, 0, -2, -4, -6 };
+	const uint8x16_t mi = vld1q_u8(msb_at), li = vld1q_u8(lsb_at);
+	const int16x8_t sh = vld1q_s16(lsb_shift);
+	const uint16x8_t three = vdupq_n_u16(3), black = vdupq_n_u16(64);
+
+	/* 16 pixels (4 groups, 20 bytes) a step; the table read is 32 bytes, so never past the line's end */
+	for (; g + 4 <= groups && q + 32 <= end; g += 4, q += 20, o += 16) {
+		uint8x16x2_t t = { { vld1q_u8(q), vld1q_u8(q + 16) } };
+		uint8x16_t msb = vqtbl2q_u8(t, mi), lsb = vqtbl2q_u8(t, li);
+		uint16x8_t lo = vorrq_u16(vshll_n_u8(vget_low_u8(msb), 2), vandq_u16(vshlq_u16(vmovl_u8(vget_low_u8(lsb)), sh), three));
+		uint16x8_t hi = vorrq_u16(vshll_n_u8(vget_high_u8(msb), 2), vandq_u16(vshlq_u16(vmovl_u8(vget_high_u8(lsb)), sh), three));
+
+		vst1q_u16(o, vqsubq_u16(lo, black));
+		vst1q_u16(o + 8, vqsubq_u16(hi, black));
+	}
+#else
+	(void)end;
+#endif
+	for (; g < groups; g++, q += 5, o += 4) {
+		for (int k = 0; k < 4; k++) {
+			int v = (q[k] << 2 | (q[4] >> (k * 2) & 3)) - 64;
+
+			o[k] = (uint16_t)(v < 0 ? 0 : v);
+		}
+	}
+}
+
+/* the line's lens shading: the grid at this height, then column i's gain and the step to column i + 1 */
+static void
+preview_shading(const struct isp *isp, float v_pos, struct preview *pv)
+{
+	float gy = v_pos * (LSC_H - 1);
+	int ly = (int)gy;
+
+	ly = ly < 0 ? 0 : ly > LSC_H - 2 ? LSC_H - 2 : ly;
+	float fy = gy - ly;
+
+	for (int c = 0; c < 3; c++) {
+		float col[LSC_W];
+
+		for (int gx = 0; gx < LSC_W; gx++) {
+			col[gx] = isp->lsc.gain[c][ly][gx] * (1 - fy) + isp->lsc.gain[c][ly + 1][gx] * fy;
+		}
+		for (int i = 0; i < 16; i++) {
+			pv->base[c][i] = col[i];
+			pv->slope[c][i] = col[i + 1] - col[i];
+		}
+	}
+}
+
+#if ISP_NEON
+/* 4 cells' gains: column lx's and the step to the next, picked out of 16 floats (64 bytes) by byte lookups */
+static inline float32x4_t
+gain4(const float *base, const float *slope, uint32x4_t lx, float32x4_t fx)
+{
+	uint8x16x4_t tb = { { vld1q_u8((const uint8_t *)base), vld1q_u8((const uint8_t *)base + 16),
+		                    vld1q_u8((const uint8_t *)base + 32), vld1q_u8((const uint8_t *)base + 48) } };
+	uint8x16x4_t ts = { { vld1q_u8((const uint8_t *)slope), vld1q_u8((const uint8_t *)slope + 16),
+		                    vld1q_u8((const uint8_t *)slope + 32), vld1q_u8((const uint8_t *)slope + 48) } };
+	/* (each lane's four bytes: lx * 4 + 0, 1, 2, 3) */
+	uint8x16_t idx = vreinterpretq_u8_u32(vmlaq_n_u32(vdupq_n_u32(0x03020100), lx, 0x04040404));
+
+	return vfmaq_f32(vreinterpretq_f32_u8(vqtbl4q_u8(tb, idx)), vreinterpretq_f32_u8(vqtbl4q_u8(ts, idx)), fx);
+}
+
+/* the colour matrix (and the gamma table's step, truncated, 0..4095) of 4 cells */
+static inline uint16x4_t
+steps4(const struct pipe *p, int c, float32x4_t R, float32x4_t G, float32x4_t B)
+{
+	float32x4_t v = vdupq_n_f32(0.5f);
+
+	if (p->identity) {
+		v = vfmaq_n_f32(v, c == 0 ? R : c == 1 ? G : B, p->m[c][c]);
+	} else {
+		v = vfmaq_n_f32(v, R, p->m[c][0]);
+		v = vfmaq_n_f32(v, G, p->m[c][1]);
+		v = vfmaq_n_f32(v, B, p->m[c][2]);
+	}
+	v = vminq_f32(vmaxq_f32(v, vdupq_n_f32(0)), vdupq_n_f32(4095));
+	return vmovn_u32(vcvtq_u32_f32(v));
+}
+#endif
+
+/* one line of the picture as three planes of 8-bit R, G, B */
+static void
+preview_row(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, struct preview *pv, uint32_t width,
+    uint32_t height, uint32_t row, uint8_t *R8, uint8_t *G8, uint8_t *B8)
+{
+	uint32_t cells_h = f->height / 2, n = pv->cw, c = 0;
+
+	if (isp->turned) {
+		row = height - 1 - row;         /* (and each line from its end, below) */
+	}
+	uint32_t cy = pv->y0 + (uint32_t)((uint64_t)row * pv->ch / height);
+	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+	bool shade = isp->lsc.on;
+	uint16_t *l0 = pv->l0 + 4, *l1 = pv->l1 + 4;      /* (unpack_raw10's room in front) */
+
+	unpack_raw10(top, f->stride, 2 * pv->x0, 2 * n, l0);
+	unpack_raw10(top + f->stride, f->stride, 2 * pv->x0, 2 * n, l1);
+	if (shade) {
+		preview_shading(isp, cells_h > 1 ? (float)cy / (cells_h - 1) : 0, pv);
+	}
+#if ISP_NEON
+	static const float lane[4] = { 0, 1, 2, 3 };
+	const float32x4_t lanes = vld1q_f32(lane);
+	uint16_t sr[8], sg[8], sb[8];
+
+	for (; c + 8 <= n; c += 8) {
+		uint16x8x2_t t = vld2q_u16(l0 + 2 * c), u = vld2q_u16(l1 + 2 * c);
+		uint16x8_t q[4] = { t.val[0], t.val[1], u.val[0], u.val[1] };
+		uint16x8_t g2 = vaddq_u16(q[pv->g0], q[pv->g1]);
+
+		for (int h = 0; h < 2; h++) {
+			uint16x4_t r16 = h ? vget_high_u16(q[pv->r]) : vget_low_u16(q[pv->r]);
+			uint16x4_t g16 = h ? vget_high_u16(g2) : vget_low_u16(g2);
+			uint16x4_t b16 = h ? vget_high_u16(q[pv->b]) : vget_low_u16(q[pv->b]);
+			float32x4_t R = vcvtq_f32_u32(vmovl_u16(r16)), G = vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(g16)), 0.5f);
+			float32x4_t B = vcvtq_f32_u32(vmovl_u16(b16));
+
+			if (shade) {
+				float32x4_t gx = vmulq_n_f32(vaddq_f32(vdupq_n_f32((float)(pv->x0 + c + 4 * h)), lanes), pv->to_grid);
+				uint32x4_t lx = vminq_u32(vcvtq_u32_f32(gx), vdupq_n_u32(LSC_W - 2));
+				float32x4_t fx = vsubq_f32(gx, vcvtq_f32_u32(lx));
+
+				R = vmulq_f32(R, gain4(pv->base[0], pv->slope[0], lx, fx));
+				G = vmulq_f32(G, gain4(pv->base[1], pv->slope[1], lx, fx));
+				B = vmulq_f32(B, gain4(pv->base[2], pv->slope[2], lx, fx));
+			}
+			vst1_u16(sr + 4 * h, steps4(&pv->p, 0, R, G, B));
+			vst1_u16(sg + 4 * h, steps4(&pv->p, 1, R, G, B));
+			vst1_u16(sb + 4 * h, steps4(&pv->p, 2, R, G, B));
+		}
+		for (int k = 0; k < 8; k++) {
+			pv->cr[c + k] = isp->gamma[sr[k]];
+			pv->cg[c + k] = isp->gamma[sg[k]];
+			pv->cb[c + k] = isp->gamma[sb[k]];
+		}
+	}
+#endif
+	for (; c < n; c++) {
+		uint16_t v[4] = { l0[2 * c], l0[2 * c + 1], l1[2 * c], l1[2 * c + 1] };
+		float R = v[pv->r], G = (float)(v[pv->g0] + v[pv->g1]) * 0.5f, B = v[pv->b];
+
+		if (shade) {
+			float gx = (pv->x0 + c) * pv->to_grid;
+			uint32_t lx = (uint32_t)gx;
+
+			lx = lx > LSC_W - 2 ? LSC_W - 2 : lx;
+			float fx = gx - lx;
+
+			R *= pv->base[0][lx] + pv->slope[0][lx] * fx;
+			G *= pv->base[1][lx] + pv->slope[1][lx] * fx;
+			B *= pv->base[2][lx] + pv->slope[2][lx] * fx;
+		}
+		const struct pipe *p = &pv->p;
+		float vr = (p->identity ? R * p->m[0][0] : p->m[0][0] * R + p->m[0][1] * G + p->m[0][2] * B) + 0.5f;
+		float vg = (p->identity ? G * p->m[1][1] : p->m[1][0] * R + p->m[1][1] * G + p->m[1][2] * B) + 0.5f;
+		float vb = (p->identity ? B * p->m[2][2] : p->m[2][0] * R + p->m[2][1] * G + p->m[2][2] * B) + 0.5f;
+
+		pv->cr[c] = isp->gamma[(int)(vr < 0 ? 0 : vr > 4095 ? 4095 : vr)];
+		pv->cg[c] = isp->gamma[(int)(vg < 0 ? 0 : vg > 4095 ? 4095 : vg)];
+		pv->cb[c] = isp->gamma[(int)(vb < 0 ? 0 : vb > 4095 ? 4095 : vb)];
+	}
+	/* each pixel its nearest cell (the line from its end when the picture is turned) */
+	if (isp->turned) {
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t k = pv->map[x], o = width - 1 - x;
+
+			R8[o] = pv->cr[k], G8[o] = pv->cg[k], B8[o] = pv->cb[k];
+		}
+	} else {
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t k = pv->map[x];
+
+			R8[x] = pv->cr[k], G8[x] = pv->cg[k], B8[x] = pv->cb[k];
+		}
+	}
+}
+
+/* two lines of planes as NV12, the arithmetic of nv12_pair() exactly (y1 NULL: the picture's odd last line) */
+static void
+nv12_planes(const uint8_t *const p0[3], const uint8_t *const p1[3], uint32_t width, uint8_t *y0, uint8_t *y1, uint8_t *uv,
+    bool video_range)
+{
+	static const int32_t full[9] = { 19595, 38470, 7471, -11058, -21710, 32768, 32768, -27439, -5329 };
+	static const int32_t video[9] = { 16829, 33039, 6416, -9714, -19070, 28784, 28784, -24103, -4681 };
+	const int32_t *k = video_range ? video : full;
+	int32_t oy = (video_range ? 16 << 16 : 0) + (1 << 15);
+	uint32_t x = 0;
+
+	for (int l = 0; l < 2; l++) {
+		const uint8_t *const *p = l ? p1 : p0;
+		uint8_t *out = l ? y1 : y0;
+
+		if (out == NULL) {
+			continue;
+		}
+		x = 0;
+#if ISP_NEON
+		for (; x + 16 <= width; x += 16) {
+			uint8x16_t r = vld1q_u8(p[0] + x), g = vld1q_u8(p[1] + x), b = vld1q_u8(p[2] + x);
+			uint16x8_t yy[2];
+
+			for (int h = 0; h < 2; h++) {
+				uint16x8_t r16 = vmovl_u8(h ? vget_high_u8(r) : vget_low_u8(r));
+				uint16x8_t g16 = vmovl_u8(h ? vget_high_u8(g) : vget_low_u8(g));
+				uint16x8_t b16 = vmovl_u8(h ? vget_high_u8(b) : vget_low_u8(b));
+				uint32x4_t a = vdupq_n_u32((uint32_t)oy), z = a;
+
+				a = vmlal_n_u16(a, vget_low_u16(r16), (uint16_t)k[0]);
+				a = vmlal_n_u16(a, vget_low_u16(g16), (uint16_t)k[1]);
+				a = vmlal_n_u16(a, vget_low_u16(b16), (uint16_t)k[2]);
+				z = vmlal_n_u16(z, vget_high_u16(r16), (uint16_t)k[0]);
+				z = vmlal_n_u16(z, vget_high_u16(g16), (uint16_t)k[1]);
+				z = vmlal_n_u16(z, vget_high_u16(b16), (uint16_t)k[2]);
+				yy[h] = vcombine_u16(vshrn_n_u32(a, 16), vshrn_n_u32(z, 16));
+			}
+			vst1q_u8(out + x, vcombine_u8(vmovn_u16(yy[0]), vmovn_u16(yy[1])));
+		}
+#endif
+		for (; x < width; x++) {
+			out[x] = (uint8_t)((k[0] * p[0][x] + k[1] * p[1][x] + k[2] * p[2][x] + oy) >> 16);
+		}
+	}
+	x = 0;
+#if ISP_NEON
+	/* 8 chroma pairs (16 pixels across, both lines) a step */
+	for (; x + 16 <= width; x += 16) {
+		int32x4_t s[3][2];
+
+		for (int c = 0; c < 3; c++) {
+			uint16x8_t sum = vaddq_u16(vpaddlq_u8(vld1q_u8(p0[c] + x)), vpaddlq_u8(vld1q_u8(p1[c] + x)));
+
+			s[c][0] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(sum)));
+			s[c][1] = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(sum)));
+		}
+		uint8x8x2_t out;
+		int16x4_t cb[2], cr[2];
+
+		for (int h = 0; h < 2; h++) {
+			int32x4_t a = vdupq_n_s32((128 << 18) + (1 << 17) - 1), z = a;
+
+			a = vmlaq_n_s32(a, s[0][h], k[3]);
+			a = vmlaq_n_s32(a, s[1][h], k[4]);
+			a = vmlaq_n_s32(a, s[2][h], k[5]);
+			z = vmlaq_n_s32(z, s[0][h], k[6]);
+			z = vmlaq_n_s32(z, s[1][h], k[7]);
+			z = vmlaq_n_s32(z, s[2][h], k[8]);
+			cb[h] = vmovn_s32(vshrq_n_s32(a, 18));
+			cr[h] = vmovn_s32(vshrq_n_s32(z, 18));
+		}
+		out.val[0] = vqmovun_s16(vcombine_s16(cb[0], cb[1]));
+		out.val[1] = vqmovun_s16(vcombine_s16(cr[0], cr[1]));
+		vst2_u8(uv + x, out);
+	}
+#endif
+	for (; x < width; x += 2) {
+		uint32_t x1 = x + 1 < width ? x + 1 : x;
+		int32_t R = p0[0][x] + p0[0][x1] + p1[0][x] + p1[0][x1];
+		int32_t G = p0[1][x] + p0[1][x1] + p1[1][x] + p1[1][x1];
+		int32_t B = p0[2][x] + p0[2][x1] + p1[2][x] + p1[2][x1];
+		int32_t cb = (k[3] * R + k[4] * G + k[5] * B + (128 << 18) + (1 << 17) - 1) >> 18;
+		int32_t cr = (k[6] * R + k[7] * G + k[8] * B + (128 << 18) + (1 << 17) - 1) >> 18;
+
+		uv[x] = (uint8_t)(cb < 0 ? 0 : cb > 255 ? 255 : cb);
+		uv[x + 1] = (uint8_t)(cr < 0 ? 0 : cr > 255 ? 255 : cr);
+	}
+}
+
+void
+isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
+    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
+{
+	uint8_t line[2][3 * 8192];
+	struct preview pvs, *pv = &pvs;         /* (60 KB on the stack, with line's 48: dispatch's threads have 512) */
+
+	if (width > 8192) {
+		return;
+	}
+	if (preview_setup(isp, f, width, height, pv)) {
+		uint8_t *planes = line[0];      /* (six planes of up to 8192: the two lines' R, G, B) */
+		const uint8_t *p0[3] = { planes, planes + 8192, planes + 2 * 8192 };
+		const uint8_t *p1[3] = { planes + 3 * 8192, planes + 4 * 8192, planes + 5 * 8192 };
+
+		for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
+			bool second = row + 1 < height;
+
+			preview_row(isp, f, raw, pv, width, height, row, (uint8_t *)p0[0], (uint8_t *)p0[1], (uint8_t *)p0[2]);
+			preview_row(isp, f, raw, pv, width, height, second ? row + 1 : row, (uint8_t *)p1[0], (uint8_t *)p1[1],
+			    (uint8_t *)p1[2]);
+			nv12_planes(p0, p1, width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+			    uv + (size_t)(row / 2) * uv_stride, video_range);
+		}
+		return;
+	}
+	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
+		bool second = row + 1 < height;
+
+		render_line(isp, f, raw, width, height, row, line[0]);
+		render_line(isp, f, raw, width, height, second ? row + 1 : row, line[1]);
+		nv12_pair(line[0], line[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+		    uv + (size_t)(row / 2) * uv_stride, video_range);
+	}
+}
+
+void
+isp_render_bgra(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *out, size_t stride,
+    uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row)
+{
+	uint8_t line[3 * 8192];
+	struct preview pvs, *pv = &pvs;
+
+	if (width > 8192) {
+		return;
+	}
+	if (preview_setup(isp, f, width, height, pv)) {
+		uint8_t *R8 = line, *G8 = line + 8192, *B8 = line + 2 * 8192;
+
+		for (uint32_t row = first_row; row < end_row && row < height; row++) {
+			uint8_t *o = out + (size_t)row * stride;
+			uint32_t x = 0;
+
+			preview_row(isp, f, raw, pv, width, height, row, R8, G8, B8);
+#if ISP_NEON
+			for (; x + 16 <= width; x += 16) {
+				uint8x16x4_t px = { { vld1q_u8(B8 + x), vld1q_u8(G8 + x), vld1q_u8(R8 + x), vdupq_n_u8(255) } };
+
+				vst4q_u8(o + 4 * x, px);
+			}
+#endif
+			for (; x < width; x++) {
+				o[4 * x] = B8[x];
+				o[4 * x + 1] = G8[x];
+				o[4 * x + 2] = R8[x];
+				o[4 * x + 3] = 255;
+			}
+		}
+		return;
+	}
+	for (uint32_t row = first_row; row < end_row && row < height; row++) {
+		uint8_t *o = out + (size_t)row * stride;
+
+		render_line(isp, f, raw, width, height, row, line);
+		for (uint32_t x = 0; x < width; x++) {
+			o[4 * x] = line[3 * x + 2];
+			o[4 * x + 1] = line[3 * x + 1];
+			o[4 * x + 2] = line[3 * x];
+			o[4 * x + 3] = 255;
+		}
+	}
+}
+
+/* ---- every pixel: bilinear demosaic -------------------------------------------------------------------- */
+
+/* the colour of each site of a 2x2 cell (0 R, 1 G, 2 B), position y * 2 + x */
+static void
+cfa(uint32_t bayer, int colour[4])
+{
+	int r, b;
+
+	cell_places(bayer, &r, &b);
+	for (int i = 0; i < 4; i++) {
+		colour[i] = i == r ? 0 : i == b ? 2 : 1;
+	}
+}
+
+/* line y of the frame as values above black (y clamped into the frame) */
+static void
+unpack_line(const struct hakios_camera_frame *f, const uint8_t *raw, int y, int *out)
+{
+	y = y < 0 ? 0 : y >= (int)f->height ? (int)f->height - 1 : y;
+	const uint8_t *line = raw + (size_t)y * f->stride;
+
+	for (uint32_t x = 0; x + 3 < f->width + 3 && x < f->width; x += 4) {
+		const uint8_t *g = line + (x >> 2) * 5;
+
+		for (int i = 0; i < 4 && x + i < f->width; i++) {
+			int v = (g[i] << 2 | (g[4] >> (i * 2) & 3)) - (int)f->black;
+
+			out[x + i] = v < 0 ? 0 : v;
+		}
+	}
+}
+
+/* one line (y) at full size as 8-bit R, G, B, from the lines y - 1, y, y + 1 (l[0..2]) */
+static void
+full_line(const struct isp *isp, const struct hakios_camera_frame *f, const int *const l[3], uint32_t y, const int colour[4],
+    const struct pipe *p, uint8_t *rgb)
+{
+	int w = (int)f->width;
+	float v_pos = f->height > 1 ? (float)y / (f->height - 1) : 0, gains[3] = { 1, 1, 1 };
+
+	for (int x = 0; x < w; x++) {
+		float sum[3] = { 0, 0, 0 };
+		int n[3] = { 0, 0, 0 };
+
+		/* each colour: its own value where the site has it, else the mean of its sites in the 3x3 around */
+		for (int dy = -1; dy <= 1; dy++) {
+			const int *line = l[dy + 1];
+			int yy = (int)y + dy;
+
+			yy = yy < 0 ? 0 : yy >= (int)f->height ? (int)f->height - 1 : yy;
+			for (int dx = -1; dx <= 1; dx++) {
+				int xx = x + dx < 0 ? 0 : x + dx >= w ? w - 1 : x + dx;
+				int c = colour[(yy & 1) * 2 + (xx & 1)];
+
+				if (dx == 0 && dy == 0) {
+					sum[c] = (float)line[xx] * 64;          /* (its own value wins over the neighbours') */
+					n[c] = 64;
+				} else if (n[c] < 64) {
+					sum[c] += (float)line[xx];
+					n[c]++;
+				}
+			}
+		}
+		if (isp->lsc.on) {
+			lsc_at(isp, w > 1 ? (float)x / (w - 1) : 0, v_pos, gains);
+		}
+		pixel(isp, p, sum[0] / (n[0] ? n[0] : 1) * gains[0], sum[1] / (n[1] ? n[1] : 1) * gains[1],
+		    sum[2] / (n[2] ? n[2] : 1) * gains[2], rgb + 3 * x);
+	}
+}
+
+void
+isp_render_full_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
+    uint8_t *uv, size_t uv_stride, uint32_t first_row, uint32_t end_row, bool video_range)
+{
+	uint32_t width = f->width;
+	int colour[4];
+	struct pipe p;
+	static __thread int *lines[4];
+	static __thread uint8_t *rgb[2];
+	static __thread uint32_t have;
+
+	if (width > have) {
+		for (int i = 0; i < 4; i++) {
+			free(lines[i]);
+			lines[i] = malloc(sizeof(int) * width);
+		}
+		for (int i = 0; i < 2; i++) {
+			free(rgb[i]);
+			rgb[i] = malloc(3 * (size_t)width);
+		}
+		have = width;
+	}
+	cfa(f->bayer, colour);
+	pipe_init(isp, &p);
+	for (uint32_t row = first_row & ~1u; row < end_row && row < f->height; row += 2) {
+		for (int i = 0; i < 4; i++) {
+			unpack_line(f, raw, (int)row - 1 + i, lines[i]);
+		}
+		const int *const above[3] = { lines[0], lines[1], lines[2] }, *const below[3] = { lines[1], lines[2], lines[3] };
+
+		bool second = row + 1 < f->height;
+
+		full_line(isp, f, above, row, colour, &p, rgb[0]);
+		full_line(isp, f, below, second ? row + 1 : row, colour, &p, rgb[1]);
+		nv12_pair(rgb[0], rgb[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+		    uv + (size_t)(row / 2) * uv_stride, video_range);
+	}
+}
+
+/* one line (y) of the sensor demosaiced, as 8-bit R, G, B (the unpacked lines around it in this thread's l) */
+static void
+demosaic_row(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint32_t row, const int colour[4],
+    const struct pipe *p, int *const l[3], uint8_t *rgb)
+{
+	for (int i = 0; i < 3; i++) {
+		unpack_line(f, raw, (int)row - 1 + i, l[i]);
+	}
+	full_line(isp, f, (const int *const *)l, row, colour, p, rgb);
+}
+
+void
+isp_render_still_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
+    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
+{
+	uint32_t x0, y0, cw, ch, fw = f->width;
+	int colour[4];
+	struct pipe p;
+	static __thread int *lines[3];
+	static __thread uint8_t *rows[2], *out[2];
+	static __thread uint32_t have_fw, have_width;
+	int32_t cached[2] = { -1, -1 };
+
+	if (fw > have_fw) {
+		for (int i = 0; i < 3; i++) {
+			free(lines[i]);
+			lines[i] = malloc(sizeof(int) * fw);
+		}
+		for (int i = 0; i < 2; i++) {
+			free(rows[i]);
+			rows[i] = malloc(3 * (size_t)fw);
+		}
+		have_fw = fw;
+	}
+	if (width > have_width) {
+		for (int i = 0; i < 2; i++) {
+			free(out[i]);
+			out[i] = malloc(3 * (size_t)width);
+		}
+		have_width = width;
+	}
+	if (lines[2] == NULL || rows[1] == NULL || out[1] == NULL) {
+		return;
+	}
+	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
+	cfa(f->bayer, colour);
+	pipe_init(isp, &p);
+	float sx_step = 2.0f * cw / width, sy_step = 2.0f * ch / height;
+
+	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
+		for (int k = 0; k < 2; k++) {
+			uint32_t r = row + k < height ? row + k : row, at = isp->turned ? height - 1 - r : r;
+			float sy = 2.0f * y0 + (at + 0.5f) * sy_step - 0.5f, ty;
+			uint32_t sy0 = sy < 0 ? 0 : (uint32_t)sy, sy1, slot[2];
+
+			sy0 = sy0 > f->height - 1 ? f->height - 1 : sy0;
+			sy1 = sy0 + 1 > f->height - 1 ? f->height - 1 : sy0 + 1;
+			ty = sy < (float)sy0 ? 0 : sy - sy0;
+			/* the two lines of the sensor it is between, demosaiced (kept from the line before where they are the same) */
+			for (int n = 0; n < 2; n++) {
+				uint32_t want = n ? sy1 : sy0;
+
+				if (cached[0] == (int32_t)want || cached[1] == (int32_t)want) {
+					slot[n] = cached[0] == (int32_t)want ? 0 : 1;
+					continue;
+				}
+				/* (into the slot the other line does not need: sy0's for sy1, and sy1's kept for sy0) */
+				slot[n] = n == 1 ? slot[0] ^ 1 : cached[0] == (int32_t)sy1 ? 1 : 0;
+				demosaic_row(isp, f, raw, want, colour, &p, lines, rows[slot[n]]);
+				cached[slot[n]] = (int32_t)want;
+			}
+			const uint8_t *a = rows[slot[0]], *b = rows[slot[1]];
+			uint8_t *o = out[k];
+
+			for (uint32_t x = 0; x < width; x++) {
+				float sx = 2.0f * x0 + (x + 0.5f) * sx_step - 0.5f, tx;
+				uint32_t sx0 = sx < 0 ? 0 : (uint32_t)sx, sx1;
+
+				sx0 = sx0 > fw - 1 ? fw - 1 : sx0;
+				sx1 = sx0 + 1 > fw - 1 ? fw - 1 : sx0 + 1;
+				tx = sx < (float)sx0 ? 0 : sx - sx0;
+				uint8_t *px = o + 3 * (isp->turned ? width - 1 - x : x);
+
+				for (int c = 0; c < 3; c++) {
+					float top = a[3 * sx0 + c] + tx * (a[3 * sx1 + c] - a[3 * sx0 + c]);
+					float bottom = b[3 * sx0 + c] + tx * (b[3 * sx1 + c] - b[3 * sx0 + c]);
+
+					px[c] = (uint8_t)(top + ty * (bottom - top) + 0.5f);
+				}
+			}
+		}
+		bool second = row + 1 < height;
+
+		nv12_pair(out[0], out[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+		    uv + (size_t)(row / 2) * uv_stride, video_range);
+	}
+}
+
+/* ---- lens shading from a flat field --------------------------------------------------------------------- */
+
+bool
+isp_lsc_from_flat(struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, float *min_ratio)
+{
+	uint32_t cells_w = f->width / 2, cells_h = f->height / 2, half_w = cells_w / (LSC_W - 1) / 2, half_h = cells_h / (LSC_H - 1) / 2;
+	float level[3][LSC_H][LSC_W], top[3] = { 0, 0, 0 };
+	uint32_t clipped = 0, seen = 0;
+	int r, b;
+
+	cell_places(f->bayer, &r, &b);
+	for (int gy = 0; gy < LSC_H; gy++) {
+		for (int gx = 0; gx < LSC_W; gx++) {
+			int cx0 = (int)((uint64_t)gx * (cells_w - 1) / (LSC_W - 1)) - (int)half_w;
+			int cy0 = (int)((uint64_t)gy * (cells_h - 1) / (LSC_H - 1)) - (int)half_h;
+			double sum[3] = { 0, 0, 0 };
+			uint32_t n = 0;
+
+			for (int cy = cy0; cy <= cy0 + 2 * (int)half_h; cy += 2) {
+				for (int cx = cx0; cx <= cx0 + 2 * (int)half_w; cx += 2) {
+					int v[4];
+
+					if (cx < 0 || cy < 0 || cx >= (int)cells_w || cy >= (int)cells_h) {
+						continue;
+					}
+					cell(raw + (size_t)cy * 2 * f->stride, f->stride, (uint32_t)cx, v);
+					sum[0] += v[r];
+					sum[2] += v[b];
+					for (int j = 0; j < 4; j++) {
+						sum[1] += j != r && j != b ? v[j] / 2.0 : 0;
+						clipped += v[j] > WHITE - 30;
+					}
+					seen += 4;
+					n++;
+				}
+			}
+			for (int c = 0; c < 3; c++) {
+				level[c][gy][gx] = n ? (float)(sum[c] / n) : 0;
+				top[c] = level[c][gy][gx] > top[c] ? level[c][gy][gx] : top[c];
+			}
+		}
+	}
+	/* bright enough to tell shading from noise, and not clipped anywhere that counts */
+	if (top[1] < 100 || clipped * 1000 > seen) {
+		return false;
+	}
+	float darkest = 1;
+
+	for (int c = 0; c < 3; c++) {
+		for (int gy = 0; gy < LSC_H; gy++) {
+			for (int gx = 0; gx < LSC_W; gx++) {
+				float l = level[c][gy][gx] > 1 ? level[c][gy][gx] : 1;
+
+				isp->lsc.gain[c][gy][gx] = top[c] / l;
+				if (c == 1 && l / top[c] < darkest) {
+					darkest = l / top[c];
+				}
+			}
+		}
+	}
+	isp->lsc.on = true;
+	if (min_ratio != NULL) {
+		*min_ratio = darkest;
+	}
+	return true;
+}
+
+/* one module's part of a tuning file (tools/camtuning.py): its ranges, and where each range's values are */
+static bool
+tune_set(const uint8_t **p, const uint8_t *end, struct isp_tune_set *set, size_t floats)
+{
+	uint32_t n;
+
+	if (end - *p < 4) {
+		return false;
+	}
+	memcpy(&n, *p, 4);
+	*p += 4;
+	if (n == 0 || n > TUNE_LIGHTS) {
+		return false;
+	}
+	set->lights = n;
+	for (uint32_t i = 0; i < n; i++) {
+		if (end - *p < 12) {
+			return false;
+		}
+		memcpy(&set->light[i].lux_from, *p, 4);
+		memcpy(&set->light[i].lux_to, *p + 4, 4);
+		memcpy(&set->light[i].ccts, *p + 8, 4);
+		*p += 12;
+		if (set->light[i].ccts == 0 || set->light[i].ccts > TUNE_CCTS) {
+			return false;
+		}
+		for (uint32_t j = 0; j < set->light[i].ccts; j++) {
+			if ((size_t)(end - *p) < (2 + floats) * 4) {
+				return false;
+			}
+			memcpy(&set->light[i].cct_from[j], *p, 4);
+			memcpy(&set->light[i].cct_to[j], *p + 4, 4);
+			set->light[i].v[j] = (const float *)(const void *)(*p + 8);     /* (every field is 4 bytes) */
+			*p += (2 + floats) * 4;
+		}
+	}
+	return true;
+}
+
+bool
+isp_load_tuning(struct isp *isp, const char *path)
+{
+	struct isp_tuning *t = calloc(1, sizeof(*t));
+	int fd = open(path, O_RDONLY);
+	struct stat st;
+	const uint8_t *p, *end;
+	bool good = false;
+
+	if (isp->tuning != NULL) {
+		free(isp->tuning->file);
+		free(isp->tuning);
+		isp->tuning = NULL;
+	}
+	if (t != NULL && fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 8 && st.st_size < (16 << 20) &&
+	    (t->file = malloc((size_t)st.st_size)) != NULL && read(fd, t->file, (size_t)st.st_size) == st.st_size) {
+		p = t->file;
+		end = p + st.st_size;
+		good = memcmp(p, "RWCISP02", 8) == 0;
+		p += 8;
+		good = good && tune_set(&p, end, &t->ccm, 9) && tune_set(&p, end, &t->lsc, 4 * LSC_W * LSC_H) && end - p >= 4;
+		if (good) {
+			memcpy(&t->refs, p, 4);
+			p += 4;
+			good = t->refs <= 16 && (size_t)(end - p) >= t->refs * 12;
+		}
+		if (good) {
+			memcpy(t->ref, p, t->refs * 12);
+		}
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	if (!good) {
+		if (t != NULL) {
+			free(t->file);
+		}
+		free(t);
+		return false;
+	}
+	isp->tuning = t;
+	return true;
+}
+
+/*
+ * Where x falls among ascending ranges [from[i], to[i]]: in one (a = b), or between two (a, b and how
+ * far from a's end to b's start, 0 to 1); before the first, the first; after the last, the last.
+ */
+static void
+pick(const float *from, const float *to, uint32_t n, float x, uint32_t *a, uint32_t *b, float *t)
+{
+	*a = *b = n - 1;
+	*t = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (x <= to[i]) {
+			*a = *b = i;
+			if (i > 0 && x < from[i]) {
+				*a = i - 1;
+				*t = (x - to[i - 1]) / (from[i] - to[i - 1]);
+			}
+			return;
+		}
+	}
+}
+
+/* a module's values for this light and temperature: those of the ranges they fall in, or between */
+static void
+tune_blend(const struct isp_tune_set *set, float lux_index, float cct, size_t floats, float *out)
+{
+	float from[TUNE_LIGHTS], to[TUNE_LIGHTS], tl;
+	uint32_t la, lb;
+
+	for (uint32_t i = 0; i < set->lights; i++) {
+		from[i] = set->light[i].lux_from;
+		to[i] = set->light[i].lux_to;
+	}
+	pick(from, to, set->lights, lux_index, &la, &lb, &tl);
+	memset(out, 0, floats * sizeof(float));
+	for (int k = 0; k < 2; k++) {
+		uint32_t l = k ? lb : la, ca, cb;
+		float w = k ? tl : 1 - tl, tc;
+
+		if (w == 0) {
+			continue;
+		}
+		pick(set->light[l].cct_from, set->light[l].cct_to, set->light[l].ccts, cct, &ca, &cb, &tc);
+		for (size_t i = 0; i < floats; i++) {
+			out[i] += w * ((1 - tc) * set->light[l].v[ca][i] + tc * set->light[l].v[cb][i]);
+		}
+	}
+}
+
+void
+isp_tune(struct isp *isp, float lux_index, float cct)
+{
+	const struct isp_tuning *t = isp->tuning;
+	float m[9], g[4 * LSC_H * LSC_W];
+	const int grid = LSC_H * LSC_W;
+
+	if (t == NULL) {
+		return;
+	}
+	tune_blend(&t->ccm, lux_index, cct, 9, m);
+	isp_set_ccm(isp, m);
+	tune_blend(&t->lsc, lux_index, cct, 4 * (size_t)grid, g);
+	for (int gy = 0; gy < LSC_H; gy++) {
+		for (int gx = 0; gx < LSC_W; gx++) {
+			int at = gy * LSC_W + gx;
+
+			isp->lsc.gain[0][gy][gx] = g[at];
+			isp->lsc.gain[1][gy][gx] = (g[grid + at] + g[2 * grid + at]) / 2;
+			isp->lsc.gain[2][gy][gx] = g[3 * grid + at];
+		}
+	}
+	isp->lsc.on = true;
+}

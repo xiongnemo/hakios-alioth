@@ -80,7 +80,6 @@ struct isp {
 	bool            asked;
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
 	struct isp_tuning *tuning;              /* isp_load_tuning()'s, or none */
-	bool            plain_preview;          /* the preview's pixels the way before 2026-11-15 (one at a time), to compare */
 };
 
 void isp_init(struct isp *isp);
