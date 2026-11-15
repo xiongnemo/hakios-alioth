@@ -325,10 +325,19 @@ static uint64_t
 millisecondsUntil(const struct msm_timespec * when)
 {
 	uint64_t now;
-	int64_t left;
+	int64_t left, end;
 
 	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
-	left = when->seconds * (int64_t) NSEC_PER_SEC + when->nanoseconds - (int64_t) now;
+	/* (11-16, oosexgang 7822f30) the seconds are the caller's: a number too big to be nanoseconds is a time far
+	 * ahead (or behind), not a wrapped one */
+	if (__builtin_mul_overflow(when->seconds, (int64_t) NSEC_PER_SEC, &end) ||
+	    __builtin_add_overflow(end, when->nanoseconds, &end)) {
+		return when->seconds > 0 && when->nanoseconds >= 0 ? GPU_PATIENCE_MS : 0;
+	}
+	if (end <= 0) {
+		return 0;
+	}
+	left = end - (int64_t) now;
 	if (left <= 0) {
 		return 0;
 	}
@@ -637,8 +646,21 @@ HakiosGPUUserClient::start(IOService * provider)
  * written, and must not be somebody else's by then.
  */
 void
-HakiosGPUUserClient::freeBuffer(struct gpu_buffer * b)
+HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 {
+	/*
+	 * (11-16, oosexgang 7822f30) gpuWait() below lets go of the lock: the buffer is taken out of its handle FIRST and
+	 * worked on as a copy, so that a second close of the same handle (or the client's closing) meanwhile cannot free the
+	 * same memory and address twice -- nor find the surface's buffer for an import and get a handle being freed.
+	 */
+	struct gpu_buffer saved = *slot;
+	struct gpu_buffer * b = &saved;
+
+	slot->memory = NULL;
+	slot->surface = NULL;
+	fBufferCount--;
+	fBufferBytes -= b->size;
+
 	bool busy = hakios_gpu_ready() && b->fence != 0 && !hakios_gpu_done(b->fence);
 
 	if (busy && fLeftCount == GPU_LEFT) {
@@ -678,10 +700,6 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * b)
 			MiniIOSurfaceDrop(b->surface);
 		}
 	}
-	b->memory = NULL;
-	b->surface = NULL;
-	fBufferCount--;
-	fBufferBytes -= b->size;
 }
 
 /* The buffers that were given back early and that the GPU is done with now: freed. With the lock held. */
@@ -1220,8 +1238,9 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		hakios_gpu_report("the ring is full");
 	}
 	if (fSubmits++ < 4) {
+		/* (addresses and words are only set up to `count`: with no command buffer, the first would be stack garbage) */
 		IOLog("HakiosGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
-		    addresses[0], words[0]);
+		    count != 0 ? addresses[0] : 0ull, count != 0 ? words[0] : 0u);
 	}
 	/* every five seconds in which something was submitted: how much, and what it cost here */
 	gGPUStat.submissions++;
@@ -1282,6 +1301,10 @@ HakiosGPUUserClient::show(const struct hakios_show * request)
 
 	if (request->width == 0 || request->width > 4096 || request->height == 0 || request->height > 4096 ||
 	    request->rowBytes < 4 * request->width) {
+		return kIOReturnBadArgument;
+	}
+	/* (11-16, oosexgang 7822f30) rowBytes is the caller's own number: no more than a buffer may be */
+	if (size > GPU_BUFFER_MAX) {
 		return kIOReturnBadArgument;
 	}
 	pixels = (uint8_t *) IOMallocData(size);

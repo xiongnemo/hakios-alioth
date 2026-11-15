@@ -1202,6 +1202,11 @@ IOMobileFramebuffer::record(MiniIOSurface * s)
 	if (fRecBase == NULL || fRecDone || s->info.width < fWidth || s->info.height < fHeight) {
 		return;
 	}
+	/* (11-16, oosexgang 7822f30) a surface whose rows do not fit in its memory is not read */
+	if ((uint64_t) s->info.offset + (uint64_t) (fHeight - 1) * s->info.bytesPerRow + (uint64_t) fWidth * 4 >
+	    s->info.allocSize) {
+		return;
+	}
 	absolutetime_to_nanoseconds(now - fFirstFrame, &since_first);
 	if (since_first < (uint64_t) gRecStart * NSEC_PER_SEC) {
 		return;
@@ -1492,6 +1497,9 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
  * panel may be of another size, and the layer itself may be scaled: both are done in one
  * step, bilinear (or nearest neighbour: fb_filter=0).
  */
+/* (11-16, oosexgang 7822f30) A layer's rectangle on the panel further out than this is not drawn. */
+#define DST_LIMIT       (1 << 24)
+
 void
 IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
 {
@@ -1500,6 +1508,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	int32_t px0, py0, px1, py1, cx0, cx1;
 	bool filter = gFilter != 0;
 	RowJob job;
+	int64_t qx0, qy0, qx1, qy1;
 
 	if (sw <= 0 || sh <= 0) {
 		sx = sy = 0;
@@ -1514,11 +1523,25 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height) {
 		return;
 	}
-	/* the rectangle on the panel */
-	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
-	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
-	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
-	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
+	/* (11-16, oosexgang 7822f30) the rows and columns named must be in the surface's memory, whatever stride and size
+	 * its maker gave it (checked in 64 bits) */
+	if ((uint64_t) s->info.offset + (uint64_t) (sy + sh - 1) * s->info.bytesPerRow + (uint64_t) (sx + sw) * 4 >
+	    s->info.allocSize) {
+		return;
+	}
+	/* the rectangle on the panel, in 64 bits: the request's numbers are the caller's (one of billions of rows is not
+	 * drawn, nor looked at row by row) */
+	qx0 = (int64_t) dx * fPanelWidth / fWidth;
+	qy0 = (int64_t) dy * fPanelHeight / fHeight;
+	qx1 = ((int64_t) dx + dw) * fPanelWidth / fWidth;
+	qy1 = ((int64_t) dy + dh) * fPanelHeight / fHeight;
+	if (qx0 < -DST_LIMIT || qy0 < -DST_LIMIT || qx1 > DST_LIMIT || qy1 > DST_LIMIT) {
+		return;
+	}
+	px0 = (int32_t) qx0;
+	py0 = (int32_t) qy0;
+	px1 = (int32_t) qx1;
+	py1 = (int32_t) qy1;
 	if (px1 <= px0 || py1 <= py0) {
 		return;
 	}
@@ -1534,14 +1557,25 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		}
 		fBlendRowSize = (uint32_t) sw;
 		fBlendRow = IONew(uint32_t, fBlendRowSize);
+		bool allocated = fBlendRow != NULL;
+
 		for (unsigned i = 0; i + 1 < fThreads; i++) {
 			fHelperBlend[i] = IONew(uint32_t, fBlendRowSize);
-			if (fHelperBlend[i] == NULL && fBlendRow != NULL) {
+			allocated = allocated && fHelperBlend[i] != NULL;
+		}
+		if (!allocated) {
+			/* (11-16, oosexgang 7822f30) every array that was made is given back at the size it was made with, so no
+			 * later growth frees one with the wrong size */
+			if (fBlendRow != NULL) {
 				IODelete(fBlendRow, uint32_t, fBlendRowSize);
 				fBlendRow = NULL;
 			}
-		}
-		if (fBlendRow == NULL) {
+			for (unsigned i = 0; i + 1 < fThreads; i++) {
+				if (fHelperBlend[i] != NULL) {
+					IODelete(fHelperBlend[i], uint32_t, fBlendRowSize);
+					fHelperBlend[i] = NULL;
+				}
+			}
 			fBlendRowSize = 0;
 		}
 	}
@@ -2359,7 +2393,6 @@ IOMobileFramebufferUserClient::frameInfo(uint32_t swapID, uint64_t when, uint64_
 	io_user_reference_t args[2 + kFrameInfoTagCount];
 	uint32_t n = 0;
 	uint64_t period;
-	bool send = false;
 
 	nanoseconds_to_absolutetime(refreshNs(), &period);
 	IOLockLock(fLock);
@@ -2374,12 +2407,10 @@ IOMobileFramebufferUserClient::frameInfo(uint32_t swapID, uint64_t when, uint64_
 				args[n++] = kind[tag] == 0 ? when : kind[tag] == 1 ? delta : kind[tag] == 3 ? period : 0;
 			}
 		}
-		send = true;
-	}
-	IOLockUnlock(fLock);
-	if (send) {
+		/* (sent under the lock, as vsync() says why) */
 		sendAsyncResult64WithOptions(ref, kIOReturnSuccess, args, n, kIOUserNotifyOptionCanDrop);
 	}
+	IOLockUnlock(fLock);
 }
 
 bool
@@ -2620,7 +2651,6 @@ IOMobileFramebufferUserClient::vsync(void)
 	OSAsyncReference64 ref;
 	io_user_reference_t args[6];
 	uint64_t now;
-	bool send = false;
 
 	IOLockLock(fLock);
 	now = fVSyncTime;
@@ -2650,13 +2680,15 @@ IOMobileFramebufferUserClient::vsync(void)
 			args[4] = (uint32_t) fVSyncCount;
 			args[5] = fVSyncCount >> 32;
 		}
-		send = true;
 		armVSync();
-	}
-	IOLockUnlock(fLock);
-	if (send) {
+		/*
+		 * (11-16, oosexgang 7822f30) sent with the lock held: registerNotificationPort() swaps the port under this lock
+		 * and only then lets go of the old one, so the port in `ref` cannot be released while it is sent to (the send
+		 * does not wait: a full queue drops the message)
+		 */
 		sendAsyncResult64WithOptions(ref, kIOReturnSuccess, args, 6, kIOUserNotifyOptionCanDrop);
 	}
+	IOLockUnlock(fLock);
 }
 
 /*
