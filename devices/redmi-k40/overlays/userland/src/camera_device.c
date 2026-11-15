@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "camera_isp.h"
 
@@ -65,6 +66,31 @@ hakios_camera_say(const char *format, ...)
 	}
 	line[n++] = '\n';
 	write(2, line, (size_t)n);
+	/*
+	 * (and into /var/tmp/hakios-camera.log, with the time: the console's lines reach the computer only with the loader's
+	 * log at the run's end, of which the middle of a long run is not kept -- 11-15's camera timings were lost so --
+	 * while this file can be read over usbsh at any time; RAM, gone with the run; cut back past 1 MB)
+	 */
+	static int file = -1;
+	static bool tried;
+
+	if (!tried) {
+		tried = true;
+		file = open("/var/tmp/hakios-camera.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+	}
+	if (file >= 0) {
+		char stamp[32];
+		struct timespec t;
+
+		if (lseek(file, 0, SEEK_END) > 1024 * 1024) {
+			ftruncate(file, 0);
+		}
+		clock_gettime(CLOCK_MONOTONIC, &t);
+		int m = snprintf(stamp, sizeof(stamp), "[%ld.%03ld] ", (long)t.tv_sec, t.tv_nsec / 1000000);
+
+		write(file, stamp, (size_t)m);
+		write(file, line, (size_t)n);
+	}
 }
 #define say hakios_camera_say
 
@@ -1491,6 +1517,15 @@ worker(void *context)
 			    "B %.2f, lux index %.0f, about %.0f K", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
 			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct);
 		}
+	}
+	/* (a short session -- an application's camera cell opened for seconds -- said too, if it had 30 frames) */
+	if (took.frames >= 30) {
+		double ms = (double)tb.numer / tb.denom / 1e6, nf = took.frames;
+		double wall = (double)(mach_absolute_time() - took.began) * ms;
+
+		say("time a frame (last %u, %.1f a second, %u given to the graph): read %.2f ms, statistics %.2f, focus %.2f, "
+		    "pictures %.2f", took.frames, wall > 0 ? nf * 1000 / wall : 0, took.given, took.read * ms / nf,
+		    took.stats * ms / nf, took.focus * ms / nf, took.give * ms / nf);
 	}
 	free(buffer);
 	close(device);
