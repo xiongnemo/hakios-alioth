@@ -390,6 +390,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/loc_enable ] && cp obj/loc_enable root/bin/
 	[ -f obj/gnss_feed ] && cp obj/gnss_feed root/bin/
 	[ -f obj/hk_telephony ] && cp obj/hk_telephony root/bin/
+	[ -f obj/psample ] && cp obj/psample root/bin/
 	# (the applications that come with this image, unpacked from ../apps/*.ipa: the job com.hakios.apps
 	# registers them at boot; those of the release's apps\ folder come from the computer instead)
 	mkdir -p root/apps
