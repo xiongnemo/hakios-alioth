@@ -3157,7 +3157,7 @@ extern "C" bool hakios_board_is_alioth(void);
 /*
  * (iOS's scale) 400, squared DBV 78, about 19 nits: what the panel shows until somebody moves the slider, and
  * CoreBrightness sets nothing before that -- a test run's whole 12 minutes of static screens, then the loader's text
- * (alioth_display_quiesce sets 78 too). 1023 until 2026-11-09 (DBV 511, a quarter of the light, ~125 nits): too
+ * (alioth_display_quiesce sets the loader's own DBV 175). 1023 until 2026-11-09 (DBV 511, a quarter of the light, ~125 nits): too
  * bright for an OLED left showing the same picture, the owner said; 600 (DBV 175, ~43 nits) until 2026-11-15:
  * still blinding at night in a lit room, the owner said.
  */
