@@ -6883,10 +6883,16 @@ rwa_render_create(struct rwa_device *device,
     */
    /* (and clip_plane_enable: every clip distance the vertex stage writes is a plane in Metal,
     * which has no switch for them; fd6 masks the shader's clip distances with this) */
+   /* (the K40's, 11-16) and points as Metal draws them: always the vertex function's [[point_size]] (Metal has no
+    * fixed size), rasterized as squares with [[point_coord]] from their top left. The template's point_size was 0
+    * and point_size_per_vertex off, so every MTLPrimitiveTypePoint drew nothing (System Check metal.setbytes.many:
+    * 2048 points, not one pixel) */
    render->rast_templ = (struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .multisample = samples > 1, .clip_plane_enable = BITFIELD_MASK(clip_planes) };
+         .multisample = samples > 1, .clip_plane_enable = BITFIELD_MASK(clip_planes),
+         .point_size_per_vertex = 1, .point_size = 1.0f, .point_quad_rasterization = 1,
+         .sprite_coord_mode = PIPE_SPRITE_COORD_UPPER_LEFT };
    render->rast = device->pipe->create_rasterizer_state(device->pipe, &render->rast_templ);
    if (!render->blend || !render->dsa || !render->rast) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
