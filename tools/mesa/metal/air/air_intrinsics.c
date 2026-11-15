@@ -74,6 +74,53 @@ is_signed_part(const char *s)
    return !strcmp(s, "s");
 }
 
+/*
+ * (the K40's, 11-16) Metal's SIMD-group and quad arithmetic by name: simd_<r> (the group), quad_<r> (cluster 4),
+ * simd_prefix_inclusive_<r> / simd_prefix_exclusive_<r> (scan 1 / 2), <r> one of sum, product, min, max, and, or,
+ * xor -- the NIR reduction for the value's type and sign. simd_sum itself is math_op's own case before this one.
+ * false: not one of these.
+ */
+static bool
+simd_reduction(const char *op, bool is_float, bool is_signed, nir_op *rop, unsigned *cluster, unsigned *scan)
+{
+   const char *r;
+
+   *cluster = 0;
+   *scan = 0;
+   if (!strncmp(op, "simd_prefix_inclusive_", 22)) {
+      r = op + 22;
+      *scan = 1;
+   } else if (!strncmp(op, "simd_prefix_exclusive_", 22)) {
+      r = op + 22;
+      *scan = 2;
+   } else if (!strncmp(op, "quad_", 5)) {
+      r = op + 5;
+      *cluster = 4;
+   } else if (!strncmp(op, "simd_", 5)) {
+      r = op + 5;
+   } else {
+      return false;
+   }
+   if (!strcmp(r, "sum"))
+      *rop = is_float ? nir_op_fadd : nir_op_iadd;
+   else if (!strcmp(r, "product"))
+      *rop = is_float ? nir_op_fmul : nir_op_imul;
+   else if (!strcmp(r, "min"))
+      *rop = is_float ? nir_op_fmin : is_signed ? nir_op_imin : nir_op_umin;
+   else if (!strcmp(r, "max"))
+      *rop = is_float ? nir_op_fmax : is_signed ? nir_op_imax : nir_op_umax;
+   else if (!strcmp(r, "and") && !is_float)
+      *rop = nir_op_iand;
+   else if (!strcmp(r, "or") && !is_float)
+      *rop = nir_op_ior;
+   else if (!strcmp(r, "xor") && !is_float)
+      *rop = nir_op_ixor;
+   else
+      return false;
+   /* (scans exist for sum and product only in Metal; quad scans have no clustered form in NIR) */
+   return *scan == 0 || *rop == nir_op_fadd || *rop == nir_op_iadd || *rop == nir_op_fmul || *rop == nir_op_imul;
+}
+
 /* Metal's fmod: the remainder of x/y, with the SIGN OF x, correctly rounded.
  *
  * nir_frem is not that function. Its constant expression is, literally,
@@ -229,6 +276,8 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    /* the sign of an integer operation is the last-but-one part: air.min.s.i32 */
    bool is_signed = n->num >= 3 ? is_signed_part(n->part[1]) : true;
    nir_def *r = NULL;
+   nir_op rop = nir_op_iadd;          /* (the K40's, 11-16) simd_reduction()'s answer */
+   unsigned cluster = 0, scan = 0;
    *handled = true;
 
    /* fast math is what every one of these means: Metal's "fast" library */
@@ -591,6 +640,31 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
        */
       r = nir_reduce(&c->b, a[0],
                      .reduction_op = is_float ? nir_op_fadd : nir_op_iadd);
+   } else if (simd_reduction(op, is_float, is_signed, &rop, &cluster, &scan)) {
+      /* (the K40's, 11-16) the rest of Metal's SIMD-group and quad arithmetic, each NIR's own and ir3's (its
+       * reduce_op_to_ir3 serves add, mul, min, max -- signed, unsigned, float -- and, or, xor; clustered reduces and
+       * the scans are lowered by ir3 itself): simd_product/min/max/and/or/xor over the group, quad_* over the four
+       * lanes of a quad (cluster 4, exact on any width), simd_prefix_{inclusive,exclusive}_{sum,product}. The group
+       * is this implementation's (64 or 128 lanes), as for simd_sum. */
+      if (scan == 1)
+         r = nir_inclusive_scan(&c->b, a[0], .reduction_op = rop);
+      else if (scan == 2)
+         r = nir_exclusive_scan(&c->b, a[0], .reduction_op = rop);
+      else
+         r = nir_reduce(&c->b, a[0], .reduction_op = rop, .cluster_size = cluster);
+   } else if (!strcmp(op, "simd_broadcast") && argc >= 2) {
+      /* (the K40's, 11-16) one lane's value, the lane named by the (uniform) second argument */
+      r = nir_read_invocation(&c->b, a[0], nir_u2u32(&c->b, a[1]));
+   } else if (!strcmp(op, "simd_shuffle_xor") && argc >= 2) {
+      r = nir_shuffle_xor(&c->b, a[0], nir_u2u32(&c->b, a[1]));
+   } else if (!strcmp(op, "quad_broadcast") && argc >= 2) {
+      r = nir_quad_broadcast(&c->b, a[0], nir_iand_imm(&c->b, nir_u2u32(&c->b, a[1]), 3));
+   } else if (!strcmp(op, "quad_shuffle") && argc >= 2) {
+      /* each lane its own source lane within its quad: the quad's first lane plus that one */
+      nir_def *base = nir_iand_imm(&c->b, nir_load_subgroup_invocation(&c->b), ~3u);
+      r = nir_shuffle(&c->b, a[0], nir_ior(&c->b, base, nir_iand_imm(&c->b, nir_u2u32(&c->b, a[1]), 3)));
+   } else if (!strcmp(op, "simd_is_first")) {
+      r = nir_elect(&c->b, 1);
    } else if ((!strcmp(op, "simd_shuffle_down") || !strcmp(op, "simd_shuffle_up")) && argc >= 2) {
       /* (the K40's) Metal's simd_shuffle_down / _up: the value of the lane delta above / below,
        * and -- unlike NIR's, which leaves them undefined -- the lanes with none keep their own
