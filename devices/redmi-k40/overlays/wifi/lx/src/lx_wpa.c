@@ -392,6 +392,7 @@ aes_decrypt(const uint8_t round_keys[176], uint8_t s[16])
 		}
 		if (round == 0) {
 			memcpy(s, t, 16);
+			memset(t, 0, sizeof(t));	/* (11-16, oosexgang b8a901b: the last block is part of the key unwrapped) */
 			break;
 		}
 		for (unsigned c = 0; c < 4; c++) {		/* the columns mixed back */
@@ -441,6 +442,7 @@ aes_unwrap(const uint8_t kek[16], const uint8_t *wrapped, unsigned length, uint8
 	}
 	memset(round_keys, 0, sizeof(round_keys));
 	memset(block, 0, sizeof(block));
+	memset(a, 0, sizeof(a));
 	return (good == 0 ? 0 : -1);
 }
 
@@ -547,8 +549,13 @@ group_key(struct lx_wpa *wpa, const uint8_t *data, unsigned length, const uint8_
 		if (e[0] == 0xdd && e[1] == 0) {
 			break;				/* (padding from here on) */
 		}
+		/*
+		 * (11-16, after oosexgang b8a901b) A group key is 16 bytes (CCMP) or 32 (TKIP, which this port joins too) and its
+		 * number 1 to 3 (IEEE 802.11-2020 12.7.2: 0 is the pairwise key's): a KDE of another length or number is not
+		 * installed with stale bytes of `group` filling it out.
+		 */
 		if (e[0] == 0xdd && e[1] >= 6 + 5 && e[2] == 0x00 && e[3] == 0x0f && e[4] == 0xac && e[5] == 1 &&
-		    e[1] - 6u <= sizeof(wpa->group)) {
+		    (e[1] - 6u == 16 || e[1] - 6u == 32) && e[1] - 6u <= sizeof(wpa->group) && (e[6] & 3) != 0) {
 			wpa->group_index = e[6] & 3;
 			wpa->group_length = e[1] - 6u;
 			memcpy(wpa->group, e + 8, wpa->group_length);
@@ -594,8 +601,17 @@ lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length
 		return (LX_WPA_BAD);
 	}
 
-	/* message 1: the access point's nonce, unsigned */
+	/*
+	 * message 1: the access point's nonce, unsigned. It starts the four-way handshake and nothing else (IEEE 802.11i
+	 * 8.5.3): once a signed message has been accepted (replay_known) the keys are proven and in use, and an unsigned
+	 * frame must not make and overwrite the KCK, KEK and TK again (11-16, oosexgang b8a901b). Left alone, as every frame
+	 * that is not ours to answer is.
+	 */
 	if ((info & (INFO_PAIRWISE | INFO_ACK | INFO_MIC)) == (INFO_PAIRWISE | INFO_ACK)) {
+		if (wpa->replay_known) {
+			*why = "it is a message 1 after the keys were proven (an unsigned frame does not change them)";
+			return (LX_WPA_NOTHING);
+		}
 		memcpy(wpa->peer_nonce, message + AT_NONCE, 32);
 		derive(wpa);
 		answer(wpa, message, 2 | INFO_PAIRWISE | INFO_MIC, wpa->own_nonce, wpa->rsn, wpa->rsn_length, reply, reply_length);
@@ -641,6 +657,7 @@ lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length
 		plain_length = data_length;
 	} else {
 		if (aes_unwrap(wpa->kek, message + AT_DATA, data_length, data) != 0) {
+			memset(data, 0, sizeof(data));	/* (a failed unwrap leaves part of the key data in it) */
 			*why = "its AES-wrapped key data does not unwrap";
 			return (LX_WPA_BAD);
 		}
