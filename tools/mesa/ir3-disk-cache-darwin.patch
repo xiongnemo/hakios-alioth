@@ -1,0 +1,32 @@
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -5,6 +5,8 @@
+ 
+ #include "nir_serialize.h"
+ 
++#include <stdio.h>
++
+ #include "ir3_compiler.h"
+ #include "ir3_nir.h"
+ 
+@@ -34,7 +36,19 @@
+       return;
+ 
+ #ifdef __APPLE__
+-   /* no build id in a Mach-O library to tell one build's shaders from another's: no cache */
++   /*
++    * (the K40's, 11-16) No build id in a Mach-O library: the library's own file stands for its build -- its time
++    * through dladdr, as Mesa's other drivers do without one (disk_cache_get_function_timestamp). Shaders compiled at
++    * a draw cost up to 42 ms the first time (metal_stats, round b1); with the cache an application's next launch in
++    * the boot finds them. Where the cache lives is the process's to say (MESA_SHADER_CACHE_DIR, set by the drivers:
++    * the data volume is in memory, so they also cap its size).
++    */
++   uint32_t library_time = 0;
++   if (!disk_cache_get_function_timestamp((void *)ir3_disk_cache_init, &library_time))
++      return;
++   char stamp[24];
++   snprintf(stamp, sizeof(stamp), "hakios-%08x", library_time);
++   compiler->disk_cache = disk_cache_create(fd_dev_name(compiler->dev_id), stamp, ir3_shader_debug_hash_key());
+    return;
+ #else
+    const char *renderer = fd_dev_name(compiler->dev_id);

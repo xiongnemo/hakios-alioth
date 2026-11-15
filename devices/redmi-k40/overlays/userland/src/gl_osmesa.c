@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include "hakios.gl.h"
@@ -129,6 +130,37 @@ forget_dead_current(void)
 	}
 }
 
+/*
+ * (the K40's, 11-16) Mesa's shader disk cache (tools/mesa/ir3-disk-cache-darwin.patch) for this process, before the
+ * first context makes the screen: in the process's own Library/Caches (an application's container, a daemon's home),
+ * 64 MB at most -- the data volume is in memory. Boot-arg mesa_cache=0: none.
+ */
+static void
+shader_cache_env_once(void)
+{
+	char args[1024] = "", dir[1024];
+	size_t len = sizeof(args) - 1;
+	const char *home = getenv("HOME");
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "mesa_cache=0") != NULL) {
+		setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+		return;
+	}
+	if (getenv("MESA_SHADER_CACHE_DIR") == NULL && home != NULL && home[0] != 0) {
+		snprintf(dir, sizeof(dir), "%s/Library/Caches/hakios-mesa", home);
+		setenv("MESA_SHADER_CACHE_DIR", dir, 0);
+	}
+	setenv("MESA_SHADER_CACHE_MAX_SIZE", "64M", 0);
+}
+
+static void
+shader_cache_env(void)
+{
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+	pthread_once(&once, shader_cache_env_once);
+}
+
 struct hakios_gl *
 hakios_gl_create_shared(int version, struct hakios_gl *share)
 {
@@ -139,6 +171,7 @@ hakios_gl_create_shared(int version, struct hakios_gl *share)
 	};
 	struct hakios_gl *gl = calloc(1, sizeof(*gl));
 
+	shader_cache_env();
 	if (gl != NULL &&
 	    (gl->context = OSMesaCreateContextAttribs(attributes, share != NULL ? share->context : NULL)) == NULL) {
 		free(gl);

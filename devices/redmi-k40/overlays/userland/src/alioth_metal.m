@@ -640,6 +640,26 @@ static struct {
  */
 static pthread_mutex_t alioth_gpu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 
+/* (the K40's, 11-16) Mesa's shader disk cache for this process: in its own Library/Caches (an application's
+ * container; a daemon's home), 64 MB at most, unless the process or boot-arg mesa_cache=0 says otherwise */
+static void
+alioth_shader_cache_env(void)
+{
+	char args[1024] = "", dir[1024];
+	size_t len = sizeof(args) - 1;
+	const char *home = getenv("HOME");
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "mesa_cache=0") != NULL) {
+		setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+		return;
+	}
+	if (getenv("MESA_SHADER_CACHE_DIR") == NULL && home != NULL && home[0] != 0) {
+		snprintf(dir, sizeof(dir), "%s/Library/Caches/hakios-mesa", home);
+		setenv("MESA_SHADER_CACHE_DIR", dir, 0);
+	}
+	setenv("MESA_SHADER_CACHE_MAX_SIZE", "64M", 0);
+}
+
 /* (the K40's, 11-16) the lock as the library's rwa_device_set_lock takes it: one level of the hold let go and taken */
 static void alioth_gpu_take(void *unused) { (void)unused; pthread_mutex_lock(&alioth_gpu); }
 static void alioth_gpu_give(void *unused) { (void)unused; pthread_mutex_unlock(&alioth_gpu); }
@@ -1866,6 +1886,10 @@ enum {
 	if (mesa_available()) {
 		char why[256] = { 0 };
 
+		/* (the K40's, 11-16) where ir3's shader disk cache lives (tools/mesa/ir3-disk-cache-darwin.patch): the
+		 * application's own Library/Caches, at most 64 MB -- the data volume is in memory. Boot-arg mesa_cache=0: none.
+		 * Read when the screen is made, so set before device_open. */
+		alioth_shader_cache_env();
 		_mesa = mesa.device_open(why, sizeof(why));
 		rw_print("the compiler library %s\n",
 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
