@@ -91,6 +91,44 @@ static uint32_t         gSurfaceUnheld;         /* surfaces around client memory
 static uint64_t         gSurfaceMaking, gSurfaceFreeing;
 static uint32_t         gSurfacesMade, gSurfacesFreed;
 static uint64_t         gSurfaceLogged[2];                      /* selectors already complained about */
+
+/*
+ * (the K40's, 11-16) Refused selectors, COUNTED: "logged once" hid that selector 6 (IOSurfaceWrapClientImage) was
+ * asked for every image CoreAnimation drew -- 12% of a core in Settings scrolls (round b5). Every 30 s in which some
+ * were refused, one line says which and how many times.
+ */
+static uint32_t         gSurfaceRefused[128];
+static uint64_t         gSurfaceRefusedSince;
+
+static void
+surfaceRefusedCount(uint32_t selector)
+{
+	uint64_t now = mach_absolute_time(), since = gSurfaceRefusedSince, ns;
+	char line[192];
+	size_t at = 0;
+
+	if (selector < 128) {
+		__atomic_fetch_add(&gSurfaceRefused[selector], 1, __ATOMIC_RELAXED);
+	}
+	if (since == 0) {
+		gSurfaceRefusedSince = now;
+		return;
+	}
+	absolutetime_to_nanoseconds(now - since, &ns);
+	if (ns < 30ull * NSEC_PER_SEC || !__atomic_compare_exchange_n(&gSurfaceRefusedSince, &since, now, false,
+	    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+		return;
+	}
+	line[0] = 0;
+	for (unsigned i = 0; i < 128 && at + 24 < sizeof(line); i++) {
+		uint32_t n = __atomic_exchange_n(&gSurfaceRefused[i], 0, __ATOMIC_RELAXED);
+
+		if (n != 0) {
+			at += (size_t) snprintf(line + at, sizeof(line) - at, " %u x%u", i, n);
+		}
+	}
+	IOLog("MiniIOSurface: refused in the last %llu s (selector x times):%s\n", ns / NSEC_PER_SEC, line);
+}
 /* Boot-arg surftrace=N: log the first N surfaces created (default 24). */
 static TUNABLE(uint32_t, gSurfaceTrace, "surftrace", 24);
 static uint32_t         gSurfaceTraced;                         /* (a tunable is read-only after boot) */
@@ -1937,6 +1975,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		IOLog("MiniIOSurface: selector %u not implemented (scalars %u in, %u out; structure %u in, %u out)\n", selector,
 		    args->scalarInputCount, args->scalarOutputCount, args->structureInputSize, args->structureOutputSize);
 	}
+	surfaceRefusedCount(selector);
 	return kIOReturnUnsupported;
 }
 

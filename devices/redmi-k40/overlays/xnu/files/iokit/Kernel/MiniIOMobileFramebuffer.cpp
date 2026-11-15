@@ -3086,6 +3086,37 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		break;
 	}
 
+	/* (the K40's, 11-16) refused selectors counted, one line every 30 s in which some were (MiniIOSurface says why) */
+	{
+		static uint32_t refused[128];
+		static uint64_t since;
+		uint64_t now = mach_absolute_time(), was = since, ns;
+
+		if (selector < 128) {
+			__atomic_fetch_add(&refused[selector], 1, __ATOMIC_RELAXED);
+		}
+		if (was == 0) {
+			since = now;
+		} else {
+			absolutetime_to_nanoseconds(now - was, &ns);
+			if (ns >= 30ull * NSEC_PER_SEC && __atomic_compare_exchange_n(&since, &was, now, false, __ATOMIC_RELAXED,
+			    __ATOMIC_RELAXED)) {
+				char line[192];
+				size_t at = 0;
+
+				line[0] = 0;
+				for (unsigned i = 0; i < 128 && at + 24 < sizeof(line); i++) {
+					uint32_t n = __atomic_exchange_n(&refused[i], 0, __ATOMIC_RELAXED);
+
+					if (n != 0) {
+						at += (size_t) snprintf(line + at, sizeof(line) - at, " %u x%u", i, n);
+					}
+				}
+				IOLog("MiniIOMobileFramebuffer: refused in the last %llu s (selector x times):%s\n", ns / NSEC_PER_SEC,
+				    line);
+			}
+		}
+	}
 	if (selector < 128 && !(gFBLogged[selector / 64] & (1ULL << (selector % 64)))) {
 		gFBLogged[selector / 64] |= 1ULL << (selector % 64);
 		IOLog("MiniIOMobileFramebuffer: selector %u not implemented (scalars %u in [0x%llx 0x%llx 0x%llx], %u out; "
