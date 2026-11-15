@@ -249,6 +249,10 @@ struct rwa_texture {
     * lenient one.
     */
    bool shader_read, shader_write;
+
+   /* (the K40's, 11-16) over memory somebody else allocated (rwa_texture_from_surface, and views of such a
+    * texture): never discarded (rwa_texture_discard), someone else shows or reads it */
+   bool imported;
 };
 
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
@@ -1662,6 +1666,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          return NULL;
       }
       texture->view_format = texture->res->format;
+      texture->imported = true;
       return texture;
    }
 
@@ -5669,15 +5674,15 @@ struct rwa_render {
 
    /* (the K40's) the encoder's rasterizer state -- -setCullMode:, -setFrontFacingWinding:,
     * -setScissorRect:, -setTriangleFillMode: -- as variants of `rast`, made on first use and
-    * kept: index = cull (2 bits) | ccw << 2 | scissor << 3 | lines << 4
+    * kept: index = cull (2 bits) | ccw << 2 | scissor << 3 | lines << 4 | depth clamp << 5 (11-16)
     */
    struct pipe_rasterizer_state rast_templ;
-   void *rast_variant[32];
+   void *rast_variant[64];
    /* (the K40's) and -setDepthBias:slopeScale:clamp:'s, one a variant, made again when the
     * numbers change (a shadow pass keeps its own)
     */
-   void *bias_variant[32];
-   float bias_value[32][3];
+   void *bias_variant[64];
+   float bias_value[64][3];
    struct pipe_resource *vbuf;        /* the full-screen quad, for the generated stage */
 
    /* What the vertex descriptor was turned into, empty for a stage that fetches no
@@ -7040,7 +7045,7 @@ attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char 
 unsigned
 rwa_draw_features(void)
 {
-   return RWA_DRAW_INDIRECT;
+   return RWA_DRAW_INDIRECT | RWA_DRAW_CLEAR_EACH | RWA_DRAW_DEPTH_CLAMP;
 }
 
 int
@@ -7502,7 +7507,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    /* an upside-down viewport (above) turns window-space winding over, and Metal's front face is
     * decided before the viewport: so it turns front_ccw over too */
    bool ccw = (draw->front_ccw != 0) != flipped;
-   unsigned variant = cull | (ccw ? 4 : 0) | (draw->scissor ? 8 : 0) | (lines ? 16 : 0);
+   /* (the K40's, 11-16) MTLDepthClipModeClamp: no clipping at the near and far planes, the depth clamped instead */
+   bool clamp = draw->depth_clamp != 0;
+   unsigned variant = cull | (ccw ? 4 : 0) | (draw->scissor ? 8 : 0) | (lines ? 16 : 0) | (clamp ? 32 : 0);
    void *rast = render->rast;
    void *stale = NULL;
    bool bias = draw->depth_bias &&
@@ -7512,6 +7519,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    rs.front_ccw = ccw;
    rs.scissor = draw->scissor != NULL;
    rs.fill_front = rs.fill_back = lines ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
+   if (clamp) {
+      rs.depth_clip_near = rs.depth_clip_far = 0;
+      rs.depth_clamp = 1;
+   }
    if (bias) {
       /* (the K40's) -setDepthBias:slopeScale:clamp:, Gallium's polygon offset number for
        * number; one variant a key, the old one let go only once the new one is bound
@@ -7665,8 +7676,20 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       unsigned mask = 0;
       for (unsigned c = 0; c < 4; c++)
          clear.f[c] = draw->clear_color ? draw->clear_color[c] : 0.0f;
-      if (draw->clear_color)
+      /* (the K40's, 11-16) each attachment its own colour, or none (RWA_DRAW_CLEAR_EACH): one Gallium clear per
+       * attachment, each with its own buffer bit -- freedreno keeps a clear value per colour buffer of the batch,
+       * so these add up before the draw as one pass's load actions. Without them, one colour for all. */
+      if (draw->clear_colors) {
+         for (unsigned i = 0; i < draw->color_count && i < PIPE_MAX_COLOR_BUFS; i++) {
+            if (!(draw->clear_color_mask & (1u << i)) || !draw->color[i])
+               continue;
+            union pipe_color_union each;
+            memcpy(each.f, &draw->clear_colors[4 * i], sizeof(each.f));
+            pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, NULL, &each, 0.0, 0);
+         }
+      } else if (draw->clear_color) {
          mask |= PIPE_CLEAR_COLOR;
+      }
       /* An aspect is cleared only if the attachment has it: clearing the stencil of a
        * Depth32Float buffer is a caller's mistake, but Gallium's clear would either
        * ignore it or touch a plane that is not there, and neither is worth finding out
@@ -7840,6 +7863,25 @@ out:
    if (zsurf)
       pipe->surface_destroy(pipe, zsurf);
    return rc;
+}
+
+/*
+ * (the K40's, 11-16) MTLStoreActionDontCare at a pass's end (air_metal.h). freedreno's invalidate_resource takes the
+ * attachment out of the resolve of the batch that wrote it -- the tiles are not written back to memory -- and marks
+ * it not valid, so the next pass into it does not read it back into tile memory either (glInvalidateFramebuffer's
+ * road). Called by the driver after the pass's last draw, never for a pass whose attachment is then resolved.
+ */
+int
+rwa_texture_discard(struct rwa_device *device, struct rwa_texture *texture, char *why, size_t why_size)
+{
+   if (!device || !texture || !texture->res) {
+      say(why, why_size, "no texture to let go of");
+      return -1;
+   }
+   if (texture->imported || !device->pipe->invalidate_resource)
+      return 0;     /* (someone else's memory is kept; a driver without the call stores everything) */
+   device->pipe->invalidate_resource(device->pipe, texture->res);
+   return 0;
 }
 
 /* (the K40's) Metal's -setThreadgroupMemoryLength:atIndex: for index 0, the one threadgroup argument the front end

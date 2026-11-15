@@ -332,6 +332,11 @@ struct rwa_draw {
 	/* (the K40's) an indirect draw's arguments for the GPU to read (only when rwa_draw_features() says so) */
 	struct rwa_buffer *indirect_buffer;
 	size_t indirect_offset;
+	/* (the K40's, 11-16) each colour attachment's own clear: 4 floats per attachment and bit i = attachment i
+	 * cleared (RWA_DRAW_CLEAR_EACH; NULL: clear_color for all); MTLDepthClipModeClamp as 1 (RWA_DRAW_DEPTH_CLAMP) */
+	const float *clear_colors;
+	unsigned clear_color_mask;
+	unsigned depth_clamp;
 };
 /* (the K40's) Metal's pipeline reflection, air_metal.h's rwa_argument (rwa_render_arguments) */
 struct rwa_struct_member {
@@ -616,7 +621,14 @@ static struct {
 	int (*fence_wait)(struct rwa_device *, void *, char *, size_t);
 	/* (the K40's) what sampling a texture reads, channel by channel (air_metal.h rwa_texture_swizzle) */
 	int (*texture_swizzle)(struct rwa_texture *, const unsigned char *, char *, size_t);
+	/* (the K40's, 11-16) an attachment's contents let go: a pass's DontCare store (air_metal.h rwa_texture_discard) */
+	int (*texture_discard)(struct rwa_device *, struct rwa_texture *, char *, size_t);
 } mesa;
+
+/* (the K40's) rwa_draw_features() bits, as air_metal.h has them */
+#define RWA_DRAW_INDIRECT       1u
+#define RWA_DRAW_CLEAR_EACH     2u      /* (11-16) rwa_draw.clear_colors / clear_color_mask */
+#define RWA_DRAW_DEPTH_CLAMP    4u      /* (11-16) rwa_draw.depth_clamp */
 
 /*
  * (the K40's) ONE LOCK FOR THE COMPILER LIBRARY. Its device is one Gallium pipe_context, which is not thread-safe,
@@ -944,6 +956,7 @@ GPU_LOCKED(int, texture_copy, (struct rwa_texture *d, unsigned dl, unsigned ds, 
     (d, dl, ds, dor, s, sl, ss, sor, z, w, ws))
 GPU_LOCKED(int, buffer_wait, (struct rwa_buffer *b, unsigned fw, char *w, size_t ws), (b, fw, w, ws))
 GPU_LOCKED(int, texture_swizzle, (struct rwa_texture *t, const unsigned char *s, char *w, size_t ws), (t, s, w, ws))
+GPU_LOCKED(int, texture_discard, (struct rwa_device *d, struct rwa_texture *t, char *w, size_t ws), (d, t, w, ws))
 
 /*
  * (the K40's) rwa_finish in its two halves: flushed with a fence under the library's lock, the fence waited for
@@ -1046,6 +1059,7 @@ mesa_available(void)
 	*(void **)&mesa.flush = dlsym(mesa.handle, "rwa_flush");
 	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
 	*(void **)&mesa.texture_swizzle = dlsym(mesa.handle, "rwa_texture_swizzle");
+	*(void **)&mesa.texture_discard = dlsym(mesa.handle, "rwa_texture_discard");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -1095,6 +1109,7 @@ mesa_available(void)
 	GPU_LOCK_WRAP(buffer_wait);
 	GPU_LOCK_WRAP(flush);
 	GPU_LOCK_WRAP(texture_swizzle);
+	GPU_LOCK_WRAP(texture_discard);
 	return true;
 }
 
@@ -1477,6 +1492,9 @@ struct gem_close { uint32_t handle, pad; };
 - (id)device;
 - (BOOL)aliothCommitted;
 - (void)aliothRun;
+/* (the K40's, 11-16) -setBytes: and its kin: the bytes copied into this buffer's upload area, which is kept until the
+ * command buffer goes; the buffer and the offset they landed at (256-byte aligned), or nil */
+- (id)aliothUpload:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset;
 @end
 
 @interface AliothMetalComputeEncoder : _MTLCommandEncoder
@@ -1635,6 +1653,12 @@ enum {
 	unsigned colorCount;
 	float clearColor[4];
 	BOOL clears;
+	/* (the K40's, 11-16) each colour attachment's clear colour and which clear (bit i); MTLDepthClipModeClamp */
+	float clearColors[8][4];
+	unsigned clearMask;
+	BOOL depthClamp;
+	/* (the K40's, 11-16) ALIOTH_DISCARD: attachments whose contents the pass's store actions let go (-endEncoding) */
+	BOOL discard;
 	/* the depth/stencil attachment of the pass, its two load actions and the state
 	 * bound when the draw was encoded. Separate flags per aspect because Metal keeps
 	 * two attachment descriptors over one texture and a pass that clears the depth and
@@ -1729,8 +1753,12 @@ enum {
 
 @interface AliothMetalSampler : _MTLSamplerState {
 	struct rwa_sampler *_sampler;
+	MTLSamplerDescriptor *_descriptor;      /* (the K40's) a copy: what a per-binding lod range is applied to */
+	NSMutableDictionary *_clamped;          /* ... and the samplers made for those ranges, by "min max" */
 }
 @property (readonly) struct rwa_sampler *mesaSampler;
+/* (the K40's) this sampler with its lod range replaced by a binding's -- itself when the range is its own */
+- (id)aliothWithLodMin:(float)lodMin max:(float)lodMax;
 @end
 
 @interface AliothMetalDepthStencilState : _MTLDepthStencilState {
@@ -2753,9 +2781,10 @@ enum {
  * what keeps us out of Apple's compiler: the AIR comes from the function object and goes to
  * our own front end.
  *
- * The cost of that road, named in docs/metal.md 10.7: with -compiler still nil,
- * -newFunctionWithName:constantValues: and -[MTLFunction reflectionWithOptions:] return nil,
- * because those go through the compiler inside Metal's own classes where we cannot reach.
+ * The cost of that road, named in docs/metal.md 10.7, was that -newFunctionWithName:constantValues:
+ * and -[MTLFunction reflectionWithOptions:] returned nil. (The K40's, corrected 11-16: function
+ * constants work -- System Check's metal.constants, 11-09 -- and reflection is built from the
+ * AIR's metadata, rwa_render_arguments.)
  */
 - (id)newComputePipelineStateWithDescriptor:(id)descriptor
 				    options:(NSUInteger)options
@@ -3536,8 +3565,9 @@ enum {
  * protocol demands instead of what our own tests happen to send.
  *
  * Aliasing: nothing here aliases anything. Every buffer is its own GEM allocation (or its
- * own Mesa allocation), there are no heaps and -makeAliasable does nothing, so "does this
- * overlap that" is NO for every pair, for certain.
+ * own Mesa allocation) -- a heap's too: a heap here hands out allocations of their own, it
+ * does not sub-allocate one block -- and -makeAliasable does nothing, so "does this overlap
+ * that" is NO for every pair, for certain.
  *
  * Completion: this driver's -commit runs the recorded work and -waitUntilCompleted fences
  * it, and nothing hands a resource back to a caller before the submission it was part of
@@ -4188,11 +4218,12 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 /*
  * True by construction, and each is a sentence about this driver rather than a shrug:
  *
- *   - nothing aliases: each texture is its own allocation of the compiler library's, there
- *     are no heaps, and -makeAliasable does nothing, so "does this overlap that" is NO for
- *     every pair, for certain;
- *   - nothing is compressed: the library allocates surfaces with no lossless-compression
- *     metadata, so there is no compression and nothing to feed back;
+ *   - nothing aliases: each texture is its own allocation of the compiler library's (a
+ *     heap's too: no sub-allocation), and -makeAliasable does nothing, so "does this overlap
+ *     that" is NO for every pair, for certain;
+ *   - no compression to feed back: freedreno may compress a texture (UBWC; never one a
+ *     shader writes since 11-16, air_metal.c texture_of_shape), but that is the GPU's own
+ *     business, invisible through every call Metal has;
  *   - nothing is sparse: there is no tail, so its size and its first mipmap are zero;
  *   - nothing is a drawable: a texture of this driver never comes from a CAMetalLayer, it is
  *     the attachment a pass draws into and -getBytes: reads back;
@@ -4265,6 +4296,7 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 		return nil;
 	}
 	_sampler = sampler;
+	_descriptor = [descriptor copy];
 	return self;
 }
 
@@ -4273,10 +4305,53 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 	if (_sampler != NULL) {
 		mesa.sampler_destroy(_sampler);
 	}
+	[_descriptor release];
+	[_clamped release];
 	[super dealloc];
 }
 
 - (struct rwa_sampler *)mesaSampler { return _sampler; }
+
+/*
+ * (the K40's) -set...SamplerState:lodMinClamp:lodMaxClamp:atIndex: replaces the sampler's own lod range for that one
+ * binding. The compiler library takes the range when a sampler is made, so a binding with a range of its own gets a
+ * sampler made for it: the same descriptor with the binding's range, made once per range and kept here. Until
+ * 11-16 the range was said and dropped -- and in the compute encoder the saying also dropped every later dispatch of
+ * the encoder (its one "refused" flag). At most 16 ranges are kept; past that the old ones are let go (a work that
+ * uses one retains it).
+ */
+- (id)aliothWithLodMin:(float)lodMin max:(float)lodMax
+{
+	if (_descriptor == nil ||
+	    ([_descriptor lodMinClamp] == lodMin && [_descriptor lodMaxClamp] == lodMax)) {
+		return self;
+	}
+	NSString *key = [NSString stringWithFormat:@"%a %a", (double)lodMin, (double)lodMax];
+
+	@synchronized (self) {
+		id made = [_clamped objectForKey:key];
+
+		if (made != nil) {
+			return made;
+		}
+		MTLSamplerDescriptor *ranged = [[_descriptor copy] autorelease];
+
+		[ranged setLodMinClamp:lodMin];
+		[ranged setLodMaxClamp:lodMax];
+		made = [[self device] newSamplerStateWithDescriptor:ranged];
+		if (made == nil) {
+			return self;    /* (the device said why) */
+		}
+		if (_clamped == nil) {
+			_clamped = [[NSMutableDictionary alloc] init];
+		} else if ([_clamped count] >= 16) {
+			[_clamped removeAllObjects];
+		}
+		[_clamped setObject:made forKey:key];
+		[made release];
+		return made;
+	}
+}
 
 @end
 
@@ -5361,6 +5436,52 @@ enum {
 	 * _ranGroup is left once when it has, for -waitUntilScheduled (the queue's enqueue order decides when) */
 	BOOL _committed, _ran;
 	dispatch_group_t _ranGroup;
+	/* (the K40's, 11-16) -setBytes:'s upload area: the buffer being filled, how far, its size, and every one made */
+	id _upload;
+	NSUInteger _uploadUsed, _uploadSize;
+	NSMutableArray *_uploads;
+}
+
+/*
+ * (the K40's, 11-16) -setBytes: / -setVertexBytes: / -setFragmentBytes: made a buffer of their own at every call -- an
+ * allocation of GPU memory and its mapping into the GPU's space each time, for what is usually a few dozen bytes of
+ * uniforms per draw. Now the bytes go into an area this command buffer keeps (64 KB first, twice the size each time
+ * it fills) at a 256-byte boundary -- the GPU can fetch a constant or storage binding from there -- and the encoder
+ * binds that buffer at that offset. The area lives as long as the command buffer, which outlives its work.
+ */
+- (id)aliothUpload:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset
+{
+	@synchronized (self) {
+		NSUInteger at = (_uploadUsed + 255) & ~(NSUInteger)255;
+
+		if (_upload == nil || at + length > _uploadSize) {
+			NSUInteger size = _uploadSize != 0 ? _uploadSize * 2 : 65536;
+
+			while (size < length) {
+				size *= 2;
+			}
+			id made = [[self device] newBufferWithLength:size options:0];
+
+			if (made == nil || [made contents] == NULL) {
+				[made release];
+				return nil;
+			}
+			if (_uploads == nil) {
+				_uploads = [[NSMutableArray alloc] init];
+			}
+			[_uploads addObject:made];
+			[made release];
+			_upload = made;
+			_uploadSize = size;
+			at = 0;
+		}
+		if (bytes != NULL && length != 0) {
+			memcpy((char *)[_upload contents] + at, bytes, length);
+		}
+		_uploadUsed = at + length;
+		*offset = at;
+		return _upload;
+	}
 }
 
 /*
@@ -5461,6 +5582,7 @@ enum {
 	[_scheduled release];
 	[_completed release];
 	[_signals release];
+	[_uploads release];
 	[_queue release];
 	if (_done != nil) {
 		dispatch_release(_done);
@@ -5875,6 +5997,117 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 	[_queue aliothCommitInOrder:self];
 }
 
+/* (the K40's, 11-16) boot-arg metal_strict=1: a refused piece of work fails its whole command buffer (the old way) */
+static BOOL
+alioth_strict(void)
+{
+	static dispatch_once_t once;
+	static BOOL strict;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		strict = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_strict=1") != NULL;
+		if (strict) {
+			rw_print("metal_strict=1: a refused draw, dispatch or blit fails its whole command buffer\n");
+		}
+	});
+	return strict;
+}
+
+/*
+ * (the K40's, 11-16) A pass's load actions without a draw: the clear-only pass, and a refused draw that carried them.
+ * Colour attachments are cleared in groups of the same colour -- rwa_render_clear takes one colour, and an attachment
+ * left NULL in its list is kept -- the depth/stencil with the first group.
+ */
+- (void)aliothClearPass:(AliothMetalWork *)work
+{
+	struct rwa_texture *color[8] = { NULL };
+	struct rwa_device *device = [[_queue device] mesaDevice];
+	char why[512] = { 0 };
+
+	for (unsigned i = 0; i < work->colorCount && i < 8; i++) {
+		color[i] = [work->color[i] mesaTexture];
+	}
+	if (device == NULL || mesa.render_clear == NULL) {
+		rw_print("a pass that only clears, and %s: nothing was cleared\n", device == NULL ?
+		         "no GPU to clear with" : "a compiler library without rwa_render_clear");
+		return;
+	}
+	unsigned left = work->clearMask;
+	BOOL first = YES;
+
+	if (left == 0 && work->clears) {
+		left = (1u << work->colorCount) - 1;     /* (recorded without the mask: every attachment, one colour) */
+		for (unsigned i = 0; i < work->colorCount && i < 8; i++) {
+			memcpy(work->clearColors[i], work->clearColor, sizeof(work->clearColor));
+		}
+	}
+	do {
+		struct rwa_texture *group[8] = { NULL };
+		const float *colour = NULL;
+
+		if (left != 0) {
+			unsigned lead = (unsigned)__builtin_ctz(left);
+
+			colour = work->clearColors[lead];
+			for (unsigned i = lead; i < work->colorCount && i < 8; i++) {
+				if ((left & (1u << i)) && memcmp(work->clearColors[i], colour, sizeof(work->clearColors[i])) == 0) {
+					group[i] = color[i];
+					left &= ~(1u << i);
+				}
+			}
+		}
+		BOOL zs = first && (work->clearsDepth || work->clearsStencil);
+
+		if (colour != NULL || zs) {
+			if (mesa.render_clear(device, group, work->colorCount, colour,
+			    zs && work->depth != nil ? [work->depth mesaTexture] : NULL,
+			    zs && work->clearsDepth ? &work->clearDepth : NULL,
+			    zs && work->clearsStencil ? &work->clearStencil : NULL, why, sizeof(why)) != 0) {
+				rw_print("a pass that only clears: %s\n", why);
+			}
+		}
+		first = NO;
+	} while (left != 0);
+}
+
+/*
+ * (the K40's, 11-16) A refused piece of work LEFT OUT and the rest of the command buffer run. Apple's driver validates
+ * nothing and runs a frame whatever is wrong in it; here one draw, dispatch or blit this driver refuses failed the
+ * whole buffer -- a game with one unserved draw a frame would show none of its frames (the idea of hakios-metal's
+ * setSkipRefused, oosexgang 210b145). The reason is said (the first 20 in a process, then every 500th) and the
+ * buffer's error taken back; a refused draw's pass still gets its load actions. Not for a lack of memory, and not with
+ * boot-arg metal_strict=1. YES: go on with the next work.
+ */
+- (BOOL)aliothSkipRefused:(id)item why:(const char *)why
+{
+	static unsigned skipped;
+
+	if (alioth_strict() || strstr(why, "no memory") != NULL || strstr(why, "out of memory") != NULL) {
+		return NO;
+	}
+	[_error release];
+	_error = nil;
+	_status = RW_CB_COMMITTED;
+	unsigned n = __atomic_add_fetch(&skipped, 1, __ATOMIC_RELAXED);
+
+	if (n <= 20 || n % 500 == 0) {
+		rw_print("left out of its command buffer (refused work no. %u in this process; metal_strict=1 fails the "
+		         "buffer instead): %s\n", n, why);
+	}
+	if ([item isKindOfClass:[AliothMetalWork class]]) {
+		AliothMetalWork *work = item;
+
+		if (work->render != nil && (work->clears || work->clearMask != 0 || work->clearsDepth ||
+		    work->clearsStencil)) {
+			[self aliothClearPass:work];
+		}
+	}
+	return YES;
+}
+
 /* Metal's own rule, kept: the recorded dispatches run here and not when they were encoded. */
 - (void)aliothRun
 {
@@ -5890,6 +6123,9 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 		if ([item isKindOfClass:[AliothMetalBlit class]]) {
 			if (![self runBlit:item why:why size:sizeof(why)]) {
 				rw_print("the blit failed: %s\n", why);
+				if ([self aliothSkipRefused:item why:why]) {
+					continue;
+				}
 				goto done;
 			}
 			continue;
@@ -5928,25 +6164,24 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 		}
 		if (work->render != nil) {
 			if (![self runDraw:work why:why size:sizeof(why)]) {
+				if ([self aliothSkipRefused:work why:why]) {
+					continue;
+				}
 				goto done;
 			}
 			continue;
 		}
 		if (work->clearOnly) {
-			struct rwa_texture *color[8] = { NULL };
+			[self aliothClearPass:work];
+			continue;
+		}
+		/* (the K40's, 11-16) a pass's depth/stencil whose store actions let it go (-endEncoding) */
+		if (work->discard) {
 			struct rwa_device *device = [[_queue device] mesaDevice];
 
-			for (unsigned i = 0; i < work->colorCount; i++) {
-				color[i] = [work->color[i] mesaTexture];
-			}
-			if (device == NULL || mesa.render_clear == NULL) {
-				rw_print("a pass that only clears, and %s: nothing was cleared\n", device == NULL ?
-				         "no GPU to clear with" : "a compiler library without rwa_render_clear");
-			} else if (mesa.render_clear(device, color, work->colorCount, work->clears ? work->clearColor :
-			    NULL, work->depth != nil ? [work->depth mesaTexture] : NULL, work->clearsDepth ?
-			    &work->clearDepth : NULL, work->clearsStencil ? &work->clearStencil : NULL, why,
-			    sizeof(why)) != 0) {
-				rw_print("a pass that only clears: %s\n", why);
+			if (device != NULL && mesa.texture_discard != NULL &&
+			    mesa.texture_discard(device, [work->depth mesaTexture], why, sizeof(why)) != 0) {
+				RW_ONCE("a pass's DontCare store: %s\n", why);
 			}
 			continue;
 		}
@@ -6030,6 +6265,9 @@ alioth_half_texels(const uint8_t *above, NSUInteger aw, NSUInteger ah, uint8_t *
 					    work->size, why, sizeof(why));
 		if (rc != 0) {
 			rw_print("the dispatch failed: %s\n", why);
+			if ([self aliothSkipRefused:work why:why]) {
+				continue;
+			}
 			_error = [[NSError errorWithDomain:@"AliothMetal" code:2
 						  userInfo:@{ NSLocalizedDescriptionKey:
 							      [NSString stringWithUTF8String:why] }]
@@ -6273,6 +6511,10 @@ done:
 		.depth_bias = work->depthBias,
 		.indirect_buffer = gpu_indirect,
 		.indirect_offset = gpu_indirect != NULL ? work->indirectOffset : 0,
+		/* (the K40's, 11-16) each attachment's own clear colour; MTLDepthClipModeClamp */
+		.clear_colors = work->clearMask != 0 ? &work->clearColors[0][0] : NULL,
+		.clear_color_mask = work->clearMask,
+		.depth_clamp = work->depthClamp ? 1 : 0,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
@@ -6643,6 +6885,15 @@ done:
 	unsigned _colorCount;
 	float _clearColor[4];
 	BOOL _clears;
+	/* (the K40's, 11-16) each colour attachment's own clear colour, and which of them clear (bit i: attachment i);
+	 * _clearColor/_clears are the first cleared one's, for a library without RWA_DRAW_CLEAR_EACH */
+	float _clearColors[8][4];
+	unsigned _clearMask;
+	/* (the K40's, 11-16) MTLDepthClipModeClamp; and the depth attachment's store action (-setDepthStoreAction: may
+	 * set it after the descriptor's), DontCare letting the GPU skip writing it out at the pass's end */
+	BOOL _depthClamp;
+	NSUInteger _depthStore, _stencilStore;
+	BOOL _depthNamed, _stencilNamed;
 	id _depth;
 	id _depthResolve;
 	id _depthStencilState;
@@ -6742,13 +6993,20 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 				         "stored and nothing is resolved\n", i, (unsigned long)store);
 			}
 		}
-		if (i == 0 && [attachment loadAction] == MTLLoadActionClear) {
+		/* (the K40's, 11-16) every attachment's own load action and colour: only attachment 0's was read, and
+		 * the library cleared EVERY colour attachment with it -- a G-buffer's normals cleared to the albedo's
+		 * colour, an attachment that loads cleared anyway */
+		if ([attachment loadAction] == MTLLoadActionClear) {
 			MTLClearColor c = [attachment clearColor];
 
-			_clearColor[0] = (float)c.red;
-			_clearColor[1] = (float)c.green;
-			_clearColor[2] = (float)c.blue;
-			_clearColor[3] = (float)c.alpha;
+			_clearColors[i][0] = (float)c.red;
+			_clearColors[i][1] = (float)c.green;
+			_clearColors[i][2] = (float)c.blue;
+			_clearColors[i][3] = (float)c.alpha;
+			if (_clearMask == 0) {
+				memcpy(_clearColor, _clearColors[i], sizeof(_clearColor));
+			}
+			_clearMask |= 1u << i;
 			_clears = YES;
 		}
 	}
@@ -6798,6 +7056,11 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 			_clearStencil = (unsigned)[sa clearStencil];
 			_clearsStencil = YES;
 		}
+		/* (the K40's, 11-16) the store actions, for -endEncoding's discard, and which aspects the pass named */
+		_depthStore = ztex != nil ? [za storeAction] : MTLStoreActionDontCare;
+		_stencilStore = stex != nil ? [sa storeAction] : MTLStoreActionDontCare;
+		_depthNamed = ztex != nil;
+		_stencilNamed = stex != nil;
 	}
 	return self;
 }
@@ -6874,21 +7137,24 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 	}
 }
 
+/* (the K40's, 11-16) the bytes in the command buffer's upload area, not a buffer of their own (-aliothUpload:...) */
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
+	NSUInteger offset = 0;
+	id buffer = [_commandBuffer aliothUpload:bytes length:length offset:&offset];
 
 	if (buffer != nil) {
-		[self setVertexBuffer:[buffer autorelease] offset:0 atIndex:index];
+		[self setVertexBuffer:buffer offset:offset atIndex:index];
 	}
 }
 
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
+	NSUInteger offset = 0;
+	id buffer = [_commandBuffer aliothUpload:bytes length:length offset:&offset];
 
 	if (buffer != nil) {
-		[self setFragmentBuffer:[buffer autorelease] offset:0 atIndex:index];
+		[self setFragmentBuffer:buffer offset:offset atIndex:index];
 	}
 }
 
@@ -7040,6 +7306,9 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 	for (unsigned i = 0; i < 4; i++) {
 		work->clearColor[i] = _clearColor[i];
 	}
+	work->clearMask = _clearMask;
+	memcpy(work->clearColors, _clearColors, sizeof(work->clearColors));
+	work->depthClamp = _depthClamp;
 	work->depth = _depth;
 	work->depthStencilState = _depthStencilState;
 	work->clearDepth = _clearDepth;
@@ -7109,6 +7378,7 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 	 * so a farther triangle drawn later covered a nearer one (System Check's metal.depth), and a pass of many
 	 * sprites would have kept only the last. */
 	_clears = NO;
+	_clearMask = 0;
 	_clearsDepth = NO;
 	_clearsStencil = NO;
 }
@@ -7228,8 +7498,10 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 		  lodMaxClamp:(float)lodMax
 		      atIndex:(NSUInteger)index
 {
-	/* (the sampler's own range, as for the fragment stage: a per-binding clamp is not carried) */
-	(void)lodMin; (void)lodMax;
+	/* (the K40's, 11-16) the binding's own lod range: a sampler made for it (-aliothWithLodMin:max:) */
+	if ([sampler isKindOfClass:[AliothMetalSampler class]]) {
+		sampler = [(AliothMetalSampler *)sampler aliothWithLodMin:lodMin max:lodMax];
+	}
 	[self setVertexSamplerState:sampler atIndex:index];
 }
 - (void)setVertexSamplerStates:(const id *)samplers withRange:(NSRange)range
@@ -7249,7 +7521,9 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 		    lodMaxClamp:(float)lodMax
 			atIndex:(NSUInteger)index
 {
-	(void)lodMin; (void)lodMax;
+	if ([sampler isKindOfClass:[AliothMetalSampler class]]) {
+		sampler = [(AliothMetalSampler *)sampler aliothWithLodMin:lodMin max:lodMax];
+	}
 	[self setFragmentSamplerState:sampler atIndex:index];
 }
 - (void)setFragmentSamplerStates:(const id *)samplers withRange:(NSRange)range
@@ -7390,10 +7664,15 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
  * _far are both on); MTLDepthClipModeClamp, which keeps a primitive outside the depth range
  * and clamps its z instead, is a different picture and the contract has nowhere to ask for
  * it. Said once rather than ignored. */
+/* (the K40's, 11-16) MTLDepthClipModeClamp: fragments beyond the near and far planes are kept and their depth clamped
+ * to the range (a shadow map's casters behind the light's near plane) -- Gallium's depth_clip_near/far off and
+ * depth_clamp on, rwa_draw.depth_clamp (a library with RWA_DRAW_DEPTH_CLAMP). It was said and clipped until then. */
 - (void)setDepthClipMode:(NSUInteger)mode
 {
-	if (mode != MTLDepthClipModeClip && !_complained) {
-		rw_print("MTLDepthClipModeClamp is not implemented; this pass clips "
+	_depthClamp = mode == MTLDepthClipModeClamp;
+	if (_depthClamp && !(mesa.draw_features != NULL && (mesa.draw_features() & RWA_DRAW_DEPTH_CLAMP)) &&
+	    !_complained) {
+		rw_print("MTLDepthClipModeClamp needs a compiler library with depth clamping; this pass clips "
 		         "against the depth range instead of clamping to it\n");
 		_complained = YES;
 	}
@@ -7427,21 +7706,24 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 }
 
 /*
- * We always store what was drawn, so these record nothing; saying it here is cheaper than
- * leaving the next reader to wonder whether a discarded attachment would be honoured.
+ * Colour attachments are always stored, so their store action records nothing: keeping the
+ * contents is a superset of every store action Metal has (DontCare only permits leaving them
+ * undefined).
  *
- * That is now also true of the depth attachment, and there it is more than tidiness: the
- * only thing MTLStoreActionDontCare permits that storing does not is leaving the contents
- * undefined, so keeping them is a superset of every store action Metal has. A pass whose
- * depth the next pass reads back therefore works whichever action it asked for -- and the
- * depth test inside one pass never depended on this at all.
+ * (The K40's, 11-16) The DEPTH/STENCIL attachment's DontCare is honoured: at -endEncoding the
+ * pass records a discard, and the GPU then skips writing the attachment out of its tile memory
+ * at the pass's end (Gallium's invalidate_resource, freedreno's batch->resolve) -- for a
+ * full-screen Depth32Float, 11 MB written and later read back per pass for nothing. Not when
+ * the pass resolves the depth (the resolve reads what is stored), not for a sub-encoder of a
+ * parallel pass (the next sub-encoder draws on), and not for an IOSurface's texture.
  */
 - (void)setColorStoreAction:(NSUInteger)action atIndex:(NSUInteger)index
 {
 	(void)action; (void)index;
 }
-- (void)setDepthStoreAction:(NSUInteger)action                 { (void)action; }
-- (void)setStencilStoreAction:(NSUInteger)action               { (void)action; }
+/* (the K40's, 11-16) a store action given late (MTLStoreActionUnknown at the start) counts for -endEncoding's discard */
+- (void)setDepthStoreAction:(NSUInteger)action                 { _depthStore = action; }
+- (void)setStencilStoreAction:(NSUInteger)action               { _stencilStore = action; }
 - (void)setColorStoreActionOptions:(NSUInteger)options atIndex:(NSUInteger)index
 {
 	(void)options; (void)index;
@@ -7488,8 +7770,8 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 - (void)useHeap:(id)heap
 {
 	(void)heap;
-	RW_ONCE("-useHeap: is a no-op here, for -useResource:'s reason, and "
-		"this driver has no heaps to make resident in any case\n");
+	RW_ONCE("-useHeap: is a no-op here, for -useResource:'s reason: a heap's allocations are "
+		"each resident for their lifetime\n");
 }
 - (void)useHeap:(id)heap stages:(NSUInteger)stages             { (void)heap; (void)stages; }
 - (void)useHeaps:(const id *)heaps count:(NSUInteger)count     { (void)heaps; (void)count; }
@@ -8136,6 +8418,8 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		for (unsigned i = 0; i < 4; i++) {
 			work->clearColor[i] = _clearColor[i];
 		}
+		work->clearMask = _clearMask;
+		memcpy(work->clearColors, _clearColors, sizeof(work->clearColors));
 		work->depth = _depth;
 		work->clearDepth = _clearDepth;
 		work->clearStencil = _clearStencil;
@@ -8159,6 +8443,28 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		b->destination = [to retain];
 		[_recorder recordBlit:b];
 		[b release];
+	}
+	/*
+	 * (the K40's, 11-16) The depth/stencil attachment let go when the pass's store actions say its contents are not
+	 * wanted (the comment above -setColorStoreAction: says why and when not). Both aspects the texture has must be
+	 * DontCare: a pass naming only the depth of a depth+stencil texture leaves the stencil to be kept.
+	 */
+	if (!_ended && _drew && _depth != nil && _depthResolve == nil && _recorder == (id)_commandBuffer &&
+	    mesa.texture_discard != NULL) {
+		NSUInteger zf = [_depth pixelFormat];
+		BOOL hasDepth = zf != MTLPixelFormatStencil8;
+		BOOL hasStencil = zf != MTLPixelFormatDepth32Float && zf != MTLPixelFormatDepth16Unorm;
+		BOOL depthGoes = hasDepth ? _depthNamed && _depthStore == MTLStoreActionDontCare : YES;
+		BOOL stencilGoes = hasStencil ? _stencilNamed && _stencilStore == MTLStoreActionDontCare : YES;
+
+		if (depthGoes && stencilGoes) {
+			AliothMetalWork *work = [[AliothMetalWork alloc] init];
+
+			work->discard = YES;
+			work->depth = _depth;
+			[_recorder recordWork:work];
+			[work release];
+		}
 	}
 	_ended = YES;
 	[super endEncoding];
@@ -8705,7 +9011,6 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 	id _samplers[RW_MAX_BUFFERS];
 	unsigned _highest, _highestTexture, _highestSampler;
 	unsigned _threadgroupBytes;     /* (the K40's) -setThreadgroupMemoryLength: for index 0 */
-	BOOL _complained;
 }
 
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
@@ -8792,17 +9097,17 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 }
 
 /* Metal lets a binding narrow the sampler's lod range. The compiler library takes the range
- * when the sampler is made, so honouring it here would need a second sampler object; until
- * it does, saying nothing would silently sample the wrong level. */
+ * when the sampler is made, so a binding with a range of its own gets a sampler made for that
+ * range (the K40's, 11-16: -aliothWithLodMin:max:). Until then the range was said once -- and
+ * the saying set the encoder's one refusal flag, so every later dispatch of the encoder was
+ * dropped. */
 - (void)setSamplerState:(id)sampler
 	    lodMinClamp:(float)lodMin
 	    lodMaxClamp:(float)lodMax
 		atIndex:(NSUInteger)index
 {
-	if (!_complained && (lodMin != 0.0f || lodMax < 1000.0f)) {
-		rw_print("a per-binding lod clamp (%g..%g) is not implemented; the "
-		         "sampler's own range is used instead\n", (double)lodMin, (double)lodMax);
-		_complained = YES;
+	if ([sampler isKindOfClass:[AliothMetalSampler class]]) {
+		sampler = [(AliothMetalSampler *)sampler aliothWithLodMin:lodMin max:lodMax];
 	}
 	[self setSamplerState:sampler atIndex:index];
 }
@@ -8818,10 +9123,11 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
  * the shader's binding is. */
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
+	NSUInteger offset = 0;
+	id buffer = [_commandBuffer aliothUpload:bytes length:length offset:&offset];
 
 	if (buffer != nil) {
-		[self setBuffer:[buffer autorelease] offset:0 atIndex:index];
+		[self setBuffer:buffer offset:offset atIndex:index];
 	}
 }
 
@@ -8830,9 +9136,8 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 {
 	AliothMetalWork *work;
 
-	if (_pipeline == nil || _complained) {
-		rw_print("this dispatch has %s and is dropped\n",
-		         _pipeline == nil ? "no pipeline state" : "a binding this driver refused");
+	if (_pipeline == nil) {
+		rw_print("this dispatch has no pipeline state and is dropped\n");
 		return nil;
 	}
 	work = [[[AliothMetalWork alloc] init] autorelease];

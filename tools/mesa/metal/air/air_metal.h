@@ -1334,11 +1334,29 @@ struct rwa_draw {
 	 * reads these, and an older one would draw the counts it was given instead. Appended. */
 	struct rwa_buffer *indirect_buffer;
 	size_t indirect_offset;
+	/* (the K40's, 11-16) each colour attachment's OWN load action: `clear_colors` is four floats per attachment
+	 * (color_count x 4) and bit i of `clear_color_mask` clears attachment i to its four; an attachment whose bit
+	 * is clear keeps what it holds. NULL: `clear_color` as before, one colour for every attachment (Metal's
+	 * per-attachment colours were all given attachment 0's until then). RWA_DRAW_CLEAR_EACH. Appended. */
+	const float *clear_colors;
+	unsigned clear_color_mask;
+	/* (the K40's, 11-16) MTLDepthClipModeClamp as 1: primitives are not clipped against the near and far planes
+	 * and the depth is clamped to the depth range instead (Gallium's depth_clip_near/far off, depth_clamp on).
+	 * RWA_DRAW_DEPTH_CLAMP. Appended. */
+	unsigned depth_clamp;
 };
 
 /* (the K40's) what this library's rwa_render_draw takes beyond the struct's first shape */
 #define RWA_DRAW_INDIRECT 1u
+#define RWA_DRAW_CLEAR_EACH 2u
+#define RWA_DRAW_DEPTH_CLAMP 4u
 unsigned rwa_draw_features(void);
+
+/* (the K40's, 11-16) The contents of an attachment let go: Metal's MTLStoreActionDontCare at a pass's end. The pass
+ * that wrote it does not write it out of the GPU's tile memory, and the next one does not read it back in
+ * (Gallium's invalidate_resource). A texture over an IOSurface is never let go (someone else shows it). 0, or -1
+ * and why. */
+int rwa_texture_discard(struct rwa_device *device, struct rwa_texture *texture, char *why, size_t why_size);
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
