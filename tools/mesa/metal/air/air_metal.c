@@ -7818,13 +7818,19 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
                                         .height = texture_height(first_t),
                                         .nr_cbufs = color_count,
                                         .samples = MAX2(first->nr_samples, 1) };
+   /* (the K40's, 11-16) on a deferred device (a Metal driver's, rwa_device_set_deferred) the attachments' KEPT
+    * surfaces (texture_surface), the clear not waited for and the framebuffer left bound -- as a draw with keep_bound:
+    * the pass after it into the same attachments is then the same freedreno batch, the clear its load action, where
+    * this waited for the whole GPU and made and destroyed its surfaces every time (a frame of one colour, every frame)
+    */
+   bool kept = device->deferred;
    for (unsigned i = 0; i < color_count; i++) {
       if (!color[i])
          continue;
       fb.width = MIN2(fb.width, texture_width(color[i]));
       fb.height = MIN2(fb.height, texture_height(color[i]));
       struct pipe_surface tmpl = surface_template(color[i]);
-      surf[i] = pipe->create_surface(pipe, color[i]->res, &tmpl);
+      surf[i] = kept ? texture_surface(device, color[i]) : pipe->create_surface(pipe, color[i]->res, &tmpl);
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
@@ -7836,7 +7842,7 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
    }
    if (depth) {
       struct pipe_surface tmpl = surface_template(depth);
-      zsurf = pipe->create_surface(pipe, depth->res, &tmpl);
+      zsurf = kept ? texture_surface(device, depth) : pipe->create_surface(pipe, depth->res, &tmpl);
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
@@ -7854,13 +7860,15 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
    if (mask)
       pipe->clear(pipe, mask, NULL, &clear, clear_depth ? (double)*clear_depth : 0.0,
                   clear_stencil ? *clear_stencil & 0xff : 0);
+   if (kept)
+      return 0;     /* (the command buffer's flush and fence say when it is done; the surfaces are the textures') */
    rc = finish_or_say_why(device, mask != 0, "clear", why, why_size);
    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
 out:
    for (unsigned i = 0; i < color_count; i++)
-      if (surf[i])
+      if (surf[i] && !kept)
          pipe->surface_destroy(pipe, surf[i]);
-   if (zsurf)
+   if (zsurf && !kept)
       pipe->surface_destroy(pipe, zsurf);
    return rc;
 }
