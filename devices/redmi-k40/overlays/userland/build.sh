@@ -218,6 +218,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
 		$DYN -O2 -o obj/camera_test src/camera_test.c src/camera_isp.c
+		# the preview render of src/camera_isp.c timed on a made-up frame, its pictures kept to compare (NEON vs C)
+		$DYN -O2 -o obj/isp_bench src/isp_bench.c src/camera_isp.c
 		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/camera_avtest.m
 		# (the microphone as an application records: allowed to, by an entitlement, if ldid is there)
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/record_test.c &&
@@ -391,6 +393,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/gnss_feed ] && cp obj/gnss_feed root/bin/
 	[ -f obj/hk_telephony ] && cp obj/hk_telephony root/bin/
 	[ -f obj/psample ] && cp obj/psample root/bin/
+	[ -f obj/isp_bench ] && cp obj/isp_bench root/bin/
 	# (the applications that come with this image, unpacked from ../apps/*.ipa: the job com.hakios.apps
 	# registers them at boot; those of the release's apps\ folder come from the computer instead)
 	mkdir -p root/apps

@@ -502,21 +502,118 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 	uint32_t cy = y0 + (uint32_t)((uint64_t)row * ch / height);
 	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
 	uint64_t step = ((uint64_t)cw << 16) / width, at = (uint64_t)x0 << 16;
-	float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0, gains[3] = { 1, 1, 1 };
+	float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
 
-	for (uint32_t x = 0; x < width; x++, at += step) {
-		uint32_t cx = (uint32_t)(at >> 16);
-		int v[4], g = 0;
+	if (isp->plain_preview) {
+		/* (the way before 2026-11-15, kept to measure the other against: each pixel on its own) */
+		float gains[3] = { 1, 1, 1 };
 
-		cell(top, f->stride, cx, v);
-		for (int j = 0; j < 4; j++) {
-			g += j != r && j != b ? v[j] : 0;
+		for (uint32_t x = 0; x < width; x++, at += step) {
+			uint32_t cx = (uint32_t)(at >> 16);
+			int v[4], g = 0;
+
+			cell(top, f->stride, cx, v);
+			for (int j = 0; j < 4; j++) {
+				g += j != r && j != b ? v[j] : 0;
+			}
+			if (isp->lsc.on) {
+				lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+			}
+			pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
 		}
-		if (isp->lsc.on) {
-			lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
-		}
-		pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
+		return;
 	}
+	/*
+	 * (this is the preview's road, every pixel of every frame -- 62 million a second for a 1920x1080 picture at 30 a
+	 * second, 11-15: mediaserverd at up to 1.5 cores. What does not change along the line is done once for it: the
+	 * lens shading's grid at this line's height, each column between its two rows -- a pixel then only goes between
+	 * two columns, without a division; the cell's two greens' places.)
+	 */
+	int g0 = -1, g1 = -1;
+	float col[3][LSC_W], to_grid = cells_w > 1 ? (float)(LSC_W - 1) / (cells_w - 1) : 0;
+	bool shade = isp->lsc.on;
+	uint8_t *o = rgb + (isp->turned ? 3 * (size_t)(width - 1) : 0);
+	ptrdiff_t next = isp->turned ? -3 : 3;
+
+	for (int j = 0; j < 4; j++) {
+		if (j != r && j != b) {
+			if (g0 < 0) {
+				g0 = j;
+			} else {
+				g1 = j;
+			}
+		}
+	}
+	if (shade) {
+		float gy = v_pos * (LSC_H - 1);
+		int ly = (int)gy;
+
+		ly = ly < 0 ? 0 : ly > LSC_H - 2 ? LSC_H - 2 : ly;
+		float fy = gy - ly;
+
+		for (int c = 0; c < 3; c++) {
+			for (int gx = 0; gx < LSC_W; gx++) {
+				col[c][gx] = isp->lsc.gain[c][ly][gx] * (1 - fy) + isp->lsc.gain[c][ly + 1][gx] * fy;
+			}
+		}
+	}
+	/*
+	 * In runs of RUN pixels, three passes: the cells' values (lens-shaded), then the colour matrix and the gamma table's
+	 * step for each -- plain arithmetic over arrays, which the compiler does with vector instructions (NEON) --, then
+	 * the table itself.
+	 */
+#define RUN 256
+	for (uint32_t x = 0; x < width; x += RUN) {
+		uint32_t n = width - x < RUN ? width - x : RUN;
+		float R[RUN], G[RUN], B[RUN];
+		int32_t step_r[RUN], step_g[RUN], step_b[RUN];
+
+		for (uint32_t i = 0; i < n; i++, at += step) {
+			uint32_t cx = (uint32_t)(at >> 16);
+			int v[4];
+
+			cell(top, f->stride, cx, v);
+			R[i] = (float)v[r];
+			G[i] = (float)(v[g0] + v[g1]) * 0.5f;
+			B[i] = (float)v[b];
+			if (shade) {
+				float gx = cx * to_grid;
+				int lx = (int)gx;
+
+				lx = lx > LSC_W - 2 ? LSC_W - 2 : lx;
+				float fx = gx - lx;
+
+				R[i] *= col[0][lx] + (col[0][lx + 1] - col[0][lx]) * fx;
+				G[i] *= col[1][lx] + (col[1][lx + 1] - col[1][lx]) * fx;
+				B[i] *= col[2][lx] + (col[2][lx + 1] - col[2][lx]) * fx;
+			}
+		}
+		if (p.identity) {
+			for (uint32_t i = 0; i < n; i++) {
+				float vr = R[i] * p.m[0][0] + 0.5f, vg = G[i] * p.m[1][1] + 0.5f, vb = B[i] * p.m[2][2] + 0.5f;
+
+				step_r[i] = (int32_t)(vr < 0 ? 0 : vr > 4095 ? 4095 : vr);
+				step_g[i] = (int32_t)(vg < 0 ? 0 : vg > 4095 ? 4095 : vg);
+				step_b[i] = (int32_t)(vb < 0 ? 0 : vb > 4095 ? 4095 : vb);
+			}
+		} else {
+			for (uint32_t i = 0; i < n; i++) {
+				float vr = p.m[0][0] * R[i] + p.m[0][1] * G[i] + p.m[0][2] * B[i] + 0.5f;
+				float vg = p.m[1][0] * R[i] + p.m[1][1] * G[i] + p.m[1][2] * B[i] + 0.5f;
+				float vb = p.m[2][0] * R[i] + p.m[2][1] * G[i] + p.m[2][2] * B[i] + 0.5f;
+
+				step_r[i] = (int32_t)(vr < 0 ? 0 : vr > 4095 ? 4095 : vr);
+				step_g[i] = (int32_t)(vg < 0 ? 0 : vg > 4095 ? 4095 : vg);
+				step_b[i] = (int32_t)(vb < 0 ? 0 : vb > 4095 ? 4095 : vb);
+			}
+		}
+		for (uint32_t i = 0; i < n; i++, o += next) {
+			o[0] = isp->gamma[step_r[i]];
+			o[1] = isp->gamma[step_g[i]];
+			o[2] = isp->gamma[step_b[i]];
+		}
+	}
+#undef RUN
 }
 
 /*
@@ -560,13 +657,376 @@ nv12_pair(const uint8_t *rgb0, const uint8_t *rgb1, uint32_t width, uint8_t *y0,
 	}
 }
 
+/* ---- the preview by cells, with NEON (2026-11-15) ------------------------------------------------------------ */
+/*
+ * The preview's road when the picture is about as wide as the sensor's part it shows (Nagram's camera cell: 1920x1080
+ * of 2000x1125 cells): each CELL of the line done once, in vectors -- the two RAW10 lines unpacked 16 pixels at a
+ * time (the black level off by a saturating subtract), a cell's four values by de-interleaving loads, lens shading
+ * (the grid's two columns around a cell picked by a table lookup), the colour matrix, the gamma table's step --,
+ * the gamma table itself one value at a time, then each pixel of the picture takes its nearest cell's colour as
+ * render_line() does; NV12 or BGRA from the three planes in vectors too. The same in plain C where there is no NEON
+ * (the computer: wsl/isp-bench.c). Pictures much narrower than their cells keep render_line().
+ */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define ISP_NEON        1
+#else
+#define ISP_NEON        0
+#endif
+
+#define PV_CELLS        4096            /* (8192 pixels across) */
+
+struct preview {
+	uint32_t        x0, y0, cw, ch;
+	int             r, b, g0, g1;
+	struct pipe     p;
+	float           to_grid;        /* a cell's index to the lens shading grid's column */
+	uint16_t        map[8192];      /* the picture's pixel -> its cell, from x0 */
+	uint16_t        l0[2 * PV_CELLS + 32], l1[2 * PV_CELLS + 32];  /* the two lines' values above black */
+	float           base[3][16], slope[3][16];                      /* the line's lens shading: column i and to i + 1 */
+	uint8_t         cr[PV_CELLS], cg[PV_CELLS], cb[PV_CELLS];       /* each cell's colour, through the gamma table */
+};
+
+static bool
+preview_setup(const struct isp *isp, const struct hakios_camera_frame *f, uint32_t width, uint32_t height, struct preview *pv)
+{
+	uint32_t cells_w = f->width / 2;
+
+	if (isp->plain_preview || f->format != 1 || width > 8192) {
+		return false;
+	}
+	crop(isp, f, width, height, &pv->x0, &pv->y0, &pv->cw, &pv->ch);
+	/* (magnified, or the picture well under its cells: render_line()) */
+	if (pv->cw < width || pv->ch < height || pv->cw > PV_CELLS || (uint64_t)pv->cw * 2 > (uint64_t)width * 3) {
+		return false;
+	}
+	cell_places(f->bayer, &pv->r, &pv->b);
+	pv->g0 = pv->g1 = -1;
+	for (int j = 0; j < 4; j++) {
+		if (j != pv->r && j != pv->b) {
+			if (pv->g0 < 0) {
+				pv->g0 = j;
+			} else {
+				pv->g1 = j;
+			}
+		}
+	}
+	pipe_init(isp, &pv->p);
+	pv->to_grid = cells_w > 1 ? (float)(LSC_W - 1) / (cells_w - 1) : 0;
+	uint64_t step = ((uint64_t)pv->cw << 16) / width, at = (uint64_t)pv->x0 << 16;
+
+	for (uint32_t x = 0; x < width; x++, at += step) {
+		pv->map[x] = (uint16_t)((at >> 16) - pv->x0);
+	}
+	return true;
+}
+
+/* pixels first .. first + n - 1 of a RAW10 line (four in five bytes), above black (64) and not below 0 */
+static void
+unpack_raw10(const uint8_t *line, size_t stride, uint32_t first, uint32_t n, uint16_t *out)
+{
+	uint32_t skip = first & 3, groups = (skip + n + 3) / 4;
+	const uint8_t *q = line + (size_t)(first / 4) * 5, *end = line + stride;
+	uint16_t *o = out - skip;       /* (the caller leaves room in front) */
+	uint32_t g = 0;
+
+#if ISP_NEON
+	static const uint8_t msb_at[16] = { 0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18 };
+	static const uint8_t lsb_at[16] = { 4, 4, 4, 4, 9, 9, 9, 9, 14, 14, 14, 14, 19, 19, 19, 19 };
+	static const int16_t lsb_shift[8] = { 0, -2, -4, -6, 0, -2, -4, -6 };
+	const uint8x16_t mi = vld1q_u8(msb_at), li = vld1q_u8(lsb_at);
+	const int16x8_t sh = vld1q_s16(lsb_shift);
+	const uint16x8_t three = vdupq_n_u16(3), black = vdupq_n_u16(64);
+
+	/* 16 pixels (4 groups, 20 bytes) a step; the table read is 32 bytes, so never past the line's end */
+	for (; g + 4 <= groups && q + 32 <= end; g += 4, q += 20, o += 16) {
+		uint8x16x2_t t = { { vld1q_u8(q), vld1q_u8(q + 16) } };
+		uint8x16_t msb = vqtbl2q_u8(t, mi), lsb = vqtbl2q_u8(t, li);
+		uint16x8_t lo = vorrq_u16(vshll_n_u8(vget_low_u8(msb), 2), vandq_u16(vshlq_u16(vmovl_u8(vget_low_u8(lsb)), sh), three));
+		uint16x8_t hi = vorrq_u16(vshll_n_u8(vget_high_u8(msb), 2), vandq_u16(vshlq_u16(vmovl_u8(vget_high_u8(lsb)), sh), three));
+
+		vst1q_u16(o, vqsubq_u16(lo, black));
+		vst1q_u16(o + 8, vqsubq_u16(hi, black));
+	}
+#else
+	(void)end;
+#endif
+	for (; g < groups; g++, q += 5, o += 4) {
+		for (int k = 0; k < 4; k++) {
+			int v = (q[k] << 2 | (q[4] >> (k * 2) & 3)) - 64;
+
+			o[k] = (uint16_t)(v < 0 ? 0 : v);
+		}
+	}
+}
+
+/* the line's lens shading: the grid at this height, then column i's gain and the step to column i + 1 */
+static void
+preview_shading(const struct isp *isp, float v_pos, struct preview *pv)
+{
+	float gy = v_pos * (LSC_H - 1);
+	int ly = (int)gy;
+
+	ly = ly < 0 ? 0 : ly > LSC_H - 2 ? LSC_H - 2 : ly;
+	float fy = gy - ly;
+
+	for (int c = 0; c < 3; c++) {
+		float col[LSC_W];
+
+		for (int gx = 0; gx < LSC_W; gx++) {
+			col[gx] = isp->lsc.gain[c][ly][gx] * (1 - fy) + isp->lsc.gain[c][ly + 1][gx] * fy;
+		}
+		for (int i = 0; i < 16; i++) {
+			pv->base[c][i] = col[i];
+			pv->slope[c][i] = col[i + 1] - col[i];
+		}
+	}
+}
+
+#if ISP_NEON
+/* 4 cells' gains: column lx's and the step to the next, picked out of 16 floats (64 bytes) by byte lookups */
+static inline float32x4_t
+gain4(const float *base, const float *slope, uint32x4_t lx, float32x4_t fx)
+{
+	uint8x16x4_t tb = { { vld1q_u8((const uint8_t *)base), vld1q_u8((const uint8_t *)base + 16),
+		                    vld1q_u8((const uint8_t *)base + 32), vld1q_u8((const uint8_t *)base + 48) } };
+	uint8x16x4_t ts = { { vld1q_u8((const uint8_t *)slope), vld1q_u8((const uint8_t *)slope + 16),
+		                    vld1q_u8((const uint8_t *)slope + 32), vld1q_u8((const uint8_t *)slope + 48) } };
+	/* (each lane's four bytes: lx * 4 + 0, 1, 2, 3) */
+	uint8x16_t idx = vreinterpretq_u8_u32(vmlaq_n_u32(vdupq_n_u32(0x03020100), lx, 0x04040404));
+
+	return vfmaq_f32(vreinterpretq_f32_u8(vqtbl4q_u8(tb, idx)), vreinterpretq_f32_u8(vqtbl4q_u8(ts, idx)), fx);
+}
+
+/* the colour matrix (and the gamma table's step, truncated, 0..4095) of 4 cells */
+static inline uint16x4_t
+steps4(const struct pipe *p, int c, float32x4_t R, float32x4_t G, float32x4_t B)
+{
+	float32x4_t v = vdupq_n_f32(0.5f);
+
+	if (p->identity) {
+		v = vfmaq_n_f32(v, c == 0 ? R : c == 1 ? G : B, p->m[c][c]);
+	} else {
+		v = vfmaq_n_f32(v, R, p->m[c][0]);
+		v = vfmaq_n_f32(v, G, p->m[c][1]);
+		v = vfmaq_n_f32(v, B, p->m[c][2]);
+	}
+	v = vminq_f32(vmaxq_f32(v, vdupq_n_f32(0)), vdupq_n_f32(4095));
+	return vmovn_u32(vcvtq_u32_f32(v));
+}
+#endif
+
+/* one line of the picture as three planes of 8-bit R, G, B */
+static void
+preview_row(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, struct preview *pv, uint32_t width,
+    uint32_t height, uint32_t row, uint8_t *R8, uint8_t *G8, uint8_t *B8)
+{
+	uint32_t cells_h = f->height / 2, n = pv->cw, c = 0;
+
+	if (isp->turned) {
+		row = height - 1 - row;         /* (and each line from its end, below) */
+	}
+	uint32_t cy = pv->y0 + (uint32_t)((uint64_t)row * pv->ch / height);
+	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+	bool shade = isp->lsc.on;
+	uint16_t *l0 = pv->l0 + 4, *l1 = pv->l1 + 4;      /* (unpack_raw10's room in front) */
+
+	unpack_raw10(top, f->stride, 2 * pv->x0, 2 * n, l0);
+	unpack_raw10(top + f->stride, f->stride, 2 * pv->x0, 2 * n, l1);
+	if (shade) {
+		preview_shading(isp, cells_h > 1 ? (float)cy / (cells_h - 1) : 0, pv);
+	}
+#if ISP_NEON
+	static const float lane[4] = { 0, 1, 2, 3 };
+	const float32x4_t lanes = vld1q_f32(lane);
+	uint16_t sr[8], sg[8], sb[8];
+
+	for (; c + 8 <= n; c += 8) {
+		uint16x8x2_t t = vld2q_u16(l0 + 2 * c), u = vld2q_u16(l1 + 2 * c);
+		uint16x8_t q[4] = { t.val[0], t.val[1], u.val[0], u.val[1] };
+		uint16x8_t g2 = vaddq_u16(q[pv->g0], q[pv->g1]);
+
+		for (int h = 0; h < 2; h++) {
+			uint16x4_t r16 = h ? vget_high_u16(q[pv->r]) : vget_low_u16(q[pv->r]);
+			uint16x4_t g16 = h ? vget_high_u16(g2) : vget_low_u16(g2);
+			uint16x4_t b16 = h ? vget_high_u16(q[pv->b]) : vget_low_u16(q[pv->b]);
+			float32x4_t R = vcvtq_f32_u32(vmovl_u16(r16)), G = vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(g16)), 0.5f);
+			float32x4_t B = vcvtq_f32_u32(vmovl_u16(b16));
+
+			if (shade) {
+				float32x4_t gx = vmulq_n_f32(vaddq_f32(vdupq_n_f32((float)(pv->x0 + c + 4 * h)), lanes), pv->to_grid);
+				uint32x4_t lx = vminq_u32(vcvtq_u32_f32(gx), vdupq_n_u32(LSC_W - 2));
+				float32x4_t fx = vsubq_f32(gx, vcvtq_f32_u32(lx));
+
+				R = vmulq_f32(R, gain4(pv->base[0], pv->slope[0], lx, fx));
+				G = vmulq_f32(G, gain4(pv->base[1], pv->slope[1], lx, fx));
+				B = vmulq_f32(B, gain4(pv->base[2], pv->slope[2], lx, fx));
+			}
+			vst1_u16(sr + 4 * h, steps4(&pv->p, 0, R, G, B));
+			vst1_u16(sg + 4 * h, steps4(&pv->p, 1, R, G, B));
+			vst1_u16(sb + 4 * h, steps4(&pv->p, 2, R, G, B));
+		}
+		for (int k = 0; k < 8; k++) {
+			pv->cr[c + k] = isp->gamma[sr[k]];
+			pv->cg[c + k] = isp->gamma[sg[k]];
+			pv->cb[c + k] = isp->gamma[sb[k]];
+		}
+	}
+#endif
+	for (; c < n; c++) {
+		uint16_t v[4] = { l0[2 * c], l0[2 * c + 1], l1[2 * c], l1[2 * c + 1] };
+		float R = v[pv->r], G = (float)(v[pv->g0] + v[pv->g1]) * 0.5f, B = v[pv->b];
+
+		if (shade) {
+			float gx = (pv->x0 + c) * pv->to_grid;
+			uint32_t lx = (uint32_t)gx;
+
+			lx = lx > LSC_W - 2 ? LSC_W - 2 : lx;
+			float fx = gx - lx;
+
+			R *= pv->base[0][lx] + pv->slope[0][lx] * fx;
+			G *= pv->base[1][lx] + pv->slope[1][lx] * fx;
+			B *= pv->base[2][lx] + pv->slope[2][lx] * fx;
+		}
+		const struct pipe *p = &pv->p;
+		float vr = (p->identity ? R * p->m[0][0] : p->m[0][0] * R + p->m[0][1] * G + p->m[0][2] * B) + 0.5f;
+		float vg = (p->identity ? G * p->m[1][1] : p->m[1][0] * R + p->m[1][1] * G + p->m[1][2] * B) + 0.5f;
+		float vb = (p->identity ? B * p->m[2][2] : p->m[2][0] * R + p->m[2][1] * G + p->m[2][2] * B) + 0.5f;
+
+		pv->cr[c] = isp->gamma[(int)(vr < 0 ? 0 : vr > 4095 ? 4095 : vr)];
+		pv->cg[c] = isp->gamma[(int)(vg < 0 ? 0 : vg > 4095 ? 4095 : vg)];
+		pv->cb[c] = isp->gamma[(int)(vb < 0 ? 0 : vb > 4095 ? 4095 : vb)];
+	}
+	/* each pixel its nearest cell (the line from its end when the picture is turned) */
+	if (isp->turned) {
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t k = pv->map[x], o = width - 1 - x;
+
+			R8[o] = pv->cr[k], G8[o] = pv->cg[k], B8[o] = pv->cb[k];
+		}
+	} else {
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t k = pv->map[x];
+
+			R8[x] = pv->cr[k], G8[x] = pv->cg[k], B8[x] = pv->cb[k];
+		}
+	}
+}
+
+/* two lines of planes as NV12, the arithmetic of nv12_pair() exactly (y1 NULL: the picture's odd last line) */
+static void
+nv12_planes(const uint8_t *const p0[3], const uint8_t *const p1[3], uint32_t width, uint8_t *y0, uint8_t *y1, uint8_t *uv,
+    bool video_range)
+{
+	static const int32_t full[9] = { 19595, 38470, 7471, -11058, -21710, 32768, 32768, -27439, -5329 };
+	static const int32_t video[9] = { 16829, 33039, 6416, -9714, -19070, 28784, 28784, -24103, -4681 };
+	const int32_t *k = video_range ? video : full;
+	int32_t oy = (video_range ? 16 << 16 : 0) + (1 << 15);
+	uint32_t x = 0;
+
+	for (int l = 0; l < 2; l++) {
+		const uint8_t *const *p = l ? p1 : p0;
+		uint8_t *out = l ? y1 : y0;
+
+		if (out == NULL) {
+			continue;
+		}
+		x = 0;
+#if ISP_NEON
+		for (; x + 16 <= width; x += 16) {
+			uint8x16_t r = vld1q_u8(p[0] + x), g = vld1q_u8(p[1] + x), b = vld1q_u8(p[2] + x);
+			uint16x8_t yy[2];
+
+			for (int h = 0; h < 2; h++) {
+				uint16x8_t r16 = vmovl_u8(h ? vget_high_u8(r) : vget_low_u8(r));
+				uint16x8_t g16 = vmovl_u8(h ? vget_high_u8(g) : vget_low_u8(g));
+				uint16x8_t b16 = vmovl_u8(h ? vget_high_u8(b) : vget_low_u8(b));
+				uint32x4_t a = vdupq_n_u32((uint32_t)oy), z = a;
+
+				a = vmlal_n_u16(a, vget_low_u16(r16), (uint16_t)k[0]);
+				a = vmlal_n_u16(a, vget_low_u16(g16), (uint16_t)k[1]);
+				a = vmlal_n_u16(a, vget_low_u16(b16), (uint16_t)k[2]);
+				z = vmlal_n_u16(z, vget_high_u16(r16), (uint16_t)k[0]);
+				z = vmlal_n_u16(z, vget_high_u16(g16), (uint16_t)k[1]);
+				z = vmlal_n_u16(z, vget_high_u16(b16), (uint16_t)k[2]);
+				yy[h] = vcombine_u16(vshrn_n_u32(a, 16), vshrn_n_u32(z, 16));
+			}
+			vst1q_u8(out + x, vcombine_u8(vmovn_u16(yy[0]), vmovn_u16(yy[1])));
+		}
+#endif
+		for (; x < width; x++) {
+			out[x] = (uint8_t)((k[0] * p[0][x] + k[1] * p[1][x] + k[2] * p[2][x] + oy) >> 16);
+		}
+	}
+	x = 0;
+#if ISP_NEON
+	/* 8 chroma pairs (16 pixels across, both lines) a step */
+	for (; x + 16 <= width; x += 16) {
+		int32x4_t s[3][2];
+
+		for (int c = 0; c < 3; c++) {
+			uint16x8_t sum = vaddq_u16(vpaddlq_u8(vld1q_u8(p0[c] + x)), vpaddlq_u8(vld1q_u8(p1[c] + x)));
+
+			s[c][0] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(sum)));
+			s[c][1] = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(sum)));
+		}
+		uint8x8x2_t out;
+		int16x4_t cb[2], cr[2];
+
+		for (int h = 0; h < 2; h++) {
+			int32x4_t a = vdupq_n_s32((128 << 18) + (1 << 17) - 1), z = a;
+
+			a = vmlaq_n_s32(a, s[0][h], k[3]);
+			a = vmlaq_n_s32(a, s[1][h], k[4]);
+			a = vmlaq_n_s32(a, s[2][h], k[5]);
+			z = vmlaq_n_s32(z, s[0][h], k[6]);
+			z = vmlaq_n_s32(z, s[1][h], k[7]);
+			z = vmlaq_n_s32(z, s[2][h], k[8]);
+			cb[h] = vmovn_s32(vshrq_n_s32(a, 18));
+			cr[h] = vmovn_s32(vshrq_n_s32(z, 18));
+		}
+		out.val[0] = vqmovun_s16(vcombine_s16(cb[0], cb[1]));
+		out.val[1] = vqmovun_s16(vcombine_s16(cr[0], cr[1]));
+		vst2_u8(uv + x, out);
+	}
+#endif
+	for (; x < width; x += 2) {
+		uint32_t x1 = x + 1 < width ? x + 1 : x;
+		int32_t R = p0[0][x] + p0[0][x1] + p1[0][x] + p1[0][x1];
+		int32_t G = p0[1][x] + p0[1][x1] + p1[1][x] + p1[1][x1];
+		int32_t B = p0[2][x] + p0[2][x1] + p1[2][x] + p1[2][x1];
+		int32_t cb = (k[3] * R + k[4] * G + k[5] * B + (128 << 18) + (1 << 17) - 1) >> 18;
+		int32_t cr = (k[6] * R + k[7] * G + k[8] * B + (128 << 18) + (1 << 17) - 1) >> 18;
+
+		uv[x] = (uint8_t)(cb < 0 ? 0 : cb > 255 ? 255 : cb);
+		uv[x + 1] = (uint8_t)(cr < 0 ? 0 : cr > 255 ? 255 : cr);
+	}
+}
+
 void
 isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
 {
 	uint8_t line[2][3 * 8192];
+	struct preview pvs, *pv = &pvs;         /* (60 KB on the stack, with line's 48: dispatch's threads have 512) */
 
 	if (width > 8192) {
+		return;
+	}
+	if (preview_setup(isp, f, width, height, pv)) {
+		uint8_t *planes = line[0];      /* (six planes of up to 8192: the two lines' R, G, B) */
+		const uint8_t *p0[3] = { planes, planes + 8192, planes + 2 * 8192 };
+		const uint8_t *p1[3] = { planes + 3 * 8192, planes + 4 * 8192, planes + 5 * 8192 };
+
+		for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
+			bool second = row + 1 < height;
+
+			preview_row(isp, f, raw, pv, width, height, row, (uint8_t *)p0[0], (uint8_t *)p0[1], (uint8_t *)p0[2]);
+			preview_row(isp, f, raw, pv, width, height, second ? row + 1 : row, (uint8_t *)p1[0], (uint8_t *)p1[1],
+			    (uint8_t *)p1[2]);
+			nv12_planes(p0, p1, width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+			    uv + (size_t)(row / 2) * uv_stride, video_range);
+		}
 		return;
 	}
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
@@ -584,8 +1044,33 @@ isp_render_bgra(const struct isp *isp, const struct hakios_camera_frame *f, cons
     uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row)
 {
 	uint8_t line[3 * 8192];
+	struct preview pvs, *pv = &pvs;
 
 	if (width > 8192) {
+		return;
+	}
+	if (preview_setup(isp, f, width, height, pv)) {
+		uint8_t *R8 = line, *G8 = line + 8192, *B8 = line + 2 * 8192;
+
+		for (uint32_t row = first_row; row < end_row && row < height; row++) {
+			uint8_t *o = out + (size_t)row * stride;
+			uint32_t x = 0;
+
+			preview_row(isp, f, raw, pv, width, height, row, R8, G8, B8);
+#if ISP_NEON
+			for (; x + 16 <= width; x += 16) {
+				uint8x16x4_t px = { { vld1q_u8(B8 + x), vld1q_u8(G8 + x), vld1q_u8(R8 + x), vdupq_n_u8(255) } };
+
+				vst4q_u8(o + 4 * x, px);
+			}
+#endif
+			for (; x < width; x++) {
+				o[4 * x] = B8[x];
+				o[4 * x + 1] = G8[x];
+				o[4 * x + 2] = R8[x];
+				o[4 * x + 3] = 255;
+			}
+		}
 		return;
 	}
 	for (uint32_t row = first_row; row < end_row && row < height; row++) {

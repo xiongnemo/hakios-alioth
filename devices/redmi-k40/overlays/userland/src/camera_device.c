@@ -1318,7 +1318,16 @@ worker(void *context)
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
 	int device = open(HAKIOS_CAMERA_DEVICE, O_RDWR), failures = 0;
+	/*
+	 * Where a frame's time goes in this process (11-15: mediaserverd at 35-146% of a core whenever an application
+	 * shows the camera): the read (the kernel's cache maintenance and copy of the whole frame), the statistics
+	 * (measure, white balance, tuning, exposure), focus, and the pictures given to the graph -- summed over 300
+	 * frames and said with the frame rate seen.
+	 */
+	struct { uint64_t read, stats, focus, give, began; uint32_t frames, given; } took = { 0 };
+	mach_timebase_info_data_t tb;
 
+	mach_timebase_info(&tb);
 	pthread_setname_np("hakios-camera");
 	if (device < 0) {
 		say("no %s (%s): no frames", HAKIOS_CAMERA_DEVICE, strerror(errno));
@@ -1354,6 +1363,20 @@ worker(void *context)
 			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
 			continue;
 		}
+		uint64_t t_read = mach_absolute_time();
+
+		/*
+		 * (to compare: the preview's pixels the old way while /var/tmp/hakios-isp-old is there -- usbsh "fill
+		 * /var/tmp/hakios-isp-old 1" makes it, "... 0" takes it away; looked at every 30 frames)
+		 */
+		if (s->frames % 30 == 0) {
+			bool plain = access("/var/tmp/hakios-isp-old", F_OK) == 0;
+
+			if (plain != isp.plain_preview) {
+				isp.plain_preview = plain;
+				say("the preview's pixels: %s", plain ? "the old way (one at a time)" : "in runs (the new way)");
+			}
+		}
 		n = read(device, buffer, bytes);
 		if (n != (ssize_t)bytes) {
 			if (n < 0 && errno == EIO) {
@@ -1368,7 +1391,12 @@ worker(void *context)
 		const struct hakios_camera_frame *f = (const void *)buffer;
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct hakios_camera_command c;
+		uint64_t t_stats = mach_absolute_time(), t_focus, t_give;
 
+		if (took.frames == 0) {
+			took.began = t_read;
+		}
+		took.read += t_stats - t_read;
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
 		/* (redmi-k40: the sensor itself, which iOS's back camera may be any of: reserved[0], its index + 1) */
@@ -1396,7 +1424,11 @@ worker(void *context)
 			af.now = true;
 			af.sweep = true;
 		}
+		t_focus = mach_absolute_time();
+		took.stats += t_focus - t_stats;
 		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
+		t_give = mach_absolute_time();
+		took.focus += t_give - t_focus;
 		s->frames++;
 
 		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
@@ -1439,9 +1471,20 @@ worker(void *context)
 				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 			}
 		}
+		took.given += s->graph_running ? 1 : 0;
 		pthread_mutex_unlock(&s->lock);
 		if (metadata != NULL) {
 			CFRelease(metadata);
+		}
+		took.give += mach_absolute_time() - t_give;
+		if (++took.frames == 300) {
+			double ms = (double)tb.numer / tb.denom / 1e6, n300 = took.frames;
+			double wall = (double)(mach_absolute_time() - took.began) * ms;
+
+			say("time a frame (last %u, %.1f a second, %u given to the graph): read %.2f ms, statistics %.2f, focus "
+			    "%.2f, pictures %.2f", took.frames, wall > 0 ? n300 * 1000 / wall : 0, took.given, took.read * ms / n300,
+			    took.stats * ms / n300, took.focus * ms / n300, took.give * ms / n300);
+			memset(&took, 0, sizeof(took));
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
