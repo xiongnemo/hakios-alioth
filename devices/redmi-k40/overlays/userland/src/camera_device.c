@@ -1149,6 +1149,7 @@ struct af {
 	bool            sweep;          /* ... and the whole travel measured */
 	float           sum_sharpness, sum_level;
 	unsigned        measured;
+	unsigned        watch_skip;     /* in focus: frames since the last look */
 };
 
 static void
@@ -1192,6 +1193,20 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		af_go(device, af, af->target);          /* (the next step of a longer way) */
 		return;
 	}
+	/*
+	 * In focus and watching, only every third frame is looked at (the sharpness took ~3.4 ms of every frame, 11-15),
+	 * and none while the focus is locked -- watching then changes nothing. "A second unlike" is 10 looks, as it was
+	 * 30 frames.
+	 */
+	if (af->state == AF_WATCH && af->sharpness > 0) {
+		if (locked) {
+			af->unlike = 0;
+			return;
+		}
+		if (++af->watch_skip % 3 != 0) {
+			return;
+		}
+	}
 	sharpness = isp_sharpness(f, raw, window[0], window[1], window[2], window[3], &level);
 	af->sum_sharpness += sharpness;
 	af->sum_level += level;
@@ -1209,7 +1224,7 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 			af->unlike = 0;
 			return;
 		}
-		if (af->sharpness > 0 && ++af->unlike < 30) {
+		if (af->sharpness > 0 && ++af->unlike < 10) {
 			return;
 		}
 		af->state = AF_STEADY;
