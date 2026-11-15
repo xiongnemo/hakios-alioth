@@ -119,6 +119,13 @@ struct rwa_device {
       bool viewport_set, stencil_ref_set;
    } bound;
 
+   /* (the K40's, 11-16) rwa_device_set_lock: the caller's lock around every call into this library, let go while a
+    * module is translated (AIR -> NIR touches no Gallium state and keeps none of its own) and taken again before the
+    * pipeline's states are made */
+   void (*lock)(void *);
+   void (*unlock)(void *);
+   void *lock_context;
+
    /* One sampler for the slots nothing was bound to, made when a dispatch first needs
     * it. See rwa_dispatch: a kernel's read() is a texture fetch and ignores the
     * sampler, but softpipe dereferences the state of every unit a shader touches.
@@ -3193,8 +3200,13 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
       .num_constants = num_constants,
    };
    const char *error;
+   /* (the K40's, 11-16) translated without the caller's lock (rwa_device_set_lock) */
+   if (device->unlock)
+      device->unlock(device->lock_context);
    compute->nir = air_to_nir(compute->mem_ctx, bitcode, size, entry, &options,
                              device->nir_options, &compute->info, &error);
+   if (device->lock)
+      device->lock(device->lock_context);
    if (!compute->nir) {
       /* The sentence the translator wrote, which is the one that matters: it begins
        * with its own category (reader, stage, interface, instruction, intrinsic) and
@@ -6610,6 +6622,14 @@ rwa_render_create(struct rwa_device *device,
    render->mem_ctx = ralloc_context(NULL);
    render->shape = *shape;
 
+   /* (the K40's, 11-16) both modules translated without the caller's lock (rwa_device_set_lock): taken again before
+    * make_stage_cso, the first Gallium call, and on the way to `fail` (rwa_render_destroy needs it) */
+   bool unlocked = false;
+   if (device->unlock && device->lock) {
+      device->unlock(device->lock_context);
+      unlocked = true;
+   }
+
    struct rwa_render_info out = { 0 };
 
    /* The fragment shader first. Its AIR -> NIR errors surface here, at creation, which
@@ -6776,6 +6796,10 @@ rwa_render_create(struct rwa_device *device,
    /* Compile both stages now. A failure here is a creation failure and says so; the
     * stages are linked later, at the draw.
     */
+   if (unlocked) {
+      device->lock(device->lock_context);     /* (the K40's: Gallium from here on) */
+      unlocked = false;
+   }
    render->fs_cso = make_stage_cso(device, fs, why, why_size);
    if (!render->fs_cso)
       goto fail;
@@ -6958,8 +6982,21 @@ rwa_render_create(struct rwa_device *device,
    return render;
 
 fail:
+   if (unlocked)
+      device->lock(device->lock_context);
    rwa_render_destroy(render);
    return NULL;
+}
+
+/* (the K40's, 11-16) the caller's lock (air_metal.h) */
+void
+rwa_device_set_lock(struct rwa_device *device, void (*lock)(void *), void (*unlock)(void *), void *context)
+{
+   if (!device)
+      return;
+   device->lock = lock;
+   device->unlock = unlock;
+   device->lock_context = context;
 }
 
 void

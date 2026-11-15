@@ -640,6 +640,10 @@ static struct {
  */
 static pthread_mutex_t alioth_gpu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 
+/* (the K40's, 11-16) the lock as the library's rwa_device_set_lock takes it: one level of the hold let go and taken */
+static void alioth_gpu_take(void *unused) { (void)unused; pthread_mutex_lock(&alioth_gpu); }
+static void alioth_gpu_give(void *unused) { (void)unused; pthread_mutex_unlock(&alioth_gpu); }
+
 /*
  * (the K40's) metal_stats=1 (a boot-arg): where command buffers' time goes, one line every 2 s while they are
  * committed -- made to -commit (encode: the application's own work and its encoders'), -commit's recorded work (run)
@@ -1872,6 +1876,16 @@ enum {
 
 		if (_mesa != NULL && deferred != NULL) {
 			deferred(_mesa, 1);
+		}
+		/* (the K40's, 11-16) the library's lock given to the library, which lets go of it while it translates a
+		 * module (rwa_device_set_lock): a pipeline made on one thread no longer stops every other thread's commits
+		 * for the whole AIR -> NIR translation */
+		void (*set_lock)(struct rwa_device *, void (*)(void *), void (*)(void *), void *) =
+		    (void (*)(struct rwa_device *, void (*)(void *), void (*)(void *), void *))dlsym(mesa.handle,
+		    "rwa_device_set_lock");
+
+		if (_mesa != NULL && set_lock != NULL) {
+			set_lock(_mesa, alioth_gpu_take, alioth_gpu_give, NULL);
 		}
 		/* (the K40's, 11-13) indexed draws' indices no longer walked on the processor (the library's
 		 * index_range: a write-combined read of every index, the larger part of a draw's cost);

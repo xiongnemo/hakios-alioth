@@ -1358,6 +1358,13 @@ unsigned rwa_draw_features(void);
  * and why. */
 int rwa_texture_discard(struct rwa_device *device, struct rwa_texture *texture, char *why, size_t why_size);
 
+/* (the K40's, 11-16) The lock a caller holds around every call into this library (one Gallium context is not
+ * thread-safe), given to the library so that it can let go of it where it touches no Gallium state: while
+ * rwa_render_create and rwa_compute_create translate a module (AIR -> NIR, the long part of making a pipeline).
+ * `unlock` must release one level of the caller's hold and `lock` take it again; a recursive lock held more than
+ * once stays held (no gain, no harm). NULLs: never let go (the default). */
+void rwa_device_set_lock(struct rwa_device *device, void (*lock)(void *), void (*unlock)(void *), void *context);
+
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
 
