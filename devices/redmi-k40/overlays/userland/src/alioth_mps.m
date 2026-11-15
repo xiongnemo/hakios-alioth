@@ -381,8 +381,15 @@ hk_scratch(id<MTLTexture> *kept, NSUInteger w, NSUInteger h)
 	[e setBytes:&across length:sizeof(across) atIndex:0];
 	[e setBytes:w length:sizeof(float) * (size_t)(2 * radius + 1) atIndex:1];
 	hk_dispatch(e, hk_pipe_separable, (NSUInteger)across.dst_size[0], (NSUInteger)across.dst_size[1]);
+	/*
+	 * (the second pass in an encoder of its own: in one encoder this driver did not make the first dispatch's
+	 * writes to the scratch texture visible to the second -- System Check mps.blur read all zeros, 11-15)
+	 */
+	[e endEncoding];
+	e = [commandBuffer computeCommandEncoder];
 	k.taps = 2 * radius + 1;
 	k.dir[1] = 1;
+	[e setBytes:w length:sizeof(float) * (size_t)(2 * radius + 1) atIndex:1];
 	[e setTexture:mid atIndex:0];
 	[e setTexture:dst atIndex:1];
 	[e setBytes:&k length:sizeof(k) atIndex:0];
@@ -522,6 +529,8 @@ hk_scratch(id<MTLTexture> *kept, NSUInteger w, NSUInteger h)
 	[e setTexture:mid atIndex:1];
 	[e setBytes:&across length:sizeof(across) atIndex:0];
 	hk_dispatch(e, hk_pipe_lanczos, (NSUInteger)across.dst_size[0], (NSUInteger)across.dst_size[1]);
+	[e endEncoding];        /* (the second pass in an encoder of its own: see the blur) */
+	e = [commandBuffer computeCommandEncoder];
 	k.src_size[0] = k.dst_size[0];
 	k.dir[1] = 1;
 	k.filter_scale = k.scale[1] < 1 ? k.scale[1] : 1;
