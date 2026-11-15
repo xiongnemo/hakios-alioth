@@ -276,6 +276,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnss_feed src/gnss_feed.m &&
 			{ ${LDID:-ldid} -Ssrc/gnss_feed.entitlements obj/gnss_feed 2>/dev/null ||
 			  echo "build.sh: no ldid: gnss_feed is unsigned, and locationd will not take its locations"; }
+		# where a process's time goes, from the outside (src/psample.c: processor time per process and per thread,
+		# stacks sampled through the task port): lldb-19 dies attaching to an application with ~900 libraries
+		$DYN -Wall -o obj/psample src/psample.c &&
+			{ ${LDID:-ldid} -Ssrc/psample.entitlements obj/psample 2>/dev/null ||
+			  echo "build.sh: no ldid: psample is unsigned, and it gets no other process's task port"; }
 		# CoreTelephony's service in CommCenter's place, for the modem's IMEI in Settings' About (src/hk_telephony.m);
 		# its job com.hakios.telephony goes only into test roots (work/wsl/mkroot-variant.sh TELEPHONY=1)
 		$DYN -fobjc-arc -framework Foundation -framework CoreTelephony -o obj/hk_telephony src/hk_telephony.m
