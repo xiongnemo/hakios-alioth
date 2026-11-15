@@ -657,10 +657,10 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_read_invocation(&c->b, a[0], nir_u2u32(&c->b, a[1]));
    } else if (!strcmp(op, "simd_shuffle_xor") && argc >= 2) {
       r = nir_shuffle_xor(&c->b, a[0], nir_u2u32(&c->b, a[1]));
-   } else if (!strcmp(op, "quad_broadcast") && argc >= 2) {
-      r = nir_quad_broadcast(&c->b, a[0], nir_iand_imm(&c->b, nir_u2u32(&c->b, a[1]), 3));
-   } else if (!strcmp(op, "quad_shuffle") && argc >= 2) {
-      /* each lane its own source lane within its quad: the quad's first lane plus that one */
+   } else if ((!strcmp(op, "quad_broadcast") || !strcmp(op, "quad_shuffle")) && argc >= 2) {
+      /* quad_broadcast: one lane of the quad for all four; quad_shuffle: each lane its own source lane in its quad.
+       * Both as a shuffle to the quad's first lane plus that one (nir_quad_broadcast gave lane 0's value for every
+       * index on the phone: System Check metal.simd, round b4, 11-16). */
       nir_def *base = nir_iand_imm(&c->b, nir_load_subgroup_invocation(&c->b), ~3u);
       r = nir_shuffle(&c->b, a[0], nir_ior(&c->b, base, nir_iand_imm(&c->b, nir_u2u32(&c->b, a[1]), 3)));
    } else if (!strcmp(op, "simd_is_first")) {
