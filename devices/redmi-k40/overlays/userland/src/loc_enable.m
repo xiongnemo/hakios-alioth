@@ -12,7 +12,10 @@
  * --tcc (test roots too): the same applications also get the privacy prompts a round meets answered yes -- camera,
  * microphone, photos (read, add) -- through tccd as Settings' privacy switches do (TCCAccessSetForBundleId, the
  * entitlement com.apple.private.tcc.manager): Nagram's photo picker, the round that measures it, asks for both.
- * usage: loc_enable [1|0] [--tcc] [BUNDLE-ID ...]   (no argument: 1)
+ * --all (test roots, the owner 11-15: "in development every permission allowed"): EVERY application -- the system's
+ * own (Camera asked for location in a round and its alert stayed up) and every one installed later, looked for every
+ * 10 seconds for as long as the system runs -- gets location "always" and every privacy service below answered yes.
+ * usage: loc_enable [1|0] [--tcc] [--all] [BUNDLE-ID ...]   (no argument: 1)
  */
 #import <CoreLocation/CoreLocation.h>
 #import <Foundation/Foundation.h>
@@ -30,19 +33,35 @@
 @interface LSApplicationProxy : NSObject
 + (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
 @property (readonly) NSURL *bundleURL;
+@property (readonly) NSString *bundleIdentifier;
+@end
+
+@interface LSApplicationWorkspace : NSObject
++ (instancetype)defaultWorkspace;
+- (NSArray<LSApplicationProxy *> *)allApplications;
 @end
 
 #define ALLOWED_WHEN_IN_USE 4           /* (kCLAuthorizationStatusAuthorizedWhenInUse) */
+#define ALLOWED_ALWAYS      3           /* (kCLAuthorizationStatusAuthorizedAlways) */
 
-/* camera, microphone, photos: TCC's answers for BID set to yes (TCC.framework, private; looked up at run time) */
+static BOOL tcc_everything;             /* --all: every service of the list, not only the four a round meets */
+
+/* TCC's answers for BID set to yes (TCC.framework, private; looked up at run time): camera, microphone, photos, and
+   with --all the rest of what an application may ask for */
 static void
 tcc_allow(NSString *bid)
 {
 	typedef Boolean (*set_fn)(CFStringRef service, CFStringRef bundle_id, Boolean granted);
 	static set_fn set;
 	static const char *services[] = { "kTCCServiceCamera", "kTCCServiceMicrophone", "kTCCServicePhotos",
-		"kTCCServicePhotosAdd" };
-	char said[256] = "";
+		"kTCCServicePhotosAdd",
+		/* (--all from here) */
+		"kTCCServiceAddressBook", "kTCCServiceCalendar", "kTCCServiceReminders", "kTCCServiceMediaLibrary",
+		"kTCCServiceSpeechRecognition", "kTCCServiceMotion", "kTCCServiceBluetoothAlways",
+		"kTCCServiceBluetoothPeripheral", "kTCCServiceUserTracking", "kTCCServiceWillow", "kTCCServiceFocusStatus",
+		"kTCCServiceNearbyInteraction", "kTCCServiceFaceID", "kTCCServiceSiri" };
+	size_t count = tcc_everything ? sizeof(services) / sizeof(services[0]) : 4;
+	char said[1024] = "";
 
 	if (set == NULL) {
 		void *tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_NOW);
@@ -53,7 +72,7 @@ tcc_allow(NSString *bid)
 			return;
 		}
 	}
-	for (size_t i = 0; i < sizeof(services) / sizeof(services[0]); i++) {
+	for (size_t i = 0; i < count; i++) {
 		CFStringRef service = CFStringCreateWithCString(NULL, services[i], kCFStringEncodingUTF8);
 		Boolean ok = set(service, (__bridge CFStringRef)bid, true);
 
@@ -105,6 +124,44 @@ allow(NSMutableArray<NSString *> *ids, BOOL tcc)
 	return ids.count > 0 ? 3 : 0;
 }
 
+/* --all: every application there is, then every new one, for as long as the system runs */
+static int
+allow_all(void)
+{
+	Class workspace = NSClassFromString(@"LSApplicationWorkspace");
+	NSMutableSet<NSString *> *done = [NSMutableSet set];
+
+	if (workspace == Nil || ![CLLocationManager respondsToSelector:@selector(setAuthorizationStatusByType:forBundleIdentifier:)]) {
+		printf("loc_enable: no LSApplicationWorkspace or no setAuthorizationStatusByType:forBundleIdentifier: here\n");
+		return 1;
+	}
+	tcc_everything = YES;
+	for (unsigned round = 0;; round++) {
+		@autoreleasepool {
+			unsigned added = 0;
+
+			for (LSApplicationProxy *app in [[workspace defaultWorkspace] allApplications]) {
+				NSString *bid = app.bundleIdentifier;
+
+				if (bid.length == 0 || [done containsObject:bid]) {
+					continue;
+				}
+				[done addObject:bid];
+				[CLLocationManager setAuthorizationStatusByType:ALLOWED_ALWAYS forBundleIdentifier:bid];
+				tcc_allow(bid);
+				added++;
+			}
+			if (added > 0) {
+				printf("loc_enable: --all: %u more applications allowed everything (%lu in all, look %u)\n", added,
+				    (unsigned long)done.count, round);
+				fflush(stdout);
+			}
+		}
+		sleep(10);
+	}
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -133,14 +190,20 @@ main(int argc, char **argv)
 		}
 		if (want && argc > 2) {
 			NSMutableArray<NSString *> *ids = [NSMutableArray array];
-			BOOL tcc = NO;
+			BOOL tcc = NO, all = NO;
 
 			for (int i = 2; i < argc; i++) {
 				if (strcmp(argv[i], "--tcc") == 0) {
 					tcc = YES;
+				} else if (strcmp(argv[i], "--all") == 0) {
+					all = YES;
 				} else {
 					[ids addObject:@(argv[i])];
 				}
+			}
+			if (all) {
+				dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+				return allow_all();
 			}
 			return allow(ids, tcc);
 		}
