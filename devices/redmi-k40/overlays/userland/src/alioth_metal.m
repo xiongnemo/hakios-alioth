@@ -650,9 +650,12 @@ static pthread_mutex_t alioth_gpu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 #include <mach/mach_time.h>
 
 enum { ST_ENCODE, ST_RUN, ST_DRAW, ST_FLUSH, ST_GPU, ST_FINISH, ST_WAIT, ST_LOCK, ST_DRAWABLE, ST_SIGNAL, ST_BLIT,
-	ST_BLIT_GPU, ST_N };
+	ST_BLIT_GPU, ST_PIPELINE, ST_N };
 static bool alioth_stats_on;
-static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_buffers, alioth_stats_since;
+/* (the K40's, 11-16) and the longest of each in the window: a pipeline made, or a first draw compiling its shader
+ * variant, mid-animation is one long stall, not a higher average */
+static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_max[ST_N], alioth_stats_buffers,
+	alioth_stats_since;
 static uint64_t alioth_blit_kinds[8];   /* the processor's blits by AliothMetalBlit kind (fill, b2b, b2t, t2b, t2t, mips) */
 static mach_timebase_info_data_t alioth_timebase;
 static id (*alioth_next_drawable_imp)(id, SEL);
@@ -661,8 +664,14 @@ static void
 alioth_stat(unsigned which, uint64_t since)
 {
 	if (alioth_stats_on) {
-		__atomic_fetch_add(&alioth_stats_t[which], mach_absolute_time() - since, __ATOMIC_RELAXED);
+		uint64_t took = mach_absolute_time() - since;
+		uint64_t was = __atomic_load_n(&alioth_stats_max[which], __ATOMIC_RELAXED);
+
+		__atomic_fetch_add(&alioth_stats_t[which], took, __ATOMIC_RELAXED);
 		__atomic_fetch_add(&alioth_stats_n[which], 1, __ATOMIC_RELAXED);
+		while (took > was && !__atomic_compare_exchange_n(&alioth_stats_max[which], &was, took, false,
+		    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+		}
 	}
 }
 
@@ -696,7 +705,7 @@ static void
 alioth_stats_commit(void)
 {
 	uint64_t now = mach_absolute_time(), since = __atomic_load_n(&alioth_stats_since, __ATOMIC_RELAXED);
-	uint64_t t[ST_N], n[ST_N], buffers;
+	uint64_t t[ST_N], n[ST_N], longest[ST_N], buffers;
 
 	if (!alioth_stats_on) {
 		return;
@@ -714,6 +723,13 @@ alioth_stats_commit(void)
 	for (unsigned i = 0; i < ST_N; i++) {
 		t[i] = __atomic_exchange_n(&alioth_stats_t[i], 0, __ATOMIC_RELAXED);
 		n[i] = __atomic_exchange_n(&alioth_stats_n[i], 0, __ATOMIC_RELAXED);
+		longest[i] = __atomic_exchange_n(&alioth_stats_max[i], 0, __ATOMIC_RELAXED);
+	}
+	if (n[ST_PIPELINE] != 0) {
+		rw_print("stats: %llu pipelines made, %.2f ms each, %.1f ms in all, the longest %.2f ms (the library's lock "
+		         "held throughout); the longest draw %.2f ms, the longest wait for the lock %.2f ms\n",
+		         (unsigned long long)n[ST_PIPELINE], alioth_stat_avg(t, n, ST_PIPELINE), alioth_ms(t[ST_PIPELINE]),
+		         alioth_ms(longest[ST_PIPELINE]), alioth_ms(longest[ST_DRAW]), alioth_ms(longest[ST_LOCK]));
 	}
 	uint64_t kinds[8];
 
@@ -2217,12 +2233,15 @@ enum {
 
 	char why[512] = { 0 };
 	struct rwa_render_info info = { 0 };
+	uint64_t made = mach_absolute_time();
 	struct rwa_render *render = mesa.render_create(_mesa,
 	    vertex_air != nil ? [vertex_air bytes] : NULL,
 	    vertex_air != nil ? [vertex_air length] : 0,
 	    vertex != nil ? [[vertex name] UTF8String] : NULL,
 	    fragment_air != nil ? [fragment_air bytes] : NULL, fragment_air != nil ? [fragment_air length] : 0,
 	    fragment != nil ? [[fragment name] UTF8String] : NULL, &shape, &info, why, sizeof(why));
+
+	alioth_stat(ST_PIPELINE, made);         /* (the K40's, 11-16: metal_stats=1 says what making pipelines costs) */
 
 	if (render == NULL) {
 		/* PRINTED as well as returned, and RW_AGAIN because the same specification
@@ -2916,9 +2935,12 @@ enum {
 
 	char why[512] = { 0 };
 	struct rwa_compute_info info = { 0 };
+	uint64_t made = mach_absolute_time();
 	struct rwa_compute *compute = mesa.compute_create(_mesa, [air bytes], [air length],
 							  [[function name] UTF8String], &info,
 							  why, sizeof(why));
+
+	alioth_stat(ST_PIPELINE, made);
 	if (compute == NULL) {
 		/* The front end's own sentence, passed through rather than replaced: it says
 		 * which construct it refused, and an application can act on that. */
