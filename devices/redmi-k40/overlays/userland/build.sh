@@ -270,7 +270,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# Location Services' own switch on at every boot (src/loc_enable.m, the job com.hakios.location): nothing sets
 		# this phone up, and without it Settings has no Location Services and no application gets a location; it
 		# is locationd's "big switch" entitlement that lets it
-		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/loc_enable src/loc_enable.m &&
+		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -lsqlite3 -o obj/loc_enable src/loc_enable.m &&
 			{ ${LDID:-ldid} -Ssrc/loc_enable.entitlements obj/loc_enable 2>/dev/null ||
 			  echo "build.sh: no ldid: loc_enable is unsigned, and locationd will not take the switch from it"; }
 		# the SDX55 modem's GNSS fixes (kern.hakios.gnss) into location services through CoreLocation's location

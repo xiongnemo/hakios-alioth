@@ -124,6 +124,57 @@ allow(NSMutableArray<NSString *> *ids, BOOL tcc)
 	return ids.count > 0 ? 3 : 0;
 }
 
+/*
+ * Photos: what TCCAccessSetForBundleId writes is a version 1 record (auth_value 2, reason 4 "system set", version 1);
+ * since iOS 14's limited library PhotoKit reads only version 2 ones and asked anyway (11-15: System Check's Photos alert
+ * with --all on). The row a user's "Allow Access to All Photos" writes is auth_value 2, auth_reason 2, auth_version 2
+ * (the phone's TCC.db, 11-15). So those rows are made so in the database itself and tccd started afresh (launchd
+ * starts it again at the next request; it keeps answers cached, so an edit alone would not be read).
+ */
+#include <signal.h>
+#include <sqlite3.h>
+
+extern int proc_listallpids(void *buffer, int buffersize);
+extern int proc_name(int pid, void *buffer, uint32_t buffersize);
+
+static void
+photos_version_two(void)
+{
+	sqlite3 *db = NULL;
+	int changed = 0;
+
+	if (sqlite3_open("/private/var/mobile/Library/TCC/TCC.db", &db) != SQLITE_OK) {
+		printf("loc_enable: TCC.db would not open: %s\n", db ? sqlite3_errmsg(db) : "?");
+		sqlite3_close(db);
+		return;
+	}
+	sqlite3_busy_timeout(db, 5000);
+	if (sqlite3_exec(db, "UPDATE access SET auth_version = 2, auth_reason = 2 WHERE service IN ('kTCCServicePhotos', "
+	    "'kTCCServicePhotosAdd') AND auth_value = 2 AND auth_version < 2", NULL, NULL, NULL) == SQLITE_OK) {
+		changed = sqlite3_changes(db);
+	} else {
+		printf("loc_enable: TCC.db: %s\n", sqlite3_errmsg(db));
+	}
+	sqlite3_close(db);
+	if (changed == 0) {
+		return;
+	}
+	/* (tccd started afresh, to read the rows again) */
+	pid_t pids[2048];
+	int n = proc_listallpids(pids, sizeof(pids)), killed = 0;
+
+	for (int i = 0; i < n && i < 2048; i++) {
+		char name[64] = "";
+
+		if (pids[i] > 0 && proc_name(pids[i], name, sizeof(name)) > 0 && strcmp(name, "tccd") == 0) {
+			killed += kill(pids[i], SIGTERM) == 0;
+		}
+	}
+	printf("loc_enable: --all: %d Photos rows made version 2 (as \"Allow Access to All Photos\" writes them); tccd "
+	    "restarted (%d)\n", changed, killed);
+	fflush(stdout);
+}
+
 /* --all: every application there is, then every new one, for as long as the system runs */
 static int
 allow_all(void)
@@ -155,6 +206,8 @@ allow_all(void)
 				printf("loc_enable: --all: %u more applications allowed everything (%lu in all, look %u)\n", added,
 				    (unsigned long)done.count, round);
 				fflush(stdout);
+				sleep(1);       /* (tccd's writes in first) */
+				photos_version_two();
 			}
 		}
 		sleep(10);
