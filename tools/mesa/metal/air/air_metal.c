@@ -105,6 +105,20 @@ struct rwa_device {
    float blend_color[4];
    bool blend_color_set;
 
+   /* (the K40's, 11-16) what rwa_render_draw bound last, so that a draw binds only what differs: freedreno marks a
+    * state dirty at EVERY bind (fd_*_state_bind), and each draw re-emitted program, blend, depth/stencil, rasterizer,
+    * vertex state, viewport and stencil reference although a pass's draws mostly share them. Cleared (all rebound at
+    * the next draw) whenever a pipeline or a depth/stencil state is destroyed -- a freed state's address may come back
+    * as a new one. freedreno re-emits everything at the start of a batch by itself, so a skipped bind never leaves a
+    * new batch without its state.
+    */
+   struct {
+      void *blend, *dsa, *rast, *vs, *fs, *velem;
+      struct pipe_viewport_state viewport;
+      struct pipe_stencil_ref stencil_ref;
+      bool viewport_set, stencil_ref_set;
+   } bound;
+
    /* One sampler for the slots nothing was bound to, made when a dispatch first needs
     * it. See rwa_dispatch: a kernel's read() is a texture fetch and ignores the
     * sampler, but softpipe dereferences the state of every unit a shader touches.
@@ -5192,6 +5206,7 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
     * -- the same trap delete_compute_state is about.
     */
    state->device->pipe->bind_depth_stencil_alpha_state(state->device->pipe, NULL);
+   memset(&state->device->bound, 0, sizeof(state->device->bound));   /* (the K40's: rwa_device.bound says why) */
    state->device->pipe->delete_depth_stencil_alpha_state(state->device->pipe, state->cso);
    for (unsigned i = 0; i < ARRAY_SIZE(state->variant); i++) {
       if (state->variant[i])
@@ -6954,6 +6969,7 @@ rwa_render_destroy(struct rwa_render *render)
       return;
    struct pipe_context *pipe = render->device->pipe;
 
+   memset(&render->device->bound, 0, sizeof(render->device->bound));   /* (the K40's: rwa_device.bound says why) */
    /* Unbound before deleted, each of them, for the reason delete_compute_state and
     * rwa_sampler_destroy give: a Gallium context holds a pointer to the state bound in
     * it, and softpipe's delete is a plain FREE, so a state deleted while bound leaves
@@ -7439,6 +7455,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * destroying them under it (what this did) freed what the next draw's set_framebuffer_state then released
     * again -- SpriteKit's second such draw aborted the process (System Check, 2026-11-09). */
    bool flipped = false;
+   struct pipe_viewport_state vp;
    if (draw->viewport) {
       float vx = draw->viewport[0], vy = draw->viewport[1], vw = draw->viewport[2], vh = draw->viewport[3];
 
@@ -7448,11 +7465,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          return -1;
       }
       flipped = vh < 0.0f;
-      pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+      vp = (struct pipe_viewport_state){
          .scale = { vw / 2.0f, -(vh / 2.0f), zfar - znear },
-         .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } });
+         .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } };
    } else
-   pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+   vp = (struct pipe_viewport_state){
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked
        * here. Metal's render-target origin is the top left and its NDC y points up, so clip
        * y = +1 belongs in memory row 0; a positive y scale puts clip y = -1 there, which is
@@ -7466,9 +7483,18 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * (100+x, 200+(3-y), ...), the texture mirrored vertically, on both back ends.
        */
       .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
-      .translate = { w / 2.0f, h / 2.0f, znear } });
+      .translate = { w / 2.0f, h / 2.0f, znear } };
+   /* (the K40's, 11-16) each of these bound only when it differs from what is bound (rwa_device.bound) */
+   if (!device->bound.viewport_set || memcmp(&device->bound.viewport, &vp, sizeof(vp))) {
+      pipe->set_viewport_states(pipe, 0, 1, &vp);
+      device->bound.viewport = vp;
+      device->bound.viewport_set = true;
+   }
 
-   pipe->bind_blend_state(pipe, render->blend);
+   if (device->bound.blend != render->blend) {
+      pipe->bind_blend_state(pipe, render->blend);
+      device->bound.blend = render->blend;
+   }
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
     * behaviour with no MTLDepthStencilState set: no test and no write.
     *
@@ -7487,14 +7513,22 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          return -1;
       }
    }
-   pipe->bind_depth_stencil_alpha_state(pipe, dsa);
+   if (device->bound.dsa != dsa) {
+      pipe->bind_depth_stencil_alpha_state(pipe, dsa);
+      device->bound.dsa = dsa;
+   }
    /* Metal keeps the reference value on the encoder and not in the state object, so it
     * is set per draw. Gallium's is one byte per face, which is the stencil buffer's
     * width; Metal's is a uint32 and only those bits can match anything.
     */
-   pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
+   struct pipe_stencil_ref sref = {
       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
-                     (uint8_t)(draw->stencil_reference[1] & 0xff) } });
+                     (uint8_t)(draw->stencil_reference[1] & 0xff) } };
+   if (!device->bound.stencil_ref_set || memcmp(&device->bound.stencil_ref, &sref, sizeof(sref))) {
+      pipe->set_stencil_ref(pipe, sref);
+      device->bound.stencil_ref = sref;
+      device->bound.stencil_ref_set = true;
+   }
    /* (the K40's) The encoder's rasterizer state, as a variant of the pipeline's: Metal's cull
     * mode is Gallium's cull_face number for number (none, front, back); its winding is the
     * front face in Metal's own y-up sense, which is GL's, and this viewport is inverted the
@@ -7568,11 +7602,20 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .maxx = MIN2(x0 + draw->scissor[2], fb.width),
          .maxy = MIN2(y0 + draw->scissor[3], fb.height) });
    }
-   pipe->bind_rasterizer_state(pipe, rast);
+   if (device->bound.rast != rast) {
+      pipe->bind_rasterizer_state(pipe, rast);
+      device->bound.rast = rast;
+   }
    if (stale)
       pipe->delete_rasterizer_state(pipe, stale);   /* (unbound now: the batch keeps what it used) */
-   pipe->bind_vs_state(pipe, render->vs_cso);
-   pipe->bind_fs_state(pipe, render->fs_cso);
+   if (device->bound.vs != render->vs_cso) {
+      pipe->bind_vs_state(pipe, render->vs_cso);
+      device->bound.vs = render->vs_cso;
+   }
+   if (device->bound.fs != render->fs_cso) {
+      pipe->bind_fs_state(pipe, render->fs_cso);
+      device->bound.fs = render->fs_cso;
+   }
 
    /*
     * The vertex state, bound on BOTH paths and never NULL.
@@ -7643,7 +7686,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * set_vertex_buffers rather than in draw_vbo. Neither driver here does, so the
     * other order worked; it worked by permission and not by contract.
     */
-   pipe->bind_vertex_elements_state(pipe, render->velem);
+   if (device->bound.velem != render->velem) {
+      pipe->bind_vertex_elements_state(pipe, render->velem);
+      device->bound.velem = render->velem;
+   }
    pipe->set_vertex_buffers(pipe, nvb, vbs);
 
    struct rwa_bound fbound = { 0 }, vbound = { 0 };
