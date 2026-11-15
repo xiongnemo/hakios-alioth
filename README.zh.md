@@ -58,7 +58,7 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 </p>
 
 [GPU Check](https://github.com/xiongnemo/ios-gpu-check) 逐项测试游戏可能用到的每一种图形能力：83 项通过 81 项，
-剩下两项需要 Metal，这个移植还没有。
+剩下两项需要 Metal，截图时这个移植还没有（现在的 Metal 情况见“能用的”）。
 
 ### 系统与设置
 
@@ -101,6 +101,26 @@ The Sims 3 Ambitions（模拟人生 3 梦想大道，OpenGL ES 1，PVRTC 纹理�
 
 [Sensor Check](https://github.com/xiongnemo/ios-sensor-check) 实时列出 App 能用到的每一个传感器和硬件输入：
 环境光、加速度计、陀螺仪、姿态、电池、温度状态、麦克风、摄像头、121 帧的屏幕、触摸和触感反馈。
+
+### 别处来的 App：Telegram 客户端
+
+<p>
+  <img src="docs/alioth/screenshots/apps/nagram-chat-1.png" width="260" alt="Nagram（Telegram 客户端）：一个群聊">
+  <img src="docs/alioth/screenshots/apps/nagram-chat-2.png" width="260" alt="Nagram：同一个群聊">
+</p>
+
+[Nagram](https://github.com/NextAlone/Nagram-iOS) 是开源的 Telegram 客户端，这里装的是它 GitHub 上没签名的发布包：
+安装器装的时候会给它做 ad hoc 签名，带上这类 App 需要的权限（App Group、iCloud、钥匙串），所以它能打开共享数据、
+登录、聊天。其他人的名字和头像已打码。
+
+### GPS
+
+<p>
+  <img src="docs/alioth/screenshots/gps/system-check-gps.png" width="260" alt="System Check：GPS 卫星、信号强度和定位">
+</p>
+
+[System Check](https://github.com/xiongnemo/ios-system-check) 的 GPS 页：调制解调器的接收机看到的卫星（GPS、北斗、
+GLONASS、Galileo、QZSS）和各自的信号强度、它的定位结果，以及 iOS 定位服务交给 App 的同一个定位。具体位置已隐去。
 
 ## 能用的
 

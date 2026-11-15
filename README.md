@@ -61,7 +61,8 @@ town; 62 fps.
 </p>
 
 [GPU Check](https://github.com/xiongnemo/ios-gpu-check) tests every graphics capability a game may need, one at a
-time: 81 of 83 pass. The two left need Metal, which this port does not have yet.
+time: 81 of 83 passed when these were taken; the two left need Metal, which the port did not have then (see What
+works for Metal now).
 
 ### System and settings
 
@@ -106,6 +107,27 @@ iPhone, so screenshots do not show their colours: the screen does.
 [Sensor Check](https://github.com/xiongnemo/ios-sensor-check) lists every sensor and hardware input an app can
 reach, live: ambient light, accelerometer, gyroscope, device motion, battery, thermal state, microphone, cameras,
 the display at 121 fps, touch and haptics.
+
+### Apps from elsewhere: a Telegram client
+
+<p>
+  <img src="docs/alioth/screenshots/apps/nagram-chat-1.png" width="260" alt="Nagram (a Telegram client): a group chat">
+  <img src="docs/alioth/screenshots/apps/nagram-chat-2.png" width="260" alt="Nagram: the same group chat">
+</p>
+
+[Nagram](https://github.com/NextAlone/Nagram-iOS), an open-source Telegram client, installed from its unsigned GitHub
+release: the installer signs what it installs ad hoc, with the entitlements such an app needs (its app group, iCloud,
+keychain), so it opens with its shared data, logs in and chats. Other people's names and pictures are hidden.
+
+### GPS
+
+<p>
+  <img src="docs/alioth/screenshots/gps/system-check-gps.png" width="260" alt="System Check: GPS satellites, their signals and the fix">
+</p>
+
+[System Check](https://github.com/xiongnemo/ios-system-check)'s GPS tab: the satellites the modem's receiver sees
+(GPS, BeiDou, GLONASS, Galileo, QZSS) with their signal strengths, its fix, and the same fix as iOS's location
+services give it to apps. The position itself is hidden.
 
 ## What works
 
