@@ -355,7 +355,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			cp $MM/libhakios.air.dylib $MM/air_metal_test obj/
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.metal.dylib -framework Foundation -framework IOKit \
 				-framework Metal -lobjc -Wno-deprecated-declarations -o obj/libhakios.metal.dylib \
-				src/alioth_metal.m src/alioth_drawable.m
+				src/alioth_metal.m src/alioth_drawable.m src/alioth_mps.m
 		fi
 	fi
 	if [ -n "$COMPILE_ONLY" ]; then

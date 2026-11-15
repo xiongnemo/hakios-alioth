@@ -1849,6 +1849,9 @@ enum {
 	}
 	alioth_stats_setup();
 	alioth_listener_fix();
+	/* (the K40's, 11-15) MPS's image kernels applications make, done by this port: src/alioth_mps.m */
+	extern void alioth_mps_install(void);
+	alioth_mps_install();
 
 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
 	 * demand: the pointer is handed out without a lock, from whichever thread a renderer
