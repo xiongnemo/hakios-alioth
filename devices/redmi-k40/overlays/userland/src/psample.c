@@ -13,9 +13,10 @@
  *       has WORD) held, its registers and its frame-pointer chain read, let go. Lines (to FILE, default stdout):
  *         psample 2 pid P name N interval I depth D uptime U timebase NUMER/DENOM
  *         thread TID NAME                       (once, when first seen)
- *         s MICROSECONDS TID R|W:CPU:PRI PC PC ...
+ *         s MICROSECONDS TID R|W:CPU:PRI:SYS PC PC ...
  *             (R: was running or runnable, W: waiting; CPU: the thread's processor time so far in us -- of a "running"
- *             thread it says whether it had a core or waited for one; PRI: its priority then; PC first, then callers)
+ *             thread it says whether it had a core or waited for one; PRI: its priority then; SYS: how much of CPU
+ *             was in the kernel (system calls, page faults): what of it is this port's; PC first, then callers)
  *         cache SLIDE BASE                      (the shared cache's slide and where it is)
  *         image LOAD SLIDE PATH                 (every loaded image, read at the end: what loaded meanwhile too)
  *         end STOPS HELD_US ELAPSED_US
@@ -498,10 +499,11 @@ stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char 
 			if (thread_info(th, THREAD_SCHED_TIMESHARE_INFO, (thread_info_t)&ts, &tn) != KERN_SUCCESS) {
 				ts.cur_priority = -1;   /* (a fixed-priority thread, say) */
 			}
-			fprintf(out, "s %llu %llu %c:%llu:%d", (unsigned long long)now_us, (unsigned long long)tid,
+			fprintf(out, "s %llu %llu %c:%llu:%d:%llu", (unsigned long long)now_us, (unsigned long long)tid,
 			    bi.run_state == TH_STATE_RUNNING ? 'R' : 'W',
 			    (unsigned long long)(bi.user_time.seconds + bi.system_time.seconds) * 1000000ull +
-			    (unsigned long long)(bi.user_time.microseconds + bi.system_time.microseconds), ts.cur_priority);
+			    (unsigned long long)(bi.user_time.microseconds + bi.system_time.microseconds), ts.cur_priority,
+			    (unsigned long long)bi.system_time.seconds * 1000000ull + (unsigned long long)bi.system_time.microseconds);
 			for (int j = 0; j < k; j++) {
 				fprintf(out, " %llx", (unsigned long long)pcs[j]);
 			}
