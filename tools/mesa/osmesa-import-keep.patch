@@ -1,6 +1,6 @@
 --- a/src/gallium/targets/osmesa/osmesa_target.c
 +++ b/src/gallium/targets/osmesa/osmesa_target.c
-@@ -71,6 +71,85 @@
+@@ -71,6 +71,86 @@
  struct pipe_resource *
  osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
  
@@ -19,8 +19,9 @@
 + * keeps its buffer open, and the next import gets the SAME handle from the kernel -- a surface that is a buffer of
 + * the client's already is that buffer again (hakios.gpu.cpp surfaceBuffer), decided by the surface object and not
 + * its ID -- which freedreno's handle table finds: nothing made, nothing mapped. An import not asked for again in
-+ * KEEP_NS is let go (a dead surface, and a scan-out slot with it, is held no longer than that). Boot-arg
-+ * gl_import_keep=1; off by default until measured.
++ * KEEP_NS is let go (a dead surface, and a scan-out slot with it, is held no longer than that). ON by default since
++ * round b2 (11-16: Flutter launches made 80-259 surface buffers per 5 s without it, 3-13 with it); boot-arg
++ * gl_import_keep=0 turns it off.
 + */
 +#define KEEP_MAX 32
 +#define KEEP_NS 100000000ull
@@ -40,7 +41,7 @@
 +      char args[1024] = "";
 +      size_t len = sizeof(args) - 1;
 +
-+      on = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "gl_import_keep=1") != NULL;
++      on = !(sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "gl_import_keep=0") != NULL);
 +   }
 +   return on;
 +}
@@ -86,7 +87,7 @@
  /*
   * The memory of an IOSurface as a texture, to draw into and to draw with (Darwin on redwood):
   * the kernel's GPU driver makes a buffer of the surface. NULL: the screen is not the GPU's, or
-@@ -101,7 +180,10 @@
+@@ -101,7 +181,10 @@
     handle.stride = s.row_bytes;
     handle.offset = s.offset;
     handle.size = s.size;
