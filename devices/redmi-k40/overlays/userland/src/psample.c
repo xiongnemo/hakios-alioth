@@ -35,6 +35,8 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+/* (the read-port trap: in libsystem_kernel since iOS 14.5, not in this SDK's headers) */
+extern kern_return_t task_read_for_pid(mach_port_name_t target_tport, int pid, mach_port_name_t *t) __attribute__((weak_import));
 /* (libproc: not in this SDK's headers) */
 extern int proc_listallpids(void *buffer, int buffersize);
 extern int proc_name(int pid, void *buffer, uint32_t buffersize);
@@ -162,16 +164,41 @@ top(int seconds, int count, int lines)
 	return 0;
 }
 
+/*
+ * The process's task port: the control port when the kernel gives one (iOS's developer mode on: hakios.board.c), so
+ * that a thread can be held while its stack is read; else the read port, with which threads are looked at running
+ * (thread_get_state stops one for the moment it takes; a stack read after that may be torn now and then). With the
+ * developer mode off, task_for_pid says KERN_SUCCESS and hands back a DEAD name (osfmk/kern/ipc_tt.c).
+ */
+static bool task_is_control;
+
 static task_t
 task_of(pid_t pid)
 {
 	task_t task = MACH_PORT_NULL;
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
 
+	if (kr == KERN_SUCCESS && MACH_PORT_VALID(task)) {
+		task_is_control = true;
+		return task;
+	}
 	if (kr != KERN_SUCCESS) {
 		fprintf(stderr, "psample: task_for_pid(%d): %s (%d)\n", pid, mach_error_string(kr), kr);
+	} else {
+		fprintf(stderr, "psample: task_for_pid(%d) gave a %s port (iOS's developer mode off?): reading only\n", pid,
+		    task == MACH_PORT_DEAD ? "dead" : "null");
+	}
+	task = MACH_PORT_NULL;
+	if (task_read_for_pid == NULL) {
+		fprintf(stderr, "psample: no task_read_for_pid in this system\n");
 		return MACH_PORT_NULL;
 	}
+	kr = task_read_for_pid(mach_task_self(), pid, &task);
+	if (kr != KERN_SUCCESS || !MACH_PORT_VALID(task)) {
+		fprintf(stderr, "psample: task_read_for_pid(%d): %s (%d)\n", pid, mach_error_string(kr), kr);
+		return MACH_PORT_NULL;
+	}
+	task_is_control = false;
 	return task;
 }
 
@@ -226,7 +253,13 @@ threads(pid_t pid, int seconds)
 	double t0, wall;
 	unsigned used;
 
-	if (task == MACH_PORT_NULL || task_threads(task, &list, &n) != KERN_SUCCESS) {
+	if (task == MACH_PORT_NULL) {
+		return 1;
+	}
+	kern_return_t kr = task_threads(task, &list, &n);
+
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "psample: task_threads: %s (%d)\n", mach_error_string(kr), kr);
 		return 1;
 	}
 	used = n < MAX_THREADS ? n : MAX_THREADS;
@@ -396,8 +429,8 @@ stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char 
 		return 1;
 	}
 	proc_name(pid, pname, sizeof(pname));
-	fprintf(out, "psample 1 pid %d name %s interval %d depth %d uptime %.3f timebase %u/%u\n", pid, pname,
-	    interval_us, depth, uptime_s(), tb.numer, tb.denom);
+	fprintf(out, "psample 1 pid %d name %s interval %d depth %d uptime %.3f timebase %u/%u port %s\n", pid, pname,
+	    interval_us, depth, uptime_s(), tb.numer, tb.denom, task_is_control ? "control" : "read");
 	t0 = mach_absolute_time();
 	end = t0 + (uint64_t)((double)seconds * 1e9 * tb.denom / tb.numer);
 	next = t0;
@@ -406,8 +439,11 @@ stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char 
 		mach_msg_type_number_t n;
 		uint64_t now_us;
 
-		if (task_threads(task, &list, &n) != KERN_SUCCESS) {
-			fprintf(out, "# the process is gone\n");
+		kern_return_t kr = task_threads(task, &list, &n);
+
+		if (kr != KERN_SUCCESS) {
+			fprintf(out, "# task_threads: %s (%d): the process is gone?\n", mach_error_string(kr), kr);
+			fprintf(stderr, "psample: task_threads: %s (%d)\n", mach_error_string(kr), kr);
 			break;
 		}
 		if (main_tid == 0 && n > 0) {
@@ -441,11 +477,15 @@ stacks(pid_t pid, int seconds, int interval_us, int depth, bool all, const char 
 				continue;
 			}
 			a = mach_absolute_time();
-			if (thread_suspend(th) != KERN_SUCCESS) {
-				continue;
+			if (task_is_control) {
+				if (thread_suspend(th) != KERN_SUCCESS) {
+					continue;
+				}
+				k = walk(task, th, pcs, depth);
+				thread_resume(th);
+			} else {
+				k = walk(task, th, pcs, depth);         /* (a read port: looked at running) */
 			}
-			k = walk(task, th, pcs, depth);
-			thread_resume(th);
 			b = mach_absolute_time();
 			held += b - a;
 			fprintf(out, "s %llu %llu %c", (unsigned long long)now_us, (unsigned long long)tid,
