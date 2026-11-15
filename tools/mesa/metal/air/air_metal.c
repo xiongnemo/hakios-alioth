@@ -1554,12 +1554,21 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
     * it before a resolve -- with 0 here every MSAA resolve was dropped without a word
     * (fd_blit: "blit unsupported"), the resolve texture left as it was.
     */
+   /*
+    * (the K40's) No UBWC for a texture a shader writes. freedreno compresses a tiled texture of a UBWC format (a6xx:
+    * RGBA16Float among them, not the 32-bit floats) once a level is 16 texels wide; a kernel's stores into one were
+    * read back right by the processor (through the blitter) but a SECOND kernel read zeros from them (System Check
+    * mps.probe, 11-16: RGBA16F at 16x16 and up, 10x16 fine, R32F and RGBA32F fine at every size -- MPS's two-pass blur
+    * and Lanczos, whose scratch is RGBA16F, gave all zeros). PIPE_BIND_CONST_BW is Gallium's own "no data-dependent
+    * bandwidth compression" (freedreno_resource.c get_best_layout: UBWC off, still tiled), added after the format
+    * queries above, which are not about layout. Images bound for a kernel are made uncompressed as well (rwa_dispatch).
+    */
    struct pipe_resource templ = {
       .target = target, .format = pf,
       .width0 = width, .height0 = height, .depth0 = depth,
       .array_size = array_size, .last_level = mips - 1, .nr_samples = query_samples,
       .nr_storage_samples = query_samples,
-      .bind = bind, .usage = PIPE_USAGE_DEFAULT };
+      .bind = bind | (write && !import ? PIPE_BIND_CONST_BW : 0), .usage = PIPE_USAGE_DEFAULT };
 
    if (import) {
       /*
@@ -4108,8 +4117,12 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
              */
             .access = (r->read ? PIPE_IMAGE_ACCESS_READ : 0) |
                       (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
+            /* (the K40's) and COHERENT, whose only effect in freedreno is that a UBWC texture bound as an image
+             * is made uncompressed first (a6xx/fd6_image.cc, fd6_set_shader_images): a texture made without
+             * ShaderWrite (a render target, UBWC) read here as an image would otherwise read what mps.probe's
+             * kernels read from a compressed one -- zeros (texture_of_shape, 11-16) */
             .shader_access = (r->read ? PIPE_IMAGE_ACCESS_READ : 0) |
-                             (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
+                             (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0) | PIPE_IMAGE_ACCESS_COHERENT,
             /* (the K40's) a view's level 0 and slices are the resource's base_level and
              * base_layer on (rwa_texture_subview); a 3D level's planes are all of it */
             .u.tex.level = t->base_level,

@@ -382,8 +382,9 @@ hk_scratch(id<MTLTexture> *kept, NSUInteger w, NSUInteger h)
 	[e setBytes:w length:sizeof(float) * (size_t)(2 * radius + 1) atIndex:1];
 	hk_dispatch(e, hk_pipe_separable, (NSUInteger)across.dst_size[0], (NSUInteger)across.dst_size[1]);
 	/*
-	 * (the second pass in an encoder of its own: in one encoder this driver did not make the first dispatch's
-	 * writes to the scratch texture visible to the second -- System Check mps.blur read all zeros, 11-15)
+	 * (the second pass in an encoder of its own -- harmless, but NOT why mps.blur read all zeros (11-15): that was the
+	 * RGBA16F scratch being UBWC-compressed from 16 texels wide, which a second kernel read as zeros whatever the
+	 * encoders (System Check mps.probe, 11-16); fixed in the compiler library, air_metal.c texture_of_shape)
 	 */
 	[e endEncoding];
 	e = [commandBuffer computeCommandEncoder];
