@@ -120,6 +120,7 @@ struct rwa_device;
 struct rwa_buffer;
 struct rwa_texture;
 struct rwa_sampler;
+struct rwa_query;
 struct rwa_compute;
 struct rwa_compute_info {
 	unsigned max_threads_per_group, thread_execution_width, static_shared_bytes;
@@ -627,6 +628,11 @@ static struct {
 	int (*texture_swizzle)(struct rwa_texture *, const unsigned char *, char *, size_t);
 	/* (the K40's, 11-16) an attachment's contents let go: a pass's DontCare store (air_metal.h rwa_texture_discard) */
 	int (*texture_discard)(struct rwa_device *, struct rwa_texture *, char *, size_t);
+	/* (the K40's, 11-16) occlusion queries for Metal's visibility results (air_metal.h rwa_query_*) */
+	struct rwa_query *(*query_begin)(struct rwa_device *, unsigned, char *, size_t);
+	int (*query_end)(struct rwa_query *, char *, size_t);
+	int (*query_result)(struct rwa_query *, unsigned, uint64_t *, char *, size_t);
+	void (*query_destroy)(struct rwa_query *);
 } mesa;
 
 /* (the K40's) rwa_draw_features() bits, as air_metal.h has them */
@@ -1002,6 +1008,10 @@ GPU_LOCKED(int, texture_copy, (struct rwa_texture *d, unsigned dl, unsigned ds, 
 GPU_LOCKED(int, buffer_wait, (struct rwa_buffer *b, unsigned fw, char *w, size_t ws), (b, fw, w, ws))
 GPU_LOCKED(int, texture_swizzle, (struct rwa_texture *t, const unsigned char *s, char *w, size_t ws), (t, s, w, ws))
 GPU_LOCKED(int, texture_discard, (struct rwa_device *d, struct rwa_texture *t, char *w, size_t ws), (d, t, w, ws))
+GPU_LOCKED(struct rwa_query *, query_begin, (struct rwa_device *d, unsigned b, char *w, size_t ws), (d, b, w, ws))
+GPU_LOCKED(int, query_end, (struct rwa_query *q, char *w, size_t ws), (q, w, ws))
+GPU_LOCKED(int, query_result, (struct rwa_query *q, unsigned wait, uint64_t *r, char *w, size_t ws), (q, wait, r, w, ws))
+GPU_LOCKED_VOID(query_destroy, (struct rwa_query *q), (q))
 
 /*
  * (the K40's) rwa_finish in its two halves: flushed with a fence under the library's lock, the fence waited for
@@ -1105,6 +1115,10 @@ mesa_available(void)
 	*(void **)&mesa.fence_wait = dlsym(mesa.handle, "rwa_fence_wait");
 	*(void **)&mesa.texture_swizzle = dlsym(mesa.handle, "rwa_texture_swizzle");
 	*(void **)&mesa.texture_discard = dlsym(mesa.handle, "rwa_texture_discard");
+	*(void **)&mesa.query_begin = dlsym(mesa.handle, "rwa_query_begin");
+	*(void **)&mesa.query_end = dlsym(mesa.handle, "rwa_query_end");
+	*(void **)&mesa.query_result = dlsym(mesa.handle, "rwa_query_result");
+	*(void **)&mesa.query_destroy = dlsym(mesa.handle, "rwa_query_destroy");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -1155,6 +1169,10 @@ mesa_available(void)
 	GPU_LOCK_WRAP(flush);
 	GPU_LOCK_WRAP(texture_swizzle);
 	GPU_LOCK_WRAP(texture_discard);
+	GPU_LOCK_WRAP(query_begin);
+	GPU_LOCK_WRAP(query_end);
+	GPU_LOCK_WRAP(query_result);
+	GPU_LOCK_WRAP(query_destroy);
 	return true;
 }
 
@@ -1540,6 +1558,8 @@ struct gem_close { uint32_t handle, pad; };
 /* (the K40's, 11-16) -setBytes: and its kin: the bytes copied into this buffer's upload area, which is kept until the
  * command buffer goes; the buffer and the offset they landed at (256-byte aligned), or nil */
 - (id)aliothUpload:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset;
+/* (the K40's, 11-16) the number of the next render pass made on it, for its visibility results */
+- (unsigned)aliothNextPass;
 @end
 
 @interface AliothMetalComputeEncoder : _MTLCommandEncoder
@@ -1608,6 +1628,25 @@ enum {
 	AliothMetalEvent *event;        /* retained */
 	uint64_t value;
 	BOOL wait;                      /* -encodeWaitForEvent:value:, not a signal */
+}
+@end
+
+/*
+ * (the K40's, 11-16) VISIBILITY RESULTS. -setVisibilityResultMode:offset: did nothing, and the visibilityResultBuffer
+ * was never written: an engine culling with occlusion queries read whatever was there (zero: "hidden"). Now each mode
+ * change is a step in the command buffer's order; at -commit a step ends the occlusion query of the step before it in
+ * the pass and begins its own (rwa_query_*: Gallium's occlusion counter, or its predicate for Boolean), and once the
+ * GPU has finished the buffer (-aliothQueriesBack) each pass's samples at each offset are summed and written there
+ * as one 64-bit value (Boolean: 1 or 0) -- a later pass's value for an offset over an earlier one's, an offset never
+ * enabled left alone. Draws another thread makes meanwhile count too (one context); a parallel pass's sub-encoders
+ * count as passes of their own.
+ */
+@interface AliothMetalQuery : NSObject {
+@public
+	NSUInteger mode, offset;        /* MTLVisibilityResultMode: 0 off, 1 Boolean, 2 Counting */
+	id buffer;                      /* retained: the pass's visibilityResultBuffer */
+	unsigned pass;                  /* which render pass of the command buffer (-aliothNextPass) */
+	struct rwa_query *query;        /* begun at -commit for this step, until the next step of the pass */
 }
 @end
 
@@ -5507,6 +5546,93 @@ enum {
 	id _upload;
 	NSUInteger _uploadUsed, _uploadSize;
 	NSMutableArray *_uploads;
+	/* (the K40's, 11-16) render passes made on it; the visibility step whose query runs now (-aliothQueryStep:) */
+	unsigned _passes;
+	AliothMetalQuery *_activeQuery;
+}
+
+- (unsigned)aliothNextPass
+{
+	return ++_passes;
+}
+
+/* (the K40's, 11-16) a visibility step at -commit: the query before it in the pass ends, its own begins */
+- (void)aliothQueryStep:(AliothMetalQuery *)step
+{
+	char why[256] = "";
+	struct rwa_device *device = [[_queue device] mesaDevice];
+
+	if (_activeQuery != nil) {
+		if (mesa.query_end(_activeQuery->query, why, sizeof(why)) != 0) {
+			RW_ONCE("a visibility query did not end: %s\n", why);
+		}
+		_activeQuery = nil;
+	}
+	if (step == nil || step->mode == 0 || step->buffer == nil) {
+		return;
+	}
+	if (device == NULL || mesa.query_begin == NULL || mesa.query_end == NULL || mesa.query_result == NULL) {
+		RW_ONCE("visibility results asked for, and this compiler library has no occlusion queries\n");
+		return;
+	}
+	step->query = mesa.query_begin(device, step->mode == 1, why, sizeof(why));
+	if (step->query == NULL) {
+		RW_ONCE("a visibility query did not begin: %s\n", why);
+		return;
+	}
+	_activeQuery = step;
+}
+
+/*
+ * (the K40's, 11-16) The visibility results, once the GPU has finished the buffer (`write` NO: a failed buffer's, let
+ * go of unwritten): each pass's queries at each offset summed and written there, the passes in order.
+ */
+- (void)aliothQueriesBack:(BOOL)write
+{
+	struct { unsigned pass; id buffer; NSUInteger offset; uint64_t sum; BOOL boolean; } got[64];
+	unsigned count = 0;
+	char why[256] = "";
+
+	for (id item in _work) {
+		if (![item isKindOfClass:[AliothMetalQuery class]] || ((AliothMetalQuery *)item)->query == NULL) {
+			continue;
+		}
+		AliothMetalQuery *q = item;
+		uint64_t r = 0;
+		int rc = write ? mesa.query_result(q->query, 1, &r, why, sizeof(why)) : -1;
+
+		if (write && rc != 0) {
+			RW_ONCE("a visibility result could not be read: %s\n", why);
+		}
+		mesa.query_destroy(q->query);
+		q->query = NULL;
+		if (rc != 0) {
+			continue;
+		}
+		unsigned i;
+
+		for (i = 0; i < count && !(got[i].pass == q->pass && got[i].buffer == q->buffer && got[i].offset == q->offset); i++) {
+		}
+		if (i == count) {
+			if (count == sizeof(got) / sizeof(got[0])) {
+				RW_ONCE("more than 64 visibility results in one command buffer: the rest are not written\n");
+				continue;
+			}
+			got[count++] = (typeof(got[0])) { .pass = q->pass, .buffer = q->buffer, .offset = q->offset };
+		}
+		got[i].sum += r;
+		got[i].boolean = q->mode == 1;
+	}
+	for (unsigned i = 0; i < count; i++) {
+		char *base = [got[i].buffer respondsToSelector:@selector(contents)] ? (char *)[got[i].buffer contents] : NULL;
+
+		if (base == NULL || got[i].offset % 8 != 0 || got[i].offset + 8 > [got[i].buffer length]) {
+			RW_ONCE("a visibility result at offset %lu does not fit its buffer (or the buffer has no contents here)\n",
+			    (unsigned long)got[i].offset);
+			continue;
+		}
+		*(uint64_t *)(base + got[i].offset) = got[i].boolean ? (got[i].sum != 0) : got[i].sum;
+	}
 }
 
 /*
@@ -6187,6 +6313,10 @@ alioth_strict(void)
 	for (id item in _work) {
 		AliothMetalWork *work = item;
 
+		if ([item isKindOfClass:[AliothMetalQuery class]]) {
+			[self aliothQueryStep:item];
+			continue;
+		}
 		if ([item isKindOfClass:[AliothMetalBlit class]]) {
 			if (![self runBlit:item why:why size:sizeof(why)]) {
 				rw_print("the blit failed: %s\n", why);
@@ -6345,6 +6475,9 @@ alioth_strict(void)
 	}
 	_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */
 done:
+	if (_activeQuery != nil) {
+		[self aliothQueryStep:nil];     /* (a pass left with its query running: ended with the buffer's work) */
+	}
 	alioth_stat(ST_RUN, committed);
 	/* The queue's slot goes back here and on every way out of this method, a failed draw
 	 * included: a buffer that errored is as finished as one that drew, and a slot kept
@@ -6888,6 +7021,7 @@ done:
 				[self aliothShadowsBack];
 				_status = RW_CB_COMPLETED;
 			}
+			[self aliothQueriesBack:waited == 0];
 			for (id handler in completed) {
 				[self aliothDeliver:(void (^)(id))handler];
 			}
@@ -6900,6 +7034,8 @@ done:
 		/* the same promise, kept here where the library cannot split the wait */
 		[self waitUntilCompleted];
 	}
+	/* (the K40's, 11-16) visibility results: query_result waits for its own work here */
+	[self aliothQueriesBack:_status != RW_CB_ERROR];
 	/* (the K40's) the events, after the wait as above -- or at once for a buffer that failed, so that no waiter is
 	 * left with a value nothing will set */
 	for (AliothMetalSignal *s in signals) {
@@ -6956,6 +7092,10 @@ done:
 	 * multisample one the pass named (used only if the pass draws nothing: -endEncoding) */
 	id _msaa[8];
 	unsigned _tileMask, _tileSamples;
+	/* (the K40's, 11-16) the pass's visibilityResultBuffer, the mode and offset set last, the pass's number */
+	id _visibility;
+	NSUInteger _visMode, _visOffset;
+	unsigned _pass;
 	unsigned _colorCount;
 	float _clearColor[4];
 	BOOL _clears;
@@ -7071,6 +7211,8 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 	}
 	_commandBuffer = commandBuffer;
 	_recorder = commandBuffer;
+	_visibility = [descriptor visibilityResultBuffer];
+	_pass = [commandBuffer aliothNextPass];
 
 	/* What the pass is drawing into, and whether it begins by clearing. Metal keeps this in
 	 * the pass descriptor rather than in the pipeline, so it belongs to the encoder. */
@@ -7823,9 +7965,27 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 	_stencilReference[0] = front;
 	_stencilReference[1] = back;
 }
+/* (the K40's, 11-16) a step in the buffer's order (AliothMetalQuery says the rest) */
 - (void)setVisibilityResultMode:(NSUInteger)mode offset:(NSUInteger)offset
 {
-	(void)mode; (void)offset;
+	if (mode != 0 && _visibility == nil) {
+		RW_ONCE("visibility results asked for in a pass with no visibilityResultBuffer (Metal's validation error); "
+			"nothing is counted\n");
+		return;
+	}
+	if (mode == _visMode && (mode == 0 || offset == _visOffset)) {
+		return;
+	}
+	AliothMetalQuery *q = [[AliothMetalQuery alloc] init];
+
+	q->mode = mode;
+	q->offset = offset;
+	q->buffer = [_visibility retain];
+	q->pass = _pass;
+	[_recorder recordBlit:q];
+	[q release];
+	_visMode = mode;
+	_visOffset = offset;
 }
 - (void)setVertexAmplificationCount:(NSUInteger)count viewMappings:(const void *)mappings
 {
@@ -8546,6 +8706,10 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	if (!_drew) {
 		_tileMask = 0;
 	}
+	/* (the K40's, 11-16) a visibility query still on ends with the pass */
+	if (!_ended && _visMode != 0) {
+		[self setVisibilityResultMode:0 offset:0];
+	}
 	if (!_ended && !_drew && (_clears || _clearsDepth || _clearsStencil) &&
 	    (_colorCount != 0 || _depth != nil)) {
 		AliothMetalWork *work = [[AliothMetalWork alloc] init];
@@ -8763,7 +8927,9 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		for (id item in r->items) {
 			if ([item isKindOfClass:[AliothMetalWork class]]) {
 				[_commandBuffer recordWork:item];
-			} else if (k + 1 == n || ((AliothMetalBlit *)item)->kind != ALIOTH_BLIT_RESOLVE) {
+			} else if (![item isKindOfClass:[AliothMetalBlit class]] || k + 1 == n ||
+			    ((AliothMetalBlit *)item)->kind != ALIOTH_BLIT_RESOLVE) {
+				/* (11-16: not every item that is not a work is a blit -- a visibility step is neither) */
 				/* (a resolve once, the last sub-encoder's: an earlier one's would resolve part of the pass) */
 				[_commandBuffer recordBlit:item];
 			}
@@ -8880,6 +9046,20 @@ alioth_listener_queue(id listener)
 - (void)dealloc
 {
 	[event release];
+	[super dealloc];
+}
+
+@end
+
+@implementation AliothMetalQuery
+
+- (void)dealloc
+{
+	/* (one whose results were never read: a buffer that failed or was never committed) */
+	if (query != NULL && mesa.query_destroy != NULL) {
+		mesa.query_destroy(query);
+	}
+	[buffer release];
 	[super dealloc];
 }
 

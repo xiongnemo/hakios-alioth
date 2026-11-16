@@ -8017,6 +8017,79 @@ rwa_texture_discard(struct rwa_device *device, struct rwa_texture *texture, char
    return 0;
 }
 
+/* (the K40's, 11-16) Metal's visibility results by Gallium occlusion queries (air_metal.h). freedreno counts them
+ * across its tiles and batches itself (its acc queries pause and resume as batches change). */
+struct rwa_query {
+   struct rwa_device *device;
+   struct pipe_query *query;
+   bool boolean, ended;
+};
+
+struct rwa_query *
+rwa_query_begin(struct rwa_device *device, unsigned boolean, char *why, size_t why_size)
+{
+   if (!device || !device->pipe->create_query) {
+      say(why, why_size, "%s has no queries", device ? rwa_device_name(device) : "no device");
+      return NULL;
+   }
+   struct rwa_query *q = calloc(1, sizeof(*q));
+   if (!q) {
+      say(why, why_size, "out of memory for a query");
+      return NULL;
+   }
+   q->device = device;
+   q->boolean = boolean != 0;
+   q->query = device->pipe->create_query(device->pipe, boolean ? PIPE_QUERY_OCCLUSION_PREDICATE
+                                                              : PIPE_QUERY_OCCLUSION_COUNTER, 0);
+   if (!q->query || !device->pipe->begin_query(device->pipe, q->query)) {
+      say(why, why_size, "%s would not %s an occlusion query", rwa_device_name(device), q->query ? "begin" : "make");
+      if (q->query)
+         device->pipe->destroy_query(device->pipe, q->query);
+      free(q);
+      return NULL;
+   }
+   return q;
+}
+
+int
+rwa_query_end(struct rwa_query *q, char *why, size_t why_size)
+{
+   if (!q || q->ended) {
+      say(why, why_size, "%s", q ? "a query ended twice" : "no query to end");
+      return -1;
+   }
+   q->ended = true;
+   if (!q->device->pipe->end_query(q->device->pipe, q->query)) {
+      say(why, why_size, "%s would not end an occlusion query", rwa_device_name(q->device));
+      return -1;
+   }
+   return 0;
+}
+
+int
+rwa_query_result(struct rwa_query *q, unsigned wait, uint64_t *result, char *why, size_t why_size)
+{
+   union pipe_query_result r = { 0 };
+
+   if (!q || !q->ended || !result) {
+      say(why, why_size, "%s", !q ? "no query" : !q->ended ? "a query not ended" : "nowhere for the result");
+      return -1;
+   }
+   if (!q->device->pipe->get_query_result(q->device->pipe, q->query, wait != 0, &r))
+      return wait ? (say(why, why_size, "%s gave no occlusion result", rwa_device_name(q->device)), -1) : 1;
+   *result = q->boolean ? (r.b ? 1 : 0) : r.u64;
+   return 0;
+}
+
+void
+rwa_query_destroy(struct rwa_query *q)
+{
+   if (!q)
+      return;
+   q->device->pipe->destroy_query(q->device->pipe, q->query);
+   free(q);
+}
+
 /* (the K40's) Metal's -setThreadgroupMemoryLength:atIndex: for index 0, the one threadgroup argument the front end
  * places (air_to_nir.c): kept on the pipeline, baked into the compiled state at the next dispatch as the block size
  * is. Rounded up to 16 as Metal requires of the length, and held to what the GPU has. */

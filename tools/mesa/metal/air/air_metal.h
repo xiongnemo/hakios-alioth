@@ -1368,6 +1368,17 @@ unsigned rwa_draw_features(void);
  * and why. */
 int rwa_texture_discard(struct rwa_device *device, struct rwa_texture *texture, char *why, size_t why_size);
 
+/* (the K40's, 11-16) OCCLUSION: Metal's visibility results (setVisibilityResultMode:offset:). A query counts the
+ * samples that pass the depth and stencil tests in the draws made on the device between its begin and its end
+ * (Gallium PIPE_QUERY_OCCLUSION_COUNTER; `boolean`: PIPE_QUERY_OCCLUSION_PREDICATE, any or none). The result is read
+ * once the work is done -- `wait` 1 waits for it, 0 answers 1 when it is not there yet. Draws of another thread
+ * made between the two count as well (one context). */
+struct rwa_query;
+struct rwa_query *rwa_query_begin(struct rwa_device *device, unsigned boolean, char *why, size_t why_size);
+int rwa_query_end(struct rwa_query *query, char *why, size_t why_size);
+int rwa_query_result(struct rwa_query *query, unsigned wait, uint64_t *result, char *why, size_t why_size);
+void rwa_query_destroy(struct rwa_query *query);
+
 /* (the K40's, 11-16) The lock a caller holds around every call into this library (one Gallium context is not
  * thread-safe), given to the library so that it can let go of it where it touches no Gallium state: while
  * rwa_render_create and rwa_compute_create translate a module (AIR -> NIR, the long part of making a pipeline).
