@@ -3938,14 +3938,19 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
              * into one allocation and moves the offset per draw is the ordinary case,
              * and the window server of this port does it 55 times a boot.
              */
-            char what[96];
-
             if (direct_buffer_offset(r, bindings, table, table_count, name, &moffset, why,
                                      why_size) != 0)
                return -1;
-            snprintf(what, sizeof(what), "buffer %u of %s", r->index, name);
-            if (buffer_offset_ok(b->device, r, b, moffset, name, what, why, why_size) != 0)
+            /* (the K40's, 11-17) the name formatted only for the message: this snprintf on every
+             * buffer of every draw was 1.3% of Flutter's raster thread (psample, round b33);
+             * buffer_offset_ok is a pure check, asked again with the name when it says no */
+            if (buffer_offset_ok(b->device, r, b, moffset, name, "a buffer", why, why_size) != 0) {
+               char what[96];
+
+               snprintf(what, sizeof(what), "buffer %u of %s", r->index, name);
+               (void)buffer_offset_ok(b->device, r, b, moffset, name, what, why, why_size);
                return -1;
+            }
          }
          /* `r->size` is air.buffer_size, which a member never carries: the frontend
           * adds a member's resource with a size of zero because the nested descriptor
@@ -7503,14 +7508,19 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
    for (unsigned i = 0; i < draw->color_count; i++) {
       struct rwa_texture *t = draw->color ? draw->color[i] : NULL;
-      char what[48];
       if (!t) {
          say(why, why_size, "colour attachment %u is not a texture", i);
          return -1;
       }
-      snprintf(what, sizeof(what), "colour attachment %u", i);
-      if (!attachment_shape_fits(t, tile_mask & (1u << i) ? 1 : samples, what, why, why_size))
+      /* (the K40's, 11-17) the name formatted only for the message (as for buffers in check_bindings) */
+      if (!attachment_shape_fits(t, tile_mask & (1u << i) ? 1 : samples, "a colour attachment", why,
+                                 why_size)) {
+         char what[48];
+
+         snprintf(what, sizeof(what), "colour attachment %u", i);
+         (void)attachment_shape_fits(t, tile_mask & (1u << i) ? 1 : samples, what, why, why_size);
          return -1;
+      }
       if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
          say(why, why_size, "colour attachment %u (%s) was made without "
                             "MTLTextureUsageRenderTarget", i, t->format_name);
