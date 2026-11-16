@@ -1,0 +1,22 @@
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.c
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c
+@@ -462,9 +462,17 @@
+ 
+    if (has_zs || assume_zs) {
+       struct fd_resource *rsc = fd_resource(pfb->zsbuf->texture);
+-      key->zsbuf_cpp[0] = rsc->layout.cpp * pfb->samples;
++      /* (hakios, the K40's Metal, 11-17) layout.cpp already counts the texture's own samples (fdl6_layout: cpp *=
++       * nr_samples), so a multisampled depth/stencil texture was given its samples twice here: a 4x D32F+S8 buffer
++       * 64 + 16 bytes a pixel of GMEM instead of 16 + 4 -- turnip's tiling counts blocksize x samples, once. Flutter's
++       * 1125x2436 4x pass (an MSRTT colour buffer, 16 bytes, over a 4x depth/stencil texture) was 96 bytes a pixel and
++       * 12x20 = 240 bins; per sample of the texture, times the framebuffer's samples (a one-sample depth texture under
++       * an MSRTT pass keeps its x samples), it is 36. Only how much GMEM is set aside changes: a6xx places the buffer
++       * by its base, and nothing derives its pitch in GMEM from zsbuf_cpp.
++       */
++      key->zsbuf_cpp[0] = rsc->layout.cpp / MAX2(rsc->layout.nr_samples, 1) * pfb->samples;
+       if (rsc->stencil)
+-         key->zsbuf_cpp[1] = rsc->stencil->layout.cpp * pfb->samples;
++         key->zsbuf_cpp[1] = rsc->stencil->layout.cpp / MAX2(rsc->stencil->layout.nr_samples, 1) * pfb->samples;
+ 
+       /* If we clear z or s but not both, and we are using z24s8 (ie.
+        * !separate_stencil) then we need to restore the other, even if
