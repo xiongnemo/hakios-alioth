@@ -5,8 +5,8 @@ Through hakios_fd_trace (air_metal.c rwa_set_trace; NULL = nothing). For the Flu
 what freedreno decided for the batches resolved in the tiles (bins, hardware binning, subpasses,
 clears, visibility stream sizes) and any visibility stream overflow it reads back.
 
---- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc	2026-11-16 20:41:08.814576400 +1100
-+++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc	2026-11-16 20:41:08.815571100 +1100
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc	2026-11-16 21:06:06.575543600 +1100
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc	2026-11-16 21:06:06.576543400 +1100
 @@ -28,6 +28,11 @@
  #include "fd6_draw.h"
  #include "fd6_emit.h"
@@ -93,3 +93,29 @@ clears, visibility stream sizes) and any visibility stream overflow it reads bac
  /**
   * Returns the UNKNOWN_8C01 value for handling partial depth/stencil
   * clear/stores to Z24S8.
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc	2026-11-16 21:06:06.576543400 +1100
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc	2026-11-16 21:06:06.577543400 +1100
+@@ -297,6 +297,23 @@
+    fd6_ctx->vsc_draw_strm_pitch = 0x440;
+    fd6_ctx->vsc_prim_strm_pitch = 0x1040;
+ 
++   /* (the K40's, 11-16) HAKIOS_FD_VSC=DRAW,PRIM (bytes a pipe): the starting sizes instead, for a test -- Flutter's
++    * on-screen pass came out empty with hardware binning while its process never read back an overflow */
++   {
++      const char *vsc = getenv("HAKIOS_FD_VSC");
++
++      if (vsc) {
++         char *end = NULL;
++         unsigned long d = strtoul(vsc, &end, 0);
++         unsigned long p = end && *end == ',' ? strtoul(end + 1, NULL, 0) : 0;
++
++         if (d >= 0x440 && d <= 0x100000 && !(d & 0x3))
++            fd6_ctx->vsc_draw_strm_pitch = d;
++         if (p >= 0x1040 && p <= 0x400000 && !(p & 0x3))
++            fd6_ctx->vsc_prim_strm_pitch = p;
++      }
++   }
++
+    fd6_ctx->control_mem =
+       fd_bo_new(screen->dev, 0x1000, 0, "control");
+ 

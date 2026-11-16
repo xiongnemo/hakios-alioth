@@ -1198,6 +1198,24 @@ mesa_available(void)
 		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0) {
 			fd_trace = strstr(args, "metal_fd_trace=1") != NULL;
 		}
+		/* (11-16) metal_fd_vsc=DRAW,PRIM: freedreno's visibility streams' starting sizes a pipe (fd6_context.cc,
+		 * HAKIOS_FD_VSC; tools/mesa/metal/fd6-msrtt-trace.patch) -- a test road */
+		if ((at = strstr(args, "metal_fd_vsc=")) != NULL) {
+			char sizes[48];
+			size_t n = 0;
+
+			at += strlen("metal_fd_vsc=");
+			while (n + 1 < sizeof(sizes) && at[n] != '\0' && at[n] != ' ') {
+				sizes[n] = at[n];
+				n++;
+			}
+			sizes[n] = '\0';
+			if (n != 0 && getenv("HAKIOS_FD_VSC") == NULL) {
+				setenv("HAKIOS_FD_VSC", sizes, 0);
+				rw_print("metal_fd_vsc=%s: freedreno's visibility streams start at these sizes a pipe (a test road)\n",
+				    sizes);
+			}
+		}
 		if ((at = strstr(args, "metal_fd_debug=")) != NULL) {
 			char flags[64];
 			size_t n = 0;
