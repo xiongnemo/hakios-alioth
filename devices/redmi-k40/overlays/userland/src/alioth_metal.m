@@ -683,6 +683,7 @@ static void alioth_gpu_give(void *unused) { (void)unused; pthread_mutex_unlock(&
  * it, and CAMetalLayer's -nextDrawable. Off, it costs one test where it would measure.
  */
 #include <mach/mach_time.h>
+#include <os/lock.h>
 
 enum { ST_ENCODE, ST_RUN, ST_DRAW, ST_FLUSH, ST_GPU, ST_FINISH, ST_WAIT, ST_LOCK, ST_DRAWABLE, ST_SIGNAL, ST_BLIT,
 	ST_BLIT_GPU, ST_PIPELINE, ST_N };
@@ -692,6 +693,8 @@ static bool alioth_stats_on;
 static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_max[ST_N], alioth_stats_buffers,
 	alioth_stats_since;
 static uint64_t alioth_blit_kinds[8];   /* the processor's blits by AliothMetalBlit kind (fill, b2b, b2t, t2b, t2t, mips) */
+/* (the K40's, 11-16) render passes in the window: all, multisample, resolved in the tiles, resolved by a blit */
+static uint64_t alioth_pass_counts[4];
 static mach_timebase_info_data_t alioth_timebase;
 static id (*alioth_next_drawable_imp)(id, SEL);
 
@@ -771,6 +774,16 @@ alioth_stats_commit(void)
 	for (unsigned i = 0; i < 8; i++) {
 		kinds[i] = __atomic_exchange_n(&alioth_blit_kinds[i], 0, __ATOMIC_RELAXED);
 	}
+	uint64_t passes[4];
+
+	for (unsigned i = 0; i < 4; i++) {
+		passes[i] = __atomic_exchange_n(&alioth_pass_counts[i], 0, __ATOMIC_RELAXED);
+	}
+	if (passes[0] != 0) {
+		rw_print("stats: %llu render passes, %llu of them multisample: %llu resolved in the tiles, %llu by a blit\n",
+		         (unsigned long long)passes[0], (unsigned long long)passes[1], (unsigned long long)passes[2],
+		         (unsigned long long)passes[3]);
+	}
 	if (n[ST_BLIT] != 0) {
 		rw_print("stats: the processor's blits: %llu fill, %llu buffer to buffer, %llu buffer to texture, %llu texture "
 		         "to buffer, %llu texture to texture, %llu mipmaps\n", (unsigned long long)kinds[0],
@@ -791,6 +804,87 @@ alioth_stats_commit(void)
 	         (unsigned long long)n[ST_WAIT], alioth_stat_avg(t, n, ST_WAIT),
 	         (unsigned long long)n[ST_LOCK], alioth_stat_avg(t, n, ST_LOCK), (unsigned long long)n[ST_DRAWABLE],
 	         alioth_stat_avg(t, n, ST_DRAWABLE));
+}
+
+/*
+ * (the K40's, 11-16) metal_stats=1: a render pass counted for the window's line, and the first 24 different SHAPES of
+ * pass a process makes said once each -- each attachment's pixel format (MTLPixelFormat's number), sample count, load
+ * and store action (Metal's numbers), resolve and whether it is done in the tiles; the depth/stencil; a visibility
+ * buffer. What an engine's passes ask of the GPU's tile memory, read off the log.
+ */
+static void
+alioth_pass_census(MTLRenderPassDescriptor *descriptor, unsigned tileMask)
+{
+	static uint32_t seen[24];
+	static unsigned seen_count;
+	static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+	char line[600];
+	size_t used = 0;
+	BOOL multisample = NO, blit = NO;
+
+	if (!alioth_stats_on) {
+		return;
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		MTLRenderPassColorAttachmentDescriptor *a = [[descriptor colorAttachments] objectAtIndexedSubscript:i];
+		id t = [a texture];
+
+		if (t == nil || used >= sizeof(line) - 120) {
+			continue;
+		}
+		multisample |= [t sampleCount] > 1;
+		blit |= [a resolveTexture] != nil && !(tileMask & (1u << i)) && [t sampleCount] > 1;
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "colour %u: %lu x%lu load %lu store %lu%s%s; ", i,
+		    (unsigned long)[t pixelFormat], (unsigned long)[t sampleCount], (unsigned long)[a loadAction],
+		    (unsigned long)[a storeAction], [a resolveTexture] != nil ? " -> resolve" : "",
+		    [a resolveTexture] == nil ? "" : tileMask & (1u << i) ? " in the tiles" : " by a blit");
+	}
+	id z = [[descriptor depthAttachment] texture], s = [[descriptor stencilAttachment] texture];
+
+	if ((z != nil || s != nil) && used < sizeof(line) - 120) {
+		id zs = z != nil ? z : s;
+
+		multisample |= [zs sampleCount] > 1;
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "depth/stencil: %lu x%lu, depth load %lu store %lu, "
+		    "stencil load %lu store %lu; ", (unsigned long)[zs pixelFormat], (unsigned long)[zs sampleCount],
+		    (unsigned long)(z != nil ? [[descriptor depthAttachment] loadAction] : 0),
+		    (unsigned long)(z != nil ? [[descriptor depthAttachment] storeAction] : 0),
+		    (unsigned long)(s != nil ? [[descriptor stencilAttachment] loadAction] : 0),
+		    (unsigned long)(s != nil ? [[descriptor stencilAttachment] storeAction] : 0));
+	}
+	if ([descriptor visibilityResultBuffer] != nil && used < sizeof(line) - 40) {
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "visibility buffer; ");
+	}
+	__atomic_fetch_add(&alioth_pass_counts[0], 1, __ATOMIC_RELAXED);
+	if (multisample) {
+		__atomic_fetch_add(&alioth_pass_counts[1], 1, __ATOMIC_RELAXED);
+	}
+	if (tileMask != 0) {
+		__atomic_fetch_add(&alioth_pass_counts[2], 1, __ATOMIC_RELAXED);
+	}
+	if (blit) {
+		__atomic_fetch_add(&alioth_pass_counts[3], 1, __ATOMIC_RELAXED);
+	}
+	/* (FNV-1a of the line: the same shape said once) */
+	uint32_t h = 2166136261u;
+	BOOL fresh = YES;
+
+	for (size_t i = 0; i < used; i++) {
+		h = (h ^ (uint8_t)line[i]) * 16777619u;
+	}
+	os_unfair_lock_lock(&lock);
+	for (unsigned i = 0; i < seen_count && fresh; i++) {
+		fresh = seen[i] != h;
+	}
+	if (fresh && seen_count < 24) {
+		seen[seen_count++] = h;
+	} else {
+		fresh = NO;
+	}
+	os_unfair_lock_unlock(&lock);
+	if (fresh) {
+		rw_print("pass shape: %s(MTLPixelFormat / sample count / MTLLoadAction / MTLStoreAction numbers)\n", line);
+	}
 }
 
 static id
@@ -7329,6 +7423,7 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 		_depthNamed = ztex != nil;
 		_stencilNamed = stex != nil;
 	}
+	alioth_pass_census(descriptor, _tileMask);
 	return self;
 }
 
