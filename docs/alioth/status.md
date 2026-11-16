@@ -39,6 +39,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | Modem | The external SDX55 over PCIe: powered on from the PMIC and GPIOs, its boot loader fed over MHI's BHI (MSI on first, or its PBL refuses the image), then Sahara (12 images), mission mode, QRTR (64 services), the AP's TFTP server for its configuration files, DMS (the IMEI, kept off every log) and online. A launchd job answers CoreTelephony in CommCenter's place, so About shows the IMEI and Settings its Cellular row. Boot-args `dt_baseband=1 mdm_step=6 mdm_msi=1 mdm_loc=1 mdm_opmode=0 mdm_listen=86400`; it needs the phone's modem partitions and the modem configuration from Xiaomi's ROM, which a kit package does not copy yet | Works without a SIM |
 | GPS | QMI LOC: a GNSS session of our own (GPS, BeiDou, GLONASS, Galileo, QZSS), with the time, XTRA predicted orbits and a Wi-Fi position injected; the fixes go to iOS's location services (CoreLocation's simulation path), the satellites to apps through `sysctl kern.hakios.gnss`. First fix: 716 s with no help, 41–63 s with all of it | Works |
 | NFC, fingerprint, proximity | — | Not started |
+| USB host (OTG: a keyboard, a mouse) | — | Not started yet: no host controller driver or USB host stack, and no key event into iOS ([issue #1](https://github.com/xiongnemo/hakios-alioth/issues/1)) |
 
 ## User space
 
