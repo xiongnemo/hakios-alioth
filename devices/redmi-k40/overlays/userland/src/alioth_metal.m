@@ -672,8 +672,11 @@ alioth_shader_cache_env(void)
 }
 
 /* (the K40's, 11-16) the lock as the library's rwa_device_set_lock takes it: one level of the hold let go and taken */
-static void alioth_gpu_take(void *unused) { (void)unused; pthread_mutex_lock(&alioth_gpu); }
-static void alioth_gpu_give(void *unused) { (void)unused; pthread_mutex_unlock(&alioth_gpu); }
+static void alioth_lock_held(const char *what);
+static void alioth_lock_letting_go(void);
+static __thread const char *alioth_lock_name;   /* (the call this thread holds the lock for: alioth_lock_held) */
+static void alioth_gpu_take(void *unused) { (void)unused; pthread_mutex_lock(&alioth_gpu); alioth_lock_held(alioth_lock_name); }
+static void alioth_gpu_give(void *unused) { (void)unused; alioth_lock_letting_go(); pthread_mutex_unlock(&alioth_gpu); }
 
 /*
  * (the K40's) metal_stats=1 (a boot-arg): where command buffers' time goes, one line every 2 s while they are
@@ -693,6 +696,9 @@ static bool alioth_stats_on;
 static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_max[ST_N], alioth_stats_buffers,
 	alioth_stats_since;
 static uint64_t alioth_blit_kinds[8];   /* the processor's blits by AliothMetalBlit kind (fill, b2b, b2t, t2b, t2t, mips) */
+/* (the K40's, 11-17) the window's longest hold of the library's lock, and by which call (alioth_lock_letting_go) */
+static uint64_t alioth_lock_hold_max;
+static const char *alioth_lock_hold_what;
 /* (the K40's, 11-16) render passes in the window: all, multisample, resolved in the tiles, resolved by a blit */
 static uint64_t alioth_pass_counts[4];
 /* (the K40's, 11-16) memoryless textures made without memory, and of them given memory at a first real use (counted
@@ -799,6 +805,14 @@ alioth_stats_commit(void)
 		         "%.2f ms, the longest wait for the lock %.2f ms\n",
 		         (unsigned long long)n[ST_PIPELINE], alioth_stat_avg(t, n, ST_PIPELINE), alioth_ms(t[ST_PIPELINE]),
 		         alioth_ms(longest[ST_PIPELINE]), alioth_ms(longest[ST_DRAW]), alioth_ms(longest[ST_LOCK]));
+	}
+	/* (11-17) who held the lock longest in the window, when that was 2 ms or more */
+	const char *hold_what = alioth_lock_hold_what;
+	uint64_t hold = __atomic_exchange_n(&alioth_lock_hold_max, 0, __ATOMIC_RELAXED);
+
+	if (alioth_ms(hold) >= 2.0) {
+		rw_print("stats: the library's lock held longest %.2f ms, for %s\n", alioth_ms(hold),
+		         hold_what != NULL ? hold_what : "?");
 	}
 	uint64_t kinds[8];
 
@@ -1057,12 +1071,46 @@ alioth_gpu_lock(void)
 	}
 }
 
+/*
+ * (the K40's, 11-17) metal_stats=1: the window's longest hold of the lock and the call that held it. Round b44: with a
+ * pipeline's stages made unlocked (5acb84a) a commit still waited 46-60 ms for the lock while Flutter made its
+ * pipelines -- something else holds it that long. The depth is this thread's (the lock is recursive, and the library
+ * lets go of one level while it translates: alioth_gpu_give / _take); the rest is written only by the holder.
+ */
+static __thread unsigned alioth_lock_depth;
+static uint64_t alioth_lock_since;
+
+static void
+alioth_lock_held(const char *what)
+{
+	if (alioth_lock_depth++ == 0) {
+		alioth_lock_name = what;
+		alioth_lock_since = alioth_stats_on ? mach_absolute_time() : 0;
+	}
+}
+
+static void
+alioth_lock_letting_go(void)
+{
+	if (alioth_lock_depth != 0 && --alioth_lock_depth == 0 && alioth_lock_since != 0) {
+		uint64_t held = mach_absolute_time() - alioth_lock_since;
+
+		if (held > __atomic_load_n(&alioth_lock_hold_max, __ATOMIC_RELAXED)) {
+			alioth_lock_hold_what = alioth_lock_name;
+			__atomic_store_n(&alioth_lock_hold_max, held, __ATOMIC_RELAXED);
+		}
+		alioth_lock_since = 0;
+	}
+}
+
 #define GPU_LOCKED(ret, name, params, args) \
 	static ret (*unlocked_##name) params; \
 	static ret locked_##name params \
 	{ \
 		alioth_gpu_lock(); \
+		alioth_lock_held(#name); \
 		ret gpu_locked_result = unlocked_##name args; \
+		alioth_lock_letting_go(); \
 		pthread_mutex_unlock(&alioth_gpu); \
 		return gpu_locked_result; \
 	}
@@ -1071,7 +1119,9 @@ alioth_gpu_lock(void)
 	static void locked_##name params \
 	{ \
 		alioth_gpu_lock(); \
+		alioth_lock_held(#name); \
 		unlocked_##name args; \
+		alioth_lock_letting_go(); \
 		pthread_mutex_unlock(&alioth_gpu); \
 	}
 #define GPU_LOCK_WRAP(name) \
