@@ -1563,9 +1563,14 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 &&
 	BOOL _assertions;                   /* Metal's own assertion switch, stored for it */
 	struct MTLTargetDeviceArch _target;     /* answered by pointer; see -targetDeviceInfo */
 	char _targetName[96];               /* the bytes _target.name points at, inside the object */
+	NSMutableDictionary *_tileProxies;  /* (the K40's, 11-16) -aliothTileProxyLike:'s, by "format WxH" */
 }
 /* Not part of any Metal protocol: how this driver's own objects reach the compiler. */
 - (struct rwa_device *)mesaDevice;
+/* (the K40's, 11-16) a one-sample texture of the driver's own like `texture` (format, size) for a multisample pass to
+ * resolve into in the tiles before a blit copies it into `texture` (an IOSurface's: alioth_tile_resolve_fits); one
+ * per format and size, kept for the device's life, never evicted (a pass may hold it); nil past 8 of them */
+- (id)aliothTileProxyLike:(id)texture;
 /* and the argument encoder of one function's `[[buffer(n)]]` set, which the method this
  * driver installs into Metal's own _MTLFunction forwards to (the end of this file says
  * why it has to): the layout is read out of the function's own bitcode, which is the one
@@ -2725,6 +2730,33 @@ enum {
 		return nil;
 	}
 	return made;
+}
+
+- (id)aliothTileProxyLike:(id)texture
+{
+	NSUInteger format = [texture pixelFormat], w = [texture width], h = [texture height];
+	NSString *key = [NSString stringWithFormat:@"%lu %lux%lu", (unsigned long)format, (unsigned long)w, (unsigned long)h];
+	id proxy;
+
+	@synchronized (self) {
+		if (_tileProxies == nil) {
+			_tileProxies = [[NSMutableDictionary alloc] init];
+		}
+		if ((proxy = [_tileProxies objectForKey:key]) == nil && [_tileProxies count] < 8) {
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h
+			    mipmapped:NO];
+
+			d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			d.storageMode = MTLStorageModePrivate;
+			if ((proxy = [self newTextureWithDescriptor:d]) != nil) {
+				[_tileProxies setObject:proxy forKey:key];
+				[proxy release];
+				rw_print("a multisample pass into an IOSurface resolves in the tiles into a texture of the driver's own "
+				         "(%s), copied into the surface by a blit\n", [key UTF8String]);
+			}
+		}
+	}
+	return proxy;
 }
 
 /* The sampler's own base class exists and owes its protocol nothing, so this is the cheapest
@@ -7266,6 +7298,7 @@ done:
 	 * multisample one the pass named (used only if the pass draws nothing: -endEncoding) */
 	id _msaa[8];
 	unsigned _tileMask, _tileSamples;
+	unsigned _proxyMask;    /* (11-16) of those, resolved into a proxy that the resolve blit copies into _resolve[i] */
 	/* (the K40's, 11-16) the pass's visibilityResultBuffer, the mode and offset set last, the pass's number */
 	id _visibility;
 	NSUInteger _visMode, _visOffset;
@@ -7347,7 +7380,9 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
  * (its later sub-encoders load the earlier ones' samples -- the parallel encoder asks to store them), 3D planes.
  * Boot-arg metal_tile_resolve=0: the old road.
  */
-static BOOL
+enum { ALIOTH_TILE_NO, ALIOTH_TILE_DIRECT, ALIOTH_TILE_PROXY };
+
+static int
 alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 {
 	static dispatch_once_t once;
@@ -7373,18 +7408,23 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 	    [attachment storeAction] != MTLStoreActionMultisampleResolve || [attachment loadAction] == MTLLoadActionLoad ||
 	    ![texture isKindOfClass:[AliothMetalTexture class]] || ![resolve isKindOfClass:[AliothMetalTexture class]] ||
 	    [attachment depthPlane] != 0 || [attachment resolveDepthPlane] != 0) {
-		return NO;
+		return ALIOTH_TILE_NO;
+	}
+	if (!([texture sampleCount] > 1 && [resolve sampleCount] == 1 && [texture pixelFormat] == [resolve pixelFormat] &&
+	    ([resolve usage] & MTLTextureUsageRenderTarget) != 0 &&
+	    MAX([texture width] >> level, 1u) == MAX([resolve width] >> resolveLevel, 1u) &&
+	    MAX([texture height] >> level, 1u) == MAX([resolve height] >> resolveLevel, 1u))) {
+		return ALIOTH_TILE_NO;
 	}
 	/*
-	 * (11-16, round b9) NOT INTO AN IOSURFACE: Flutter's on-screen pass resolved in the tiles into its drawable (a
-	 * linear IOSurface the kernel gave the GPU) left the screen black in 2 launches of 2 while its own read-back checks
-	 * passed and its frames ran at 84/s -- the tile store's resolve into such a surface does not reach what the
-	 * compositor reads (not understood yet). The driver's own textures resolve in the tiles; a drawable keeps the blit.
+	 * (11-16, round b9) NOT STRAIGHT INTO AN IOSURFACE: Flutter's on-screen pass resolved in the tiles into its drawable
+	 * (a linear IOSurface the kernel gave the GPU) left the screen black in 2 launches of 2 while its own read-back
+	 * checks passed and its frames ran at 84/s -- the tile store's resolve into such a surface does not reach what the
+	 * compositor reads (not understood yet; metal_tile_resolve=2 does it anyway, to study). Such a pass resolves in the
+	 * tiles into a PROXY of the driver's own (one per format and size, -aliothTileProxyLike:) that the old road's GPU
+	 * blit then copies into the drawable: ~33 MB of memory traffic a full-screen frame instead of ~187.
 	 */
-	return [texture sampleCount] > 1 && [resolve sampleCount] == 1 && [texture pixelFormat] == [resolve pixelFormat] &&
-	    ([resolve usage] & MTLTextureUsageRenderTarget) != 0 && (iosurfaces || ![(AliothMetalTexture *)resolve aliothImported]) &&
-	    MAX([texture width] >> level, 1u) == MAX([resolve width] >> resolveLevel, 1u) &&
-	    MAX([texture height] >> level, 1u) == MAX([resolve height] >> resolveLevel, 1u);
+	return iosurfaces || ![(AliothMetalTexture *)resolve aliothImported] ? ALIOTH_TILE_DIRECT : ALIOTH_TILE_PROXY;
 }
 
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
@@ -7430,13 +7470,25 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 				_resolve[i] = alioth_attachment_texture([attachment resolveTexture],
 				    [attachment resolveLevel], [attachment resolveSlice],
 				    [attachment resolveDepthPlane]);
-				if (alioth_tile_resolve_fits(attachment)) {
+				int road = alioth_tile_resolve_fits(attachment);
+				id proxy = road == ALIOTH_TILE_PROXY ?
+				    [(AliothMetalDevice *)[commandBuffer device] aliothTileProxyLike:_resolve[i]] : nil;
+
+				if (road == ALIOTH_TILE_DIRECT) {
 					/* resolved in the tiles: the draws render into the resolve texture at the pass's
 					 * sample count, and no resolve blit follows (alioth_tile_resolve_fits says why) */
 					_msaa[i] = texture;
 					_color[i] = _resolve[i];
 					_resolve[i] = nil;
 					_tileMask |= 1u << i;
+					_tileSamples = (unsigned)[[attachment texture] sampleCount];
+				} else if (proxy != nil) {
+					/* resolved in the tiles into the proxy, which the resolve blit at -endEncoding copies
+					 * into the drawable (_resolve[i] stays it) */
+					_msaa[i] = texture;
+					_color[i] = proxy;
+					_tileMask |= 1u << i;
+					_proxyMask |= 1u << i;
 					_tileSamples = (unsigned)[[attachment texture] sampleCount];
 				}
 			} else {
@@ -8885,12 +8937,14 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	 */
 	for (unsigned i = 0; !_ended && !_drew && _tileMask != 0 && i < _colorCount; i++) {
 		if (_tileMask & (1u << i)) {
-			_resolve[i] = _color[i];
+			if (!(_proxyMask & (1u << i))) {
+				_resolve[i] = _color[i];        /* (a proxy's pass keeps the drawable in _resolve[i]) */
+			}
 			_color[i] = _msaa[i];
 		}
 	}
 	if (!_drew) {
-		_tileMask = 0;
+		_tileMask = _proxyMask = 0;
 	}
 	/* (the K40's, 11-16) a visibility query still on ends with the pass */
 	if (!_ended && _visMode != 0) {
