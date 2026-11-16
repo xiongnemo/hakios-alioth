@@ -1209,6 +1209,12 @@ mesa_available(void)
 		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0) {
 			fd_trace = strstr(args, "metal_fd_trace=1") != NULL;
 		}
+		/* (11-17) metal_msaa_clear=0: a multisample pass's clear by u_blitter's draw again, not as the tiles' own
+		 * clear (tools/mesa/metal/fd6-msrtt-clear.patch, HAKIOS_FD_MSAA_CLEAR) */
+		if (strstr(args, "metal_msaa_clear=0") != NULL && getenv("HAKIOS_FD_MSAA_CLEAR") == NULL) {
+			setenv("HAKIOS_FD_MSAA_CLEAR", "0", 0);
+			rw_print("metal_msaa_clear=0: a multisample pass is cleared by a draw (u_blitter), as before 11-17\n");
+		}
 		/* (11-16) metal_fd_vsc=DRAW,PRIM: freedreno's visibility streams' starting sizes a pipe (fd6_context.cc,
 		 * HAKIOS_FD_VSC; tools/mesa/metal/fd6-msrtt-trace.patch) -- a test road */
 		if ((at = strstr(args, "metal_fd_vsc=")) != NULL) {

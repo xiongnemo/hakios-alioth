@@ -1,0 +1,80 @@
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -606,6 +606,46 @@
+    return (buffers & FD_BUFFER_DEPTH) && zsbuf->lrz;
+ }
+ 
++/* (hakios, the K40's Metal, 11-17) Whether a multisample clear can be the tiles' own clear -- the blit event into
++ * GMEM that emit_subpass_clears writes with RB_BLIT_DST_INFO_SAMPLES, as turnip clears a multisample attachment in
++ * GMEM -- instead of u_blitter's full-screen draw (the 3D pipe is needed only by a clear in system memory, which the
++ * 2D engine cannot do multisampled). Only when the batch is certain to be rendered in tiles: a colour buffer
++ * multisampled in the tiles over a one-sample texture (MSRTT, Metal's memoryless MSAA attachment resolved at the
++ * tile store), whose batch fd_autotune_use_bypass sends to fallback_use_bypass, which says GMEM for samples > 1;
++ * nothing layered (bypass), FD_MESA_DEBUG=sysmem not set. HAKIOS_FD_MSAA_CLEAR=0 (boot-arg metal_msaa_clear=0) goes
++ * back to u_blitter. The draw cost the committing thread ~2.4% of a pass (b33/b34 profiles) and the GPU a shaded
++ * full-screen quad at 4 samples a pixel in every bin.
++ */
++static bool
++hakios_msaa_clear_in_tiles(struct fd_batch *batch)
++{
++   static int on = -1;
++
++   if (on < 0) {
++      const char *e = getenv("HAKIOS_FD_MSAA_CLEAR");
++      on = !(e && e[0] == '0');
++   }
++   if (!on || FD_DBG(SYSMEM))
++      return false;
++
++   struct pipe_framebuffer_state *pfb = &batch->framebuffer;
++   bool msrtt = false;
++
++   for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
++      struct pipe_surface *psurf = pfb->cbufs[i];
++
++      if (!psurf)
++         continue;
++      if (psurf->u.tex.first_layer < psurf->u.tex.last_layer)
++         return false;
++      if (psurf->nr_samples && psurf->nr_samples != psurf->texture->nr_samples)
++         msrtt = true;
++   }
++   if (pfb->zsbuf && pfb->zsbuf->u.tex.first_layer < pfb->zsbuf->u.tex.last_layer)
++      return false;
++   return msrtt;
++}
++
+ static bool
+ fd6_clear(struct fd_context *ctx, enum fd_buffer_mask buffers,
+           const union pipe_color_union *color, double depth,
+@@ -614,8 +654,10 @@
+    struct pipe_framebuffer_state *pfb = &ctx->batch->framebuffer;
+    struct fd_batch_subpass *subpass = ctx->batch->subpass;
+    unsigned color_buffers = buffers >> 2;
+-
+-   if (pfb->samples > 1) {
++   /* (hakios, 11-17) a multisample clear of a batch rendered in tiles for certain: the tiles' own clear */
++   bool in_tiles = pfb->samples > 1 && hakios_msaa_clear_in_tiles(ctx->batch);
++
++   if (pfb->samples > 1 && !in_tiles) {
+       /* we need to do multisample clear on 3d pipe, so fallback to u_blitter.
+        * But we do this ourselves so that we can still benefit from LRZ, as
+        * normally zfunc==ALWAYS would invalidate LRZ.  So we want to mark the
+@@ -630,7 +672,7 @@
+       /* If we won't be able to do any fast-clears, avoid pointlessly
+        * splitting out a new subpass:
+        */
+-      if (pfb->samples > 1 && !do_lrz_clear(ctx, buffers))
++      if (pfb->samples > 1 && !in_tiles && !do_lrz_clear(ctx, buffers))
+          return true;
+ 
+       subpass = fd_batch_create_subpass(ctx->batch);
+@@ -663,7 +705,7 @@
+    }
+ 
+    /* We've already done the fallback 3d clear: */
+-   if (pfb->samples > 1)
++   if (pfb->samples > 1 && !in_tiles)
+       return true;
+ 
+    u_foreach_bit (i, color_buffers)
