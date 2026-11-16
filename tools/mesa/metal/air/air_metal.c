@@ -507,6 +507,21 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
     * every vertex the same texture coordinate (RWA_TEX_* below), and over a constant
     * flat and smooth are the same number.
     */
+   /*
+    * (the K40's, 11-17) A VERTEX STAGE'S OUTPUTS NUMBERED BY SLOT, position first -- the long black Flutter launch. The
+    * translator numbered them in the order of the Metal output struct, and SPIRV-Cross (Impeller's shaders) puts the
+    * position LAST, after the varyings: uv 0, colour 1, position 2. ir3 files an output at outputs[driver_location],
+    * and the variant it builds for freedreno's hardware binning pass drops the varyings, leaving outputs[0] and [1]
+    * empty -- and an empty entry reads as slot 0, which IS VARYING_SLOT_POS, at register r0.x. ir3_find_output_regid
+    * then hands the binning pass that register for the position, every primitive lands somewhere else, every bin is
+    * empty and every draw of the batch is skipped: Flutter's whole frame lost whenever freedreno rendered it in tiles
+    * with binning (the old road's ~1 launch in 4, the tile resolve's every one; rounds b16-b32, System Check
+    * metal.msaa.vsout: "position first: drawn; position last: LOST"). Mesa's own frontends number by slot, which is
+    * what this asks for: nir_assign_io_var_locations sorts by location, so the built-ins come before VAR0. The
+    * fragment stage is linked to the vertex stage by slot, not by these numbers.
+    */
+   if (nir->info.stage == MESA_SHADER_VERTEX)
+      nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs, MESA_SHADER_VERTEX);
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
 }
