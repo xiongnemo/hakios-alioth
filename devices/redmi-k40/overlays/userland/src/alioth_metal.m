@@ -1175,6 +1175,34 @@ mesa_available(void)
 		return mesa.handle != NULL;
 	}
 	tried = true;
+	/*
+	 * (the K40's, 11-16) boot-arg metal_fd_debug=FLAGS (a test road): freedreno's own FD_MESA_DEBUG for this
+	 * library, comma-separated as freedreno takes them (nobin, nogmem, ...), set before its screen reads it once.
+	 * Flutter's drawable came out all zero after the GPU when its 300-draw pass was resolved in the tiles (round b16,
+	 * metal_drawable_peek) while a one-draw pass of the same shape was right; nobin says whether hardware binning --
+	 * tiles its pass found empty are skipped -- is what loses it.
+	 */
+	{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+		const char *at;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && (at = strstr(args, "metal_fd_debug=")) != NULL) {
+			char flags[64];
+			size_t n = 0;
+
+			at += strlen("metal_fd_debug=");
+			while (n + 1 < sizeof(flags) && at[n] != '\0' && at[n] != ' ') {
+				flags[n] = at[n];
+				n++;
+			}
+			flags[n] = '\0';
+			if (n != 0 && getenv("FD_MESA_DEBUG") == NULL) {
+				setenv("FD_MESA_DEBUG", flags, 0);
+				rw_print("metal_fd_debug=%s: freedreno's FD_MESA_DEBUG for this process (a test road)\n", flags);
+			}
+		}
+	}
 	mesa.handle = dlopen("/redwood/lib/libhakios.air.dylib", RTLD_NOW);
 	if (mesa.handle == NULL) {
 		rw_print("no compiler library: %s\n", dlerror());
