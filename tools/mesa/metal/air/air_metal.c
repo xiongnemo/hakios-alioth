@@ -119,6 +119,18 @@ struct rwa_device {
       bool viewport_set, stencil_ref_set;
    } bound;
 
+   /* (the K40's, 11-16) the sampler views and sampler states left bound by keep_bound draws, fragment stage [0] and
+    * vertex stage [1]: a draw that binds the same ones binds nothing, where every draw bound them and unbound them
+    * again (freedreno re-emitting the stage's textures each time). What is left bound here is taken out of the context
+    * before any of it can be destroyed -- rwa_texture_destroy, rwa_texture_swizzle, rwa_sampler_destroy,
+    * rwa_render_destroy, rwa_device_close (kept_drop): a sampler state is not reference-counted and a view's
+    * destruction under a bound context is the trap unbind_stage was written against. */
+   struct {
+      struct pipe_sampler_view *views[RWA_MAX_TEXTURES];
+      void *samplers[RWA_MAX_TEXTURES];
+      unsigned num_views, num_samplers;
+   } kept[2];
+
    /* (the K40's, 11-16) rwa_device_set_lock: the caller's lock around every call into this library, let go while a
     * module is translated (AIR -> NIR touches no Gallium state and keeps none of its own) and taken again before the
     * pipeline's states are made */
@@ -650,11 +662,50 @@ fail:
    return NULL;
 }
 
+/* (the K40's, 11-16) rwa_device.kept: a stage's kept views and samplers out of the context, and forgotten */
+static void
+kept_drop_stage(struct rwa_device *device, unsigned k)
+{
+   struct pipe_context *pipe = device->pipe;
+   enum pipe_shader_type stage = k ? PIPE_SHADER_VERTEX : PIPE_SHADER_FRAGMENT;
+
+   if (device->kept[k].num_views)
+      pipe->set_sampler_views(pipe, stage, 0, 0, device->kept[k].num_views, false, NULL);
+   if (device->kept[k].num_samplers) {
+      void *none[RWA_MAX_TEXTURES] = { 0 };
+      pipe->bind_sampler_states(pipe, stage, 0, device->kept[k].num_samplers, none);
+   }
+   memset(&device->kept[k], 0, sizeof(device->kept[k]));
+}
+
+static void
+kept_drop(struct rwa_device *device)
+{
+   kept_drop_stage(device, 0);
+   kept_drop_stage(device, 1);
+}
+
+/* whether a view or a sampler state is among what is kept bound (then kept_drop before it goes) */
+static bool
+kept_holds(const struct rwa_device *device, const void *view, const void *sampler)
+{
+   for (unsigned k = 0; k < 2; k++) {
+      for (unsigned i = 0; view && i < device->kept[k].num_views; i++)
+         if (device->kept[k].views[i] == view)
+            return true;
+      for (unsigned i = 0; sampler && i < device->kept[k].num_samplers; i++)
+         if (device->kept[k].samplers[i] == sampler)
+            return true;
+   }
+   return false;
+}
+
 void
 rwa_device_close(struct rwa_device *device)
 {
    if (!device)
       return;
+   kept_drop(device);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    if (device->metal_default_sampler)
@@ -1743,6 +1794,9 @@ rwa_texture_destroy(struct rwa_texture *texture)
    if (!texture)
       return;
    argbuf_scrub(texture->device, NULL, texture, NULL);
+   /* (the K40's, 11-16) a view kept bound by keep_bound draws is taken out of the context first (rwa_device.kept) */
+   if (texture->view && kept_holds(texture->device, texture->view, NULL))
+      kept_drop(texture->device);
    /* The view first: it holds a reference of its own on the resource. Nothing has to
     * be unbound here, because rwa_dispatch unbinds every texture it bound once its
     * fence has come back -- a context left holding this would be holding freed memory
@@ -2579,6 +2633,9 @@ rwa_sampler_destroy(struct rwa_sampler *sampler)
     * freed memory until something else is bound over it.
     */
    argbuf_scrub(sampler->device, NULL, NULL, sampler);
+   /* (the K40's, 11-16) ... except what keep_bound draws left bound (rwa_device.kept): out of the context first */
+   if (kept_holds(sampler->device, NULL, sampler->cso) || kept_holds(sampler->device, NULL, sampler->cso_compare))
+      kept_drop(sampler->device);
    sampler->device->pipe->delete_sampler_state(sampler->device->pipe, sampler->cso);
    sampler->device->pipe->delete_sampler_state(sampler->device->pipe,
                                                sampler->cso_compare);
@@ -3983,10 +4040,16 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
            const struct air_shader_info *info, void **own_sampler,
            const bool *compare_sampler,
            const struct rwa_bindings *bindings, const struct rwa_buffer_bind *table,
-           unsigned table_count, const char *name, struct rwa_bound *bound, char *why,
+           unsigned table_count, const char *name, struct rwa_bound *bound, bool keep, char *why,
            size_t why_size)
 {
    struct pipe_context *pipe = device->pipe;
+   /* (the K40's, 11-16) a keep_bound draw's fragment or vertex stage: its views and samplers stay bound and are bound
+    * only where they differ (rwa_device.kept); any other binding of those stages forgets what was kept first */
+   int k = stage == PIPE_SHADER_FRAGMENT ? 0 : stage == PIPE_SHADER_VERTEX ? 1 : -1;
+
+   if (k >= 0 && !keep)
+      kept_drop_stage(device, (unsigned)k);
 
    /* Each buffer bound as whatever the shader declared the index to be. Metal has one
     * [[buffer(n)]] index space and Gallium has two, so a `constant` parameter is a UBO
@@ -4272,17 +4335,39 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
 
    if (num_ssbo)
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
-   if (num_views)
-      pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);
    if (num_images)
       pipe->set_shader_images(pipe, stage, 0, num_images, 0, images);
-   if (num_samplers)
-      pipe->bind_sampler_states(pipe, stage, 0, num_samplers, samplers);
+   if (k >= 0 && keep) {
+      struct rwa_device *d = device;
+      unsigned had_views = d->kept[k].num_views, had_samplers = d->kept[k].num_samplers;
+      unsigned ns = MAX2(num_samplers, had_samplers);
+
+      /* the same views at the same slots, none more and none fewer: nothing to bind; else these, and the slots the
+       * last draw had beyond them let go */
+      if (num_views != had_views || memcmp(views, d->kept[k].views, num_views * sizeof(views[0])) != 0) {
+         pipe->set_sampler_views(pipe, stage, 0, num_views, had_views > num_views ? had_views - num_views : 0, false,
+                                 views);
+         memcpy(d->kept[k].views, views, sizeof(d->kept[k].views));
+         d->kept[k].num_views = num_views;
+      }
+      /* (samplers[] is zero past num_samplers, so binding ns of them clears what the last draw had beyond) */
+      if (num_samplers != had_samplers || memcmp(samplers, d->kept[k].samplers, ns * sizeof(samplers[0])) != 0) {
+         pipe->bind_sampler_states(pipe, stage, 0, ns, samplers);
+         memcpy(d->kept[k].samplers, samplers, sizeof(d->kept[k].samplers));
+         d->kept[k].num_samplers = num_samplers;
+      }
+      bound->num_views = bound->num_samplers = 0;   /* (left bound: nothing for unbind_stage to take back) */
+   } else {
+      if (num_views)
+         pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);
+      if (num_samplers)
+         pipe->bind_sampler_states(pipe, stage, 0, num_samplers, samplers);
+      bound->num_views = num_views;
+      bound->num_samplers = num_samplers;
+   }
 
    bound->num_ssbo = num_ssbo;
-   bound->num_views = num_views;
    bound->num_images = num_images;
-   bound->num_samplers = num_samplers;
    return 0;
 }
 
@@ -4397,7 +4482,7 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
    struct rwa_bound bound = { 0 };
    if (bind_stage(device, PIPE_SHADER_COMPUTE, &compute->info, compute->own_sampler,
                   compute->compare_sampler,
-                  bindings, table, table_count, name, &bound, why, why_size) != 0)
+                  bindings, table, table_count, name, &bound, false, why, why_size) != 0)
       return -1;
 
    struct pipe_grid_info grid = {
@@ -7034,6 +7119,7 @@ rwa_render_destroy(struct rwa_render *render)
    struct pipe_context *pipe = render->device->pipe;
 
    memset(&render->device->bound, 0, sizeof(render->device->bound));   /* (the K40's: rwa_device.bound says why) */
+   kept_drop(render->device);   /* (the K40's, 11-16: its own samplers may be what is kept bound, rwa_device.kept) */
    /* Unbound before deleted, each of them, for the reason delete_compute_state and
     * rwa_sampler_destroy give: a Gallium context holds a pointer to the state bound in
     * it, and softpipe's delete is a plain FREE, so a state deleted while bound leaves
@@ -7776,13 +7862,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    if (bind_stage(device, PIPE_SHADER_FRAGMENT, &render->finfo, render->frag_own_sampler,
                   render->frag_compare_sampler,
                   &draw->fragment, draw->fragment_buffer_table, draw->fragment_buffer_table_count,
-                  fname, &fbound, why, why_size) != 0)
+                  fname, &fbound, draw->keep_bound != 0, why, why_size) != 0)
       goto unbind;
    if (!render->generated_vertex &&
        bind_stage(device, PIPE_SHADER_VERTEX, &render->vinfo, render->vert_own_sampler,
                   render->vert_compare_sampler,
                   &draw->vertex, draw->vertex_buffer_table, draw->vertex_buffer_table_count, vname,
-                  &vbound, why, why_size) != 0)
+                  &vbound, draw->keep_bound != 0, why, why_size) != 0)
       goto unbind;
 
    /* clear_color NULL is MTLLoadActionLoad: keep what the attachment holds. A pointer
@@ -8486,6 +8572,8 @@ rwa_texture_swizzle(struct rwa_texture *texture, const unsigned char swizzle[4],
    /* (a view made before reads the old channels: the next binding makes another. Metal sets a
     * swizzle when it makes the texture, before anything samples it, so there is none) */
    if (texture->view) {
+      if (kept_holds(texture->device, texture->view, NULL))
+         kept_drop(texture->device);   /* (the K40's, 11-16: rwa_device.kept) */
       texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
       texture->view = NULL;
    }

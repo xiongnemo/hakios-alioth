@@ -5814,6 +5814,8 @@ enum {
 	id _upload;
 	NSUInteger _uploadUsed, _uploadSize;
 	NSMutableArray *_uploads;
+	char *_uploadBase;              /* (11-16) _upload's contents, and the lock the area is filled under */
+	os_unfair_lock _uploadLock;
 	/* (the K40's, 11-16) render passes made on it; the visibility step whose query runs now (-aliothQueryStep:) */
 	unsigned _passes;
 	AliothMetalQuery *_activeQuery;
@@ -5912,37 +5914,44 @@ enum {
  */
 - (id)aliothUpload:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset
 {
-	@synchronized (self) {
-		NSUInteger at = (_uploadUsed + 255) & ~(NSUInteger)255;
+	/* (11-16) an unfair lock, not @synchronized: one is taken at every -setBytes:, and @synchronized looks its lock up
+	 * in a table each time (id2data -- Flutter's own @synchronized was 14% of its raster thread, round b10) */
+	id upload;
 
-		if (_upload == nil || at + length > _uploadSize) {
-			NSUInteger size = _uploadSize != 0 ? _uploadSize * 2 : 65536;
+	os_unfair_lock_lock(&_uploadLock);
+	NSUInteger at = (_uploadUsed + 255) & ~(NSUInteger)255;
 
-			while (size < length) {
-				size *= 2;
-			}
-			id made = [[self device] newBufferWithLength:size options:0];
+	if (_upload == nil || at + length > _uploadSize) {
+		NSUInteger size = _uploadSize != 0 ? _uploadSize * 2 : 65536;
 
-			if (made == nil || [made contents] == NULL) {
-				[made release];
-				return nil;
-			}
-			if (_uploads == nil) {
-				_uploads = [[NSMutableArray alloc] init];
-			}
-			[_uploads addObject:made];
+		while (size < length) {
+			size *= 2;
+		}
+		id made = [[self device] newBufferWithLength:size options:0];
+
+		if (made == nil || [made contents] == NULL) {
 			[made release];
-			_upload = made;
-			_uploadSize = size;
-			at = 0;
+			os_unfair_lock_unlock(&_uploadLock);
+			return nil;
 		}
-		if (bytes != NULL && length != 0) {
-			memcpy((char *)[_upload contents] + at, bytes, length);
+		if (_uploads == nil) {
+			_uploads = [[NSMutableArray alloc] init];
 		}
-		_uploadUsed = at + length;
-		*offset = at;
-		return _upload;
+		[_uploads addObject:made];
+		[made release];
+		_upload = made;
+		_uploadBase = (char *)[made contents];
+		_uploadSize = size;
+		at = 0;
 	}
+	if (bytes != NULL && length != 0) {
+		memcpy(_uploadBase + at, bytes, length);
+	}
+	_uploadUsed = at + length;
+	*offset = at;
+	upload = _upload;
+	os_unfair_lock_unlock(&_uploadLock);
+	return upload;
 }
 
 /*
