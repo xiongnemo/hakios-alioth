@@ -8276,6 +8276,21 @@ rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, struct r
    blit.dst.box.z = (int)dst->base_layer;
    blit.mask = util_format_is_depth_or_stencil(src->res->format) ? PIPE_MASK_ZS : PIPE_MASK_RGBA;
    blit.filter = PIPE_TEX_FILTER_NEAREST;
+   /*
+    * (the K40's, 11-16) INTO AN IOSURFACE, BY A DRAW. A multisample source always went through u_blitter's 3D draw (fd6's
+    * 2D engine declines one), and those pictures reached the screen. A one-sample source -- the tile resolve's proxy
+    * (alioth_metal.m -aliothTileProxyLike:) -- went through the 2D engine, and Flutter's screen stayed black that way
+    * (round b10, 8 of 8), as it did when the tile store's blit event wrote the drawable itself (b9). Until that is
+    * understood, a copy into an imported surface asks for an identity swizzle, which fd6's 2D blit declines
+    * (fd6_blitter.cc can_do_blit), so that u_blitter draws it as it drew every resolve that was seen.
+    */
+   if (dst->imported && blit.mask == PIPE_MASK_RGBA && src->res->nr_samples <= 1) {
+      blit.swizzle_enable = true;
+      blit.swizzle[0] = PIPE_SWIZZLE_X;
+      blit.swizzle[1] = PIPE_SWIZZLE_Y;
+      blit.swizzle[2] = PIPE_SWIZZLE_Z;
+      blit.swizzle[3] = PIPE_SWIZZLE_W;
+   }
    device->pipe->blit(device->pipe, &blit);
    device->pipe->flush(device->pipe, NULL, 0);
    return 0;
