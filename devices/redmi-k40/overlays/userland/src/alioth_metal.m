@@ -4123,6 +4123,20 @@ alioth_peek(void *surface, id texture, unsigned passes, unsigned tiled, NSString
 		}
 	}
 	memcpy(c, base + row * (height / 2) + 4 * (width / 2), 4);
+	/* and every second pixel of every second row: how many are not transparent and how many not black -- the 64
+	 * points miss sparse content (a frame of small circles), which left round b26 unreadable */
+	size_t opaque = 0, coloured = 0, looked = 0;
+
+	for (size_t y = 0; y < height; y += 2) {
+		const uint8_t *r = base + row * y;
+
+		for (size_t x = 0; x < width; x += 2, looked++) {
+			const uint8_t *px = r + 4 * x;
+
+			opaque += px[3] != 0;
+			coloured += (px[0] | px[1] | px[2]) != 0;
+		}
+	}
 	(void)alioth_surface.unlock(surface, 1, NULL);
 	/* the same centre through the GPU driver's own read (what an application's -getBytes: sees): if this has the picture
 	 * and the memory above has not, the processor's view of the surface is stale, not the drawing */
@@ -4137,6 +4151,8 @@ alioth_peek(void *surface, id texture, unsigned passes, unsigned tiled, NSString
 	    "points in its memory %u not black, %u with opacity 0; the centre B G R A %u %u %u %u in memory, %s %u %u %u %u\n",
 	    width, height, passes, tiled, lit, clear, c[0], c[1], c[2], c[3], read ? "through the driver" : "(not read through "
 	    "the driver)", g[0], g[1], g[2], g[3]);
+	rw_print("peek:   a quarter of its pixels looked at (%zu): %zu not transparent (%.1f%%), %zu not black (%.1f%%)\n", looked,
+	    opaque, looked ? 100.0 * opaque / looked : 0.0, coloured, looked ? 100.0 * coloured / looked : 0.0);
 	if ([census length] != 0) {
 		rw_print("peek:   its draws by pipeline label: %s\n", [census UTF8String]);
 	}
