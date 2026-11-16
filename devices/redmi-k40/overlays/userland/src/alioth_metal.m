@@ -5732,6 +5732,7 @@ alioth_clear_semaphore_debt(id commandBuffer)
 	dispatch_queue_t _waitQueue;         /* (the K40's) where this queue's buffers wait for the GPU, in order */
 	NSMutableArray *_order;              /* (the K40's) buffers enqueued and not yet run, in enqueue order */
 	BOOL _draining;                      /* (the K40's) a thread is running them (-aliothCommitInOrder:) */
+	dispatch_queue_t _runQueue;          /* (the K40's, 11-17) metal_run_thread=1: where they run instead */
 }
 
 - (instancetype)initWithAliothDevice:(AliothMetalDevice *)device descriptor:(id)descriptor
@@ -5946,9 +5947,62 @@ alioth_clear_semaphore_debt(id commandBuffer)
 	}
 }
 
+/*
+ * (the K40's, 11-17) boot-arg metal_run_thread=1 (a test road): a committed buffer runs on a serial queue of the command
+ * queue's own, not on the thread that committed it. Running it -- the recorded draws into the compiler library, the
+ * tiles' commands at the flush, the kernel's submit -- was 33% of Flutter's raster thread (psample, round b34), time in
+ * which it could have been encoding its next frame; Metal's -commit promises nothing synchronous. The waits already
+ * handle a buffer committed and not yet run (-waitUntilScheduled, -waitUntilCompleted wait for _ranGroup), as they had
+ * to for one held back behind an earlier, uncommitted buffer.
+ */
+static BOOL
+alioth_run_thread(void)
+{
+	static dispatch_once_t once;
+	static BOOL on;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_run_thread=1") != NULL) {
+			on = YES;
+			rw_print("metal_run_thread=1: command buffers run on a queue of their command queue's (a test road)\n");
+		}
+	});
+	return on;
+}
+
+- (dispatch_queue_t)aliothRunQueue
+{
+	@synchronized (self) {
+		if (_runQueue == nil) {
+			dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+			    QOS_CLASS_USER_INTERACTIVE, 0);
+
+			_runQueue = dispatch_queue_create("aliothmetal.run", attr);
+		}
+		return _runQueue;
+	}
+}
+
 - (void)aliothCommitInOrder:(AliothMetalCommandBuffer *)buffer
 {
+	if (alioth_run_thread()) {
+		[self aliothEnqueue:buffer];
+		/* (the block keeps this queue, and the buffer is in _order, which keeps it, until it has run) */
+		dispatch_async([self aliothRunQueue], ^{
+			[self aliothDrainInOrder];
+		});
+		return;
+	}
 	[self aliothEnqueue:buffer];
+	[self aliothDrainInOrder];
+}
+
+/* the queue's committed buffers, run in enqueue order, by whichever thread got here first (-aliothCommitInOrder:) */
+- (void)aliothDrainInOrder
+{
 	@synchronized (self) {
 		if (_draining) {
 			return;         /* (the thread running this queue's buffers comes to it in its turn) */
@@ -5979,6 +6033,9 @@ alioth_clear_semaphore_debt(id commandBuffer)
 	[_completionQueue release];
 	if (_waitQueue != nil) {
 		dispatch_release(_waitQueue);
+	}
+	if (_runQueue != nil) {
+		dispatch_release(_runQueue);
 	}
 	[_order release];
 	[super dealloc];
