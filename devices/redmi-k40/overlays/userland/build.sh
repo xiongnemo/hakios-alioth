@@ -335,6 +335,15 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# ... and what this GPU makes of an unsigned integer turned into a float (src/u2f_test.c)
 			$DYN $M/libOSMesa.8.dylib -o obj/u2f_test src/u2f_test.c
 			cp $M/libOSMesa.8.dylib obj/
+			# (the K40's, 11-17) the names of the unstripped library beside the stripped one (FILE.nm: what
+			# tools/psample-report.py reads to name a stripped binary's frames -- the compositor's GL was addresses)
+			for u in ../xnu-deps/build/mesa/build-*/src/gallium/targets/osmesa/libOSMesa.8.dylib; do
+				[ -f "$u" ] && { llvm-nm -n --defined-only "$u" > obj/libOSMesa.8.dylib.nm 2>/dev/null ||
+					rm -f obj/libOSMesa.8.dylib.nm; }
+				break
+			done
+			llvm-nm -n --defined-only obj/libhakios.gl.dylib > obj/libhakios.gl.dylib.nm 2>/dev/null ||
+				rm -f obj/libhakios.gl.dylib.nm
 			# air_run draws with a Metal shader translated by the AIR frontend
 			# and reads the pixels back (docs/air.md). It is built inside the
 			# Mesa build, because it needs Gallium itself and not the gl*
@@ -356,6 +365,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.metal.dylib -framework Foundation -framework IOKit \
 				-framework Metal -lobjc -Wno-deprecated-declarations -o obj/libhakios.metal.dylib \
 				src/alioth_metal.m src/alioth_drawable.m src/alioth_mps.m
+			# (the K40's, 11-17) both libraries' names for tools/psample-report.py (FILE.nm), the static functions too
+			llvm-nm -n --defined-only obj/libhakios.metal.dylib > obj/libhakios.metal.dylib.nm 2>/dev/null ||
+				rm -f obj/libhakios.metal.dylib.nm
+			[ -f $MM/libhakios.air.nm ] && cp $MM/libhakios.air.nm obj/libhakios.air.dylib.nm
 		fi
 	fi
 	if [ -n "$COMPILE_ONLY" ]; then
