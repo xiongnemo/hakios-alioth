@@ -207,8 +207,21 @@ static struct {
 	uint64_t making;                        /* ... and the time it took to make the others */
 	uint32_t invalidated;                   /* surfaces the GPU wrote, out of this processor's cache before they are shown */
 	uint64_t invalidating;                  /* ... and the time that took */
+	uint32_t pushes;                        /* (11-17) surfaces pushed out of the cache for a submission ... */
+	uint64_t biggest_push;                  /* ... and the biggest of them, bytes */
 } gGPUStat;
 static TUNABLE(uint32_t, gInvalScan, "gpu_inval_scan", 0);
+/*
+ * (the K40's, 11-17) Test roads for the cache pass of a submission (submit()). It pushes a surface's every line out of
+ * this processor's cache when its seed moved, when this program has the buffer mapped, when it was last pushed
+ * gpu_push_ms ago or more -- and whenever the submission names it for WRITING. freedreno names every buffer for
+ * reading and writing alike, so that last reason is every submission: 3-3.5 MB pushed a submission while Flutter
+ * animates, 94-162 us each, 215-370 ms of the submitting threads' time every 5 s (rounds b12/b13), for surfaces only
+ * the GPU writes -- a drawable, CoreAnimation's frames -- whose lines this processor never dirtied.
+ * gpu_push_write=0: naming a surface for writing is no reason by itself. gpu_push_ms=N: the again-interval.
+ */
+static TUNABLE(uint32_t, gPushWrite, "gpu_push_write", 1);
+static TUNABLE(uint32_t, gPushAgainMs, "gpu_push_ms", GPU_PUSH_AGAIN_MS);
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -1143,7 +1156,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 	 * ordinary memory (gpu_cached=1).
 	 */
 	began = mach_absolute_time();
-	nanoseconds_to_absolutetime(GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
+	nanoseconds_to_absolutetime((uint64_t) gPushAgainMs * NSEC_PER_MSEC, &again);
 	for (uint32_t i = 0; i < request->nr_bos; i++) {
 		struct gpu_buffer * b = buffer(bos[i].handle);
 
@@ -1163,11 +1176,15 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			uint32_t seed = b->surface->shared()->seed;
 
 			if (seed == b->seed && !b->seen && began - b->pushed < again &&
-			    !(bos[i].flags & MSM_SUBMIT_BO_WRITE)) {
+			    (!gPushWrite || !(bos[i].flags & MSM_SUBMIT_BO_WRITE))) {
 				continue;
 			}
 			b->seed = seed;
 			b->pushed = began;
+			gGPUStat.pushes++;
+			if (b->size > gGPUStat.biggest_push) {
+				gGPUStat.biggest_push = b->size;
+			}
 		} else if (!b->seen || !gGPUCached) {
 			continue;
 		}
@@ -1264,9 +1281,11 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 
 		absolutetime_to_nanoseconds(gGPUStat.invalidating, &invalidating);
 		IOLog("HakiosGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept); %u surfaces out of the "
-		    "cache before they were shown, in %llu us each\n", gGPUStat.made,
-		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20,
-		    gGPUStat.invalidated, gGPUStat.invalidated ? invalidating / NSEC_PER_USEC / gGPUStat.invalidated : 0);
+		    "cache before they were shown, in %llu us each; %u surfaces pushed for submissions, the biggest %llu KB\n",
+		    gGPUStat.made, gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again,
+		    fKeptBytes >> 20, gGPUStat.invalidated,
+		    gGPUStat.invalidated ? invalidating / NSEC_PER_USEC / gGPUStat.invalidated : 0, gGPUStat.pushes,
+		    gGPUStat.biggest_push >> 10);
 		IOLog("HakiosGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
