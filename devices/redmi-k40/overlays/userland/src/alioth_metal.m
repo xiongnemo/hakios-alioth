@@ -695,6 +695,33 @@ static uint64_t alioth_stats_t[ST_N], alioth_stats_n[ST_N], alioth_stats_max[ST_
 static uint64_t alioth_blit_kinds[8];   /* the processor's blits by AliothMetalBlit kind (fill, b2b, b2t, t2b, t2t, mips) */
 /* (the K40's, 11-16) render passes in the window: all, multisample, resolved in the tiles, resolved by a blit */
 static uint64_t alioth_pass_counts[4];
+/* (the K40's, 11-16) memoryless textures made without memory, and of them given memory at a first real use (counted
+ * whatever metal_stats says; said in its window line) */
+static uint64_t alioth_memoryless_counts[2];
+
+/* (the K40's, 11-16) boot-arg metal_lazy_memoryless=0: memoryless textures get their memory when made, as before */
+static BOOL
+alioth_lazy_memoryless(void)
+{
+	static dispatch_once_t once;
+	static BOOL lazy = YES;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		lazy = !(sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 &&
+		    strstr(args, "metal_lazy_memoryless=0") != NULL);
+	});
+	return lazy;
+}
+
+static BOOL
+alioth_swizzle_is_identity(MTLTextureSwizzleChannels s)
+{
+	return s.red == MTLTextureSwizzleRed && s.green == MTLTextureSwizzleGreen && s.blue == MTLTextureSwizzleBlue &&
+	    s.alpha == MTLTextureSwizzleAlpha;
+}
 static mach_timebase_info_data_t alioth_timebase;
 static id (*alioth_next_drawable_imp)(id, SEL);
 
@@ -780,9 +807,11 @@ alioth_stats_commit(void)
 		passes[i] = __atomic_exchange_n(&alioth_pass_counts[i], 0, __ATOMIC_RELAXED);
 	}
 	if (passes[0] != 0) {
-		rw_print("stats: %llu render passes, %llu of them multisample: %llu resolved in the tiles, %llu by a blit\n",
+		rw_print("stats: %llu render passes, %llu of them multisample: %llu resolved in the tiles, %llu by a blit; "
+		         "memoryless textures so far %llu, %llu of them given memory at a first use\n",
 		         (unsigned long long)passes[0], (unsigned long long)passes[1], (unsigned long long)passes[2],
-		         (unsigned long long)passes[3]);
+		         (unsigned long long)passes[3], (unsigned long long)alioth_memoryless_counts[0],
+		         (unsigned long long)alioth_memoryless_counts[1]);
 	}
 	if (n[ST_BLIT] != 0) {
 		rw_print("stats: the processor's blits: %llu fill, %llu buffer to buffer, %llu buffer to texture, %llu texture "
@@ -1902,6 +1931,7 @@ enum {
 	AliothMetalDevice *_owner;
 	struct rwa_texture *_texture;
 	struct rwa_texture_shape _shape;
+	BOOL _lazy;                /* (the K40's, 11-16) memoryless: _texture made at the first -mesaTexture */
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
 	id _parent;                /* (the K40's) a view's texture, retained: -parentTexture */
 	NSUInteger _parentLevel, _parentSlice;   /* (the K40's) where a view starts in its parent */
@@ -1912,6 +1942,8 @@ enum {
 	NSUInteger _shadowPlane;
 }
 @property (readonly) struct rwa_texture *mesaTexture;
+/* (the K40's, 11-16) made with no compiler-library texture yet: memoryless, given memory at the first -mesaTexture */
+- (void)aliothSetLazy;
 /* (the K40's) what a pass draws into for this texture at an attachment's level and slice */
 - (id)aliothAttachmentLevel:(NSUInteger)level slice:(NSUInteger)slice;
 /* (the K40's) what sampling it reads, channel by channel: MTLTextureDescriptor.swizzle, a view's */
@@ -2659,13 +2691,28 @@ enum {
 		.sample_count = (unsigned)[descriptor sampleCount],
 		.usage = (unsigned)[descriptor usage],
 	};
-	struct rwa_texture *texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
+	/*
+	 * (the K40's, 11-16) MTLStorageModeMemoryless: a texture whose contents live only in the GPU's tile memory during a
+	 * pass (Metal allows it only as an attachment that is not loaded or stored). Its memory is made at its first real
+	 * use (-mesaTexture), not here: a multisample attachment resolved in the tiles (alioth_tile_resolve_fits) is never
+	 * used at all -- Flutter's Impeller makes its 4x targets memoryless on an Apple-family device, ~44 MB for a
+	 * full-screen BGRA8 one. One with a swizzle is made at once (rare). Boot-arg metal_lazy_memoryless=0: at once.
+	 */
+	BOOL lazy = [descriptor storageMode] == MTLStorageModeMemoryless && alioth_lazy_memoryless() &&
+	    alioth_swizzle_is_identity([descriptor swizzle]);
+	struct rwa_texture *texture = lazy ? NULL : mesa.texture_create(_mesa, &shape, why, sizeof(why));
 
-	if (texture == NULL) {
+	if (texture == NULL && !lazy) {
 		rw_print("%s\n", why);
 		return nil;
 	}
 	AliothMetalTexture *made = [[AliothMetalTexture alloc] initWithAliothDevice:self texture:texture shape:&shape];
+
+	if (made != nil && lazy) {
+		[made aliothSetLazy];
+		__atomic_fetch_add(&alioth_memoryless_counts[0], 1, __ATOMIC_RELAXED);
+		return made;
+	}
 
 	/* (the K40's) MTLTextureDescriptor.swizzle: what sampling it reads (nil when that cannot be done: a
 	 * texture whose channels came back in another order would be found much later, by a picture) */
@@ -4008,7 +4055,30 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 	(void)alioth_surface.unlock(_shadowSurface, 0, NULL);
 }
 
-- (struct rwa_texture *)mesaTexture { return _texture; }
+/* (the K40's, 11-16) a memoryless texture's memory, made here at its first real use (-newTextureWithDescriptor:) */
+- (void)aliothSetLazy { _lazy = YES; }
+
+- (struct rwa_texture *)mesaTexture
+{
+	struct rwa_texture *t = __atomic_load_n(&_texture, __ATOMIC_ACQUIRE);
+
+	if (t == NULL && _lazy) {
+		@synchronized (self) {
+			if ((t = _texture) == NULL) {
+				char why[256] = { 0 };
+
+				t = mesa.texture_create([_owner mesaDevice], &_shape, why, sizeof(why));
+				if (t == NULL) {
+					RW_AGAIN("a memoryless texture's memory, made at its first use: %s\n", why);
+				} else {
+					__atomic_store_n(&_texture, t, __ATOMIC_RELEASE);
+					__atomic_fetch_add(&alioth_memoryless_counts[1], 1, __ATOMIC_RELAXED);
+				}
+			}
+		}
+	}
+	return t;
+}
 
 - (id)device                       { return _owner; }
 - (NSUInteger)width                { return _shape.width; }
@@ -4089,7 +4159,7 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 	for (size_t i = 3; !alpha && i < pw * ph * 4; i += 4) {
 		pixels[i] = 255;
 	}
-	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, pixels, pw * 4, why,
+	if (mesa.texture_write([self mesaTexture], (unsigned)level, (unsigned)slice, origin, size, pixels, pw * 4, why,
 			       sizeof(why)) != 0) {
 		rw_print("writing decoded PVRTC texels: %s\n", why);
 	}
@@ -4119,7 +4189,7 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 		for (unsigned z = 0; z < size[2]; z++) {
 			unsigned at[3] = { origin[0], origin[1], origin[2] + z }, one[3] = { size[0], size[1], 1 };
 
-			if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, at, one,
+			if (mesa.texture_write([self mesaTexture], (unsigned)level, (unsigned)slice, at, one,
 					       (const char *)bytes + (size_t)z * image, stride, why, sizeof(why)) != 0) {
 				rw_print("writing texels: %s\n", why);
 				return;
@@ -4127,7 +4197,7 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 		}
 		return;
 	}
-	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+	if (mesa.texture_write([self mesaTexture], (unsigned)level, (unsigned)slice, origin, size, bytes,
 			       stride, why, sizeof(why)) != 0) {
 		rw_print("writing texels: %s\n", why);
 	}
@@ -4160,7 +4230,7 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 		for (unsigned z = 0; z < size[2]; z++) {
 			unsigned at[3] = { origin[0], origin[1], origin[2] + z }, one[3] = { size[0], size[1], 1 };
 
-			if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, at, one,
+			if (mesa.texture_read([self mesaTexture], (unsigned)level, (unsigned)slice, at, one,
 					      (char *)bytes + (size_t)z * image, stride, why, sizeof(why)) != 0) {
 				rw_print("reading texels: %s\n", why);
 				return;
@@ -4168,7 +4238,7 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 		}
 		return;
 	}
-	if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+	if (mesa.texture_read([self mesaTexture], (unsigned)level, (unsigned)slice, origin, size, bytes,
 			      stride, why, sizeof(why)) != 0) {
 		rw_print("reading texels: %s\n", why);
 	}
@@ -4198,7 +4268,7 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 		         "older than this driver and cannot say what a depth buffer holds\n");
 		return NO;
 	}
-	if (mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why,
+	if (mesa.depth_read([self mesaTexture], 0, 0, origin, size, depth, stencil, why,
 			    sizeof(why)) != 0) {
 		rw_print("reading the depth of a texture: %s\n", why);
 		return NO;
@@ -4272,9 +4342,9 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 	shape.pixel_format = (unsigned)format;
 	shape.type = (unsigned)type;
 	view = mesa.texture_subview != NULL ?
-	    mesa.texture_subview(_texture, &shape, (unsigned)levels.location, (unsigned)levels.length,
+	    mesa.texture_subview([self mesaTexture], &shape, (unsigned)levels.location, (unsigned)levels.length,
 		(unsigned)slices.location, (unsigned)slices.length, why, sizeof(why)) :
-	    mesa.texture_view(_texture, &shape, why, sizeof(why));
+	    mesa.texture_view([self mesaTexture], &shape, why, sizeof(why));
 	if (view == NULL) {
 		RW_AGAIN("a texture view of levels %lu+%lu and slices %lu+%lu: %s; nil\n", (unsigned long)levels.location,
 			 (unsigned long)levels.length, (unsigned long)slices.location, (unsigned long)slices.length, why);
@@ -4312,7 +4382,7 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 			 channels[0], channels[1], channels[2], channels[3]);
 		return NO;
 	}
-	if (mesa.texture_swizzle(_texture, channels, why, sizeof(why)) != 0) {
+	if (mesa.texture_swizzle([self mesaTexture], channels, why, sizeof(why)) != 0) {
 		RW_AGAIN("a texture swizzled %u %u %u %u: %s; nil\n", channels[0], channels[1], channels[2], channels[3],
 			 why);
 		return NO;
@@ -4353,7 +4423,7 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 			return nil;
 		}
 		shape.type = ms ? MTLTextureType2DMultisample : MTLTextureType2D;
-		t = mesa.texture_subview(_texture, &shape, (unsigned)level, 1, (unsigned)slice, 1, why, sizeof(why));
+		t = mesa.texture_subview([self mesaTexture], &shape, (unsigned)level, 1, (unsigned)slice, 1, why, sizeof(why));
 		if (t == NULL) {
 			RW_AGAIN("a pass into level %lu, slice %lu of a texture: %s; drawn into the texture as it is\n",
 				 (unsigned long)level, (unsigned long)slice, why);
