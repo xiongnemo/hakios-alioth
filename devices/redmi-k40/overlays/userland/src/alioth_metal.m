@@ -7889,7 +7889,7 @@ static int
 alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 {
 	static dispatch_once_t once;
-	static BOOL off, iosurfaces, proxies;
+	static BOOL off, iosurfaces = YES, proxies;
 	id texture = [attachment texture], resolve = [attachment resolveTexture];
 	NSUInteger level = [attachment level], resolveLevel = [attachment resolveLevel];
 
@@ -7899,15 +7899,15 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 
 		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0) {
 			off = strstr(args, "metal_tile_resolve=0") != NULL;
-			/* (test roads for a pass into an IOSurface, both of which left Flutter's screenshots black on 11-16: 2
-			 * straight into it as 3fb7c06 did, 3 into a proxy copied by a blit as 78b7ef9 did) */
-			iosurfaces = strstr(args, "metal_tile_resolve=2") != NULL;
+			/* (11-17: straight into IOSurfaces is the default again; 4 = the old road for them as 83f0925 had it,
+			 * 3 = into a proxy then a blit as 78b7ef9 did -- a test road) */
 			proxies = strstr(args, "metal_tile_resolve=3") != NULL;
+			iosurfaces = strstr(args, "metal_tile_resolve=4") == NULL && !proxies;
 		}
-		if (off || iosurfaces || proxies) {
-			rw_print("metal_tile_resolve=%d: multisample resolves %s\n", off ? 0 : iosurfaces ? 2 : 3, off ? "go through "
-			    "memory and a blit" : iosurfaces ? "in the tiles straight into IOSurfaces too (a test road)" : "in the tiles "
-			    "into a proxy for an IOSurface, then a blit (a test road)");
+		if (off || !iosurfaces) {
+			rw_print("metal_tile_resolve=%d: multisample resolves %s\n", off ? 0 : proxies ? 3 : 4, off ? "go through "
+			    "memory and a blit" : proxies ? "in the tiles into a proxy for an IOSurface, then a blit (a test road)" :
+			    "in the tiles, but into IOSurfaces through memory and a blit");
 		}
 	});
 	if (off || mesa.draw_features == NULL || !(mesa.draw_features() & RWA_DRAW_TILE_RESOLVE) ||
@@ -7923,14 +7923,12 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 		return ALIOTH_TILE_NO;
 	}
 	/*
-	 * (11-16) NOT FOR A PASS INTO AN IOSURFACE. Flutter's on-screen pass (4x BGRA8 + 4x Depth32Float_Stencil8,
-	 * resolved into its drawable) left the screenshots BLACK whichever way it resolved in the tiles -- straight into
-	 * the drawable (round b9, 2 of 2) or into a proxy of the driver's own copied by the old road's blit (round b10, 8
-	 * of 8) -- while the same session's old road drew 2 of 2, Flutter's own read-back checks passed, a drawable read
-	 * back by its application was right (System Check metal.msaa.drawable) and the display took Flutter's frames at
-	 * 74 a second. Whether the panel was black or only the screenshot (the loader reading the panel's memory) is not
-	 * known without eyes on the screen. Until it is, a pass into an IOSurface takes the old road; the driver's own
-	 * textures (offscreen multisample: engines') resolve in the tiles. metal_tile_resolve=2 / =3: the two roads above.
+	 * (11-17) INTO AN IOSURFACE TOO, AGAIN. On 11-16 Flutter's on-screen pass resolved in the tiles into its drawable
+	 * came out empty, and IOSurfaces were kept on the old road (83f0925). The cause was not the IOSurface: freedreno's
+	 * hardware binning read Impeller's vertex positions from the wrong register (its vertex stages put the position
+	 * last; fixed in the compiler library, 4d0fde0), and a pass resolved in the tiles is always binned. Since the fix
+	 * (round b34): Flutter drawn, its frame test 91-100 a second against 74 on the old road, its GPU time a command
+	 * buffer 4.5-6.1 ms against 9.6. metal_tile_resolve=4: IOSurfaces through memory and a blit as before; =3: a proxy.
 	 */
 	if ([(AliothMetalTexture *)resolve aliothImported]) {
 		return iosurfaces ? ALIOTH_TILE_DIRECT : proxies ? ALIOTH_TILE_PROXY : ALIOTH_TILE_NO;
