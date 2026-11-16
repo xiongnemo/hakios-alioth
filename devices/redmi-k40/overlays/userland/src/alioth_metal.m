@@ -698,6 +698,9 @@ static uint64_t alioth_pass_counts[4];
 /* (the K40's, 11-16) memoryless textures made without memory, and of them given memory at a first real use (counted
  * whatever metal_stats says; said in its window line) */
 static uint64_t alioth_memoryless_counts[2];
+/* (the K40's, 11-17) works in the window: taken from the pool, made fresh because it was empty (+[AliothMetalWork
+ * allocWithZone:]) -- the run thread keeps more buffers in flight, so more works alive at once */
+static uint64_t alioth_work_counts[2];
 
 /* (the K40's, 11-16) boot-arg metal_lazy_memoryless=0: memoryless textures get their memory when made, as before */
 static BOOL
@@ -812,6 +815,13 @@ alioth_stats_commit(void)
 		         (unsigned long long)passes[0], (unsigned long long)passes[1], (unsigned long long)passes[2],
 		         (unsigned long long)passes[3], (unsigned long long)alioth_memoryless_counts[0],
 		         (unsigned long long)alioth_memoryless_counts[1]);
+	}
+	uint64_t reused = __atomic_exchange_n(&alioth_work_counts[0], 0, __ATOMIC_RELAXED);
+	uint64_t fresh = __atomic_exchange_n(&alioth_work_counts[1], 0, __ATOMIC_RELAXED);
+
+	if (reused + fresh != 0) {
+		rw_print("stats: works: %llu from the pool, %llu made fresh (it was empty)\n", (unsigned long long)reused,
+		    (unsigned long long)fresh);
 	}
 	if (n[ST_BLIT] != 0) {
 		rw_print("stats: the processor's blits: %llu fill, %llu buffer to buffer, %llu buffer to texture, %llu texture "
@@ -5480,7 +5490,9 @@ out:
  * only. Boot-arg metal_work_pool=0: malloc and free every time, as before.
  */
 static os_unfair_lock alioth_work_lock = OS_UNFAIR_LOCK_INIT;
-static void *alioth_work_pool[512];
+/* (11-17: 2048, was 512 -- the run thread keeps ~9 of Flutter's 48-draw buffers in flight and their works alive until
+ * each completes; 2048 x ~2.4 KB is at most ~5 MB kept, and only after such a peak) */
+static void *alioth_work_pool[2048];
 static unsigned alioth_work_pooled;
 
 static BOOL
@@ -5512,8 +5524,10 @@ alioth_work_pool_on(void)
 		os_unfair_lock_unlock(&alioth_work_lock);
 	}
 	if (bytes == NULL) {
+		__atomic_fetch_add(&alioth_work_counts[1], 1, __ATOMIC_RELAXED);
 		return [super allocWithZone:zone];
 	}
+	__atomic_fetch_add(&alioth_work_counts[0], 1, __ATOMIC_RELAXED);
 	memset(bytes, 0, class_getInstanceSize(self));
 	return objc_constructInstance(self, bytes);
 }
