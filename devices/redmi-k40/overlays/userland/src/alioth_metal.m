@@ -7351,7 +7351,7 @@ static BOOL
 alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 {
 	static dispatch_once_t once;
-	static BOOL off;
+	static BOOL off, iosurfaces;
 	id texture = [attachment texture], resolve = [attachment resolveTexture];
 	NSUInteger level = [attachment level], resolveLevel = [attachment resolveLevel];
 
@@ -7359,9 +7359,14 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 		char args[1024] = "";
 		size_t len = sizeof(args) - 1;
 
-		off = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_tile_resolve=0") != NULL;
-		if (off) {
-			rw_print("metal_tile_resolve=0: multisample resolves go through memory and a blit\n");
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0) {
+			off = strstr(args, "metal_tile_resolve=0") != NULL;
+			/* (a test road: into IOSurfaces too, as 3fb7c06 did -- to study why their screen stayed black) */
+			iosurfaces = strstr(args, "metal_tile_resolve=2") != NULL;
+		}
+		if (off || iosurfaces) {
+			rw_print("metal_tile_resolve=%d: multisample resolves %s\n", off ? 0 : 2, off ? "go through memory and a blit" :
+			    "in the tiles into IOSurfaces too (a test road)");
 		}
 	});
 	if (off || mesa.draw_features == NULL || !(mesa.draw_features() & RWA_DRAW_TILE_RESOLVE) ||
@@ -7377,7 +7382,7 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 	 * compositor reads (not understood yet). The driver's own textures resolve in the tiles; a drawable keeps the blit.
 	 */
 	return [texture sampleCount] > 1 && [resolve sampleCount] == 1 && [texture pixelFormat] == [resolve pixelFormat] &&
-	    ([resolve usage] & MTLTextureUsageRenderTarget) != 0 && ![(AliothMetalTexture *)resolve aliothImported] &&
+	    ([resolve usage] & MTLTextureUsageRenderTarget) != 0 && (iosurfaces || ![(AliothMetalTexture *)resolve aliothImported]) &&
 	    MAX([texture width] >> level, 1u) == MAX([resolve width] >> resolveLevel, 1u) &&
 	    MAX([texture height] >> level, 1u) == MAX([resolve height] >> resolveLevel, 1u);
 }
