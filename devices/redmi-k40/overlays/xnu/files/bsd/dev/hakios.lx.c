@@ -580,6 +580,18 @@ lx_os_station_lost(int error)
 	hakios_sta_lost(error);
 }
 
+void
+lx_os_station_associated(void)
+{
+	hakios_sta_associated();
+}
+
+int
+lx_os_station_asked(void)
+{
+	return hakios_sta_asked() ? 1 : 0;
+}
+
 /* ---- the driver ---------------------------------------------------------------------------------------- */
 
 /* The object has its own; this is the one of a kernel built without it. */

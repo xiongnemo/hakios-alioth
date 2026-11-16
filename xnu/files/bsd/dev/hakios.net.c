@@ -144,9 +144,18 @@ net_output(ifnet_t ifp, mbuf_t packet)
 {
 	struct net_if *n = net_if_of(ifp);
 	size_t length = mbuf_pkthdr_len(packet);
-	bool sent = false;
+	bool sent = false, eapol = false;
+	uint8_t type[2];
 
-	if (length <= HAKIOS_NET_FRAME_MAX && n->up) {
+	/*
+	 * (2026-11-16) A radio's link is up once its network is joined with keys; before that an 802.1X client (iOS's
+	 * eapolclient, through an ndrv socket) has to talk with the access point: frames of type 0x888e go to the link
+	 * while it is down, and the link decides (hakios.lx: only while associated with an 802.1X network).
+	 */
+	if (!n->up && n->link->wireless && length >= ETHER_HDR_LEN && mbuf_copydata(packet, 12, 2, type) == 0) {
+		eapol = type[0] == 0x88 && type[1] == 0x8e;
+	}
+	if (length <= HAKIOS_NET_FRAME_MAX && (n->up || eapol)) {
 		bpf_tap_out(ifp, DLT_EN10MB, packet, NULL, 0);
 		trace_packet(packet, length);
 		lck_mtx_lock(&n->tx_lock);

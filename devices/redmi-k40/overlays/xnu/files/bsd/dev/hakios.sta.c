@@ -320,7 +320,52 @@ hakios_sta_lost(int error)
 	thread_wakeup((event_t)&sta_ops);
 }
 
+/* (on the station's join, from the thread here: the listener is told at once, as of a join that is over) */
+void
+hakios_sta_associated(void)
+{
+	hakios_apple80211_event(HAKIOS_STA_ASSOCIATED, 0);
+}
+
+/* (for a join that waits long -- an 802.1X network's -- to give up when somebody wants something else; not a scan) */
+bool
+hakios_sta_asked(void)
+{
+	bool asked;
+
+	lck_mtx_lock(&sta_lock);
+	asked = asked_power || asked_leave || asked_join;
+	lck_mtx_unlock(&sta_lock);
+	return asked;
+}
+
 /* ---- who wants a network ------------------------------------------------------------------------------- */
+
+/*
+ * The 802.1X client's key, while this file's thread is in the station's join waiting for it: so straight to the
+ * station side, not through the thread (as state() is).
+ */
+int
+hakios_sta_session_key(const uint8_t *key, unsigned length, const uint8_t *bssid)
+{
+	const struct hakios_sta_ops *ops;
+	int error;
+
+	lck_mtx_lock(&sta_lock);
+	if ((ops = sta_ops) != NULL && ops->session_key != NULL) {
+		sta_reads++;
+	}
+	lck_mtx_unlock(&sta_lock);
+	if (ops == NULL || ops->session_key == NULL) {
+		return ops == NULL ? ENXIO : EOPNOTSUPP;
+	}
+	error = ops->session_key(key, length, bssid);
+	lck_mtx_lock(&sta_lock);
+	sta_reads--;
+	lck_mtx_unlock(&sta_lock);
+	thread_wakeup((event_t)&sta_calls);
+	return error;
+}
 
 bool
 hakios_sta_present(void)

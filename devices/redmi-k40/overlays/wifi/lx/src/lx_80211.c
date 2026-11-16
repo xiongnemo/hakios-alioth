@@ -111,7 +111,23 @@ struct lx_radio {
 	unsigned answer_length;
 	uint8_t answer_elements[ELEMENTS_MOST];	/* of the association response */
 	uint8_t rsn[24];			/* our RSN element, as the association request has it */
+	uint8_t akm;				/* the key management it asks for: 2 a passphrase's key, 1 802.1X's */
 	struct lx_wpa wpa;
+	/*
+	 * (11-16) WPA2-Enterprise: the join is of an 802.1X network. Once associated, frames of type 0x888e other than
+	 * the handshake's pass between the access point and iOS's 802.1X client (eapolclient), until its key -- the MSK,
+	 * whose first 32 bytes are the PMK -- comes back (boundary_session_key()); the handshake is ours as for a
+	 * passphrase. A key message that comes before that key is kept and answered, on the receiving thread (the only
+	 * one that calls lx_wpa_message()), as soon as it is there.
+	 */
+	bool eap;
+	volatile bool eap_open;			/* associated: EAP frames pass */
+	volatile bool eap_key;			/* the client's key is in wpa.pmk */
+	volatile bool eap_replay;		/* ... and a key message that came before it waits in eap_pending */
+	uint32_t auth_upper;			/* the join's (hakios.sta.h), for whoever asks */
+	unsigned eap_in, eap_out, eap_early;	/* EAP frames to iOS, from it; key messages before the key */
+	unsigned eap_pending_length;
+	uint8_t eap_pending[14 + LX_WPA_REPLY_MOST];
 	volatile int handshake;			/* the last thing lx_wpa_message() said */
 	const char *handshake_why;
 	struct work_struct group_work;		/* a new group key, later on */
@@ -902,11 +918,53 @@ handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 	}
 }
 
+/*
+ * (802.1X) What kind of EAPOL frame passed, for the first 80 of a run: its type, and for EAP the code, the number and
+ * the method -- never what it carries (the identity, a name, is in there in the clear).
+ */
+static void
+eap_note(const char *way, const uint8_t *frame, unsigned length)
+{
+	static unsigned said;
+	static const char *const codes[] = { "?", "Request", "Response", "SUCCESS", "FAILURE" };
+	unsigned type = length > 15 ? frame[15] : 99, code = length > 18 ? frame[18] : 0, method = length > 22 ? frame[22] : 0;
+
+	if (said >= 80) {
+		return;
+	}
+	said++;
+	if (type != 0) {
+		lx_tell("lx: 802.1X: %s: EAPOL %s, %u bytes\n", way, type == 1 ? "Start" : type == 2 ? "Logoff" : type == 3 ? "Key" :
+		    "of another type", length);
+		return;
+	}
+	lx_tell("lx: 802.1X: %s: EAP %s number %u%s%s, %u bytes\n", way, code <= 4 ? codes[code] : "?", length > 19 ? frame[19] : 0,
+	    code == 1 || code == 2 ? ", method " : "", code != 1 && code != 2 ? "" : method == 1 ? "Identity" : method == 3 ?
+	    "Nak (asks for another method)" : method == 13 ? "TLS" : method == 21 ? "TTLS" : method == 25 ? "PEAP" : method == 26 ?
+	    "MSCHAPv2" : method == 43 ? "FAST" : method == 2 ? "Notification" : "other", length);
+}
+
 /* An Ethernet frame the radio has received. */
 static void
 ethernet_received(struct lx_radio *radio, struct sk_buff *skb)
 {
-	if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0x8e) {
+	if (skb->len >= 18 && skb->data[12] == 0x88 && skb->data[13] == 0x8e && radio->eap && skb->data[15] != 3) {
+		/* 802.1X (EAPOL of a type other than 3, a key's: EAP mostly): iOS's 802.1X client's, from our access point only */
+		if (radio->eap_open && memcmp(skb->data + 6, radio->target.address, ETH_ALEN) == 0) {
+			radio->eap_in++;
+			eap_note("in", skb->data, skb->len);
+			lx_os_net_input(skb->data, skb->len);
+		}
+	} else if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0x8e && radio->eap && !radio->eap_key) {
+		/* a key message before the 802.1X client's key: the last one is kept, and answered once the key is there */
+		lx_os_lock();
+		radio->eap_early++;
+		if (skb->len <= sizeof(radio->eap_pending)) {
+			memcpy(radio->eap_pending, skb->data, skb->len);
+			radio->eap_pending_length = skb->len;
+		}
+		lx_os_unlock();
+	} else if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0x8e) {
 		handshake_message(radio, skb->data, skb->len);
 	} else if (radio->joined && skb->len >= 14) {
 		*(skb->data[0] & 1 ? &radio->received_group : &radio->received) += 1;
@@ -998,6 +1056,22 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	const struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
 
 	radio->frames++;
+	if (radio->eap_replay) {
+		/* (802.1X) the key message that came before the client's key, answered now that it is there -- here, on this thread */
+		uint8_t kept[sizeof(radio->eap_pending)];
+		unsigned length;
+
+		lx_os_lock();
+		length = radio->eap_pending_length;
+		memcpy(kept, radio->eap_pending, length);
+		radio->eap_pending_length = 0;
+		radio->eap_replay = false;
+		lx_os_unlock();
+		if (length >= 14 && radio->eap_key) {
+			lx_tell("lx: 802.1X: the key message that came before the key is answered now\n");
+			handshake_message(radio, kept, length);
+		}
+	}
 	if (status->flag & RX_FLAG_8023) {
 		radio->group_as_ethernet += skb->len >= 14 && (skb->data[0] & 1);
 		ethernet_received(radio, skb);
@@ -1409,6 +1483,7 @@ request_elements(struct lx_radio *radio, uint8_t *out)
 		radio->rsn[14] = 1;
 		radio->rsn[15] = 0;
 		memcpy(radio->rsn + 16, "\x00\x0f\xac\x02\x00\x00", 6);
+		radio->rsn[19] = radio->akm != 0 ? radio->akm : 2;
 		memcpy(at, radio->rsn, 22);
 		at += 22;
 	}
@@ -1445,14 +1520,17 @@ request_elements(struct lx_radio *radio, uint8_t *out)
 /*
  * What kind of protection the access point offers (its RSN element: version, the group's
  * cipher, the ciphers and the kinds of key management it takes, capabilities). NULL if we can
- * join it -- CCMP, a passphrase's key (kind 2), management frames unprotected --, and
- * *group_cipher is then what it ciphers frames to everybody with; else what stands in the way.
+ * join it -- CCMP, the key management `akm` (2: a passphrase's key; 1: 802.1X's), management
+ * frames unprotected --, and *group_cipher is then what it ciphers frames to everybody with; else
+ * what stands in the way.
  */
 static const char *
-protection(const struct lx_target *target, unsigned *group_cipher, unsigned *pairwise_cipher)
+protection(const struct lx_target *target, unsigned *group_cipher, unsigned *pairwise_cipher, unsigned akm)
 {
 	const uint8_t *rsn = element(target->elements, target->elements_length, 48), *at, *end;
 	bool ccmp = false, tkip = false, passphrase = false;
+	static char offered[96];			/* (one join at a time) */
+	size_t used = 0;
 	unsigned count;
 
 	if (rsn == NULL) {
@@ -1488,14 +1566,25 @@ protection(const struct lx_target *target, unsigned *group_cipher, unsigned *pai
 		return ("its RSN key-management list is truncated");
 	}
 	for (; count != 0 && end - at >= 4; count--, at += 4) {
-		passphrase |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 2;
+		passphrase |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == akm;
+		if (used < sizeof(offered) - 16) {
+			used += (size_t)snprintf(offered + used, sizeof(offered) - used, used == 0 ? "%s%u" : ", %s%u", at[0] == 0x00 &&
+			    at[1] == 0x0f && at[2] == 0xac ? "" : "vendor's ", at[3]);
+		}
 	}
 	if (!ccmp && !tkip) {
 		return ("it does not offer TKIP or CCMP");
 	}
 	*pairwise_cipher = ccmp ? 4 : 2;
 	if (!passphrase) {
-		return ("it does not take a passphrase's key of the WPA2 kind (WPA3 only, or an enterprise network)");
+		static char why[200];
+
+		/* (AKM 1 802.1X, 2 passphrase, 3 802.1X with fast transition, 4 FT passphrase, 5 802.1X SHA-256, 6 passphrase
+		 * SHA-256, 8 SAE (WPA3), 11/12 802.1X Suite B, 18 OWE) */
+		snprintf(why, sizeof(why), "%s (the key management it offers: %s)", akm == 1 ? "it does not take 802.1X key "
+		    "management of the WPA2 kind (AKM 1): WPA3-Enterprise, SHA-256 or fast transition only" : "it does not take a "
+		    "passphrase's key of the WPA2 kind (WPA3 only, or an enterprise network)", used != 0 ? offered : "none");
+		return (why);
 	}
 	if (end - at >= 2 && (at[0] & 0x40)) {
 		return ("it requires protected management frames, which are not done here");
@@ -1616,6 +1705,11 @@ station_leave(struct lx_radio *radio)
 		radio->joined = false;
 		lx_os_net_link(0);
 	}
+	lx_os_lock();
+	radio->eap_open = radio->eap_key = radio->eap_replay = false;
+	radio->eap_pending_length = 0;
+	explicit_bzero(radio->eap_pending, sizeof(radio->eap_pending));
+	lx_os_unlock();
 	if (radio->sta != NULL && state >= IEEE80211_STA_AUTH && radio->answer != ANSWER_GONE) {
 		struct sk_buff *skb;
 		uint8_t *frame;
@@ -1743,7 +1837,7 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 	if (name_length == 0 || name_length > sizeof(radio->want)) {
 		return (EINVAL);
 	}
-	if (what->security != HAKIOS_STA_WPA2_PSK && what->security != HAKIOS_STA_OPEN) {
+	if (what->security != HAKIOS_STA_WPA2_PSK && what->security != HAKIOS_STA_OPEN && what->security != HAKIOS_STA_WPA2_8021X) {
 		lx_tell("lx: a network with unsupported security is asked for\n");
 		return (ENOTSUP);
 	}
@@ -1751,6 +1845,10 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		station_leave(radio);
 		lx_tell("lx: the network joined before is left\n");
 	}
+	radio->eap = what->security == HAKIOS_STA_WPA2_8021X;
+	radio->akm = radio->eap ? 1 : 2;
+	radio->auth_upper = what->auth_upper;
+	radio->eap_in = radio->eap_out = radio->eap_early = 0;
 	INIT_WORK(&radio->group_work, group_rekey);
 	INIT_WORK(&radio->ba_work, ba_handle);
 	radio->ba_asked = 0;
@@ -1804,14 +1902,15 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		/* (a beacon can be heard on the channel next to its own: where it says it is counts) */
 		channel = linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band));
 	}
-	obstacle = what->security == HAKIOS_STA_OPEN ? NULL : protection(target, &group_cipher, &pairwise_cipher);
+	obstacle = what->security == HAKIOS_STA_OPEN ? NULL : protection(target, &group_cipher, &pairwise_cipher, radio->akm);
 	lx_tell("lx: the network that is wanted: an access point (..:%02x:%02x:%02x) on channel %u (%u MHz) at %d dBm, capabilities "
 	    "%#x, beacons every %u units; HT %s, VHT %s, WMM %s; %s%s\n", target->address[3], target->address[4], target->address[5],
 	    channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
 	    channel->center_freq : 0, target->signal, target->capability, target->interval, element(target->elements,
 	    target->elements_length, 45) ? "yes" : "no", element(target->elements, target->elements_length, 191) ? "yes" : "no",
 	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle == NULL ?
-	    what->security == HAKIOS_STA_OPEN ? "open: it can be joined" : "WPA2-PSK with CCMP/TKIP: it can be joined" : "IT CANNOT BE JOINED: ",
+	    what->security == HAKIOS_STA_OPEN ? "open: it can be joined" : radio->eap ? "WPA2-Enterprise (802.1X) with CCMP/TKIP: "
+	    "it can be joined" : "WPA2-PSK with CCMP/TKIP: it can be joined" : "IT CANNOT BE JOINED: ",
 	    obstacle == NULL ? "" : obstacle);
 	if ((what->security != HAKIOS_STA_OPEN && obstacle != NULL) || channel == NULL || (channel->flags & IEEE80211_CHAN_DISABLED)) {
 		return (ENOTSUP);
@@ -1823,9 +1922,12 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 
 	/* The passphrase and handshake state exist only for protected networks. */
 	bzero(&radio->wpa, sizeof(radio->wpa));
-	if (what->security == HAKIOS_STA_WPA2_PSK) {
+	if (what->security == HAKIOS_STA_WPA2_PSK || radio->eap) {
 		began = lx_os_nanoseconds();
-		if (what->passphrase_length != 0) {
+		if (radio->eap) {
+			radio->eap_key = radio->eap_replay = false;	/* (the PMK: the 802.1X client's, later) */
+			radio->eap_pending_length = 0;
+		} else if (what->passphrase_length != 0) {
 			lx_wpa_pmk(what->passphrase, what->passphrase_length, name, name_length, radio->wpa.pmk);
 		} else {
 			memcpy(radio->wpa.pmk, what->pmk, sizeof(radio->wpa.pmk));
@@ -1838,8 +1940,10 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		radio->wpa.pairwise_length = pairwise_cipher == 2 ? 32 : 16;
 		radio->wpa.descriptor_version = pairwise_cipher == 2 ? 1 : 2;
 		radio->handshake = LX_WPA_NOTHING;
-		printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: %llu ms\n",
-		    name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull);
+		if (!radio->eap) {
+			printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: "
+			    "%llu ms\n", name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull);
+		}
 	} else {
 		radio->handshake = LX_WPA_NOTHING;
 	}
@@ -2028,6 +2132,58 @@ station_join_once(struct lx_radio *radio, const struct hakios_sta_join *what)
 		lx_os_net_link(1);
 		lx_tell("lx: THE OPEN NETWORK IS JOINED: frames can pass\n");
 		return (0);
+	}
+
+	/*
+	 * 802.1X: the access point asks who we are as soon as we are associated, and iOS's 802.1X client answers -- its
+	 * EAP frames pass from now on (ethernet_received(), lx_station_send()) -- and talks with the network's server
+	 * (PEAP or TTLS, a certificate that may want a tap on "Trust", the user's name and password). When that is
+	 * through it hands its key in (boundary_session_key()), and the access point begins the handshake. Up to 90 s
+	 * (boot-arg wifi_eap_wait=S), less if the access point gives up on us or iOS asks for something else.
+	 */
+	if (radio->eap) {
+		unsigned long long waited = lx_os_nanoseconds(), said_at = waited, limit = lx_os_option("wifi_eap_wait");
+		const char *why = NULL;
+
+		limit = (limit != 0 && limit <= 600 ? limit : 90) * 1000000000ull;
+		lx_os_lock();
+		radio->eap_open = true;
+		lx_os_unlock();
+		lx_tell("lx: 802.1X: ASSOCIATED. The authentication is iOS's 802.1X client's (eapolclient): its frames pass now; "
+		    "its key is waited for, up to %llu s\n", limit / 1000000000ull);
+		lx_os_station_associated();
+		for (;;) {
+			lx_os_lock();
+			if (!radio->eap_key && radio->answer != ANSWER_GONE) {
+				lx_os_sleep(&radio->eap_key, 500 * 1000000ull);
+			}
+			lx_os_unlock();
+			if (radio->eap_key) {
+				break;
+			}
+			why = radio->answer == ANSWER_GONE ? "the access point has shown us the door (the server turned us down, or "
+			    "it gave up waiting)" : lx_os_station_asked() ? "iOS asked for something else (Settings, or its 802.1X "
+			    "client gave up)" : lx_os_nanoseconds() - waited >= limit ? "the time ran out" : NULL;
+			if (why != NULL) {
+				break;
+			}
+			if (lx_os_nanoseconds() - said_at >= 10000000000ull) {
+				said_at = lx_os_nanoseconds();
+				lx_tell("lx: 802.1X: still no key after %llu s: %u EAP frames to iOS so far, %u from it\n", (said_at -
+				    waited) / 1000000000ull, radio->eap_in, radio->eap_out);
+			}
+		}
+		if (!radio->eap_key) {
+			lx_tell("lx: 802.1X: NO KEY CAME from iOS's 802.1X client in %llu s: %s. %u EAP frames went to iOS, %u came "
+			    "from it%s\n", (lx_os_nanoseconds() - waited) / 1000000000ull, why, radio->eap_in, radio->eap_out,
+			    radio->eap_in == 0 ? " -- the access point asked nothing?" : radio->eap_out == 0 ? " -- iOS's client "
+			    "never answered: did it run, and did its frames get out?" : "");
+			error = radio->answer == ANSWER_GONE ? ECONNRESET : lx_os_station_asked() ? ECANCELED : EAUTH;
+			goto out;
+		}
+		lx_tell("lx: 802.1X: THE KEY IS THERE, %llu ms after the association (%u EAP frames to iOS, %u from it; %u key "
+		    "messages came before it): the handshake\n", (lx_os_nanoseconds() - waited) / 1000000ull, radio->eap_in,
+		    radio->eap_out, radio->eap_early);
 	}
 
 	/* the handshake: the access point begins it; its messages come in as frames and are answered where they come in */
@@ -2223,9 +2379,15 @@ int
 lx_station_send(const unsigned char *frame, unsigned long length)
 {
 	struct lx_radio *radio = the_radio;
+	bool eapol = length >= 14 && frame[12] == 0x88 && frame[13] == 0x8e;
 
-	if (radio == NULL || !radio->joined) {
+	/* (before the keys only 802.1X's frames, to the access point being joined: unciphered, as there is no key yet) */
+	if (radio == NULL || !(radio->joined || (radio->eap_open && eapol && radio->sta != NULL))) {
 		return (ENETDOWN);
+	}
+	if (eapol && radio->eap) {
+		radio->eap_out++;
+		eap_note("out", frame, (unsigned)length);
 	}
 	return (ethernet_send(radio, frame, (unsigned)length, false) ? 0 : ENOBUFS);
 }
@@ -2351,6 +2513,8 @@ boundary_state(struct hakios_sta_state *state)
 	state->phase = radio->joined ? HAKIOS_STA_JOINED : radio->joining ? HAKIOS_STA_JOINING : radio->scan == 1 ?
 	    HAKIOS_STA_SCANNING : HAKIOS_STA_IDLE;
 	state->last_error = radio->last_error;
+	state->authenticating = radio->joining && !radio->joined && radio->eap_open && radio->sta != NULL;
+	state->auth_upper = (radio->joined || radio->joining) ? radio->auth_upper : 0;
 	if ((radio->joined || radio->joining) && radio->target.found) {
 		memcpy(state->bss.bssid, radio->target.address, ETH_ALEN);
 		memcpy(state->bss.ssid, radio->want, radio->want_length);
@@ -2386,6 +2550,39 @@ boundary_channels(struct hakios_sta_channel *channels, unsigned most)
 	return (count);
 }
 
+/*
+ * (on any thread: does not sleep) The 802.1X client's key for the join that waits for it: its MSK, whose first 32
+ * bytes are the PMK (IEEE 802.11-2020 12.7.1.3, AKM 1), or the PMK itself. Never written anywhere but wpa.pmk.
+ */
+static int
+boundary_session_key(const uint8_t *key, unsigned length, const uint8_t *bssid)
+{
+	struct lx_radio *radio = the_radio;
+	int error = 0;
+
+	if (radio == NULL || key == NULL || length < 32) {
+		return (radio == NULL ? ENXIO : EINVAL);
+	}
+	lx_os_lock();
+	if (!radio->eap || !radio->eap_open || radio->sta == NULL) {
+		error = ENXIO;
+	} else if (bssid != NULL && memcmp(bssid, radio->target.address, ETH_ALEN) != 0) {
+		error = EINVAL;				/* (for another access point: pre-authentication, not done here) */
+	} else if (radio->eap_key) {
+		error = EALREADY;			/* (a second key for the same join: the handshake has the first) */
+	} else {
+		memcpy(radio->wpa.pmk, key, sizeof(radio->wpa.pmk));
+		radio->eap_key = true;
+		radio->eap_replay = radio->eap_pending_length != 0;
+		lx_os_wakeup(&radio->eap_key);
+	}
+	lx_os_unlock();
+	lx_tell("lx: 802.1X: a key from iOS's 802.1X client (%u bytes, %s): %s\n", length, bssid != NULL ? "for a named access "
+	    "point" : "for the one joined", error == 0 ? "taken" : error == ENXIO ? "NO JOIN OF AN 802.1X NETWORK WAITS FOR ONE" :
+	    error == EINVAL ? "for another access point: not taken" : "a second one: not taken");
+	return (error);
+}
+
 static struct hakios_sta_ops boundary = {
 	.power = boundary_power,
 	.scan = boundary_scan,
@@ -2394,6 +2591,7 @@ static struct hakios_sta_ops boundary = {
 	.leave = boundary_leave,
 	.state = boundary_state,
 	.channels = boundary_channels,
+	.session_key = boundary_session_key,
 };
 
 /*

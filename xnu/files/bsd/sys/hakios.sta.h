@@ -42,7 +42,12 @@ struct hakios_sta_scan {
 	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
 };
 
-enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK };
+/*
+ * HAKIOS_STA_WPA2_8021X: WPA2-Enterprise (RSN, AKM 1). The station associates and then lets frames of type 0x888e
+ * pass both ways, so that an 802.1X client above (iOS's eapolclient) can authenticate with the network's server;
+ * that client's key comes back through hakios_sta_session_key(), and the station does the four-way handshake with it.
+ */
+enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK, HAKIOS_STA_WPA2_8021X };
 
 struct hakios_sta_join {
 	uint8_t ssid[32], ssid_length;
@@ -50,6 +55,7 @@ struct hakios_sta_join {
 	int security;
 	uint8_t pmk[32];                        /* WPA2 with a passphrase: the key made of the passphrase and the name ... */
 	uint8_t passphrase[64], passphrase_length;      /* ... or, if this is not empty, the passphrase itself */
+	uint32_t auth_upper;                    /* how the asker named the protection (Apple80211's upper type), to give back */
 };
 
 enum hakios_sta_phase { HAKIOS_STA_OFF, HAKIOS_STA_IDLE, HAKIOS_STA_SCANNING, HAKIOS_STA_JOINING, HAKIOS_STA_JOINED };
@@ -58,6 +64,8 @@ struct hakios_sta_state {
 	enum hakios_sta_phase phase;
 	struct hakios_sta_bss bss;             /* the network joined or being joined */
 	int last_error;                         /* why the last join failed or the network was lost (an errno); 0: it was not */
+	bool authenticating;                    /* JOINING, associated with an 802.1X network: its 802.1X exchange is under way */
+	uint32_t auth_upper;                    /* the join's auth_upper (0: not said) */
 };
 
 #define HAKIOS_STA_CHANNEL_PASSIVE     1u      /* the radio may only listen there */
@@ -82,6 +90,12 @@ struct hakios_sta_ops {
 	void (*state)(struct hakios_sta_state *state);         /* on any thread; does not sleep */
 	unsigned (*channels)(struct hakios_sta_channel *channels, unsigned most);      /* what the radio may tune to */
 	uint8_t address[6];
+	/*
+	 * On any thread, while a join of an 802.1X network waits for it (NULL: no 802.1X here): the 802.1X client's key,
+	 * its MSK (64 bytes) or the PMK itself (32), for the access point `bssid` (NULL: the one being joined). Does not
+	 * sleep. 0, or an errno (ENXIO: no such join under way).
+	 */
+	int (*session_key)(const uint8_t *key, unsigned length, const uint8_t *bssid);
 };
 
 /* What happens, said to whoever listens (the Apple80211 side). */
@@ -91,12 +105,16 @@ enum hakios_sta_event {
 	HAKIOS_STA_JOIN_DONE,                  /* status: 0, or the join's errno */
 	HAKIOS_STA_LINK,                       /* status: 1 a network is joined, 0 it has been left when asked,
 	                                         * an errno: it was lost (the access point showed us the door) */
+	HAKIOS_STA_ASSOCIATED,                 /* status 0: a join of an 802.1X network is associated; its 802.1X exchange
+	                                         * begins (JOIN_DONE follows when it is over) */
 };
 
 #ifdef KERNEL
 /* ---- the station side ---- */
 void     hakios_sta_attach(const struct hakios_sta_ops *ops);         /* NULL: it is going away (waits for a call under way) */
 void     hakios_sta_lost(int error);                                   /* the network joined is gone by itself */
+void     hakios_sta_associated(void);                                  /* an 802.1X network's join is associated */
+bool     hakios_sta_asked(void);                                       /* a leave, a join or the power asked for meanwhile */
 
 /* ---- who wants a network: each asks and returns; the outcome is an event. 0, or an errno ---- */
 bool     hakios_sta_present(void);
@@ -113,6 +131,8 @@ bool     hakios_sta_heard(unsigned index, struct hakios_sta_bss *bss);
 void     hakios_sta_state(struct hakios_sta_state *state);
 unsigned hakios_sta_channels(struct hakios_sta_channel *channels, unsigned most);
 bool     hakios_sta_address(uint8_t *address);
+/* an 802.1X client's key for the join under way (ops->session_key): 0, or an errno */
+int      hakios_sta_session_key(const uint8_t *key, unsigned length, const uint8_t *bssid);
 
 /* ---- the listener: bsd/dev/hakios.apple80211.c ---- */
 void     hakios_apple80211_event(enum hakios_sta_event event, int status);

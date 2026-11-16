@@ -90,6 +90,8 @@ unsigned long long lx_os_irq_count(unsigned vector);		/* how many have arrived *
 /* ---- the station: scanning and joining, for whoever asks the kernel (hakios.sta.h) ---- */
 void	 lx_os_station(const struct hakios_sta_ops *ops);	/* here it is, to be asked; NULL: no longer (returns when no call is under way) */
 void	 lx_os_station_lost(int error);				/* the network joined is gone by itself */
+void	 lx_os_station_associated(void);			/* an 802.1X network's join is associated: its EAP begins */
+int	 lx_os_station_asked(void);				/* a leave, another join or the power has been asked for meanwhile */
 
 /*
  * ---- the names the object shows the kernel. lx_start(): bring the driver up on the radio and

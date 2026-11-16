@@ -30,10 +30,23 @@
  * when the station has joined or failed, event 9 says so, and ASSOCIATE_RESULT (21) gives the
  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
+ *
+ * (2026-11-16) WPA2-Enterprise -- eduroam and the like: 802.1X, RSN AKM 1. The join comes without a key and with an
+ * enterprise upper type (eapolclient of 16.5 counts 1, 4, 0x80, 0x800, 0x4000, 0x8000 as such: its
+ * wireless_is_wpa_enterprise() reads them back through AUTH_TYPE). wifid starts eapolclient for it
+ * (WiFiDeviceEAPAssociate), and eapolclient does the EAP conversation itself over an ndrv socket on en0, so the
+ * station associates, says so (event 9 at once, ASSOCIATE_RESULT 1; boot-arg wifi_eap_assoc=0: only when it is all
+ * over, as for a passphrase), lets frames of type 0x888e pass while BSSID, SSID and AUTH_TYPE answer, and waits.
+ * eapolclient's key comes back as CIPHER_KEY (3): 148 bytes, the MSK (64) at 0x10 with cipher 7 and the access point
+ * at 0x5c, or cipher 9 without it (read out of eapolclient: wireless_set_wpa_msk()). The first 32 bytes of the MSK are
+ * the PMK (IEEE 802.11-2020 12.7.1.3); the station does the four-way handshake with it as with a passphrase's, and the
+ * link comes up after it. Set 89 (eapolclient: forget the PMKs cached) is answered: nothing is cached; get 83 (the
+ * PMKs cached) is not, so each join does the whole EAP conversation.
  */
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/kern_event.h>
 #include <sys/kernel.h>
@@ -71,8 +84,8 @@ type_name(int32_t type)
 		{ 30, "COUNTERMEASURES" }, { 32, "RATE_SET" }, { 42, "STATION_LIST" }, { 43, "DRIVER_VERSION" },
 		{ 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" }, { 49, "STATS" },
 		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
-		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
-		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
+		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 83, "PMK_CACHE (eapolclient)" }, { 85, "IE" },
+		{ 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" }, { 89, "PMK_CACHE_CLEAR (eapolclient)" }, { 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
 		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
 	};
 
@@ -164,7 +177,27 @@ struct apple80211_assoc {
 };
 
 #define CIPHER_PMK              6
+#define CIPHER_MSK_FOR          7               /* CIPHER_KEY: an 802.1X client's MSK, for the access point named in it */
+#define CIPHER_MSK              9               /* ... for the one joined */
 #define CIPHER_PASSPHRASE       10
+
+/* CIPHER_KEY (3): 148 bytes, as eapolclient of 16.5 fills it */
+struct apple80211_key {
+	uint32_t version, length, cipher;
+	uint16_t flags, index;
+	uint8_t key[64];
+	uint32_t rsc_length;
+	uint8_t rsc[8];
+	uint8_t bssid[6];
+	uint8_t rest[0x94 - 0x62];
+};
+
+/* Apple80211's upper authentication types that eapolclient counts as 802.1X (wireless_is_wpa_enterprise()) */
+static bool
+enterprise(uint32_t upper)
+{
+	return upper == 0x1 || upper == 0x4 || upper == 0x80 || upper == 0x800 || upper == 0x4000 || upper == 0x8000;
+}
 
 /* the link event's data (at least 32 bytes, or the framework drops the event) */
 struct apple80211_link_changed {
@@ -179,6 +212,8 @@ struct apple80211_link_changed {
 
 _Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
     "the association request as iOS 16.5 has it");
+_Static_assert(sizeof(struct apple80211_key) == 0x94 && offsetof(struct apple80211_key, key) == 0x10 &&
+    offsetof(struct apple80211_key, bssid) == 0x5c, "a key as eapolclient of 16.5 hands it in");
 _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
     "the link event as iOS 16.5 reads it");
 _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
@@ -201,6 +236,7 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "hakios-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+static bool assoc_told;                         /* event 9 has been posted for the 802.1X join under way (on association) */
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -389,25 +425,30 @@ get(struct apple80211req *request)
 		break;
 	}
 
-	/* the rest is about the network joined, and there is none unless the station says so */
+	/*
+	 * The rest is about the network joined, and there is none unless the station says so -- or one being joined that
+	 * the station is associated with while an 802.1X client authenticates (eapolclient asks BSSID, SSID and AUTH_TYPE
+	 * then, and without the BSSID it takes the link to be down and sends nothing).
+	 */
 	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
 		return ENOMEM;
 	}
 	hakios_sta_state(state);
+	bool there = state->phase == HAKIOS_STA_JOINED || state->authenticating;
 	switch (request->req_type) {
 	case 13:                                /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
-		request->req_val = state->phase == HAKIOS_STA_JOINED ? 4 : state->phase == HAKIOS_STA_JOINING ? 2 :
-		    state->phase == HAKIOS_STA_SCANNING ? 1 : 0;
+		request->req_val = state->phase == HAKIOS_STA_JOINED ? 4 : state->authenticating ? 3 : state->phase ==
+		    HAKIOS_STA_JOINING ? 2 : state->phase == HAKIOS_STA_SCANNING ? 1 : 0;
 		break;
 	case 1:                                 /* its name; the length goes back in the request */
-		if (state->phase != HAKIOS_STA_JOINED) {
+		if (!there) {
 			error = ENXIO;
 		} else if ((error = give(request, state->bss.ssid, state->bss.ssid_length)) == 0) {
 			request->req_len = state->bss.ssid_length;
 		}
 		break;
 	case 9:                                 /* its access point's address */
-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, state->bss.bssid, 6);
+		error = !there ? ENXIO : give(request, state->bss.bssid, 6);
 		break;
 	case 4: {                               /* its channel */
 		struct {
@@ -415,7 +456,7 @@ get(struct apple80211req *request)
 			struct apple80211_channel channel;
 		} answer = { .version = 1 };
 
-		if (state->phase != HAKIOS_STA_JOINED) {
+		if (!there) {
 			error = ENXIO;
 		} else {
 			channel_fill(&answer.channel, state->bss.frequency, 0);
@@ -430,18 +471,18 @@ get(struct apple80211req *request)
 		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
 			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
 
-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		error = !there ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
 	}
 	case 103:                               /* all of it, as a scan's result */
-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+		error = !there ? ENXIO : give_network(request, &state->bss);
 		break;
-	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
+	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase -- or as asked */
 		struct {
 			uint32_t version, lower, upper, extended;
-		} answer = { .version = 1, .lower = 1, .upper = 8 };
+		} answer = { .version = 1, .lower = 1, .upper = enterprise(state->auth_upper) ? state->auth_upper : 8 };
 
-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		error = !there ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
 	}
 	default:
@@ -540,7 +581,11 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 	what->ssid_length = (uint8_t)asked->ssid_length;
 	memcpy(what->ssid, asked->ssid, asked->ssid_length);
 	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
-	if (asked->key_length == 0) {
+	what->auth_upper = asked->auth_upper;
+	if (asked->key_length == 0 && enterprise(asked->auth_upper)) {
+		what->security = HAKIOS_STA_WPA2_8021X;         /* (the key comes later, from eapolclient: set_key()) */
+		strlcat(said, " (802.1X)", said_size);
+	} else if (asked->key_length == 0) {
 		what->security = HAKIOS_STA_OPEN;
 	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
 		what->security = HAKIOS_STA_WPA2_PSK;
@@ -569,12 +614,52 @@ out:
 	return error;
 }
 
+/* CIPHER_KEY: an 802.1X client's key for the join under way (lengths and kinds only in the log, never the key) */
+static int
+set_key(const struct apple80211req *request, char *said, size_t said_size)
+{
+	struct apple80211_key *asked;
+	int error;
+
+	if (request->req_len < offsetof(struct apple80211_key, rest)) {
+		return EINVAL;
+	}
+	if ((asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO)) == NULL) {
+		return ENOMEM;
+	}
+	if ((error = copyin(request->req_data, asked, offsetof(struct apple80211_key, rest))) != 0) {
+		goto out;
+	}
+	snprintf(said, said_size, " (a key: cipher %u, %u bytes, %s)", asked->cipher, asked->length, asked->cipher ==
+	    CIPHER_MSK_FOR ? "an 802.1X MSK for a given access point" : asked->cipher == CIPHER_MSK ? "an 802.1X MSK" :
+	    asked->cipher == CIPHER_PMK ? "a PMK" : "of a kind not taken here");
+	if (asked->cipher != CIPHER_MSK_FOR && asked->cipher != CIPHER_MSK && asked->cipher != CIPHER_PMK) {
+		error = EOPNOTSUPP;                     /* (WEP's: 1, 2) */
+	} else if (asked->length == 0) {
+		error = 0;                              /* (taken back: nothing is kept past the join anyway) */
+	} else if (asked->length > sizeof(asked->key) || asked->length < 32) {
+		error = EINVAL;
+	} else {
+		error = hakios_sta_session_key(asked->key, asked->length, asked->cipher == CIPHER_MSK_FOR ? asked->bssid : NULL);
+		printf("apple80211: the 802.1X client's key (%u bytes) for the join: %d%s\n", asked->length, error, error == ENXIO ?
+		    " (no join of an 802.1X network waits for one)" : "");
+	}
+out:
+	memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
+	kfree_data(asked, sizeof(*asked));
+	return error;
+}
+
 static int
 set(const struct apple80211req *request, char *said, size_t said_size)
 {
 	switch (request->req_type) {
 	case 20:
 		return set_join(request, said, said_size);
+	case 3:
+		return set_key(request, said, said_size);
+	case 89:                                /* eapolclient: forget the PMKs cached -- there are none */
+		return 0;
 	case 22:                                /* leave the network */
 		return hakios_sta_ask_leave();
 	case 19: {                              /* the radio's power */
@@ -624,7 +709,8 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 	if (said < 200) {
 		said++;
 		printf("apple80211: the station says: %s, %d\n", event == HAKIOS_STA_POWER ? "power" : event == HAKIOS_STA_SCAN_DONE ?
-		    "a scan is over" : event == HAKIOS_STA_JOIN_DONE ? "a join is over" : "the link", status);
+		    "a scan is over" : event == HAKIOS_STA_JOIN_DONE ? "a join is over" : event == HAKIOS_STA_ASSOCIATED ?
+		    "associated with an 802.1X network, its authentication begins" : "the link", status);
 	}
 	switch (event) {
 	case HAKIOS_STA_POWER:
@@ -636,12 +722,39 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 		lck_mtx_unlock(&apple80211_lock);
 		post(EVENT_SCAN_DONE, NULL, 0);
 		break;
-	case HAKIOS_STA_JOIN_DONE:
+	case HAKIOS_STA_ASSOCIATED: {
+		/* as a driver does for 802.1X: association done now; the link comes up after the handshake (LINK, 1) */
+		uint32_t early = 1;
+
+		PE_parse_boot_argn("wifi_eap_assoc", &early, sizeof(early));
+		if (early == 0) {
+			break;
+		}
 		lck_mtx_lock(&apple80211_lock);
-		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
+		join_result = 1;
+		assoc_told = true;
 		lck_mtx_unlock(&apple80211_lock);
+		post(EVENT_SSID_CHANGED, NULL, 0);
+		post(EVENT_BSSID_CHANGED, NULL, 0);
 		post(EVENT_ASSOC_DONE, NULL, 0);
 		break;
+	}
+	case HAKIOS_STA_JOIN_DONE: {
+		bool told;
+
+		lck_mtx_lock(&apple80211_lock);
+		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
+		told = assoc_told;
+		assoc_told = false;
+		lck_mtx_unlock(&apple80211_lock);
+		if (!told) {
+			post(EVENT_ASSOC_DONE, NULL, 0);
+		} else if (status != 0) {
+			/* (association was said to be done: what fails after it is the link lost, not a join that failed) */
+			hakios_apple80211_event(HAKIOS_STA_LINK, status == 1 ? EIO : status);
+		}
+		break;
+	}
 	case HAKIOS_STA_LINK: {
 		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
 			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
