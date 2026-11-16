@@ -7024,7 +7024,8 @@ alioth_tile_skips(NSString *label)
 	const char *l = [label UTF8String];
 
 	for (unsigned i = 0; i < count; i++) {
-		if (l != NULL && strncmp(l, prefixes[i], strlen(prefixes[i])) == 0) {
+		/* ("*": every draw -- and the pass's first, which keeps its clears, drawn into one pixel only: runDraw) */
+		if (strcmp(prefixes[i], "*") == 0 || (l != NULL && strncmp(l, prefixes[i], strlen(prefixes[i])) == 0)) {
 			return YES;
 		}
 	}
@@ -7033,10 +7034,16 @@ alioth_tile_skips(NSString *label)
 
 - (BOOL)runDraw:(AliothMetalWork *)work why:(char *)why size:(size_t)size
 {
-	if (work->tileMask != 0 && !work->clears && !work->clearsDepth && !work->clearsStencil &&
-	    [work->color[0] isKindOfClass:[AliothMetalTexture class]] && [(AliothMetalTexture *)work->color[0] aliothImported] &&
-	    alioth_tile_skips([work->render label])) {
-		return YES;
+	/* (metal_tile_skip=*: the pass's first draw, which carries its clears, into the top-left pixel only) */
+	static const unsigned one_pixel[4] = { 0, 0, 1, 1 };
+	BOOL pixel_only = NO;
+
+	if (work->tileMask != 0 && [work->color[0] isKindOfClass:[AliothMetalTexture class]] &&
+	    [(AliothMetalTexture *)work->color[0] aliothImported] && alioth_tile_skips([work->render label])) {
+		if (!work->clears && !work->clearsDepth && !work->clearsStencil) {
+			return YES;
+		}
+		pixel_only = alioth_tile_skips(@"*");  /* (true only when the list has "*": no label begins with it) */
 	}
 	struct rwa_texture *color[8] = { NULL };
 	struct rwa_buffer *vertex_buffers[RW_MAX_BUFFERS] = { NULL };
@@ -7241,7 +7248,7 @@ alioth_tile_skips(NSString *label)
 		.viewport = work->hasViewport ? work->viewport : NULL,
 		.cull_mode = work->cullMode,
 		.front_ccw = work->frontCCW,
-		.scissor = work->hasScissor ? work->scissor : NULL,
+		.scissor = pixel_only ? one_pixel : work->hasScissor ? work->scissor : NULL,
 		.fill_lines = work->fillLines,
 		/* (the K40's) the draws of this buffer batched into one pass; -commit's flush and fence, or
 		 * -waitUntilCompleted's finish, say when they are done (each draw was waited for, 40 frames a second) */
