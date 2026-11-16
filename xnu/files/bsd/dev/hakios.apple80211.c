@@ -655,8 +655,6 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
 		break;
 	}
-	default:                                /* (HAKIOS_STA_ASSOCIATED: 802.1X, the Redmi K40 overlay's) */
-		break;
 	}
 }
 
