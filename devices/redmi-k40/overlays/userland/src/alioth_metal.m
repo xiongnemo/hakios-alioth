@@ -4069,11 +4069,27 @@ alioth_peek_on(void)
 static BOOL alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *row, size_t *width,
 				 size_t *height);
 
+static uint64_t alioth_peek_last;
+static unsigned alioth_peek_told;
+
+/* whether the next peek prints (one line every 2 s a process, the first 4 at once) -- the facts are read only then */
+static BOOL
+alioth_peek_due(void)
+{
+	static mach_timebase_info_data_t tb;
+	uint64_t now = mach_absolute_time(), then = __atomic_load_n(&alioth_peek_last, __ATOMIC_RELAXED);
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return __atomic_load_n(&alioth_peek_told, __ATOMIC_RELAXED) < 4 || (now - then) * tb.numer / tb.denom >= 2000000000ull;
+}
+
 static void
 alioth_peek(void *surface, id texture, unsigned passes, unsigned tiled, NSString *census)
 {
-	static uint64_t last;
-	static unsigned told;
+#define last alioth_peek_last
+#define told alioth_peek_told
 	uint64_t now = mach_absolute_time(), then = __atomic_load_n(&last, __ATOMIC_RELAXED);
 	static mach_timebase_info_data_t tb;
 	uint8_t *base;
@@ -4124,6 +4140,8 @@ alioth_peek(void *surface, id texture, unsigned passes, unsigned tiled, NSString
 	if ([census length] != 0) {
 		rw_print("peek:   its draws by pipeline label: %s\n", [census UTF8String]);
 	}
+#undef last
+#undef told
 }
 
 /*
@@ -7361,10 +7379,11 @@ alioth_tile_skips(NSString *label)
 {
 	void *surface = NULL;
 	id texture = nil;
-	unsigned passes = 0, tiled = 0;
+	unsigned passes = 0, tiled = 0, facts_told = 0;
 	NSCountedSet *labels = nil;
+	NSMutableString *facts = nil;
 
-	if (!alioth_peek_on()) {
+	if (!alioth_peek_on() || !alioth_peek_due()) {
 		return;
 	}
 	for (id item in _work) {
@@ -7384,9 +7403,32 @@ alioth_tile_skips(NSString *label)
 					tiled += (w->tileMask >> i) & 1u;
 					if (labels == nil) {
 						labels = [NSCountedSet set];
+						facts = [NSMutableString string];
 					}
 					[labels addObject:w->render != nil ? ([w->render label] ?: @"(no label)") :
 					    w->clearOnly ? @"(clear only)" : @"(no pipeline)"];
+					/* the pass's clear colour, and what its texture-sampling draws read (size, imported, the centre
+					 * texel after the GPU), the first few */
+					if (w->clears && facts_told < 6) {
+						const float *cc = (w->clearMask & 1u) ? w->clearColors[0] : w->clearColor;
+
+						[facts appendFormat:@"; clear R G B A %.2f %.2f %.2f %.2f", cc[0], cc[1], cc[2], cc[3]];
+						facts_told++;
+					}
+					if (w->textureCount > 0 && facts_told < 6 && [w->textures[0] isKindOfClass:[AliothMetalTexture class]]) {
+						id t = w->textures[0];
+						uint8_t texel[8] = { 0 };
+						NSUInteger tw = [t width], th = [t height];
+
+						if ([t pixelFormat] == MTLPixelFormatBGRA8Unorm || [t pixelFormat] == MTLPixelFormatRGBA8Unorm) {
+							[t getBytes:texel bytesPerRow:4 fromRegion:MTLRegionMake2D(tw / 2, th / 2, 1, 1) mipmapLevel:0];
+						}
+						[facts appendFormat:@"; %@ samples a %lux%lu format %lu%s, centre %u %u %u %u",
+						    [w->render label] ?: @"(no label)", (unsigned long)tw, (unsigned long)th,
+						    (unsigned long)[t pixelFormat], [(AliothMetalTexture *)t aliothImported] ? " (an IOSurface)" : "",
+						    texel[0], texel[1], texel[2], texel[3]];
+						facts_told++;
+					}
 				}
 			}
 		} else if ([item isKindOfClass:[AliothMetalBlit class]]) {
@@ -7414,6 +7456,9 @@ alioth_tile_skips(NSString *label)
 				break;
 			}
 			[census appendFormat:@"%@%@ x%lu", [census length] ? @", " : @"", l, (unsigned long)[labels countForObject:l]];
+		}
+		if ([facts length] != 0) {
+			[census appendString:facts];
 		}
 		alioth_peek(surface, texture, passes, tiled, census);
 	}
