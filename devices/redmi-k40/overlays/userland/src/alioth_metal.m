@@ -5948,8 +5948,8 @@ alioth_clear_semaphore_debt(id commandBuffer)
 }
 
 /*
- * (the K40's, 11-17) boot-arg metal_run_thread=1 (a test road): a committed buffer runs on a serial queue of the command
- * queue's own, not on the thread that committed it. Running it -- the recorded draws into the compiler library, the
+ * (the K40's, 11-17) A committed buffer runs on a serial queue of the command queue's own, not on the thread that
+ * committed it (boot-arg metal_run_thread=0: on that thread, as until 11-17). Running it -- the recorded draws into the compiler library, the
  * tiles' commands at the flush, the kernel's submit -- was 33% of Flutter's raster thread (psample, round b34), time in
  * which it could have been encoding its next frame; Metal's -commit promises nothing synchronous. The waits already
  * handle a buffer committed and not yet run (-waitUntilScheduled, -waitUntilCompleted wait for _ranGroup), as they had
@@ -5959,15 +5959,19 @@ static BOOL
 alioth_run_thread(void)
 {
 	static dispatch_once_t once;
-	static BOOL on;
+	static BOOL on = YES;
 
+	/* (11-17: the default since rounds b38/b39 -- Flutter's frame test 111-113 a second against 92-104, its slowest frame
+	 * 95-126 ms against 152-187, metal.engine.screen 65.7 against 59.4, screen2 50.3 against 40.6; Metal tab 84 pass,
+	 * GPU tab 83/83, Effects tab 17 scenarios at 121.4 a second, Map's Metal self-test drawn. metal_run_thread=0: each
+	 * buffer runs on the thread that commits it, as before) */
 	dispatch_once(&once, ^{
 		char args[1024] = "";
 		size_t len = sizeof(args) - 1;
 
-		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_run_thread=1") != NULL) {
-			on = YES;
-			rw_print("metal_run_thread=1: command buffers run on a queue of their command queue's (a test road)\n");
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_run_thread=0") != NULL) {
+			on = NO;
+			rw_print("metal_run_thread=0: command buffers run on the thread that commits them\n");
 		}
 	});
 	return on;
