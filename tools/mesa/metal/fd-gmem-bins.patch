@@ -1,0 +1,48 @@
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.c
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c
+@@ -251,6 +251,45 @@
+               layout_gmem(key, nbins_x + 1, nbins_y - 1, gmem)) {
+       nbins_x++;
+       nbins_y--;
++   }
++
++   /* (hakios, the K40's Metal, 11-17) THE FEWEST BINS THAT FIT. The walk above keeps the two counts level, and a
++    * bin's width moves in steps of tile_align_w (96 on the A650): a tall picture ends with narrow, short bins when
++    * fewer, wider ones fit -- Flutter's 1125x2436 pass at 4 samples (36 bytes a pixel) gets 12x11 = 132 bins of
++    * 96x224 where 6x16 = 96 of 192x160 fit in the same GMEM. Every bin is one more pass of the CP over the batch's
++    * draws (skipped or not, each draw's state is read again), its clears and its resolve. So every column count is
++    * tried with the fewest rows that fit (more rows for the same columns only add bins), and the fewest bins win; a
++    * tie keeps the walk's answer. Once per framebuffer shape (the gmem cache). HAKIOS_FD_GMEM_SEARCH=0 (boot-arg
++    * metal_gmem_search=0): the walk's answer, as upstream.
++    */
++   static int search = -1;
++   if (search < 0) {
++      const char *e = getenv("HAKIOS_FD_GMEM_SEARCH");
++      search = !(e && e[0] == '0');
++   }
++   if (search) {
++      uint32_t min_x = 1, min_y = 1;
++      uint32_t max_x = DIV_ROUND_UP(key->width, screen->info->tile_align_w) + 1;
++      uint32_t max_y = DIV_ROUND_UP(key->height, screen->info->tile_align_h) + 1;
++
++      while (div_align(key->width, min_x, screen->info->tile_align_w) > max_width)
++         min_x++;
++      while (div_align(key->height, min_y, screen->info->tile_align_h) > max_height)
++         min_y++;
++      layout_gmem(key, nbins_x, nbins_y, gmem);
++      uint32_t best = gmem->nbins_x * gmem->nbins_y;
++      for (uint32_t x = min_x; x <= max_x; x++) {
++         for (uint32_t y = min_y; y <= max_y; y++) {
++            if (!layout_gmem(key, x, y, gmem))
++               continue;
++            if (gmem->nbins_x * gmem->nbins_y < best) {
++               best = gmem->nbins_x * gmem->nbins_y;
++               nbins_x = x;
++               nbins_y = y;
++            }
++            break;
++         }
++      }
+    }
+ 
+    layout_gmem(key, nbins_x, nbins_y, gmem);

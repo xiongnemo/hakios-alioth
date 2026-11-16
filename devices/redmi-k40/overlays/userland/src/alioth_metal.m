@@ -1215,6 +1215,12 @@ mesa_available(void)
 			setenv("HAKIOS_FD_MSAA_CLEAR", "0", 0);
 			rw_print("metal_msaa_clear=0: a multisample pass is cleared by a draw (u_blitter), as before 11-17\n");
 		}
+		/* (11-17) metal_gmem_search=0: freedreno's own choice of bins, not the fewest that fit
+		 * (tools/mesa/metal/fd-gmem-bins.patch, HAKIOS_FD_GMEM_SEARCH) */
+		if (strstr(args, "metal_gmem_search=0") != NULL && getenv("HAKIOS_FD_GMEM_SEARCH") == NULL) {
+			setenv("HAKIOS_FD_GMEM_SEARCH", "0", 0);
+			rw_print("metal_gmem_search=0: freedreno's own choice of bins, as before 11-17\n");
+		}
 		/* (11-16) metal_fd_vsc=DRAW,PRIM: freedreno's visibility streams' starting sizes a pipe (fd6_context.cc,
 		 * HAKIOS_FD_VSC; tools/mesa/metal/fd6-msrtt-trace.patch) -- a test road */
 		if ((at = strstr(args, "metal_fd_vsc=")) != NULL) {
