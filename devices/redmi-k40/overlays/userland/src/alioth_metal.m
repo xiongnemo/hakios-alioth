@@ -794,8 +794,9 @@ alioth_stats_commit(void)
 		longest[i] = __atomic_exchange_n(&alioth_stats_max[i], 0, __ATOMIC_RELAXED);
 	}
 	if (n[ST_PIPELINE] != 0) {
-		rw_print("stats: %llu pipelines made, %.2f ms each, %.1f ms in all, the longest %.2f ms (the library's lock "
-		         "held throughout); the longest draw %.2f ms, the longest wait for the lock %.2f ms\n",
+		/* (11-17: the library's lock is no longer held while it translates and compiles, rwa_device_set_lock) */
+		rw_print("stats: %llu pipelines made, %.2f ms each, %.1f ms in all, the longest %.2f ms; the longest draw "
+		         "%.2f ms, the longest wait for the lock %.2f ms\n",
 		         (unsigned long long)n[ST_PIPELINE], alioth_stat_avg(t, n, ST_PIPELINE), alioth_ms(t[ST_PIPELINE]),
 		         alioth_ms(longest[ST_PIPELINE]), alioth_ms(longest[ST_DRAW]), alioth_ms(longest[ST_LOCK]));
 	}

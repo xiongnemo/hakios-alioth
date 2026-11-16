@@ -132,8 +132,9 @@ struct rwa_device {
    } kept[2];
 
    /* (the K40's, 11-16) rwa_device_set_lock: the caller's lock around every call into this library, let go while a
-    * module is translated (AIR -> NIR touches no Gallium state and keeps none of its own) and taken again before the
-    * pipeline's states are made */
+    * module is translated (AIR -> NIR touches no Gallium state and keeps none of its own) and, from 11-17, while a render
+    * pipeline's two shader stages are made (rwa_render_create says why that is safe); taken again before its other
+    * states are made */
    void (*lock)(void *);
    void (*unlock)(void *);
    void *lock_context;
@@ -6931,11 +6932,16 @@ rwa_render_create(struct rwa_device *device,
 
    /* Compile both stages now. A failure here is a creation failure and says so; the
     * stages are linked later, at the draw.
+    *
+    * (the K40's, 11-17) STILL WITHOUT THE CALLER'S LOCK. Making a stage is NIR passes on this
+    * pipeline's own clone and the driver's create_vs_state/create_fs_state, and those two are
+    * called concurrently with the context's other calls by design: u_threaded_context hands
+    * them straight through from the application's thread while its driver thread draws, and
+    * freedreno's (ir3_shader_state_create) only reads the screen's compiler and queues the
+    * initial variants on its own ir3q threads. They were the long hold: Flutter's second launch
+    * made 67 pipelines, the longest 63.8 ms, and a commit waited 59.3 ms for the lock behind it
+    * (round b42) -- a frame lost on the run thread while the raster thread built a pipeline.
     */
-   if (unlocked) {
-      device->lock(device->lock_context);     /* (the K40's: Gallium from here on) */
-      unlocked = false;
-   }
    render->fs_cso = make_stage_cso(device, fs, why, why_size);
    if (!render->fs_cso)
       goto fail;
@@ -6951,6 +6957,10 @@ rwa_render_create(struct rwa_device *device,
       ralloc_free(vs);
    if (!render->vs_cso)
       goto fail;
+   if (unlocked) {
+      device->lock(device->lock_context);     /* (the K40's: the context's own state from here on) */
+      unlocked = false;
+   }
 
    /*
     * THE BLEND STATE, which until now was the fixed one air_run draws with -- colormask
