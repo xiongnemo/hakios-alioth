@@ -1932,6 +1932,7 @@ enum {
 	struct rwa_texture *_texture;
 	struct rwa_texture_shape _shape;
 	BOOL _lazy;                /* (the K40's, 11-16) memoryless: _texture made at the first -mesaTexture */
+	BOOL _imported;            /* (the K40's, 11-16) over an IOSurface the kernel gave the GPU (a drawable's) */
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
 	id _parent;                /* (the K40's) a view's texture, retained: -parentTexture */
 	NSUInteger _parentLevel, _parentSlice;   /* (the K40's) where a view starts in its parent */
@@ -1944,6 +1945,9 @@ enum {
 @property (readonly) struct rwa_texture *mesaTexture;
 /* (the K40's, 11-16) made with no compiler-library texture yet: memoryless, given memory at the first -mesaTexture */
 - (void)aliothSetLazy;
+/* (the K40's, 11-16) over an IOSurface (a drawable's), or a view of one: never resolved into in the tiles */
+- (void)aliothSetImported;
+- (BOOL)aliothImported;
 /* (the K40's) what a pass draws into for this texture at an attachment's level and slice */
 - (id)aliothAttachmentLevel:(NSUInteger)level slice:(NSUInteger)slice;
 /* (the K40's) what sampling it reads, channel by channel: MTLTextureDescriptor.swizzle, a view's */
@@ -3465,9 +3469,10 @@ enum {
 			    took.surface, took.width, took.height, took.rowBytes, took.pixelFormat, took.planes, took.handle);
 		}
 	}
-	return [[AliothMetalTexture alloc] initWithAliothDevice:self
-							 texture:texture
-							   shape:&shape];
+	AliothMetalTexture *made = [[AliothMetalTexture alloc] initWithAliothDevice:self texture:texture shape:&shape];
+
+	[made aliothSetImported];
+	return made;
 }
 - (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
 - (id)newBufferWithBytesNoCopy:(void *)bytes
@@ -4057,6 +4062,8 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 
 /* (the K40's, 11-16) a memoryless texture's memory, made here at its first real use (-newTextureWithDescriptor:) */
 - (void)aliothSetLazy { _lazy = YES; }
+- (void)aliothSetImported { _imported = YES; }
+- (BOOL)aliothImported { return _imported || (_parent != nil && [_parent aliothImported]); }
 
 - (struct rwa_texture *)mesaTexture
 {
@@ -4433,6 +4440,9 @@ alioth_view_shape(struct rwa_texture_shape *shape, const struct rwa_texture_shap
 		view = [[AliothMetalTexture alloc] initWithAliothDevice:_owner texture:t shape:&shape];
 		if (view == nil) {
 			return nil;
+		}
+		if ([self aliothImported]) {
+			[view aliothSetImported];
 		}
 		if (_attachmentViews == nil) {
 			_attachmentViews = [[NSMutableDictionary alloc] init];
@@ -7360,8 +7370,14 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 	    [attachment depthPlane] != 0 || [attachment resolveDepthPlane] != 0) {
 		return NO;
 	}
+	/*
+	 * (11-16, round b9) NOT INTO AN IOSURFACE: Flutter's on-screen pass resolved in the tiles into its drawable (a
+	 * linear IOSurface the kernel gave the GPU) left the screen black in 2 launches of 2 while its own read-back checks
+	 * passed and its frames ran at 84/s -- the tile store's resolve into such a surface does not reach what the
+	 * compositor reads (not understood yet). The driver's own textures resolve in the tiles; a drawable keeps the blit.
+	 */
 	return [texture sampleCount] > 1 && [resolve sampleCount] == 1 && [texture pixelFormat] == [resolve pixelFormat] &&
-	    ([resolve usage] & MTLTextureUsageRenderTarget) != 0 &&
+	    ([resolve usage] & MTLTextureUsageRenderTarget) != 0 && ![(AliothMetalTexture *)resolve aliothImported] &&
 	    MAX([texture width] >> level, 1u) == MAX([resolve width] >> resolveLevel, 1u) &&
 	    MAX([texture height] >> level, 1u) == MAX([resolve height] >> resolveLevel, 1u);
 }
