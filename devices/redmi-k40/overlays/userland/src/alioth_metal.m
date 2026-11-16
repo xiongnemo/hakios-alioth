@@ -7386,7 +7386,7 @@ static int
 alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 {
 	static dispatch_once_t once;
-	static BOOL off, iosurfaces;
+	static BOOL off, iosurfaces, proxies;
 	id texture = [attachment texture], resolve = [attachment resolveTexture];
 	NSUInteger level = [attachment level], resolveLevel = [attachment resolveLevel];
 
@@ -7396,12 +7396,15 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 
 		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0) {
 			off = strstr(args, "metal_tile_resolve=0") != NULL;
-			/* (a test road: into IOSurfaces too, as 3fb7c06 did -- to study why their screen stayed black) */
+			/* (test roads for a pass into an IOSurface, both of which left Flutter's screenshots black on 11-16: 2
+			 * straight into it as 3fb7c06 did, 3 into a proxy copied by a blit as 78b7ef9 did) */
 			iosurfaces = strstr(args, "metal_tile_resolve=2") != NULL;
+			proxies = strstr(args, "metal_tile_resolve=3") != NULL;
 		}
-		if (off || iosurfaces) {
-			rw_print("metal_tile_resolve=%d: multisample resolves %s\n", off ? 0 : 2, off ? "go through memory and a blit" :
-			    "in the tiles into IOSurfaces too (a test road)");
+		if (off || iosurfaces || proxies) {
+			rw_print("metal_tile_resolve=%d: multisample resolves %s\n", off ? 0 : iosurfaces ? 2 : 3, off ? "go through "
+			    "memory and a blit" : iosurfaces ? "in the tiles straight into IOSurfaces too (a test road)" : "in the tiles "
+			    "into a proxy for an IOSurface, then a blit (a test road)");
 		}
 	});
 	if (off || mesa.draw_features == NULL || !(mesa.draw_features() & RWA_DRAW_TILE_RESOLVE) ||
@@ -7417,14 +7420,19 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 		return ALIOTH_TILE_NO;
 	}
 	/*
-	 * (11-16, round b9) NOT STRAIGHT INTO AN IOSURFACE: Flutter's on-screen pass resolved in the tiles into its drawable
-	 * (a linear IOSurface the kernel gave the GPU) left the screen black in 2 launches of 2 while its own read-back
-	 * checks passed and its frames ran at 84/s -- the tile store's resolve into such a surface does not reach what the
-	 * compositor reads (not understood yet; metal_tile_resolve=2 does it anyway, to study). Such a pass resolves in the
-	 * tiles into a PROXY of the driver's own (one per format and size, -aliothTileProxyLike:) that the old road's GPU
-	 * blit then copies into the drawable: ~33 MB of memory traffic a full-screen frame instead of ~187.
+	 * (11-16) NOT FOR A PASS INTO AN IOSURFACE. Flutter's on-screen pass (4x BGRA8 + 4x Depth32Float_Stencil8,
+	 * resolved into its drawable) left the screenshots BLACK whichever way it resolved in the tiles -- straight into
+	 * the drawable (round b9, 2 of 2) or into a proxy of the driver's own copied by the old road's blit (round b10, 8
+	 * of 8) -- while the same session's old road drew 2 of 2, Flutter's own read-back checks passed, a drawable read
+	 * back by its application was right (System Check metal.msaa.drawable) and the display took Flutter's frames at
+	 * 74 a second. Whether the panel was black or only the screenshot (the loader reading the panel's memory) is not
+	 * known without eyes on the screen. Until it is, a pass into an IOSurface takes the old road; the driver's own
+	 * textures (offscreen multisample: engines') resolve in the tiles. metal_tile_resolve=2 / =3: the two roads above.
 	 */
-	return iosurfaces || ![(AliothMetalTexture *)resolve aliothImported] ? ALIOTH_TILE_DIRECT : ALIOTH_TILE_PROXY;
+	if ([(AliothMetalTexture *)resolve aliothImported]) {
+		return iosurfaces ? ALIOTH_TILE_DIRECT : proxies ? ALIOTH_TILE_PROXY : ALIOTH_TILE_NO;
+	}
+	return ALIOTH_TILE_DIRECT;
 }
 
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
