@@ -1,0 +1,95 @@
+From: nemo <38759782+xiongnemo@users.noreply.github.com>
+Subject: freedreno a6xx (K40 Metal only): a trace line per multisampled-render-to-texture batch
+
+Through hakios_fd_trace (air_metal.c rwa_set_trace; NULL = nothing). For the Flutter black screen:
+what freedreno decided for the batches resolved in the tiles (bins, hardware binning, subpasses,
+clears, visibility stream sizes) and any visibility stream overflow it reads back.
+
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc	2026-11-16 20:41:08.814576400 +1100
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc	2026-11-16 20:41:08.815571100 +1100
+@@ -28,6 +28,11 @@
+ #include "fd6_draw.h"
+ #include "fd6_emit.h"
+ #include "fd6_gmem.h"
++
++/* (the K40's, 11-16) set by the Metal library (air_metal.c rwa_set_trace): a line per batch that renders through a
++ * surface of more samples than its resource, for the driver's log */
++extern "C" void (*hakios_fd_trace)(const char *line);
++static void hakios_trace_batch(struct fd_batch *batch);
+ #include "fd6_pack.h"
+ #include "fd6_program.h"
+ #include "fd6_resource.h"
+@@ -691,6 +696,13 @@
+    if (!vsc_overflow)
+       return;
+ 
++   if (hakios_fd_trace) {
++      char line[160];
++      snprintf(line, sizeof(line), "fd6: the visibility stream overflowed: %#x (pitches draw %#x prim %#x)",
++               vsc_overflow, fd6_ctx->vsc_draw_strm_pitch, fd6_ctx->vsc_prim_strm_pitch);
++      hakios_fd_trace(line);
++   }
++
+    /* clear overflow flag: */
+    control->vsc_overflow = 0;
+ 
+@@ -1112,6 +1124,7 @@
+ static void
+ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
+ {
++   hakios_trace_batch(batch);
+    struct fd_ringbuffer *ring = batch->gmem;
+    struct pipe_framebuffer_state *pfb = &batch->framebuffer;
+    const struct fd_gmem_stateobj *gmem = batch->gmem_state;
+@@ -1732,6 +1745,51 @@
+           (psurf->nr_samples != psurf->texture->nr_samples);
+ }
+ 
++static void
++hakios_trace_batch(struct fd_batch *batch)
++{
++   static unsigned told;
++   const struct pipe_framebuffer_state *pfb = &batch->framebuffer;
++   bool msrtt = false;
++
++   if (!hakios_fd_trace)
++      return;
++   for (unsigned i = 0; i < pfb->nr_cbufs; i++)
++      if (pfb->cbufs[i] && needs_resolve(pfb->cbufs[i]))
++         msrtt = true;
++   if (!msrtt)
++      return;
++   told++;
++   if (told > 60 && told % 300 != 0)
++      return;
++
++   const struct fd_gmem_stateobj *gmem = batch->gmem_state;
++   struct fd6_context *fd6_ctx = fd6_context(batch->ctx);
++   unsigned subpasses = 0, subpass_draws = 0, fast = 0;
++   foreach_subpass (subpass, batch) {
++      subpasses++;
++      subpass_draws += subpass->num_draws;
++      fast |= (unsigned)subpass->fast_cleared;
++   }
++   struct fd_resource *zs = pfb->zsbuf ? fd_resource(pfb->zsbuf->texture) : NULL;
++   char line[480];
++   snprintf(line, sizeof(line),
++            "fd6 msrtt batch %u: %ux%u x%u, cbufs %u (0: %s over a x%u resource), zs %s; %u draws (%u in %u "
++            "subpasses, fast-cleared %#x), bins %ux%u maxpw %u maxph %u, hw binning %d; cleared %#x resolve %#x "
++            "restore %#x invalidated %#x gmem_reason %#x; stream bits draw %u prim %u, pitches draw %#x prim %#x; "
++            "lrz %d valid %d",
++            told, pfb->width, pfb->height, pfb->samples, pfb->nr_cbufs,
++            pfb->cbufs[0] ? util_format_short_name(pfb->cbufs[0]->format) : "none",
++            pfb->cbufs[0] ? pfb->cbufs[0]->texture->nr_samples : 0,
++            zs ? util_format_short_name(pfb->zsbuf->format) : "none",
++            batch->num_draws, subpass_draws, subpasses, fast, gmem->nbins_x, gmem->nbins_y, gmem->maxpw,
++            gmem->maxph, use_hw_binning(batch), batch->cleared, batch->resolve, batch->restore,
++            batch->invalidated, batch->gmem_reason, batch->draw_strm_bits, batch->prim_strm_bits,
++            fd6_ctx->vsc_draw_strm_pitch, fd6_ctx->vsc_prim_strm_pitch, zs && zs->lrz ? 1 : 0,
++            zs ? zs->lrz_valid : 0);
++   hakios_fd_trace(line);
++}
++
+ /**
+  * Returns the UNKNOWN_8C01 value for handling partial depth/stencil
+  * clear/stores to Z24S8.

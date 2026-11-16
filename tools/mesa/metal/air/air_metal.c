@@ -4509,6 +4509,16 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
    return rc;
 }
 
+/* (the K40's, 11-16) freedreno's own trace lines (tools/mesa/metal/fd6-msrtt-trace.patch: one per batch resolved in
+ * the tiles, and a visibility stream overflow read back), handed to the driver's log; NULL: none (air_metal.h) */
+void (*hakios_fd_trace)(const char *line);
+
+void
+rwa_set_trace(void (*fn)(const char *line))
+{
+   hakios_fd_trace = fn;
+}
+
 void
 rwa_device_set_deferred(struct rwa_device *device, unsigned deferred)
 {

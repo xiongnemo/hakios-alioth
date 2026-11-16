@@ -1164,6 +1164,13 @@ alioth_finish(struct rwa_device *device, char *why, size_t size)
 
 static NSUInteger alioth_texel_bytes(NSUInteger format);     /* (with the blit encoder, below) */
 
+/* (the K40's, 11-16) one of freedreno's trace lines (metal_fd_trace=1, tools/mesa/metal/fd6-msrtt-trace.patch) */
+static void
+alioth_fd_trace_line(const char *line)
+{
+	rw_print("fd: %s\n", line);
+}
+
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
  * no library worth loading, and the device object still has to exist. */
 static bool
@@ -1175,6 +1182,7 @@ mesa_available(void)
 		return mesa.handle != NULL;
 	}
 	tried = true;
+	BOOL fd_trace = NO;     /* (11-16) boot-arg metal_fd_trace=1: freedreno's trace lines here (rwa_set_trace) */
 	/*
 	 * (the K40's, 11-16) boot-arg metal_fd_debug=FLAGS (a test road): freedreno's own FD_MESA_DEBUG for this
 	 * library, comma-separated as freedreno takes them (nobin, nogmem, ...), set before its screen reads it once.
@@ -1187,7 +1195,10 @@ mesa_available(void)
 		size_t len = sizeof(args) - 1;
 		const char *at;
 
-		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && (at = strstr(args, "metal_fd_debug=")) != NULL) {
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0) {
+			fd_trace = strstr(args, "metal_fd_trace=1") != NULL;
+		}
+		if ((at = strstr(args, "metal_fd_debug=")) != NULL) {
 			char flags[64];
 			size_t n = 0;
 
@@ -1258,6 +1269,14 @@ mesa_available(void)
 	*(void **)&mesa.texture_subview = dlsym(mesa.handle, "rwa_texture_subview");
 	*(void **)&mesa.texture_mipmaps = dlsym(mesa.handle, "rwa_texture_mipmaps");
 	*(void **)&mesa.draw_features = dlsym(mesa.handle, "rwa_draw_features");
+	if (fd_trace) {
+		void (*set_trace)(void (*)(const char *)) = (void (*)(void (*)(const char *)))dlsym(mesa.handle, "rwa_set_trace");
+
+		if (set_trace != NULL) {
+			set_trace(alioth_fd_trace_line);
+			rw_print("metal_fd_trace=1: freedreno's lines for batches resolved in the tiles follow (a test)\n");
+		}
+	}
 	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
 	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
 	*(void **)&mesa.texture_copy = dlsym(mesa.handle, "rwa_texture_copy");

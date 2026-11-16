@@ -1454,6 +1454,11 @@ void *rwa_flush(struct rwa_device *device, unsigned want_fence);
  * rwa_fence_wait, or rwa_finish) and reads nothing before. 0, the default, waits as before. */
 void rwa_device_set_deferred(struct rwa_device *device, unsigned deferred);
 
+/* (the K40's, 11-16) a function for freedreno's trace lines (tools/mesa/metal/fd6-msrtt-trace.patch): one line per
+ * batch that renders through a surface of more samples than its resource, and a visibility stream overflow read
+ * back. NULL (the default): none. */
+void rwa_set_trace(void (*fn)(const char *line));
+
 /* (the K40's, 2026-11-13) 1: every indexed draw's indices are walked on the processor for their
  * bounds, as all were before (boot-arg metal_index_walk=1, for comparisons). 0, the default: only
  * the generated quad's are; other indexed draws reach Gallium with unknown bounds and the
