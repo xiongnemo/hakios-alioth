@@ -1946,6 +1946,7 @@ enum {
 	MTLTextureSwizzleChannels _swizzle;
 	void *_shadowSurface;                    /* (the K40's) the IOSurface this texture stands in for, retained */
 	NSUInteger _shadowPlane;
+	void *_peekSurface;                      /* (the K40's, 11-16) metal_drawable_peek=1: the IOSurface, retained */
 }
 @property (readonly) struct rwa_texture *mesaTexture;
 /* (the K40's, 11-16) made with no compiler-library texture yet: memoryless, given memory at the first -mesaTexture */
@@ -1953,6 +1954,9 @@ enum {
 /* (the K40's, 11-16) over an IOSurface (a drawable's), or a view of one: never resolved into in the tiles */
 - (void)aliothSetImported;
 - (BOOL)aliothImported;
+/* (the K40's, 11-16) the same with the surface, kept for metal_drawable_peek=1 (-[AliothMetalCommandBuffer aliothPeekBack]) */
+- (void)aliothSetImportedSurface:(void *)surface;
+- (void *)aliothPeekSurface;
 /* (the K40's) what a pass draws into for this texture at an attachment's level and slice */
 - (id)aliothAttachmentLevel:(NSUInteger)level slice:(NSUInteger)slice;
 /* (the K40's) what sampling it reads, channel by channel: MTLTextureDescriptor.swizzle, a view's */
@@ -3503,7 +3507,7 @@ enum {
 	}
 	AliothMetalTexture *made = [[AliothMetalTexture alloc] initWithAliothDevice:self texture:texture shape:&shape];
 
-	[made aliothSetImported];
+	[made aliothSetImportedSurface:s];
 	return made;
 }
 - (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
@@ -3969,6 +3973,116 @@ alioth_surface_calls(void)
 	    alioth_surface.plane_width != NULL && alioth_surface.plane_height != NULL;
 }
 
+/*
+ * (the K40's, 11-16) metal_drawable_peek=1: once the GPU is done with a command buffer that drew or blitted into an
+ * IOSurface (a drawable), what the surface's memory holds then -- 64 points of a grid, how many are not black, how
+ * many have no opacity, and its centre -- one line every 2 s a process at most (the first 4 at once). Flutter's
+ * screen stayed black whenever its drawable was resolved in the tiles (rounds b9, b10, b14, b15: straight in, by the
+ * 2D engine, by a draw) while its own read-back checks passed. This says whether the picture is in the surface after
+ * the GPU -- then the window server shows it wrong or reads it too early -- or is not, and the driver wrote it wrong.
+ * Off by default: it reads the surface's memory on the completion queue.
+ */
+static BOOL
+alioth_peek_on(void)
+{
+	static dispatch_once_t once;
+	static BOOL on;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_drawable_peek=1") != NULL) {
+			on = alioth_surface_calls();
+			rw_print("metal_drawable_peek=1: %s\n", on ? "an IOSurface drawn into is read back after the GPU (a test)" :
+			    "no IOSurface calls found; nothing is read back");
+		}
+	});
+	return on;
+}
+
+static BOOL alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *row, size_t *width,
+				 size_t *height);
+
+static void
+alioth_peek(void *surface, id texture, unsigned passes, unsigned tiled)
+{
+	static uint64_t last;
+	static unsigned told;
+	uint64_t now = mach_absolute_time(), then = __atomic_load_n(&last, __ATOMIC_RELAXED);
+	static mach_timebase_info_data_t tb;
+	uint8_t *base;
+	size_t row, width, height;
+	unsigned lit = 0, clear = 0;
+	uint8_t c[4] = { 0, 0, 0, 0 };
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	if (__atomic_load_n(&told, __ATOMIC_RELAXED) >= 4 && (now - then) * tb.numer / tb.denom < 2000000000ull) {
+		return;
+	}
+	if (!__atomic_compare_exchange_n(&last, &then, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+		return;         /* (another thread's line this time) */
+	}
+	__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED);
+	(void)alioth_surface.lock(surface, 1 /* kIOSurfaceLockReadOnly */, NULL);
+	if (alioth_surface.planes(surface) != 0 || !alioth_surface_plane(surface, 0, &base, &row, &width, &height) ||
+	    row < width * 4) {
+		(void)alioth_surface.unlock(surface, 1, NULL);
+		rw_print("peek: an IOSurface that is not one plane of 4-byte pixels\n");
+		return;
+	}
+	for (unsigned gy = 0; gy < 8; gy++) {
+		for (unsigned gx = 0; gx < 8; gx++) {
+			const uint8_t *px = base + row * ((2 * gy + 1) * height / 16) + 4 * ((2 * gx + 1) * width / 16);
+
+			lit += (px[0] | px[1] | px[2]) != 0;
+			clear += px[3] == 0;
+		}
+	}
+	memcpy(c, base + row * (height / 2) + 4 * (width / 2), 4);
+	(void)alioth_surface.unlock(surface, 1, NULL);
+	/* the same centre through the GPU driver's own read (what an application's -getBytes: sees): if this has the picture
+	 * and the memory above has not, the processor's view of the surface is stale, not the drawing */
+	uint8_t g[4] = { 0, 0, 0, 0 };
+	BOOL read = NO;
+
+	if ([texture isKindOfClass:[AliothMetalTexture class]] && [texture width] == width && [texture height] == height) {
+		[texture getBytes:g bytesPerRow:4 fromRegion:MTLRegionMake2D(width / 2, height / 2, 1, 1) mipmapLevel:0];
+		read = YES;
+	}
+	rw_print("peek: after the GPU, an IOSurface of %zux%zu (%u passes into it, %u resolved in the tiles): of 64 "
+	    "points in its memory %u not black, %u with opacity 0; the centre B G R A %u %u %u %u in memory, %s %u %u %u %u\n",
+	    width, height, passes, tiled, lit, clear, c[0], c[1], c[2], c[3], read ? "through the driver" : "(not read through "
+	    "the driver)", g[0], g[1], g[2], g[3]);
+}
+
+/*
+ * (the K40's, 11-16) metal_present_after_gpu=1 (a test road): a buffer's scheduled handlers -- a present is one -- are
+ * delivered once the GPU has finished it, not once it is submitted. The GPU's one ring puts a frame before the window
+ * server's reading of it, but not before the display's own reading of a surface it was handed as a layer (the kernel's
+ * framebuffer takes an application's surface straight into a layer: "swap N layer 0: surface ... 1125x2436"). If
+ * Flutter's black screen is a present that came too early for that, this draws it.
+ */
+static BOOL
+alioth_present_after_gpu(void)
+{
+	static dispatch_once_t once;
+	static BOOL on;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_present_after_gpu=1") != NULL) {
+			on = YES;
+			rw_print("metal_present_after_gpu=1: scheduled handlers (presents) once the GPU is done (a test road)\n");
+		}
+	});
+	return on;
+}
+
 @implementation AliothMetalTexture
 
 + (void)load
@@ -4018,6 +4132,9 @@ alioth_surface_calls(void)
 	if (_shadowSurface != NULL) {
 		CFRelease(_shadowSurface);
 		__atomic_fetch_sub(&alioth_shadows, 1, __ATOMIC_RELAXED);
+	}
+	if (_peekSurface != NULL) {
+		CFRelease(_peekSurface);
 	}
 	[super dealloc];
 }
@@ -4096,6 +4213,20 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 - (void)aliothSetLazy { _lazy = YES; }
 - (void)aliothSetImported { _imported = YES; }
 - (BOOL)aliothImported { return _imported || (_parent != nil && [_parent aliothImported]); }
+- (void)aliothSetImportedSurface:(void *)surface
+{
+	_imported = YES;
+	if (surface != NULL && _peekSurface == NULL && alioth_peek_on()) {
+		_peekSurface = (void *)CFRetain(surface);
+	}
+}
+- (void *)aliothPeekSurface
+{
+	if (_peekSurface != NULL) {
+		return _peekSurface;
+	}
+	return [_parent isKindOfClass:[AliothMetalTexture class]] ? [(AliothMetalTexture *)_parent aliothPeekSurface] : NULL;
+}
 
 - (struct rwa_texture *)mesaTexture
 {
@@ -7085,6 +7216,51 @@ done:
 	}
 }
 
+/* (the K40's, 11-16) metal_drawable_peek=1 (alioth_peek): the first IOSurface this buffer drew or blitted into, read
+ * once the GPU is done with it, with how many of the buffer's draws went into it and how many of those resolved in
+ * the tiles (into it, or into a proxy a blit then copied into it) */
+- (void)aliothPeekBack
+{
+	void *surface = NULL;
+	id texture = nil;
+	unsigned passes = 0, tiled = 0;
+
+	if (!alioth_peek_on()) {
+		return;
+	}
+	for (id item in _work) {
+		if ([item isKindOfClass:[AliothMetalWork class]]) {
+			AliothMetalWork *w = item;
+
+			if (w->pipeline != nil) {
+				continue;
+			}
+			for (unsigned i = 0; i < w->colorCount && i < 8; i++) {
+				void *s = [w->color[i] isKindOfClass:[AliothMetalTexture class]] ? [w->color[i] aliothPeekSurface] : NULL;
+
+				if (s != NULL && (surface == NULL || s == surface)) {
+					surface = s;
+					texture = texture != nil ? texture : w->color[i];
+					passes++;
+					tiled += (w->tileMask >> i) & 1u;
+				}
+			}
+		} else if ([item isKindOfClass:[AliothMetalBlit class]]) {
+			id d = ((AliothMetalBlit *)item)->destination;
+			void *s = [d isKindOfClass:[AliothMetalTexture class]] ? [d aliothPeekSurface] : NULL;
+
+			if (s != NULL && (surface == NULL || s == surface)) {
+				surface = s;
+				texture = texture != nil ? texture : d;
+				passes++;
+			}
+		}
+	}
+	if (surface != NULL) {
+		alioth_peek(surface, texture, passes, tiled);
+	}
+}
+
 /* The fence is the whole point: a dispatch that the GPU does not finish must not read as a
  * result. air_run learned that the expensive way (docs/air.md section 5). */
 - (void)waitUntilCompleted
@@ -7252,10 +7428,16 @@ done:
 		flushed = mach_absolute_time();
 	}
 	_kernelEnd = flushed;
-	for (id handler in scheduled) {
-		[self aliothDeliver:(void (^)(id))handler];
+	/* (metal_present_after_gpu=1: kept for after the fence below) */
+	BOOL late = async && [scheduled count] > 0 && alioth_present_after_gpu();
+
+	if (!late) {
+		for (id handler in scheduled) {
+			[self aliothDeliver:(void (^)(id))handler];
+		}
+		[scheduled release];
+		scheduled = nil;
 	}
-	[scheduled release];
 
 	/*
 	 * (the K40's) THE WAIT OFF THIS THREAD. A completed handler is a promise about the GPU, so it is kept only once
@@ -7282,6 +7464,12 @@ done:
 			_gpuStart = MAX(flushed, _queue.aliothLastGPUEnd);
 			_gpuEnd = end;
 			_queue.aliothLastGPUEnd = end;
+			if (late) {
+				for (id handler in scheduled) {
+					[self aliothDeliver:(void (^)(id))handler];
+				}
+				[scheduled release];
+			}
 			/* (the events first, in the buffer's order: the GPU reached them before it finished the buffer;
 			 * set on a failure too, so that nothing waits for ever on a value a broken buffer owed) */
 			for (AliothMetalSignal *s in signals) {
@@ -7296,6 +7484,7 @@ done:
 				_status = RW_CB_ERROR;
 			} else {
 				[self aliothShadowsBack];
+				[self aliothPeekBack];
 				_status = RW_CB_COMPLETED;
 			}
 			[self aliothQueriesBack:waited == 0];
