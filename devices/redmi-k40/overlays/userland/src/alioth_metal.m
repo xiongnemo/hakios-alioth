@@ -5237,7 +5237,53 @@ out:
 
 @end
 
+/*
+ * (the K40's, 11-16) RECYCLED WORKS. One AliothMetalWork is made per draw (~2.4 KB: its binding tables are fixed
+ * arrays of 32) and freed with its command buffer, and Flutter's raster thread spent ~12% of its running time in
+ * malloc and free for them (round b10's psample of Runner: objc_alloc_init under -recordDraw: 7.3%,
+ * small_free_list_add_ptr 5.9%; ~29000 draws a second). A work let go now goes back to a pool -- what the runtime
+ * keeps for the object let go first (objc_destructInstance: side-table counts, weak references, associations) -- and
+ * the next +allocWithZone: takes it back zeroed (objc_constructInstance), at most 512 kept, an exact AliothMetalWork
+ * only. Boot-arg metal_work_pool=0: malloc and free every time, as before.
+ */
+static os_unfair_lock alioth_work_lock = OS_UNFAIR_LOCK_INIT;
+static void *alioth_work_pool[512];
+static unsigned alioth_work_pooled;
+
+static BOOL
+alioth_work_pool_on(void)
+{
+	static dispatch_once_t once;
+	static BOOL on = YES;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		on = !(sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_work_pool=0") != NULL);
+	});
+	return on;
+}
+
 @implementation AliothMetalWork
+
++ (id)allocWithZone:(NSZone *)zone
+{
+	void *bytes = NULL;
+
+	if (self == [AliothMetalWork class] && alioth_work_pool_on()) {
+		os_unfair_lock_lock(&alioth_work_lock);
+		if (alioth_work_pooled != 0) {
+			bytes = alioth_work_pool[--alioth_work_pooled];
+		}
+		os_unfair_lock_unlock(&alioth_work_lock);
+	}
+	if (bytes == NULL) {
+		return [super allocWithZone:zone];
+	}
+	memset(bytes, 0, class_getInstanceSize(self));
+	return objc_constructInstance(self, bytes);
+}
 
 /*
  * (the K40's) What a recorded work refers to, kept alive until the work goes: Metal retains whatever a command buffer
@@ -5311,6 +5357,22 @@ out:
 		for (unsigned i = 0; i < vertexSamplerCount && i < RW_MAX_BUFFERS; i++) {
 			[vertexSamplers[i] release];
 		}
+	}
+	/* (the K40's, 11-16) back to the pool (+allocWithZone: says why), or freed as NSObject's -dealloc would */
+	if (object_getClass(self) == [AliothMetalWork class] && alioth_work_pool_on()) {
+		BOOL kept = NO;
+
+		objc_destructInstance(self);
+		os_unfair_lock_lock(&alioth_work_lock);
+		if (alioth_work_pooled < sizeof(alioth_work_pool) / sizeof(alioth_work_pool[0])) {
+			alioth_work_pool[alioth_work_pooled++] = self;
+			kept = YES;
+		}
+		os_unfair_lock_unlock(&alioth_work_lock);
+		if (!kept) {
+			free(self);
+		}
+		return;
 	}
 	[super dealloc];
 }
