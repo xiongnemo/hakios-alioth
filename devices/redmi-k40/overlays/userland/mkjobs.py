@@ -294,6 +294,9 @@ for label in labels:
         job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
     with open(f'{dest}/{label}.plist', 'wb') as f:
         plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
+    # 0644 whatever the umask: launchd refuses a job plist that is group- or world-writable ("bad ownership/
+    # permissions"), and a build under umask 002 wrote 0664 -- every job refused (issue #1)
+    os.chmod(f'{dest}/{label}.plist', 0o644)
     program = job.get('Program') or job['ProgramArguments'][0]
     missing = '' if present(program) else ('   (NOT on the iOS volume!)' if root_volume
                                            else '   (NOT in the system image!)')
@@ -321,5 +324,6 @@ if rest:
             job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
         with open(f'{dest}/{name}', 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
+        os.chmod(f'{dest}/{name}', 0o644)     # (as above: launchd refuses a writable job plist)
         count += 1
     print(f'  ... and {count} more jobs, started on demand only')

@@ -5,7 +5,8 @@ English · [中文](README.zh.md)
 > **Issues welcome, pull requests not.** Found a bug, have a question, or know how something should be fixed? Please
 > open an [issue](https://github.com/xiongnemo/hakios-alioth/issues), and feel free to propose a fix in it, as a
 > description or a diff. Because of how this port is developed, pull requests cannot be accepted, so they are
-> turned off for this repository.
+> turned off for this repository. The repository's owner is very busy in real life, so issues are read about once
+> every two days: expect a turnaround of roughly 48 hours.
 
 The stock iOS 16.5 (20F66) user space on the Redmi K40 / POCO F3 (`alioth`, Snapdragon 870), running on the
 open-source XNU kernel with our own boot loader and drivers. It is a port of [HakiOS](https://github.com/oosexgang/hakios-os)
