@@ -133,10 +133,25 @@ drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long siz
 	return -call((unsigned)(DRM_COMMAND_BASE + index), (void *)(uintptr_t)data, size);
 }
 
+/* DRM_MSM_GEM_MADVISE: { u32 handle; u32 madv; u32 retained; } */
+#define HAKIOS_MSM_GEM_MADVISE  0x08
+
 int
 drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
 {
 	(void)fd;
+	/*
+	 * (the K40's, 11-17) A buffer's madvise answered here, without the kernel: its answer is always "retained"
+	 * (HakiosGPU's kMsmGemMadvise, which never lets a buffer's memory go), and freedreno asks on every buffer its
+	 * cache gives out or takes back -- fd6_build_bindless_state makes a descriptor buffer for every draw that
+	 * changes them, a submission its ring buffers. backboardd's GL thread (gdrv0) spent 9.5% of its time in those
+	 * round trips while Settings scrolled (round b43, libOSMesa named). If the kernel ever takes memory back from a
+	 * DONTNEED buffer, this must ask it again.
+	 */
+	if (index == HAKIOS_MSM_GEM_MADVISE && data != NULL && size >= 3 * sizeof(uint32_t)) {
+		((uint32_t *)data)[2] = 1;
+		return 0;
+	}
 	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
 }
 
