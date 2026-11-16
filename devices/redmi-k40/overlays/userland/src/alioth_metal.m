@@ -7402,6 +7402,27 @@ alioth_tile_skips(NSString *label)
 	if (!alioth_peek_on() || !alioth_peek_due()) {
 		return;
 	}
+	/* (the old road: a pass renders into a multisample texture and a resolve blit copies it into the surface -- its
+	 * draws are the works into that blit's source, so they are counted as the surface's too) */
+	NSMutableSet *sources = nil;
+
+	for (id item in _work) {
+		if ([item isKindOfClass:[AliothMetalBlit class]] && ((AliothMetalBlit *)item)->kind == ALIOTH_BLIT_RESOLVE) {
+			id d = ((AliothMetalBlit *)item)->destination;
+
+			if ([d isKindOfClass:[AliothMetalTexture class]] && [d aliothPeekSurface] != NULL &&
+			    ((AliothMetalBlit *)item)->source != nil) {
+				if (sources == nil) {
+					sources = [NSMutableSet set];
+				}
+				[sources addObject:((AliothMetalBlit *)item)->source];
+				if (surface == NULL) {
+					surface = [d aliothPeekSurface];
+					texture = d;
+				}
+			}
+		}
+	}
 	for (id item in _work) {
 		if ([item isKindOfClass:[AliothMetalWork class]]) {
 			AliothMetalWork *w = item;
@@ -7412,6 +7433,9 @@ alioth_tile_skips(NSString *label)
 			for (unsigned i = 0; i < w->colorCount && i < 8; i++) {
 				void *s = [w->color[i] isKindOfClass:[AliothMetalTexture class]] ? [w->color[i] aliothPeekSurface] : NULL;
 
+				if (s == NULL && w->color[i] != nil && [sources containsObject:w->color[i]]) {
+					s = surface;    /* (an old-road pass into the surface: counted with it, its draws not tiled) */
+				}
 				if (s != NULL && (surface == NULL || s == surface)) {
 					surface = s;
 					texture = texture != nil ? texture : w->color[i];
