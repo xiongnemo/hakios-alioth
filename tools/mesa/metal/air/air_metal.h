@@ -1344,12 +1344,22 @@ struct rwa_draw {
 	 * and the depth is clamped to the depth range instead (Gallium's depth_clip_near/far off, depth_clamp on).
 	 * RWA_DRAW_DEPTH_CLAMP. Appended. */
 	unsigned depth_clamp;
+	/* (the K40's, 11-16) MULTISAMPLE RESOLVED IN THE TILES: bit i of `tile_resolve_mask` says colour attachment i is
+	 * the pass's ONE-sample resolve texture, rendered at `tile_samples` samples a pixel in the GPU's tile memory
+	 * and averaged into it as each tile is written out (a Gallium surface of nr_samples over a one-sample
+	 * resource: EXT_multisampled_render_to_texture's road; freedreno a6xx resolves at the tile store). For
+	 * Metal's MTLStoreActionMultisampleResolve with a load that does not read the samples: the multisample
+	 * texture is never written, and no resolve blit follows -- where it was written whole (4 samples a pixel)
+	 * and read back whole by the blit. RWA_DRAW_TILE_RESOLVE. Appended. */
+	unsigned tile_resolve_mask;
+	unsigned tile_samples;
 };
 
 /* (the K40's) what this library's rwa_render_draw takes beyond the struct's first shape */
 #define RWA_DRAW_INDIRECT 1u
 #define RWA_DRAW_CLEAR_EACH 2u
 #define RWA_DRAW_DEPTH_CLAMP 4u
+#define RWA_DRAW_TILE_RESOLVE 8u
 unsigned rwa_draw_features(void);
 
 /* (the K40's, 11-16) The contents of an attachment let go: Metal's MTLStoreActionDontCare at a pass's end. The pass

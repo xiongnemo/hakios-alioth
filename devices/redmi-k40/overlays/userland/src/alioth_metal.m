@@ -337,6 +337,10 @@ struct rwa_draw {
 	const float *clear_colors;
 	unsigned clear_color_mask;
 	unsigned depth_clamp;
+	/* (the K40's, 11-16) colour attachments that are the one-sample resolve texture, rendered at tile_samples and
+	 * resolved in the GPU's tiles (RWA_DRAW_TILE_RESOLVE) */
+	unsigned tile_resolve_mask;
+	unsigned tile_samples;
 };
 /* (the K40's) Metal's pipeline reflection, air_metal.h's rwa_argument (rwa_render_arguments) */
 struct rwa_struct_member {
@@ -629,6 +633,7 @@ static struct {
 #define RWA_DRAW_INDIRECT       1u
 #define RWA_DRAW_CLEAR_EACH     2u      /* (11-16) rwa_draw.clear_colors / clear_color_mask */
 #define RWA_DRAW_DEPTH_CLAMP    4u      /* (11-16) rwa_draw.depth_clamp */
+#define RWA_DRAW_TILE_RESOLVE   8u      /* (11-16) rwa_draw.tile_resolve_mask / tile_samples */
 
 /*
  * (the K40's) ONE LOCK FOR THE COMPILER LIBRARY. Its device is one Gallium pipe_context, which is not thread-safe,
@@ -1699,6 +1704,8 @@ enum {
 	BOOL depthClamp;
 	/* (the K40's, 11-16) ALIOTH_DISCARD: attachments whose contents the pass's store actions let go (-endEncoding) */
 	BOOL discard;
+	/* (the K40's, 11-16) colour attachments resolved in the tiles (rwa_draw.tile_resolve_mask), at tileSamples */
+	unsigned tileMask, tileSamples;
 	/* the depth/stencil attachment of the pass, its two load actions and the state
 	 * bound when the draw was encoded. Separate flags per aspect because Metal keeps
 	 * two attachment descriptors over one texture and a pass that clears the depth and
@@ -6575,6 +6582,9 @@ done:
 		.clear_colors = work->clearMask != 0 ? &work->clearColors[0][0] : NULL,
 		.clear_color_mask = work->clearMask,
 		.depth_clamp = work->depthClamp ? 1 : 0,
+		/* (the K40's, 11-16) multisample resolved in the tiles (alioth_tile_resolve_fits) */
+		.tile_resolve_mask = work->tileMask,
+		.tile_samples = work->tileSamples,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
@@ -6942,6 +6952,10 @@ done:
 	AliothMetalRenderPipeline *_pipeline;
 	id _color[8];
 	id _resolve[8];         /* (the K40's) each colour attachment's resolveTexture, resolved at -endEncoding */
+	/* (the K40's, 11-16) attachments resolved in the tiles: _color[i] is then the resolve texture, _msaa[i] the
+	 * multisample one the pass named (used only if the pass draws nothing: -endEncoding) */
+	id _msaa[8];
+	unsigned _tileMask, _tileSamples;
 	unsigned _colorCount;
 	float _clearColor[4];
 	BOOL _clears;
@@ -7006,6 +7020,48 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 	return view != nil ? view : texture;
 }
 
+/*
+ * (the K40's, 11-16) MULTISAMPLE RESOLVED IN THE TILES. A pass whose multisample colour attachment ends in
+ * MTLStoreActionMultisampleResolve -- the samples not wanted after it -- and does not load them: the draws render into
+ * the one-sample resolve texture through a surface of the pass's sample count, so the GPU keeps the samples in its
+ * tile memory and averages them into the resolve texture as each tile is written out (rwa_draw.tile_resolve_mask;
+ * freedreno a6xx's resolve at the tile store, EXT_multisampled_render_to_texture's road). Until now the samples went
+ * out to memory whole and a blit read them back: at 1125x2436 RGBA16Float x4 (System Check's metal.engine.screen)
+ * ~88 MB written and read again every frame, then a flush of its own. Metal's own tile GPUs do the same with
+ * memoryless multisample textures. Not for: a load (the samples are read), StoreAndMultisampleResolve (they are
+ * kept), a resolve texture of another format or size or without MTLTextureUsageRenderTarget, a parallel pass
+ * (its later sub-encoders load the earlier ones' samples -- the parallel encoder asks to store them), 3D planes.
+ * Boot-arg metal_tile_resolve=0: the old road.
+ */
+static BOOL
+alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
+{
+	static dispatch_once_t once;
+	static BOOL off;
+	id texture = [attachment texture], resolve = [attachment resolveTexture];
+	NSUInteger level = [attachment level], resolveLevel = [attachment resolveLevel];
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		off = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_tile_resolve=0") != NULL;
+		if (off) {
+			rw_print("metal_tile_resolve=0: multisample resolves go through memory and a blit\n");
+		}
+	});
+	if (off || mesa.draw_features == NULL || !(mesa.draw_features() & RWA_DRAW_TILE_RESOLVE) ||
+	    [attachment storeAction] != MTLStoreActionMultisampleResolve || [attachment loadAction] == MTLLoadActionLoad ||
+	    ![texture isKindOfClass:[AliothMetalTexture class]] || ![resolve isKindOfClass:[AliothMetalTexture class]] ||
+	    [attachment depthPlane] != 0 || [attachment resolveDepthPlane] != 0) {
+		return NO;
+	}
+	return [texture sampleCount] > 1 && [resolve sampleCount] == 1 && [texture pixelFormat] == [resolve pixelFormat] &&
+	    ([resolve usage] & MTLTextureUsageRenderTarget) != 0 &&
+	    MAX([texture width] >> level, 1u) == MAX([resolve width] >> resolveLevel, 1u) &&
+	    MAX([texture height] >> level, 1u) == MAX([resolve height] >> resolveLevel, 1u);
+}
+
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
 				  descriptor:(MTLRenderPassDescriptor *)descriptor
 {
@@ -7047,6 +7103,15 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 				_resolve[i] = alioth_attachment_texture([attachment resolveTexture],
 				    [attachment resolveLevel], [attachment resolveSlice],
 				    [attachment resolveDepthPlane]);
+				if (alioth_tile_resolve_fits(attachment)) {
+					/* resolved in the tiles: the draws render into the resolve texture at the pass's
+					 * sample count, and no resolve blit follows (alioth_tile_resolve_fits says why) */
+					_msaa[i] = texture;
+					_color[i] = _resolve[i];
+					_resolve[i] = nil;
+					_tileMask |= 1u << i;
+					_tileSamples = (unsigned)[[attachment texture] sampleCount];
+				}
 			} else {
 				rw_print("colour attachment %u asks for a multisample resolve "
 				         "(storeAction %lu) with no resolveTexture; the attachment is "
@@ -7362,6 +7427,8 @@ alioth_attachment_texture(id texture, NSUInteger level, NSUInteger slice, NSUInt
 	for (unsigned i = 0; i < _colorCount; i++) {
 		work->color[i] = _color[i];
 	}
+	work->tileMask = _tileMask;
+	work->tileSamples = _tileSamples;
 	work->clears = _clears;
 	for (unsigned i = 0; i < 4; i++) {
 		work->clearColor[i] = _clearColor[i];
@@ -8465,6 +8532,20 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
  */
 - (void)endEncoding
 {
+	/*
+	 * (the K40's, 11-16) a pass meant to resolve in the tiles that drew nothing: its clear goes to the multisample
+	 * texture it named and is resolved by a blit as before (a one-sample colour surface and a multisample depth one
+	 * in one framebuffer would disagree on the sample count, and only a draw brings the surface of the right count)
+	 */
+	for (unsigned i = 0; !_ended && !_drew && _tileMask != 0 && i < _colorCount; i++) {
+		if (_tileMask & (1u << i)) {
+			_resolve[i] = _color[i];
+			_color[i] = _msaa[i];
+		}
+	}
+	if (!_drew) {
+		_tileMask = 0;
+	}
 	if (!_ended && !_drew && (_clears || _clearsDepth || _clearsStencil) &&
 	    (_colorCount != 0 || _depth != nil)) {
 		AliothMetalWork *work = [[AliothMetalWork alloc] init];
@@ -8643,6 +8724,12 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	AliothMetalRecorder *recorder = [[[AliothMetalRecorder alloc] init] autorelease];
 	AliothMetalRenderEncoder *encoder;
 
+	/* (the K40's, 11-16) the samples kept between sub-encoders: no resolve in the tiles (alioth_tile_resolve_fits) */
+	for (unsigned i = 0; i < 8; i++) {
+		if (d.colorAttachments[i].texture != nil && d.colorAttachments[i].storeAction == MTLStoreActionMultisampleResolve) {
+			d.colorAttachments[i].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+		}
+	}
 	@synchronized (self) {
 		/* the first sub-encoder clears as the pass says; the later ones load what the earlier ones drew */
 		if (_recorders.count != 0) {

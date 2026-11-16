@@ -263,6 +263,9 @@ struct rwa_texture {
     * draws into one pass (texture_surface)
     */
    struct pipe_surface *surface;
+   /* (the K40's, 11-16) ... and, for a one-sample texture a multisample pass resolves into in the tiles
+    * (rwa_draw.tile_resolve_mask), its surface of that many samples, kept the same way */
+   struct pipe_surface *tile_surface;
 
    /* what MTLTextureUsage allowed, which is checked at every dispatch: a kernel that
     * writes a texture the application declared read-only is an application's mistake,
@@ -1753,6 +1756,8 @@ rwa_texture_destroy(struct rwa_texture *texture)
     */
    if (texture->surface)
       pipe_surface_reference(&texture->surface, NULL);
+   if (texture->tile_surface)
+      pipe_surface_reference(&texture->tile_surface, NULL);
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
 }
@@ -1790,6 +1795,22 @@ texture_surface(struct rwa_device *device, struct rwa_texture *t)
       t->surface = device->pipe->create_surface(device->pipe, t->res, &tmpl);
    }
    return t->surface;
+}
+
+/* (the K40's, 11-16) A one-sample texture's render surface of `samples` samples, resolved into it at the tile store
+ * (rwa_draw.tile_resolve_mask). Kept with it as texture_surface's is; a texture is resolved into at one sample count
+ * (a pass of another count makes it again). */
+static struct pipe_surface *
+texture_tile_surface(struct rwa_device *device, struct rwa_texture *t, unsigned samples)
+{
+   if (t->tile_surface && t->tile_surface->nr_samples != samples)
+      pipe_surface_reference(&t->tile_surface, NULL);
+   if (!t->tile_surface) {
+      struct pipe_surface tmpl = surface_template(t);
+      tmpl.nr_samples = (uint8_t)samples;
+      t->tile_surface = device->pipe->create_surface(device->pipe, t->res, &tmpl);
+   }
+   return t->tile_surface;
 }
 
 /*
@@ -7104,7 +7125,7 @@ attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char 
 unsigned
 rwa_draw_features(void)
 {
-   return RWA_DRAW_INDIRECT | RWA_DRAW_CLEAR_EACH | RWA_DRAW_DEPTH_CLAMP;
+   return RWA_DRAW_INDIRECT | RWA_DRAW_CLEAR_EACH | RWA_DRAW_DEPTH_CLAMP | RWA_DRAW_TILE_RESOLVE;
 }
 
 int
@@ -7355,6 +7376,20 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    unsigned samples = render->shape.sample_count ? render->shape.sample_count : 1;
    unsigned w = 0, h = 0;
+   /* (the K40's, 11-16) attachments resolved in the tiles: one-sample textures of a pass of draw->tile_samples */
+   unsigned tile_mask = draw->tile_resolve_mask & ((1u << draw->color_count) - 1);
+   if (tile_mask) {
+      if (draw->tile_samples != samples || samples < 2) {
+         say(why, why_size, "a resolve in the tiles at %u samples and the pipeline was made for %u", draw->tile_samples,
+             samples);
+         return -1;
+      }
+      if (!device->screen->caps.surface_sample_count) {
+         say(why, why_size, "%s cannot render a one-sample texture at %u samples (no surface sample count)",
+             rwa_device_name(device), samples);
+         return -1;
+      }
+   }
    for (unsigned i = 0; i < draw->color_count; i++) {
       struct rwa_texture *t = draw->color ? draw->color[i] : NULL;
       char what[48];
@@ -7363,7 +7398,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          return -1;
       }
       snprintf(what, sizeof(what), "colour attachment %u", i);
-      if (!attachment_shape_fits(t, samples, what, why, why_size))
+      if (!attachment_shape_fits(t, tile_mask & (1u << i) ? 1 : samples, what, why, why_size))
          return -1;
       if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
          say(why, why_size, "colour attachment %u (%s) was made without "
@@ -7460,10 +7495,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * draw a pass of its own -- the whole attachment through the tiles and back each time
     */
    for (unsigned i = 0; i < draw->color_count; i++) {
-      surf[i] = texture_surface(device, draw->color[i]);
+      surf[i] = tile_mask & (1u << i) ? texture_tile_surface(device, draw->color[i], samples)
+                                      : texture_surface(device, draw->color[i]);
       if (!surf[i]) {
-         say(why, why_size, "%s would not make a render surface of colour attachment %u",
-             rwa_device_name(device), i);
+         say(why, why_size, "%s would not make a render surface of colour attachment %u%s",
+             rwa_device_name(device), i, tile_mask & (1u << i) ? " at the pass's sample count" : "");
          return -1;
       }
       fb.cbufs[i] = surf[i];
@@ -8332,6 +8368,7 @@ rwa_texture_subview(struct rwa_texture *texture, const struct rwa_texture_shape 
    *view = *texture;
    view->view = NULL;
    view->surface = NULL;   /* (its own, in its own format, level and slice) */
+   view->tile_surface = NULL;
    view->res = NULL;
    pipe_resource_reference(&view->res, texture->res);
    view->format_name = fmt->name;
