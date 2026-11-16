@@ -1139,8 +1139,6 @@ GPU_LOCKED_VOID(buffer_destroy, (struct rwa_buffer *b), (b))
 GPU_LOCKED(struct rwa_compute *, compute_create, (struct rwa_device *d, const void *bc, size_t n, const char *e,
     struct rwa_compute_info *i, char *w, size_t ws), (d, bc, n, e, i, w, ws))
 GPU_LOCKED_VOID(compute_destroy, (struct rwa_compute *c), (c))
-GPU_LOCKED(struct rwa_texture *, texture_create, (struct rwa_device *d, const struct rwa_texture_shape *s, char *w,
-    size_t ws), (d, s, w, ws))
 GPU_LOCKED(int, texture_write, (struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3],
     const unsigned z[3], const void *b, size_t st, char *w, size_t ws), (t, l, s, o, z, b, st, w, ws))
 GPU_LOCKED(int, texture_read, (struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3],
@@ -1399,7 +1397,14 @@ mesa_available(void)
 	GPU_LOCK_WRAP(buffer_destroy);
 	GPU_LOCK_WRAP(compute_create);
 	GPU_LOCK_WRAP(compute_destroy);
-	GPU_LOCK_WRAP(texture_create);
+	/*
+	 * (the K40's, 11-17) NOT texture_create, as texture_from_surface never was: rwa_texture_create asks only the
+	 * SCREEN (is_format_supported, resource_create), which Gallium makes thread-safe -- no context state. It was the
+	 * lock's longest hold: 60-76 ms making Impeller's full-screen 4x depth/stencil (55 MB from the kernel, zeroed and
+	 * made write-combined), and the run thread's commits waited 40-60 ms behind it at every Flutter launch (round b46,
+	 * "the library's lock held longest 59.89 ms, for texture_create"). A texture's views, surfaces and uploads are the
+	 * context's and stay under the lock.
+	 */
 	GPU_LOCK_WRAP(texture_write);
 	GPU_LOCK_WRAP(texture_read);
 	GPU_LOCK_WRAP(depth_read);
