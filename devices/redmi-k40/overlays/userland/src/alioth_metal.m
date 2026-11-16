@@ -4070,7 +4070,7 @@ static BOOL alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base
 				 size_t *height);
 
 static void
-alioth_peek(void *surface, id texture, unsigned passes, unsigned tiled)
+alioth_peek(void *surface, id texture, unsigned passes, unsigned tiled, NSString *census)
 {
 	static uint64_t last;
 	static unsigned told;
@@ -4121,6 +4121,9 @@ alioth_peek(void *surface, id texture, unsigned passes, unsigned tiled)
 	    "points in its memory %u not black, %u with opacity 0; the centre B G R A %u %u %u %u in memory, %s %u %u %u %u\n",
 	    width, height, passes, tiled, lit, clear, c[0], c[1], c[2], c[3], read ? "through the driver" : "(not read through "
 	    "the driver)", g[0], g[1], g[2], g[3]);
+	if ([census length] != 0) {
+		rw_print("peek:   its draws by pipeline label: %s\n", [census UTF8String]);
+	}
 }
 
 /*
@@ -6970,8 +6973,71 @@ done:
 /* A draw, built out of what the encoder recorded. Separate from the dispatch loop because the
  * two have different bindings -- a draw has them per stage -- and folding them together would
  * mean a struct whose fields mean different things depending on a flag. */
+/*
+ * (the K40's, 11-16) boot-arg metal_tile_skip=PREFIX[,PREFIX...] (a test road): in a pass resolved in the tiles into an
+ * IOSurface, the draws whose pipeline label begins with one of these are left out (a pass's first draw, which carries
+ * its clears, never is). Flutter's on-screen pass so resolved is lost whole whenever freedreno bins it in hardware
+ * (rounds b16-b24) while System Check's passes of every shape tried bin fine: leaving out one kind of Flutter's draws at
+ * a time names the kind that empties the binning.
+ */
+static BOOL
+alioth_tile_skips(NSString *label)
+{
+	static dispatch_once_t once;
+	static char prefixes[8][48];
+	static unsigned count;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+		const char *at;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0 || (at = strstr(args, "metal_tile_skip=")) == NULL) {
+			return;
+		}
+		at += strlen("metal_tile_skip=");
+		while (*at != '\0' && *at != ' ' && count < 8) {
+			size_t n = 0;
+
+			while (at[n] != '\0' && at[n] != ' ' && at[n] != ',' && n + 1 < sizeof(prefixes[0])) {
+				prefixes[count][n] = at[n] == '_' ? ' ' : at[n];       /* (a space in a label: written _) */
+				n++;
+			}
+			prefixes[count][n] = '\0';
+			if (n != 0) {
+				rw_print("metal_tile_skip: draws of pipelines labelled \"%s...\" left out of passes resolved in the "
+				    "tiles into IOSurfaces (a test road)\n", prefixes[count]);
+				count++;
+			}
+			at += n;
+			while (*at != '\0' && *at != ' ' && *at != ',') {
+				at++;
+			}
+			if (*at == ',') {
+				at++;
+			}
+		}
+	});
+	if (count == 0 || label == nil) {
+		return NO;
+	}
+	const char *l = [label UTF8String];
+
+	for (unsigned i = 0; i < count; i++) {
+		if (l != NULL && strncmp(l, prefixes[i], strlen(prefixes[i])) == 0) {
+			return YES;
+		}
+	}
+	return NO;
+}
+
 - (BOOL)runDraw:(AliothMetalWork *)work why:(char *)why size:(size_t)size
 {
+	if (work->tileMask != 0 && !work->clears && !work->clearsDepth && !work->clearsStencil &&
+	    [work->color[0] isKindOfClass:[AliothMetalTexture class]] && [(AliothMetalTexture *)work->color[0] aliothImported] &&
+	    alioth_tile_skips([work->render label])) {
+		return YES;
+	}
 	struct rwa_texture *color[8] = { NULL };
 	struct rwa_buffer *vertex_buffers[RW_MAX_BUFFERS] = { NULL };
 	struct rwa_vertex_stream vertex_streams[RW_MAX_BUFFERS] = { { NULL, 0 } };
@@ -7289,6 +7355,7 @@ done:
 	void *surface = NULL;
 	id texture = nil;
 	unsigned passes = 0, tiled = 0;
+	NSCountedSet *labels = nil;
 
 	if (!alioth_peek_on()) {
 		return;
@@ -7308,6 +7375,11 @@ done:
 					texture = texture != nil ? texture : w->color[i];
 					passes++;
 					tiled += (w->tileMask >> i) & 1u;
+					if (labels == nil) {
+						labels = [NSCountedSet set];
+					}
+					[labels addObject:w->render != nil ? ([w->render label] ?: @"(no label)") :
+					    w->clearOnly ? @"(clear only)" : @"(no pipeline)"];
 				}
 			}
 		} else if ([item isKindOfClass:[AliothMetalBlit class]]) {
@@ -7322,7 +7394,21 @@ done:
 		}
 	}
 	if (surface != NULL) {
-		alioth_peek(surface, texture, passes, tiled);
+		NSMutableString *census = [NSMutableString string];
+		NSArray *byCount = [[labels allObjects] sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+			NSUInteger ca = [labels countForObject:a], cb = [labels countForObject:b];
+
+			return ca > cb ? NSOrderedAscending : ca < cb ? NSOrderedDescending : [a compare:b];
+		}];
+
+		for (NSString *l in byCount) {
+			if ([census length] > 400) {
+				[census appendString:@" ..."];
+				break;
+			}
+			[census appendFormat:@"%@%@ x%lu", [census length] ? @", " : @"", l, (unsigned long)[labels countForObject:l]];
+		}
+		alioth_peek(surface, texture, passes, tiled, census);
 	}
 }
 
