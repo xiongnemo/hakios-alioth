@@ -386,6 +386,10 @@ struct air_to_nir_options {
    bool module_constants;
 };
 
+/* (the K40's, 11-17) every array and string of `src` copied under mem_ctx into `dst` (which may be `src`): what
+ * air_to_nir does to the info it hands back, for a caller that keeps a translation and hands out copies of it */
+void air_shader_info_copy(void *mem_ctx, struct air_shader_info *dst, const struct air_shader_info *src);
+
 /* Translates one AIR module (one function of a .metallib). entry_point may
  * be NULL: the module's own entry point is taken. On failure returns NULL
  * and sets *error (allocated under mem_ctx) to "<category>: <what>", where

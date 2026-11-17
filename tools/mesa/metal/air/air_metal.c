@@ -60,6 +60,7 @@
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/os_time.h"
+#include <pthread.h>
 #include "util/u_gen_mipmap.h"
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
@@ -150,6 +151,22 @@ struct rwa_device {
    uint64_t seen_vertex[1024], seen_fragment[1024];
    unsigned seen_vertex_count, seen_fragment_count;
    uint64_t seen_pipelines;
+
+   /* (the K40's, 11-17) THE TRANSLATION CACHE (translate_cached): each render pipeline stage module translated once
+    * per process -- the bitcode kept for an exact match, the NIR and its air_shader_info under xlat_ctx, a copy handed
+    * out for every pipeline that names the module again. Its own lock: translations run without the caller's. */
+   pthread_mutex_t xlat_lock;
+   void *xlat_ctx;
+   struct rwa_translated {
+      uint64_t hash;
+      size_t size;
+      const void *bitcode;
+      const char *entry;
+      nir_shader *nir;
+      struct air_shader_info info;
+   } *xlat;
+   unsigned xlat_count, xlat_cap;
+   uint64_t xlat_hits;
 
    /* One sampler for the slots nothing was bound to, made when a dispatch first needs
     * it. See rwa_dispatch: a kernel's read() is a texture fetch and ignores the
@@ -572,6 +589,9 @@ rwa_device_open(char *why, size_t why_size)
     */
    bool software = debug_get_bool_option("RWA_SOFTWARE", false);
    device->software = software;
+   /* (the K40's, 11-17) the translation cache (translate_cached) */
+   pthread_mutex_init(&device->xlat_lock, NULL);
+   device->xlat_ctx = ralloc_context(NULL);
 
 #ifdef GALLIUM_FREEDRENO
    if (!software) {
@@ -749,6 +769,8 @@ rwa_device_close(struct rwa_device *device)
       device->pipe->delete_sampler_state(device->pipe, device->metal_default_sampler);
    device->pipe->destroy(device->pipe);
    device->screen->destroy(device->screen);
+   ralloc_free(device->xlat_ctx);   /* (the K40's, 11-17: the translation cache) */
+   pthread_mutex_destroy(&device->xlat_lock);
    free(device);
    glsl_type_singleton_decref();
 }
@@ -6670,18 +6692,93 @@ blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen 
    return true;
 }
 
-/* (the K40's, 11-17) one stage module of a render pipeline, counted once (rwa_device.seen_*): FNV-1a of its bitcode
- * and entry point; nothing for a stage with no module */
-static void
-module_seen(uint64_t *seen, unsigned *count, const void *bitcode, size_t size, const char *entry)
+/* (the K40's, 11-17) FNV-1a of a stage module's bitcode and entry point */
+static uint64_t
+module_hash(const void *bitcode, size_t size, const char *entry)
 {
-   if (!bitcode || !size)
-      return;
    uint64_t h = 14695981039346656037ull;
    for (size_t i = 0; i < size; i++)
       h = (h ^ ((const uint8_t *)bitcode)[i]) * 1099511628211ull;
    for (const char *p = entry; p && *p; p++)
       h = (h ^ (uint8_t)*p) * 1099511628211ull;
+   return h;
+}
+
+/*
+ * (the K40's, 11-17) A RENDER PIPELINE STAGE'S TRANSLATION, ONCE A PROCESS. Translating AIR is three quarters of making
+ * a render pipeline (0.6-1.6 ms of it, rounds b57/b58), and Flutter's 67 pipelines are made of 15 vertex modules and
+ * 60 fragment ones (b62: 134 translations for 75 modules; System Check's 60 pipelines, 39 modules). The translation
+ * of a module (with the module's own constants, rwa_render_create's only options) depends on its bitcode, its entry
+ * point and the device's NIR options alone, so it is kept: the bitcode for an exact match, a clone of the NIR and a
+ * copy of its info (air_shader_info_copy) under the device's xlat_ctx; every later pipeline that names the same
+ * module gets a clone and a copy of its own, as if translated. At most 512 kept. HAKIOS_AIR_CACHE=0 (boot-arg
+ * metal_air_cache=0): translated every time, as before.
+ */
+static nir_shader *
+translate_cached(struct rwa_device *device, void *mem_ctx, const void *bitcode, size_t size, const char *entry,
+                 const struct air_to_nir_options *opts, struct air_shader_info *info, const char **error)
+{
+   static int on = -1;
+
+   if (on < 0) {
+      const char *e = getenv("HAKIOS_AIR_CACHE");
+      on = !(e && e[0] == '0');
+   }
+   if (!on || !info || !opts || !opts->module_constants || opts->library_wrapper)
+      return air_to_nir(mem_ctx, bitcode, size, entry, opts, device->nir_options, info, error);
+   uint64_t h = module_hash(bitcode, size, entry);
+
+   pthread_mutex_lock(&device->xlat_lock);
+   for (unsigned i = 0; i < device->xlat_count; i++) {
+      struct rwa_translated *t = &device->xlat[i];
+      if (t->hash == h && t->size == size && !memcmp(t->bitcode, bitcode, size) &&
+          !strcmp(t->entry ? t->entry : "", entry ? entry : "")) {
+         nir_shader *nir = nir_shader_clone(mem_ctx, t->nir);
+         air_shader_info_copy(mem_ctx, info, &t->info);
+         device->xlat_hits++;
+         pthread_mutex_unlock(&device->xlat_lock);
+         if (error)
+            *error = NULL;
+         return nir;
+      }
+   }
+   pthread_mutex_unlock(&device->xlat_lock);
+
+   nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, opts, device->nir_options, info, error);
+   if (!nir)
+      return NULL;
+   pthread_mutex_lock(&device->xlat_lock);
+   if (device->xlat_count < 512) {
+      if (device->xlat_count == device->xlat_cap) {
+         unsigned cap = device->xlat_cap ? device->xlat_cap * 2 : 32;
+         struct rwa_translated *grown = reralloc(device->xlat_ctx, device->xlat, struct rwa_translated, cap);
+         if (grown) {
+            device->xlat = grown;
+            device->xlat_cap = cap;
+         }
+      }
+      if (device->xlat_count < device->xlat_cap) {
+         struct rwa_translated *t = &device->xlat[device->xlat_count++];
+         t->hash = h;
+         t->size = size;
+         t->bitcode = ralloc_memdup(device->xlat_ctx, bitcode, size);
+         t->entry = entry ? ralloc_strdup(device->xlat_ctx, entry) : NULL;
+         t->nir = nir_shader_clone(device->xlat_ctx, nir);
+         air_shader_info_copy(device->xlat_ctx, &t->info, info);
+      }
+   }
+   pthread_mutex_unlock(&device->xlat_lock);
+   return nir;
+}
+
+/* (the K40's, 11-17) one stage module of a render pipeline, counted once (rwa_device.seen_*); nothing for a stage
+ * with no module */
+static void
+module_seen(uint64_t *seen, unsigned *count, const void *bitcode, size_t size, const char *entry)
+{
+   if (!bitcode || !size)
+      return;
+   uint64_t h = module_hash(bitcode, size, entry);
    for (unsigned i = 0; i < *count; i++)
       if (seen[i] == h)
          return;
@@ -6898,8 +6995,9 @@ rwa_render_create(struct rwa_device *device,
       /* (the K40's, 11-17) the module's own constants from the translation's own parse
        * (air_to_nir_options.module_constants), not a second read with air_module_function_constants */
       const struct air_to_nir_options fopts = { .module_constants = true };
-      fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size, fragment_entry, &fopts,
-                      device->nir_options, &render->finfo, &error);
+      /* (the K40's, 11-17: once a process for one module, translate_cached) */
+      fs = translate_cached(device, render->mem_ctx, fragment_bitcode, fragment_size, fragment_entry, &fopts,
+                            &render->finfo, &error);
       if (!fs) {
          say(why, why_size, "%s", error ? error : "the fragment module could not be translated");
          goto fail;
@@ -6949,8 +7047,8 @@ rwa_render_create(struct rwa_device *device,
          goto fail;
       }
       const struct air_to_nir_options vopts = { .module_constants = true };   /* (as the fragment's) */
-      vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
-                      device->nir_options, &render->vinfo, &error);
+      vs = translate_cached(device, render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
+                            &render->vinfo, &error);
       if (!vs) {
          say(why, why_size, "%s", error ? error : "the vertex module could not be translated");
          goto fail;

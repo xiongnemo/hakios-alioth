@@ -3986,6 +3986,61 @@ run_static_initializers(struct air_ctx *c)
    }
 }
 
+/* (the K40's, 11-17) Every array and string of an air_shader_info into mem_ctx: the translator's own last step (what
+ * it hands back must not point into the module, which it frees), and a translation cache's (rwa_render_create: an
+ * info kept, then copied out for each pipeline). dst may be src -- copied in place -- or another struct, which then
+ * gets src's fields first. */
+void
+air_shader_info_copy(void *mem_ctx, struct air_shader_info *info, const struct air_shader_info *src)
+{
+   if (info != src)
+      *info = *src;
+   if (info->num_resources) {
+      info->resources = ralloc_memdup(mem_ctx, info->resources,
+                                      info->num_resources * sizeof(*info->resources));
+      for (unsigned i = 0; i < info->num_resources; i++) {
+         struct air_resource *r = &info->resources[i];
+         r->name = ralloc_strdup(mem_ctx, r->name);
+         r->type_name = ralloc_strdup(mem_ctx, r->type_name);
+         /* (the K40's) the struct members, for reflection: out of ctx too */
+         if (r->num_members) {
+            r->members = ralloc_memdup(mem_ctx, r->members,
+                                       r->num_members * sizeof(*r->members));
+            for (unsigned m = 0; m < r->num_members; m++) {
+               r->members[m].name = ralloc_strdup(mem_ctx, r->members[m].name);
+               r->members[m].type_name = ralloc_strdup(mem_ctx, r->members[m].type_name);
+            }
+         } else {
+            r->members = NULL;
+         }
+      }
+   }
+   if (info->num_varyings) {
+      info->varyings = ralloc_memdup(mem_ctx, info->varyings,
+                                     info->num_varyings * sizeof(*info->varyings));
+      for (unsigned i = 0; i < info->num_varyings; i++)
+         info->varyings[i].name = ralloc_strdup(mem_ctx, info->varyings[i].name);
+   }
+   if (info->num_vertex_attributes) {
+      info->vertex_attributes =
+         ralloc_memdup(mem_ctx, info->vertex_attributes,
+                       info->num_vertex_attributes * sizeof(*info->vertex_attributes));
+      for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
+         struct air_vertex_attribute *a = &info->vertex_attributes[i];
+         a->name = ralloc_strdup(mem_ctx, a->name);
+         a->type_name = ralloc_strdup(mem_ctx, a->type_name);
+         a->function_constant = ralloc_strdup(mem_ctx, a->function_constant);
+      }
+   }
+   if (info->num_notes) {
+      info->notes = ralloc_memdup(mem_ctx, info->notes,
+                                  info->num_notes * sizeof(*info->notes));
+      for (unsigned i = 0; i < info->num_notes; i++)
+         info->notes[i] = ralloc_strdup(mem_ctx, info->notes[i]);
+   }
+   info->entry_point = ralloc_strdup(mem_ctx, info->entry_point);
+}
+
 /* -- the entry point ---------------------------------------------------- */
 
 nir_shader *
@@ -4258,50 +4313,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
        * vertex_attributes was not copied at all, which was the same bug with
        * no bytes left to get away with.
        */
-      if (info->num_resources) {
-         info->resources = ralloc_memdup(mem_ctx, info->resources,
-                                         info->num_resources * sizeof(*info->resources));
-         for (unsigned i = 0; i < info->num_resources; i++) {
-            struct air_resource *r = &info->resources[i];
-            r->name = ralloc_strdup(mem_ctx, r->name);
-            r->type_name = ralloc_strdup(mem_ctx, r->type_name);
-            /* (the K40's) the struct members, for reflection: out of ctx too */
-            if (r->num_members) {
-               r->members = ralloc_memdup(mem_ctx, r->members,
-                                          r->num_members * sizeof(*r->members));
-               for (unsigned m = 0; m < r->num_members; m++) {
-                  r->members[m].name = ralloc_strdup(mem_ctx, r->members[m].name);
-                  r->members[m].type_name = ralloc_strdup(mem_ctx, r->members[m].type_name);
-               }
-            } else {
-               r->members = NULL;
-            }
-         }
-      }
-      if (info->num_varyings) {
-         info->varyings = ralloc_memdup(mem_ctx, info->varyings,
-                                        info->num_varyings * sizeof(*info->varyings));
-         for (unsigned i = 0; i < info->num_varyings; i++)
-            info->varyings[i].name = ralloc_strdup(mem_ctx, info->varyings[i].name);
-      }
-      if (info->num_vertex_attributes) {
-         info->vertex_attributes =
-            ralloc_memdup(mem_ctx, info->vertex_attributes,
-                          info->num_vertex_attributes * sizeof(*info->vertex_attributes));
-         for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
-            struct air_vertex_attribute *a = &info->vertex_attributes[i];
-            a->name = ralloc_strdup(mem_ctx, a->name);
-            a->type_name = ralloc_strdup(mem_ctx, a->type_name);
-            a->function_constant = ralloc_strdup(mem_ctx, a->function_constant);
-         }
-      }
-      if (info->num_notes) {
-         info->notes = ralloc_memdup(mem_ctx, info->notes,
-                                     info->num_notes * sizeof(*info->notes));
-         for (unsigned i = 0; i < info->num_notes; i++)
-            info->notes[i] = ralloc_strdup(mem_ctx, info->notes[i]);
-      }
-      info->entry_point = ralloc_strdup(mem_ctx, info->entry_point);
+      air_shader_info_copy(mem_ctx, info, info);   /* (the K40's, 11-17: the copy, a function of its own) */
    }
    ralloc_free(ctx);
    if (error)

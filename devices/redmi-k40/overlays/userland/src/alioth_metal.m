@@ -1313,6 +1313,12 @@ mesa_available(void)
 			setenv("FD_GPU_TRACEPOINT", "-all,render_pass,binning_ib,render_gmem,render_sysmem,flush_batch", 0);
 			rw_print("metal_gpu_trace=1: the GPU's time of every render pass into %s\n", file);
 		}
+		/* (11-17) metal_air_cache=0: every render pipeline stage translated again, not once a process
+		 * (air_metal.c translate_cached, HAKIOS_AIR_CACHE) */
+		if (strstr(args, "metal_air_cache=0") != NULL && getenv("HAKIOS_AIR_CACHE") == NULL) {
+			setenv("HAKIOS_AIR_CACHE", "0", 0);
+			rw_print("metal_air_cache=0: every render pipeline's stages translated from their AIR again\n");
+		}
 		/* (11-17) metal_gmem_search=0: freedreno's own choice of bins, not the fewest that fit
 		 * (tools/mesa/metal/fd-gmem-bins.patch, HAKIOS_FD_GMEM_SEARCH) */
 		if (strstr(args, "metal_gmem_search=0") != NULL && getenv("HAKIOS_FD_GMEM_SEARCH") == NULL) {
