@@ -61,9 +61,14 @@
 #include "util/u_debug.h"
 #include "util/os_time.h"
 #include "util/blob.h"
+#include "util/crc32.h"
 #include "util/disk_cache.h"
 #include "util/mesa-sha1.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "util/u_gen_mipmap.h"
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
@@ -6709,36 +6714,88 @@ module_hash(const void *bitcode, size_t size, const char *entry)
  * (the K40's, 11-18) THE TRANSLATION CACHE ON DISK. ir3's disk cache already spares an application's next launch in the
  * boot its shader compiles; what was left of making a pipeline was translating its AIR again -- Flutter Check's second
  * launch, 0.57 ms of its 1.05 ms a pipeline (round b91: 38 of its 70 ms for 67 pipelines). A translation (NIR + info,
- * air_serialize.c) is kept in Mesa's disk cache beside ir3's (MESA_SHADER_CACHE_DIR: the app's Library/Caches, set by
- * alioth_metal.m; mesa_cache=0 has none), keyed by the module's bytes, its entry point, the options that change what
- * the translator makes, the device's kind -- and, through disk_cache_create, this library's own file time, so a new
- * build never reads an old one's (the same stamp as ir3's, ir3-disk-cache-darwin.patch). HAKIOS_AIR_DISK=0
- * (boot-arg metal_air_disk=0): none. air2nir --roundtrip checks the blob against a fresh translation; 4119 of the
- * corpus's translations came back identical (11-18).
+ * air_serialize.c) is kept as a file of its own -- the SHA-1 of the module's bytes, its entry point, the options that
+ * change what the translator makes and the device's kind -- in MESA_SHADER_CACHE_DIR (the app's Library/Caches, set
+ * by alioth_metal.m; mesa_cache=0 has none) under hakios-air-STAMP, STAMP this library's own file time (the same as
+ * ir3's, ir3-disk-cache-darwin.patch): a new build never reads an old one's. HAKIOS_AIR_DISK=0 (boot-arg
+ * metal_air_disk=0): none. air2nir --roundtrip checks the blob against a fresh translation; 4119 of the corpus's
+ * translations came back identical (11-18).
+ *
+ * NOT Mesa's disk cache, which the first try used (cd1e312, round b98): its default store is one database whose every
+ * read and write takes a mutex and an exclusive flock, part file by part file, shared with ir3's own -- a cold launch's
+ * 75 misses and puts made Flutter Check's first launch's pipelines 400 ms instead of 134-167 (b82-b97), for 12 ms saved
+ * on each later one. A file a translation: a miss is one failed open; a put a write to a file of its own and a rename,
+ * so a reader sees a whole file or none. A header with the length and a CRC-32 of the blob all the same. At most 4096
+ * puts a process.
  */
-static struct disk_cache *xlat_disk_cache;
+#define XLAT_FILE_MAGIC 0x43524941u     /* "AIRC" */
+static char xlat_dir[1024];             /* "" when there is no cache */
 static uint64_t xlat_disk_counts[3];    /* found, not found, ns taking the found ones out */
+static unsigned xlat_disk_puts;
 
 static void
 xlat_disk_open(void)
 {
-   const char *e = getenv("HAKIOS_AIR_DISK");
-   if (e && e[0] == '0')
-      return;
+   const char *e = getenv("HAKIOS_AIR_DISK"), *base = getenv("MESA_SHADER_CACHE_DIR");
+   const char *off = getenv("MESA_SHADER_CACHE_DISABLE");
    uint32_t t = 0;
-   if (!disk_cache_get_function_timestamp((void *)xlat_disk_open, &t))
+
+   if ((e && e[0] == '0') || !base || !base[0] || (off && (off[0] == 't' || off[0] == '1')) ||
+       !disk_cache_get_function_timestamp((void *)xlat_disk_open, &t))
       return;
-   char stamp[24];
-   snprintf(stamp, sizeof(stamp), "air-%08x", t);
-   xlat_disk_cache = disk_cache_create("hakios-air", stamp, 0);
+   char dir[sizeof(xlat_dir)];
+   if (snprintf(dir, sizeof(dir), "%s/hakios-air-%08x", base, t) >= (int)sizeof(dir))
+      return;
+   if ((mkdir(base, 0755) != 0 && errno != EEXIST) || (mkdir(dir, 0755) != 0 && errno != EEXIST))
+      return;
+   strlcpy(xlat_dir, dir, sizeof(xlat_dir));
 }
 
-static struct disk_cache *
+static const char *
 xlat_disk(void)
 {
    static pthread_once_t once = PTHREAD_ONCE_INIT;
    pthread_once(&once, xlat_disk_open);
-   return xlat_disk_cache;
+   return xlat_dir[0] ? xlat_dir : NULL;
+}
+
+/* the file's bytes after its header, malloc'd, when it is whole; NULL otherwise */
+static void *
+xlat_file_read(const char *path, size_t *size)
+{
+   int fd = open(path, O_RDONLY);
+   if (fd < 0)
+      return NULL;
+   uint32_t head[3];
+   void *data = NULL;
+   if (read(fd, head, sizeof(head)) == (ssize_t)sizeof(head) && head[0] == XLAT_FILE_MAGIC && head[1] != 0 &&
+       head[1] < (64u << 20) && (data = malloc(head[1])) != NULL) {
+      if (read(fd, data, head[1]) != (ssize_t)head[1] || util_hash_crc32(data, head[1]) != head[2]) {
+         free(data);
+         data = NULL;
+      } else {
+         *size = head[1];
+      }
+   }
+   close(fd);
+   return data;
+}
+
+static void
+xlat_file_write(const char *path, const void *data, size_t size)
+{
+   if (__atomic_fetch_add(&xlat_disk_puts, 1, __ATOMIC_RELAXED) >= 4096)
+      return;
+   char tmp[sizeof(xlat_dir) + 96];
+   snprintf(tmp, sizeof(tmp), "%s.%d.%p.tmp", path, (int)getpid(), (void *)pthread_self());
+   int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
+   if (fd < 0)
+      return;
+   const uint32_t head[3] = { XLAT_FILE_MAGIC, (uint32_t)size, util_hash_crc32(data, size) };
+   bool ok = write(fd, head, sizeof(head)) == (ssize_t)sizeof(head) && write(fd, data, size) == (ssize_t)size;
+   close(fd);
+   if (!ok || rename(tmp, path) != 0)
+      unlink(tmp);
 }
 
 /* air_to_nir through the cache on disk (above); without an info to fill, or with no cache, air_to_nir itself */
@@ -6746,12 +6803,13 @@ static nir_shader *
 translate_disk(struct rwa_device *device, void *mem_ctx, const void *bitcode, size_t size, const char *entry,
                const struct air_to_nir_options *opts, struct air_shader_info *info, const char **error)
 {
-   struct disk_cache *dc = info && opts ? xlat_disk() : NULL;
-   cache_key key;
+   const char *dir = info && opts ? xlat_disk() : NULL;
+   char path[sizeof(xlat_dir) + 48];
 
-   if (dc) {
+   if (dir) {
       struct mesa_sha1 sha;
       uint8_t digest[SHA1_DIGEST_LENGTH];
+      char hex[SHA1_DIGEST_STRING_LENGTH];
       const char *e = entry ? entry : "";
       const uint8_t flags[4] = { opts->module_constants, opts->grid_inputs, opts->library_wrapper, device->software };
 
@@ -6762,11 +6820,12 @@ translate_disk(struct rwa_device *device, void *mem_ctx, const void *bitcode, si
       if (!opts->module_constants && opts->num_constants)
          _mesa_sha1_update(&sha, opts->constants, opts->num_constants * sizeof(*opts->constants));
       _mesa_sha1_final(&sha, digest);
-      disk_cache_compute_key(dc, digest, sizeof(digest), key);
+      _mesa_sha1_format(hex, digest);
+      snprintf(path, sizeof(path), "%s/%s", dir, hex);
 
       uint64_t began = os_time_get_nano();
       size_t got = 0;
-      void *data = disk_cache_get(dc, key, &got);
+      void *data = xlat_file_read(path, &got);
       if (data) {
          nir_shader *nir = air_translation_deserialize(mem_ctx, device->nir_options, data, got, info);
          free(data);
@@ -6781,11 +6840,11 @@ translate_disk(struct rwa_device *device, void *mem_ctx, const void *bitcode, si
       __atomic_fetch_add(&xlat_disk_counts[1], 1, __ATOMIC_RELAXED);
    }
    nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, opts, device->nir_options, info, error);
-   if (nir && dc) {
+   if (nir && dir) {
       struct blob b;
       blob_init(&b);
       if (air_translation_serialize(&b, nir, info))
-         disk_cache_put(dc, key, b.data, b.size, NULL);   /* (copied: written by the cache's own thread) */
+         xlat_file_write(path, b.data, b.size);
       blob_finish(&b);
    }
    return nir;
