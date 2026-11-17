@@ -1332,6 +1332,19 @@ mesa_available(void)
 			setenv("FD_GPU_TRACEPOINT", "-all,render_pass,binning_ib,render_gmem,render_sysmem,flush_batch", 0);
 			rw_print("metal_gpu_trace=1: the GPU's time of every render pass into %s\n", file);
 		}
+		/* (11-18) metal_dump_air=1: every stage module a pipeline is made from written once into this process's
+		 * temporary directory as air-ENTRY-HASH.bc (air_metal.c dump_air, HAKIOS_AIR_DUMP) -- the shaders an app
+		 * compiles at run time, for the PC's air2nir / ir3_compiler. A test road. */
+		if (strstr(args, "metal_dump_air=1") != NULL && getenv("HAKIOS_AIR_DUMP") == NULL) {
+			char dir[900] = "";
+			size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+
+			if (n == 0 || n > sizeof(dir)) {
+				strlcpy(dir, "/tmp/", sizeof(dir));
+			}
+			setenv("HAKIOS_AIR_DUMP", dir, 0);
+			rw_print("metal_dump_air=1: every pipeline's stage modules into %sair-*.bc\n", dir);
+		}
 		/* (11-17) metal_air_cache=0: every render pipeline stage translated again, not once a process
 		 * (air_metal.c translate_cached, HAKIOS_AIR_CACHE) */
 		if (strstr(args, "metal_air_cache=0") != NULL && getenv("HAKIOS_AIR_CACHE") == NULL) {

@@ -3252,6 +3252,8 @@ slot_shapes(nir_shader *cs, struct rwa_slot slots[RWA_MAX_TEXTURES],
    }
 }
 
+static void dump_air(const void *bitcode, size_t size, const char *entry);
+
 struct rwa_compute *
 rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                    const char *entry, struct rwa_compute_info *info,
@@ -3295,6 +3297,7 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
    /* (the K40's, 11-16) translated without the caller's lock (rwa_device_set_lock) */
    if (device->unlock)
       device->unlock(device->lock_context);
+   dump_air(bitcode, size, entry);
    compute->nir = air_to_nir(compute->mem_ctx, bitcode, size, entry, &options,
                              device->nir_options, &compute->info, &error);
    if (device->lock)
@@ -6698,6 +6701,58 @@ module_hash(const void *bitcode, size_t size, const char *entry)
 }
 
 /*
+ * (the K40's, 11-18) HAKIOS_AIR_DUMP=DIR (alioth_metal.m sets it to the app's temporary directory for boot-arg
+ * metal_dump_air=1): every stage module a pipeline is made from, render or compute, written once a process to
+ * DIR/air-ENTRY-HASH.bc, as it is handed to the translator. The point is the AIR the phone compiled at run time
+ * (-newLibraryWithSource:: Map, System Check's own newer tests), which the PC never had: fetched, it goes straight into
+ * the PC's air2nir and ir3_compiler (debug build, the same finalize as here), so a shader ir3 cannot take is found
+ * there and not by an app dying on the phone (round b84). Function constants need nothing beside it: they are zero
+ * here as on the PC (rwa_compute_create). At most 1024 files a process; a test road, off by default.
+ */
+static void
+dump_air(const void *bitcode, size_t size, const char *entry)
+{
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+   static uint64_t seen[1024];
+   static unsigned count;
+   static const char *dir;
+   static int on = -1;
+
+   if (on == 0 || !bitcode || !size)
+      return;
+   pthread_mutex_lock(&lock);
+   if (on < 0) {
+      dir = getenv("HAKIOS_AIR_DUMP");
+      on = dir && dir[0];
+   }
+   uint64_t h = on ? module_hash(bitcode, size, entry) : 0;
+   bool fresh = on && count < ARRAY_SIZE(seen);
+   for (unsigned i = 0; fresh && i < count; i++)
+      fresh = seen[i] != h;
+   if (fresh)
+      seen[count++] = h;
+   pthread_mutex_unlock(&lock);
+   if (!fresh)
+      return;
+
+   char name[64] = "";
+   size_t n = 0;
+   for (const char *p = entry ? entry : "module"; *p && n < sizeof(name) - 1; p++)
+      name[n++] = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
+                  *p == '_' || *p == '-' ? *p : '_';
+   name[n] = '\0';
+   char path[1024];
+   size_t dl = strlen(dir);
+   snprintf(path, sizeof(path), "%s%sair-%s-%016llx.bc", dir, dl && dir[dl - 1] == '/' ? "" : "/", name,
+            (unsigned long long)h);
+   FILE *f = fopen(path, "wb");
+   if (!f)
+      return;
+   fwrite(bitcode, 1, size, f);
+   fclose(f);
+}
+
+/*
  * (the K40's, 11-17) A RENDER PIPELINE STAGE'S TRANSLATION, ONCE A PROCESS. Translating AIR is three quarters of making
  * a render pipeline (0.6-1.6 ms of it, rounds b57/b58), and Flutter's 67 pipelines are made of 15 vertex modules and
  * 60 fragment ones (b62: 134 translations for 75 modules; System Check's 60 pipelines, 39 modules). The translation
@@ -6717,6 +6772,7 @@ translate_cached(struct rwa_device *device, void *mem_ctx, const void *bitcode, 
       const char *e = getenv("HAKIOS_AIR_CACHE");
       on = !(e && e[0] == '0');
    }
+   dump_air(bitcode, size, entry);
    if (!on || !info || !opts || !opts->module_constants || opts->library_wrapper)
       return air_to_nir(mem_ctx, bitcode, size, entry, opts, device->nir_options, info, error);
    uint64_t h = module_hash(bitcode, size, entry);
