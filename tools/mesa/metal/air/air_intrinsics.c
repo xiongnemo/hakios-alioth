@@ -647,7 +647,14 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "popcount")) {
       r = nir_bit_count(&c->b, a[0]);
    } else if (!strcmp(op, "clz")) {
-      r = nir_uclz(&c->b, a[0]);
+      /* (the K40's, 11-17) width - 1 - the highest set bit, which is the width for a zero (ufind_msb(0) = -1): ir3
+       * has no uclz ("Unhandled ALU op: uclz", SceneKit's depth min/max and debug kernels in the PC's debug ir3) and
+       * does find_msb with its own clz instruction. Of the value widened to 32 bits, the answer the input's width. */
+      unsigned bits = a[0]->bit_size;
+      nir_def *msb = nir_ufind_msb(&c->b, bits < 32 ? nir_u2u32(&c->b, a[0]) : a[0]);
+      r = nir_isub(&c->b, nir_imm_int(&c->b, bits - 1), msb);
+      if (bits != 32)
+         r = nir_u2uN(&c->b, r, bits);
    } else if (!strcmp(op, "ctz")) {
       /* Metal's ctz returns the type's width when the value is zero */
       nir_def *lsb = nir_find_lsb(&c->b, a[0]);

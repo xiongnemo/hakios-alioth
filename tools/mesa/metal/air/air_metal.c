@@ -516,6 +516,21 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen, bool base_grou
                var->data.driver_location = nir->num_inputs++;
       }
    }
+   /* (the K40's, 11-17) [[point_coord]] the same way on the GPU: ir3 has no load_point_coord ("Unhandled intrinsic",
+    * SpriteKit's PointSprite_FragFunc, VFX's sprite and particle fragment shaders, in the PC's debug ir3) and takes
+    * the point's coordinate as the input at VARYING_SLOT_PNTC, which freedreno has the rasterizer write for every
+    * fragment of a point (ir3_point_sprite: PNTC is always replaced; the origin at the top left, Metal's as GL's
+    * default). */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && screen->caps.fs_position_is_sysval) {
+      static const struct nir_lower_sysvals_to_varyings_options pntc_opts = {
+         .point_coord = true,
+      };
+      if (nir_lower_sysvals_to_varyings(nir, &pntc_opts)) {
+         nir_foreach_shader_in_variable(var, nir)
+            if (var->data.location == VARYING_SLOT_PNTC)
+               var->data.driver_location = nir->num_inputs++;
+      }
+   }
    NIR_PASS(_, nir, nir_lower_system_values);
    /* An options struct of all-false and not NULL, which are not the same thing here and
     * the difference is a trap. nir_lower_system_values *introduces*
