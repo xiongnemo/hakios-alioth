@@ -1263,6 +1263,23 @@ mesa_available(void)
 			setenv("HAKIOS_FD_MSAA_CLEAR", "0", 0);
 			rw_print("metal_msaa_clear=0: a multisample pass is cleared by a draw (u_blitter), as before 11-17\n");
 		}
+		/* (11-17) metal_gpu_trace=1: freedreno's GPU timestamps around every render pass, its binning, and which road
+		 * (GMEM: its bins / system memory) -- Mesa's u_trace "print", only those few tracepoints (none per bin) -- into
+		 * gputrace-PROGRAM-PID.txt in this process's temporary directory: where a frame's GPU time goes, pass by pass.
+		 * A test road: every timestamp is a wait of the GPU's own. */
+		if (strstr(args, "metal_gpu_trace=1") != NULL && getenv("MESA_GPU_TRACES") == NULL) {
+			char dir[900] = "", file[1024];
+			size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+
+			if (n == 0 || n > sizeof(dir)) {
+				strlcpy(dir, "/tmp/", sizeof(dir));
+			}
+			snprintf(file, sizeof(file), "%sgputrace-%s-%d.txt", dir, getprogname(), (int)getpid());
+			setenv("MESA_GPU_TRACES", "print", 0);
+			setenv("MESA_GPU_TRACEFILE", file, 0);
+			setenv("FD_GPU_TRACEPOINT", "-all,render_pass,binning_ib,render_gmem,render_sysmem,flush_batch", 0);
+			rw_print("metal_gpu_trace=1: the GPU's time of every render pass into %s\n", file);
+		}
 		/* (11-17) metal_gmem_search=0: freedreno's own choice of bins, not the fewest that fit
 		 * (tools/mesa/metal/fd-gmem-bins.patch, HAKIOS_FD_GMEM_SEARCH) */
 		if (strstr(args, "metal_gmem_search=0") != NULL && getenv("HAKIOS_FD_GMEM_SEARCH") == NULL) {
