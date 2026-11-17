@@ -607,6 +607,10 @@ struct rwa_texture *rwa_texture_create_tile_only(struct rwa_device *device, cons
  * out[1] ns translating both stages' AIR into NIR, out[2] ns making the two stages (NIR passes and the driver's
  * create_*_state), out[3] ns for the rest (blend, depth, rasterizer and vertex states, reflection) */
 void rwa_device_pipeline_times(struct rwa_device *device, uint64_t out[4]);
+/* (the K40's, 11-17) since the device was opened: out[0] render pipelines made, out[1] distinct vertex stage modules
+ * among them, out[2] distinct fragment ones (by their bitcode and entry point) -- how much a translation cache would
+ * have saved */
+void rwa_device_pipeline_modules(struct rwa_device *device, uint64_t out[3]);
 
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);

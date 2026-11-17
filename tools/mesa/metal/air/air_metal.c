@@ -144,6 +144,12 @@ struct rwa_device {
     * [0] pipelines, [1] AIR -> NIR of both stages, [2] the two stages made (NIR passes, create_*_state), [3] the rest
     * (blend, depth, rasterizer, vertex states, reflection), in ns; atomics: part of it runs without the lock */
    uint64_t pipeline_times[4];
+   /* (the K40's, 11-17) the stage modules render pipelines were made of, by a hash of their bitcode and entry point:
+    * how often a pipeline translates a module another pipeline translated already (rwa_device_pipeline_modules);
+    * counted under the caller's lock, at most 1024 of each kind */
+   uint64_t seen_vertex[1024], seen_fragment[1024];
+   unsigned seen_vertex_count, seen_fragment_count;
+   uint64_t seen_pipelines;
 
    /* One sampler for the slots nothing was bound to, made when a dispatch first needs
     * it. See rwa_dispatch: a kernel's read() is a texture fetch and ignores the
@@ -6664,6 +6670,25 @@ blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen 
    return true;
 }
 
+/* (the K40's, 11-17) one stage module of a render pipeline, counted once (rwa_device.seen_*): FNV-1a of its bitcode
+ * and entry point; nothing for a stage with no module */
+static void
+module_seen(uint64_t *seen, unsigned *count, const void *bitcode, size_t size, const char *entry)
+{
+   if (!bitcode || !size)
+      return;
+   uint64_t h = 14695981039346656037ull;
+   for (size_t i = 0; i < size; i++)
+      h = (h ^ ((const uint8_t *)bitcode)[i]) * 1099511628211ull;
+   for (const char *p = entry; p && *p; p++)
+      h = (h ^ (uint8_t)*p) * 1099511628211ull;
+   for (unsigned i = 0; i < *count; i++)
+      if (seen[i] == h)
+         return;
+   if (*count < 1024)
+      seen[(*count)++] = h;
+}
+
 struct rwa_render *
 rwa_render_create(struct rwa_device *device,
                   const void *vertex_bitcode, size_t vertex_size,
@@ -7213,6 +7238,9 @@ rwa_render_create(struct rwa_device *device,
 
    if (info)
       *info = out;
+   module_seen(device->seen_vertex, &device->seen_vertex_count, vertex_bitcode, vertex_size, vertex_entry);
+   module_seen(device->seen_fragment, &device->seen_fragment_count, fragment_bitcode, fragment_size, fragment_entry);
+   device->seen_pipelines++;
    {
       uint64_t t_end = os_time_get_nano();
 
@@ -7228,6 +7256,15 @@ fail:
       device->lock(device->lock_context);
    rwa_render_destroy(render);
    return NULL;
+}
+
+/* (the K40's, 11-17) air_metal.h */
+void
+rwa_device_pipeline_modules(struct rwa_device *device, uint64_t out[3])
+{
+   out[0] = device ? device->seen_pipelines : 0;
+   out[1] = device ? device->seen_vertex_count : 0;
+   out[2] = device ? device->seen_fragment_count : 0;
 }
 
 /* (the K40's, 11-17) air_metal.h */
