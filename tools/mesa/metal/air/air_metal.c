@@ -3322,19 +3322,17 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
     * and return nil before a driver sees them (docs/metal.md 10.7). A module that needs
     * real values will say so -- the translator refuses what it cannot fold.
     */
-   struct air_constant_value *constants;
-   unsigned num_constants =
-      air_module_function_constants(compute->mem_ctx, bitcode, size, &constants);
-
    /* library_wrapper is false, unlike air_run --library: a wrapped air.visible function
     * is a shader made up to be measurable, not a pipeline anyone can dispatch. Metal
     * stitches those into a caller at pipeline time (air.stitching_info), which this
     * frontend does not implement, and a driver asked to make a compute pipeline out of
     * one should be told that rather than handed a wrapper.
+    *
+    * (the K40's, 11-17) the zero constants read from the translation's own parse of the module
+    * (air_to_nir_options.module_constants), not by a second read of it
     */
    const struct air_to_nir_options options = {
-      .constants = constants,
-      .num_constants = num_constants,
+      .module_constants = true,
    };
    const char *error;
    /* (the K40's, 11-16) translated without the caller's lock (rwa_device_set_lock) */
@@ -6872,10 +6870,9 @@ rwa_render_create(struct rwa_device *device,
       memset(&render->finfo, 0, sizeof(render->finfo));
       render->finfo.stage = MESA_SHADER_FRAGMENT;
    } else {
-      struct air_constant_value *ffc;
-      unsigned num_ffc =
-         air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
-      const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
+      /* (the K40's, 11-17) the module's own constants from the translation's own parse
+       * (air_to_nir_options.module_constants), not a second read with air_module_function_constants */
+      const struct air_to_nir_options fopts = { .module_constants = true };
       fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size, fragment_entry, &fopts,
                       device->nir_options, &render->finfo, &error);
       if (!fs) {
@@ -6926,10 +6923,7 @@ rwa_render_create(struct rwa_device *device,
          say(why, why_size, "%zu bytes is not a vertex shader module", vertex_size);
          goto fail;
       }
-      struct air_constant_value *vfc;
-      unsigned num_vfc =
-         air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
-      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
+      const struct air_to_nir_options vopts = { .module_constants = true };   /* (as the fragment's) */
       vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
                       device->nir_options, &render->vinfo, &error);
       if (!vs) {

@@ -4011,6 +4011,30 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       ralloc_free(ctx);
       return NULL;
    }
+   /* (the K40's, 11-17) the module's own constants, as air_module_function_constants reads them, from this parse
+    * (air_to_nir_options.module_constants) */
+   struct air_to_nir_options own;
+   if (options && options->module_constants) {
+      own = *options;
+      own.constants = NULL;
+      own.num_constants = 0;
+      const struct air_named_md *n = named_md(c.m, "air.function_constants");
+      if (n && n->num_ops) {
+         struct air_constant_value *v = rzalloc_array(ctx, struct air_constant_value, n->num_ops);
+         for (unsigned i = 0; i < n->num_ops; i++) {
+            const struct air_md *node = n->ops[i];
+            for (unsigned k = 1; k < (node ? node->num_ops : 0); k++) {
+               uint64_t idx;
+               if (md_int(node, k, &idx)) {
+                  v[own.num_constants++].index = idx;
+                  break;
+               }
+            }
+         }
+         own.constants = v;
+      }
+      c.options = &own;
+   }
 
    const struct air_md *entry = NULL;
    int stage = module_stage(c.m, &entry);

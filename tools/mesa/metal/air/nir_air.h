@@ -377,6 +377,13 @@ struct air_to_nir_options {
     * entry point of the corpus and is counted separately.
     */
    bool library_wrapper;
+
+   /* (the K40's, 11-17) The constants are the module's own, each of value zero -- what air_module_function_constants
+    * hands a caller to pass back as `constants` -- read from the same parse of the bitcode instead of a second one.
+    * `constants` and `num_constants` are then not read. Reading a module is most of a translation: making a render
+    * pipeline spent 0.8-1.8 ms of its 1.1-2.5 ms translating its two stages (round b57), each read twice.
+    */
+   bool module_constants;
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may
