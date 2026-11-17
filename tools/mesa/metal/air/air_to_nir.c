@@ -199,8 +199,13 @@ static const struct glsl_type *
 param_glsl_type(struct air_ctx *c, const struct air_type *t)
 {
    unsigned bits = air_nir_bit_size(c, t);
+   /* (the K40's, 11-17) and 8- and 1-bit ones their own: an i8 or i1 member of a returned struct went through a
+    * 32-bit uint local and came back 32 bits wide, into an `and i8` (AppleCV3D's PointWarpVS, CoreRE's fsDebugLod:
+    * the PC's debug ir3 asserted src_bit_size == bit_size; a release build would have miscompiled) */
    return glsl_vector_type(bits == 16 ? GLSL_TYPE_FLOAT16 :
-                           bits == 64 ? GLSL_TYPE_UINT64 : GLSL_TYPE_UINT,
+                           bits == 64 ? GLSL_TYPE_UINT64 :
+                           bits == 8 ? GLSL_TYPE_UINT8 :
+                           bits == 1 ? GLSL_TYPE_BOOL : GLSL_TYPE_UINT,
                            air_nir_components(t));
 }
 
@@ -2323,6 +2328,8 @@ translate_gep(struct air_ctx *c, const struct air_inst *in)
    return true;
 }
 
+static const char *air_value_kind_name(const struct air_value *v);
+
 static bool
 translate_binop(struct air_ctx *c, const struct air_inst *in)
 {
@@ -2332,6 +2339,16 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
       return false;
    bool is_float = air_type_is_float(air_type_scalar(in->base.type));
    nir_def *res;
+
+   /* (the K40's, 11-17) both operands the instruction's own width, which LLVM guarantees and a release build of
+    * NIR's builder does not check (src_bit_size == bit_size): an operand that arrives otherwise is named here
+    * rather than built into an ALU instruction a debug build asserts on and a release one miscompiles */
+   unsigned want = air_nir_bit_size(c, in->base.type);
+   bool shift = in->sub == AIR_BINOP_SHL || in->sub == AIR_BINOP_LSHR || in->sub == AIR_BINOP_ASHR;
+   if (x->bit_size != want || (!shift && y->bit_size != want))
+      return air_error(c, "instruction: a binary operator %u of %u-bit %s whose operands are %u and %u bits "
+                          "(%s, %s)", in->sub, want, is_float ? "floats" : "integers", x->bit_size, y->bit_size,
+                       air_value_kind_name(in->operands[0]), air_value_kind_name(in->operands[1]));
 
    /* Metal compiles with fast math on, and the modules say so per
     * instruction. Without the flags the arithmetic must not be reassociated,
@@ -2986,6 +3003,29 @@ nir_block_of(struct air_ctx *c, const struct air_block *b)
    return n;
 }
 
+/* (the K40's, 11-17) a value as wide as the output variable it is stored into: a bool or an 8-bit member of the
+ * returned struct goes into an int output (no output is narrower), and storing it as it is was invalid NIR --
+ * which a release build let through (AppleCV3D's and RoomPlan's vertex shaders' `is_valid`, the PC's debug ir3).
+ * A bool becomes 0 / 1 (or 0.0 / 1.0), a narrower integer is extended by the variable's own signedness, a
+ * narrower float widened. */
+static nir_def *
+fit_output(struct air_ctx *c, const nir_variable *var, nir_def *d)
+{
+   const struct glsl_type *t = glsl_without_array(var->type);
+   unsigned want = glsl_base_type_get_bit_size(glsl_get_base_type(t));
+   if (d->bit_size == want || !glsl_type_is_numeric(t))
+      return d;
+   enum glsl_base_type base = glsl_get_base_type(t);
+   bool is_float = base == GLSL_TYPE_FLOAT || base == GLSL_TYPE_FLOAT16 || base == GLSL_TYPE_DOUBLE;
+   bool is_signed = base == GLSL_TYPE_INT || base == GLSL_TYPE_INT16 || base == GLSL_TYPE_INT8 ||
+                    base == GLSL_TYPE_INT64;
+   if (d->bit_size == 1)
+      return is_float ? nir_b2fN(&c->b, d, want) : nir_b2iN(&c->b, d, want);
+   if (is_float)
+      return nir_f2fN(&c->b, d, want);
+   return is_signed ? nir_i2iN(&c->b, d, want) : nir_u2uN(&c->b, d, want);
+}
+
 static bool
 emit_return(struct air_ctx *c, const struct air_inst *in)
 {
@@ -3068,8 +3108,8 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
          }
          if (!v->elems[i] || v->elems[i]->kind != AIR_VAL_SSA)
             continue; /* a field left undef is a target nothing writes */
-         nir_store_var(&c->b, c->outputs[i].var, v->elems[i]->def,
-                       BITFIELD_MASK(v->elems[i]->def->num_components));
+         nir_def *d = fit_output(c, c->outputs[i].var, v->elems[i]->def);
+         nir_store_var(&c->b, c->outputs[i].var, d, BITFIELD_MASK(d->num_components));
       }
       return true;
    }
@@ -3077,7 +3117,8 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
       return air_error(c, "instruction: a returned value that is not a number");
    if (!c->num_outputs || !c->outputs[0].var)
       return air_error(c, "interface: a returned value with no output");
-   nir_store_var(&c->b, c->outputs[0].var, v->def, BITFIELD_MASK(v->def->num_components));
+   nir_def *d = fit_output(c, c->outputs[0].var, v->def);
+   nir_store_var(&c->b, c->outputs[0].var, d, BITFIELD_MASK(d->num_components));
    return true;
 }
 
@@ -4608,13 +4649,14 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
     * a pointer parameter leaves behind, then delete everything but the entry
     * point, which every consumer of this NIR assumes.
     */
+   /* (the K40's, 11-17) the RETURNS first: nir_lower_goto_ifs turns a goto to a function's end block into a return
+    * jump wherever it is not the last thing. In a callee nir_inline_function_impl asserts there is none ("type !=
+    * nir_jump_return"; spirv_to_nir lowers them first for the same reason) -- a release build skipped the assertion
+    * and the inlined CFG was wrong: ir3's register allocator crashed on RenderBox's filter_blur_fragment and four of
+    * its neighbours (wsl/ir3-debug-one.sh, the PC's debug ir3_compiler). In the entry point ir3's divergence
+    * analysis has no return either ("Unsupported return instruction": MLCompute's concat_channels_forward). */
+   NIR_PASS(_, c.nir, nir_lower_returns);
    if (_mesa_hash_table_num_entries(c.fns)) {
-      /* (the K40's, 11-17) and before that the RETURNS: nir_lower_goto_ifs turns a callee's goto to its end block
-       * into a return jump wherever it is not the last thing, and nir_inline_function_impl asserts there is none
-       * ("type != nir_jump_return"; spirv_to_nir lowers them first for the same reason). A release build skipped
-       * the assertion and the inlined CFG was wrong -- ir3's register allocator crashed on RenderBox's
-       * filter_blur_fragment and four of its neighbours (wsl/ir3-debug-one.sh, the PC's debug ir3_compiler). */
-      NIR_PASS(_, c.nir, nir_lower_returns);
       NIR_PASS(_, c.nir, nir_inline_functions);
       NIR_PASS(_, c.nir, nir_opt_deref);
       nir_remove_non_entrypoints(c.nir);
