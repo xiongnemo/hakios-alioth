@@ -1,0 +1,41 @@
+its source only when every use of that source wants the result at the width the fold gives it. all_uses_safe_conv
+checked that each use is a conversion it can fold, not that they agree on half vs full: with a 16-bit shr whose
+uses were cov.u16u8 (half) and cov.u16u32 (full), folding for the first rewrote the second into mov.u32u32 of a half
+register -- ir3_validate's assertion in a debug build (AppleCV3D / Recon3D PhongWithSemantics), wrong code in a
+release one. Against the pristine 25.0.7 (the tarball); also applied to the PC build's tree.
+
+--- a/src/freedreno/ir3/ir3_cf.c
++++ b/src/freedreno/ir3/ir3_cf.c
+@@ -72,13 +72,22 @@
+ }
+ 
+ static bool
+-all_uses_safe_conv(struct ir3_instruction *conv_src, type_t src_type)
++all_uses_safe_conv(struct ir3_instruction *conv_src, type_t src_type, bool half)
+ {
+    opc_t opc = conv_src->opc;
+    bool first = true;
+    foreach_ssa_use (use, conv_src) {
+       opc_t new_opc = opc;
+       if (!is_safe_conv(use, src_type, &new_opc))
++         return false;
++      /* (hakios, the K40's Metal, 11-18) Every use must want the result at the
++       * width the fold gives the source -- the conversion's: rewrite_src_uses
++       * makes each of them a plain mov of it. A 16-bit value converted both to
++       * 8 bits (a half register) and to 32 bits (a full one) was folded for the
++       * first and the second became mov.u32u32 of a half register (ir3_validate:
++       * "type_size(src_type) <= 16 == HALF"; wrong code without the check).
++       */
++      if (is_half(use) != half)
+          return false;
+       /* Check if multiple uses have conflicting requirements on the opcode.
+        */
+@@ -148,7 +157,7 @@
+    if (src_type != dst_type)
+       return false;
+ 
+-   if (!all_uses_safe_conv(src, src_type))
++   if (!all_uses_safe_conv(src, src_type, is_half(conv)))
+       return false;
+ 
+    ir3_set_dst_type(src, is_half(conv));
