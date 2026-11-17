@@ -645,7 +645,12 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "mul_hi")) {
       r = is_signed ? nir_imul_high(&c->b, a[0], a[1]) : nir_umul_high(&c->b, a[0], a[1]);
    } else if (!strcmp(op, "popcount")) {
-      r = nir_bit_count(&c->b, a[0]);
+      /* (the K40's, 11-18) bit_count's answer is 32 bits whatever its source: of a narrower value, widened first and
+       * the count narrowed back to the value's width (as clz and ctz below) */
+      unsigned bits = a[0]->bit_size;
+      r = nir_bit_count(&c->b, bits < 32 ? nir_u2u32(&c->b, a[0]) : a[0]);
+      if (bits != 32)
+         r = nir_u2uN(&c->b, r, bits);
    } else if (!strcmp(op, "clz")) {
       /* (the K40's, 11-17) width - 1 - the highest set bit, which is the width for a zero (ufind_msb(0) = -1): ir3
        * has no uclz ("Unhandled ALU op: uclz", SceneKit's depth min/max and debug kernels in the PC's debug ir3) and
@@ -656,10 +661,16 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       if (bits != 32)
          r = nir_u2uN(&c->b, r, bits);
    } else if (!strcmp(op, "ctz")) {
-      /* Metal's ctz returns the type's width when the value is zero */
-      nir_def *lsb = nir_find_lsb(&c->b, a[0]);
-      r = nir_bcsel(&c->b, nir_ieq_imm(&c->b, a[0], 0),
-                    nir_imm_intN_t(&c->b, a[0]->bit_size, a[0]->bit_size), lsb);
+      /* Metal's ctz returns the type's width when the value is zero.
+       * (the K40's, 11-18) find_lsb's answer is 32 bits whatever its source, and the width's constant was made at the
+       * value's: a 16-bit ctz was a bcsel of a 16- and a 32-bit value (nir_builder's assertion in the PC's debug ir3,
+       * MPSMatrix's MatrixSoftMaxGradient; wrong code in a release build). Done at 32 bits, narrowed at the end. */
+      unsigned bits = a[0]->bit_size;
+      nir_def *v = bits < 32 ? nir_u2u32(&c->b, a[0]) : a[0];
+      nir_def *lsb = nir_find_lsb(&c->b, v);
+      r = nir_bcsel(&c->b, nir_ieq_imm(&c->b, v, 0), nir_imm_int(&c->b, bits), lsb);
+      if (bits != 32)
+         r = nir_u2uN(&c->b, r, bits);
    } else if (!strcmp(op, "reverse_bits")) {
       r = nir_bitfield_reverse(&c->b, a[0]);
    } else if (!strcmp(op, "rotate")) {
