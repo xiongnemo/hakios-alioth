@@ -1,0 +1,23 @@
+--- a/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
+@@ -8,6 +8,7 @@
+ 
+ #include "pipe/p_screen.h"
+ #include "pipe/p_state.h"
++#include <stdlib.h>
+ #include "tgsi/tgsi_dump.h"
+ #include "util/format/u_format.h"
+ #include "util/u_inlines.h"
+@@ -581,6 +582,12 @@
+     */
+    unsigned num_threads = sysconf(_SC_NPROCESSORS_ONLN) / 2;
+ 
++   /* (hakios, the K40's Metal, 11-17) HAKIOS_IR3_THREADS=N: N compile threads (1-16) instead of half the
++    * processors online -- the Metal driver sets it from boot-arg metal_ir3_threads=N */
++   const char *hakios_threads = getenv("HAKIOS_IR3_THREADS");
++   if (hakios_threads && atoi(hakios_threads) > 0)
++      num_threads = MIN2(atoi(hakios_threads), 16);
++
+    /* Create at least one thread - even on single core CPU systems. */
+    num_threads = MAX2(1, num_threads);
+ 

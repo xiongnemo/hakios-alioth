@@ -1337,6 +1337,20 @@ mesa_available(void)
 			setenv("HAKIOS_FD_GMEM_SEARCH", "0", 0);
 			rw_print("metal_gmem_search=0: freedreno's own choice of bins, as before 11-17\n");
 		}
+		/* (11-17) metal_ir3_threads=N: N shader compile threads (ir3q; freedreno's own is half the processors
+		 * online, 3) -- tools/mesa/metal/ir3-compile-threads.patch, HAKIOS_IR3_THREADS; a launch's first frames
+		 * wait for that queue */
+		if ((at = strstr(args, "metal_ir3_threads=")) != NULL && getenv("HAKIOS_IR3_THREADS") == NULL) {
+			int threads = atoi(at + strlen("metal_ir3_threads="));
+
+			if (threads > 0 && threads <= 16) {
+				char value[8];
+
+				snprintf(value, sizeof(value), "%d", threads);
+				setenv("HAKIOS_IR3_THREADS", value, 0);
+				rw_print("metal_ir3_threads=%d: %d shader compile threads\n", threads, threads);
+			}
+		}
 		/* (11-16) metal_fd_vsc=DRAW,PRIM: freedreno's visibility streams' starting sizes a pipe (fd6_context.cc,
 		 * HAKIOS_FD_VSC; tools/mesa/metal/fd6-msrtt-trace.patch) -- a test road */
 		if ((at = strstr(args, "metal_fd_vsc=")) != NULL) {
