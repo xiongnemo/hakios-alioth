@@ -413,6 +413,14 @@ void air_finalize_for_gallium(nir_shader *nir, bool fs_position_is_sysval, bool 
  * air_to_nir does to the info it hands back, for a caller that keeps a translation and hands out copies of it */
 void air_shader_info_copy(void *mem_ctx, struct air_shader_info *dst, const struct air_shader_info *src);
 
+/* (the K40's, 11-18) a translation (air_to_nir's NIR and info) into a blob and back, for a cache on disk
+ * (air_serialize.c); the deserialized NIR and the info's arrays and strings under mem_ctx. NULL (and the info zeroed)
+ * for a blob that is not a whole translation. */
+struct blob;
+bool air_translation_serialize(struct blob *b, const nir_shader *nir, const struct air_shader_info *info);
+nir_shader *air_translation_deserialize(void *mem_ctx, const nir_shader_compiler_options *options, const void *data,
+                                        size_t size, struct air_shader_info *info);
+
 /* (the K40's, 11-17) where translations' time went since the last call, zeroed: out[0] translations, out[1] ns
  * reading modules, out[2] ns translating bodies, out[3] ns structurizing, inlining and copying infos out */
 void air_translation_times(uint64_t out[4]);

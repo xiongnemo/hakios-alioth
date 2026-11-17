@@ -34,6 +34,7 @@
 #include "nir_builder.h"
 #include "nir_air.h"
 #include "air_module.h"
+#include "util/blob.h"
 #include "util/ralloc.h"
 
 /* --library: translate an air.visible library function inside a generated
@@ -448,6 +449,106 @@ interface_module(const struct module_ref *mod)
    return 0;
 }
 
+/* (the K40's, 11-18) every field of an info, for --roundtrip's comparison */
+static void
+dump_info(FILE *fp, const struct air_shader_info *i)
+{
+#define S(x) ((x) ? (x) : "(null)")
+   fprintf(fp, "stage %d entry %s res %u var %u attr %u read %#x rts %u fbf %#x rog %#x notes %u tg %u grid %d\n",
+           i->stage, S(i->entry_point), i->num_resources, i->num_varyings, i->num_vertex_attributes,
+           i->vertex_attributes_read, i->num_render_targets, i->fbfetch_targets, i->raster_order_groups,
+           i->num_notes, i->threadgroup_bytes, i->reads_group_grid);
+   for (unsigned k = 0; k < i->num_resources; k++) {
+      const struct air_resource *r = &i->resources[k];
+      const struct air_sampler_state *s = &r->sampler;
+      fprintf(fp, "r %d %u %u %d%d %u %s %s %d %u %u %u %u %d %#" PRIx64 " %u%u%u %u%u%u %d %u %u %u %u %u %u %d %u %u\n",
+              r->kind, r->index, r->size, r->read, r->write, r->param, S(r->name), S(r->type_name), r->unused,
+              r->array_length, r->type_size, r->type_align, r->num_members, r->inline_sampler, r->sampler_state,
+              s->address[0], s->address[1], s->address[2], s->mag_filter, s->min_filter, s->mip_filter,
+              s->pixel_coord, s->compare_func, s->max_anisotropy, s->lod_min, s->lod_max, s->border_color,
+              s->reduction, r->raster_order_group, r->argbuf_set, r->argbuf_id);
+      for (unsigned m = 0; m < r->num_members; m++)
+         fprintf(fp, "  m %s %s %u %u %d\n", S(r->members[m].name), S(r->members[m].type_name),
+                 r->members[m].offset, r->members[m].size, r->members[m].is_struct);
+   }
+   for (unsigned k = 0; k < i->num_varyings; k++) {
+      const struct air_varying *v = &i->varyings[k];
+      fprintf(fp, "v %s %u %u %d%d%d%d\n", S(v->name), v->slot, v->components, v->flat, v->centroid, v->sample,
+              v->no_perspective);
+   }
+   for (unsigned k = 0; k < i->num_vertex_attributes; k++) {
+      const struct air_vertex_attribute *a = &i->vertex_attributes[k];
+      fprintf(fp, "a %u %u %u %u %u %d %s %s %d %s\n", a->index, a->location, a->components, a->driver_location,
+              a->bit_size, a->base_type, S(a->name), S(a->type_name), a->used, S(a->function_constant));
+   }
+   for (unsigned k = 0; k < i->num_notes; k++)
+      fprintf(fp, "n %s\n", S(i->notes[k]));
+#undef S
+}
+
+static char *
+shader_text(nir_shader *nir, const struct air_shader_info *info)
+{
+   char *buf = NULL;
+   size_t len = 0;
+   FILE *fp = open_memstream(&buf, &len);
+   nir_foreach_function_impl(impl, nir) {
+      nir_index_ssa_defs(impl);
+      nir_index_blocks(impl);
+   }
+   nir_print_shader(nir, fp);
+   dump_info(fp, info);
+   fclose(fp);
+   return buf;
+}
+
+/* (the K40's, 11-18) --roundtrip: each module translated, then through air_translation_serialize and
+ * air_translation_deserialize (the Metal library's translation cache on disk), and the two compared as text -- the
+ * NIR as nir_print shows it, every field of the info. One line a module; 1 if any differs. */
+static int
+roundtrip_module(const struct module_ref *mod)
+{
+   void *ctx = ralloc_context(NULL);
+   const char *err = NULL;
+   struct air_constant_value *fc;
+   unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
+   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+                                        .library_wrapper = library_wrapper };
+   struct air_shader_info info, back;
+   nir_shader *nir = air_to_nir(ctx, mod->bitcode, mod->size, NULL, &options, &default_options, &info, &err);
+   if (!nir) {
+      printf("roundtrip -\t%s\t(refused: not compared)\n", mod->name);
+      ralloc_free(ctx);
+      return 0;
+   }
+   struct blob b;
+   blob_init(&b);
+   bool ok = air_translation_serialize(&b, nir, &info);
+   nir_shader *nir2 = ok ? air_translation_deserialize(ctx, &default_options, b.data, b.size, &back) : NULL;
+   int bad = 1;
+   if (!nir2) {
+      printf("roundtrip FAIL\t%s\t(the blob did not come back: %zu bytes)\n", mod->name, b.size);
+   } else {
+      char *x = shader_text(nir, &info), *y = shader_text(nir2, &back);
+      bad = strcmp(x, y) != 0;
+      printf("roundtrip %s\t%s\t%zu bytes\n", bad ? "DIFF" : "ok", mod->name, b.size);
+      if (bad) {
+         /* the first line that differs */
+         const char *p = x, *q = y;
+         while (*p && *p == *q)
+            p++, q++;
+         while (p > x && p[-1] != '\n')
+            p--, q--;
+         printf("  was: %.160s\n  now: %.160s\n", p, q);
+      }
+      free(x);
+      free(y);
+   }
+   blob_finish(&b);
+   ralloc_free(ctx);
+   return bad;
+}
+
 /* tools/air/corpus.py reads these lines: tab-separated key=value */
 static void
 report_one(const struct module_ref *mod)
@@ -521,7 +622,7 @@ report_one(const struct module_ref *mod)
 int
 main(int argc, char **argv)
 {
-   enum { TRANSLATE, LL, LIST, REPORT, EVAL, INTERFACE } mode = TRANSLATE;
+   enum { TRANSLATE, LL, LIST, REPORT, EVAL, INTERFACE, ROUNDTRIP } mode = TRANSLATE;
    int i = 1;
    while (i < argc && !strcmp(argv[i], "--library"))
       library_wrapper = true, i++;
@@ -535,10 +636,12 @@ main(int argc, char **argv)
       mode = EVAL, i++;
    else if (i < argc && !strcmp(argv[i], "--interface"))
       mode = INTERFACE, i++;
+   else if (i < argc && !strcmp(argv[i], "--roundtrip"))
+      mode = ROUNDTRIP, i++;
    if (i >= argc) {
       fprintf(stderr,
               "usage: air2nir [--library] "
-              "[--ll | --list | --report | --eval | --interface] "
+              "[--ll | --list | --report | --eval | --interface | --roundtrip] "
               "FILE [FUNCTION]\n");
       return 2;
    }
@@ -587,6 +690,10 @@ main(int argc, char **argv)
       }
       if (mode == INTERFACE) {
          status |= interface_module(&mods[k]);
+         continue;
+      }
+      if (mode == ROUNDTRIP) {
+         status |= roundtrip_module(&mods[k]);
          continue;
       }
       if (mode == LIST) {

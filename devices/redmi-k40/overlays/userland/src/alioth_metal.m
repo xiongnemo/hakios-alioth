@@ -716,6 +716,7 @@ static struct rwa_device *alioth_stats_device;
 static void (*alioth_pipeline_times)(struct rwa_device *, uint64_t[4]);
 static void (*alioth_pipeline_modules)(struct rwa_device *, uint64_t[3]);
 static void (*alioth_translation_times)(uint64_t[4]);
+static void (*alioth_translation_disk)(uint64_t[3]);    /* (11-18) rwa_translation_disk */
 /* (the K40's, 11-16) render passes in the window: all, multisample, resolved in the tiles, resolved by a blit */
 static uint64_t alioth_pass_counts[4];
 /* (the K40's, 11-16) memoryless textures made without memory, and of them given memory at a first real use (counted
@@ -850,6 +851,17 @@ alioth_stats_commit(void)
 			rw_print("stats: %llu translations, one: %.3f ms reading the module, %.3f ms translating its body, %.3f ms "
 			         "structurizing and the rest\n", (unsigned long long)tt[0], tt[1] / 1e6 / tt[0], tt[2] / 1e6 / tt[0],
 			         tt[3] / 1e6 / tt[0]);
+		}
+		/* (11-18) and the translation cache on disk: found there (and how long taking one out took) or not */
+		uint64_t td[3] = { 0 };
+
+		if (alioth_translation_disk != NULL) {
+			alioth_translation_disk(td);
+		}
+		if (td[0] + td[1] != 0) {
+			rw_print("stats: translations on disk: %llu found, %.3f ms taking one out; %llu not found (translated and "
+			         "put there)\n", (unsigned long long)td[0], td[0] ? td[2] / 1e6 / td[0] : 0.0,
+			         (unsigned long long)td[1]);
 		}
 	}
 	/* (11-17) who held the lock longest in the window, when that was 2 ms or more */
@@ -1345,6 +1357,12 @@ mesa_available(void)
 			setenv("HAKIOS_AIR_DUMP", dir, 0);
 			rw_print("metal_dump_air=1: every pipeline's stage modules into %sair-*.bc\n", dir);
 		}
+		/* (11-18) metal_air_disk=0: no translation cache on disk (air_metal.c translate_disk, HAKIOS_AIR_DISK) --
+		 * every launch translates its pipelines' AIR again, as before */
+		if (strstr(args, "metal_air_disk=0") != NULL && getenv("HAKIOS_AIR_DISK") == NULL) {
+			setenv("HAKIOS_AIR_DISK", "0", 0);
+			rw_print("metal_air_disk=0: no translation cache on disk\n");
+		}
 		/* (11-17) metal_air_cache=0: every render pipeline stage translated again, not once a process
 		 * (air_metal.c translate_cached, HAKIOS_AIR_CACHE) */
 		if (strstr(args, "metal_air_cache=0") != NULL && getenv("HAKIOS_AIR_CACHE") == NULL) {
@@ -1440,6 +1458,7 @@ mesa_available(void)
 	*(void **)&alioth_pipeline_times = dlsym(mesa.handle, "rwa_device_pipeline_times");
 	*(void **)&alioth_pipeline_modules = dlsym(mesa.handle, "rwa_device_pipeline_modules");
 	*(void **)&alioth_translation_times = dlsym(mesa.handle, "rwa_translation_times");
+	*(void **)&alioth_translation_disk = dlsym(mesa.handle, "rwa_translation_disk");
 	*(void **)&mesa.texture_write = dlsym(mesa.handle, "rwa_texture_write");
 	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");
 	*(void **)&mesa.depth_read = dlsym(mesa.handle, "rwa_depth_read");

@@ -627,6 +627,10 @@ void rwa_device_pipeline_modules(struct rwa_device *device, uint64_t out[3]);
  * copying the info out */
 void rwa_translation_times(uint64_t out[4]);
 
+/* (the K40's, 11-18) the translation cache on disk since the last call, zeroed: out[0] translations found there,
+ * out[1] not found (translated, then put there), out[2] ns taking the found ones out */
+void rwa_translation_disk(uint64_t out[3]);
+
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 

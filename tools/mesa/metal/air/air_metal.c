@@ -60,6 +60,9 @@
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/os_time.h"
+#include "util/blob.h"
+#include "util/disk_cache.h"
+#include "util/mesa-sha1.h"
 #include <pthread.h>
 #include "util/u_gen_mipmap.h"
 
@@ -3253,6 +3256,9 @@ slot_shapes(nir_shader *cs, struct rwa_slot slots[RWA_MAX_TEXTURES],
 }
 
 static void dump_air(const void *bitcode, size_t size, const char *entry);
+static nir_shader *translate_disk(struct rwa_device *device, void *mem_ctx, const void *bitcode, size_t size,
+                                  const char *entry, const struct air_to_nir_options *opts,
+                                  struct air_shader_info *info, const char **error);
 
 struct rwa_compute *
 rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
@@ -3298,8 +3304,7 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
    if (device->unlock)
       device->unlock(device->lock_context);
    dump_air(bitcode, size, entry);
-   compute->nir = air_to_nir(compute->mem_ctx, bitcode, size, entry, &options,
-                             device->nir_options, &compute->info, &error);
+   compute->nir = translate_disk(device, compute->mem_ctx, bitcode, size, entry, &options, &compute->info, &error);
    if (device->lock)
       device->lock(device->lock_context);
    if (compute->nir)
@@ -6701,6 +6706,100 @@ module_hash(const void *bitcode, size_t size, const char *entry)
 }
 
 /*
+ * (the K40's, 11-18) THE TRANSLATION CACHE ON DISK. ir3's disk cache already spares an application's next launch in the
+ * boot its shader compiles; what was left of making a pipeline was translating its AIR again -- Flutter Check's second
+ * launch, 0.57 ms of its 1.05 ms a pipeline (round b91: 38 of its 70 ms for 67 pipelines). A translation (NIR + info,
+ * air_serialize.c) is kept in Mesa's disk cache beside ir3's (MESA_SHADER_CACHE_DIR: the app's Library/Caches, set by
+ * alioth_metal.m; mesa_cache=0 has none), keyed by the module's bytes, its entry point, the options that change what
+ * the translator makes, the device's kind -- and, through disk_cache_create, this library's own file time, so a new
+ * build never reads an old one's (the same stamp as ir3's, ir3-disk-cache-darwin.patch). HAKIOS_AIR_DISK=0
+ * (boot-arg metal_air_disk=0): none. air2nir --roundtrip checks the blob against a fresh translation; 4119 of the
+ * corpus's translations came back identical (11-18).
+ */
+static struct disk_cache *xlat_disk_cache;
+static uint64_t xlat_disk_counts[3];    /* found, not found, ns taking the found ones out */
+
+static void
+xlat_disk_open(void)
+{
+   const char *e = getenv("HAKIOS_AIR_DISK");
+   if (e && e[0] == '0')
+      return;
+   uint32_t t = 0;
+   if (!disk_cache_get_function_timestamp((void *)xlat_disk_open, &t))
+      return;
+   char stamp[24];
+   snprintf(stamp, sizeof(stamp), "air-%08x", t);
+   xlat_disk_cache = disk_cache_create("hakios-air", stamp, 0);
+}
+
+static struct disk_cache *
+xlat_disk(void)
+{
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+   pthread_once(&once, xlat_disk_open);
+   return xlat_disk_cache;
+}
+
+/* air_to_nir through the cache on disk (above); without an info to fill, or with no cache, air_to_nir itself */
+static nir_shader *
+translate_disk(struct rwa_device *device, void *mem_ctx, const void *bitcode, size_t size, const char *entry,
+               const struct air_to_nir_options *opts, struct air_shader_info *info, const char **error)
+{
+   struct disk_cache *dc = info && opts ? xlat_disk() : NULL;
+   cache_key key;
+
+   if (dc) {
+      struct mesa_sha1 sha;
+      uint8_t digest[SHA1_DIGEST_LENGTH];
+      const char *e = entry ? entry : "";
+      const uint8_t flags[4] = { opts->module_constants, opts->grid_inputs, opts->library_wrapper, device->software };
+
+      _mesa_sha1_init(&sha);
+      _mesa_sha1_update(&sha, bitcode, size);
+      _mesa_sha1_update(&sha, e, strlen(e) + 1);
+      _mesa_sha1_update(&sha, flags, sizeof(flags));
+      if (!opts->module_constants && opts->num_constants)
+         _mesa_sha1_update(&sha, opts->constants, opts->num_constants * sizeof(*opts->constants));
+      _mesa_sha1_final(&sha, digest);
+      disk_cache_compute_key(dc, digest, sizeof(digest), key);
+
+      uint64_t began = os_time_get_nano();
+      size_t got = 0;
+      void *data = disk_cache_get(dc, key, &got);
+      if (data) {
+         nir_shader *nir = air_translation_deserialize(mem_ctx, device->nir_options, data, got, info);
+         free(data);
+         if (nir) {
+            __atomic_fetch_add(&xlat_disk_counts[0], 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&xlat_disk_counts[2], os_time_get_nano() - began, __ATOMIC_RELAXED);
+            if (error)
+               *error = NULL;
+            return nir;
+         }
+      }
+      __atomic_fetch_add(&xlat_disk_counts[1], 1, __ATOMIC_RELAXED);
+   }
+   nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, opts, device->nir_options, info, error);
+   if (nir && dc) {
+      struct blob b;
+      blob_init(&b);
+      if (air_translation_serialize(&b, nir, info))
+         disk_cache_put(dc, key, b.data, b.size, NULL);   /* (copied: written by the cache's own thread) */
+      blob_finish(&b);
+   }
+   return nir;
+}
+
+/* (the K40's, 11-18) air_metal.h */
+void
+rwa_translation_disk(uint64_t out[3])
+{
+   for (unsigned i = 0; i < 3; i++)
+      out[i] = __atomic_exchange_n(&xlat_disk_counts[i], 0, __ATOMIC_RELAXED);
+}
+
+/*
  * (the K40's, 11-18) HAKIOS_AIR_DUMP=DIR (alioth_metal.m sets it to the app's temporary directory for boot-arg
  * metal_dump_air=1): every stage module a pipeline is made from, render or compute, written once a process to
  * DIR/air-ENTRY-HASH.bc, as it is handed to the translator. The point is the AIR the phone compiled at run time
@@ -6774,7 +6873,7 @@ translate_cached(struct rwa_device *device, void *mem_ctx, const void *bitcode, 
    }
    dump_air(bitcode, size, entry);
    if (!on || !info || !opts || !opts->module_constants || opts->library_wrapper)
-      return air_to_nir(mem_ctx, bitcode, size, entry, opts, device->nir_options, info, error);
+      return translate_disk(device, mem_ctx, bitcode, size, entry, opts, info, error);
    uint64_t h = module_hash(bitcode, size, entry);
 
    pthread_mutex_lock(&device->xlat_lock);
@@ -6793,7 +6892,7 @@ translate_cached(struct rwa_device *device, void *mem_ctx, const void *bitcode, 
    }
    pthread_mutex_unlock(&device->xlat_lock);
 
-   nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, opts, device->nir_options, info, error);
+   nir_shader *nir = translate_disk(device, mem_ctx, bitcode, size, entry, opts, info, error);
    if (!nir)
       return NULL;
    pthread_mutex_lock(&device->xlat_lock);
