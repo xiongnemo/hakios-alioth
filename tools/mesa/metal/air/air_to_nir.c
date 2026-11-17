@@ -2747,7 +2747,10 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[1]);
       if (!v || !i)
          return false;
-      air_set(c, &in->base, air_val_ssa(c, nir_vector_extract(&c->b, v, nir_u2u32(&c->b, i))));
+      /* (the K40's, 11-17) an i1 index -- `extractelement <2 x T> %v, i1 %c`, which LLVM makes of a select between
+       * two lanes (RenderBox's stroke fragment shaders) -- is a boolean in NIR and has no u2u32: b2i32 */
+      air_set(c, &in->base, air_val_ssa(c, nir_vector_extract(&c->b, v, i->bit_size == 1 ? nir_b2i32(&c->b, i)
+                                                                                       : nir_u2u32(&c->b, i))));
       return true;
    }
    case AIR_OP_INSERTELT: {
@@ -2761,7 +2764,8 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
           * (nir_vector_insert's compare and select) -- Impeller's sRGB/linear filters write a
           * colour's lanes in a loop (refused until 2026-11-10: LinearToSrgbFilter,
           * SrgbToLinearFilter) */
-         air_set(c, &in->base, air_val_ssa(c, nir_vector_insert(&c->b, v, x, nir_u2u32(&c->b, i))));
+         air_set(c, &in->base, air_val_ssa(c, nir_vector_insert(&c->b, v, x, i->bit_size == 1 ? nir_b2i32(&c->b, i)
+                                                                                             : nir_u2u32(&c->b, i))));
          return true;
       }
       air_set(c, &in->base,
@@ -3140,6 +3144,82 @@ val_holds_ptr(const struct air_val *v)
    return false;
 }
 
+/*
+ * (the K40's, 11-17) A STRUCT OR AN ARRAY PASSED BY VALUE to a function of the module: a tree of values here, never
+ * a NIR value, so it had no parameter to go through -- "a struct where a number belongs" at the callee's first
+ * extractvalue, 26 of the iOS 16.5 image's entry points (RenderBox, CoreRE, SceneKit's standard_frag). It goes as
+ * its number leaves, one parameter each in the tree's order, and the callee rebuilds the same tree from them
+ * (undef fields stay NULL, as an undef aggregate's do). Only a tree of numbers: one holding a pointer is still
+ * bound from the caller's resolution, as before.
+ */
+static bool
+agg_is_numbers(const struct air_val *v)
+{
+   if (!v)
+      return true;
+   if (v->kind == AIR_VAL_SSA)
+      return v->def != NULL;
+   if (v->kind != AIR_VAL_AGG)
+      return false;
+   for (unsigned i = 0; i < v->num_elems; i++)
+      if (!agg_is_numbers(v->elems[i]))
+         return false;
+   return true;
+}
+
+static void
+agg_leaf_params(nir_function *fn, unsigned *idx, const struct air_val *v)
+{
+   if (!v)
+      return;
+   if (v->kind == AIR_VAL_SSA) {
+      fn->params[(*idx)++] = (nir_parameter){ .num_components = (uint8_t)v->def->num_components,
+                                              .bit_size = (uint8_t)v->def->bit_size };
+      return;
+   }
+   for (unsigned i = 0; i < v->num_elems; i++)
+      agg_leaf_params(fn, idx, v->elems[i]);
+}
+
+static unsigned
+agg_leaf_count(const struct air_val *v)
+{
+   if (!v)
+      return 0;
+   if (v->kind == AIR_VAL_SSA)
+      return 1;
+   unsigned n = 0;
+   for (unsigned i = 0; i < v->num_elems; i++)
+      n += agg_leaf_count(v->elems[i]);
+   return n;
+}
+
+static struct air_val *
+agg_from_params(struct air_ctx *c, const struct air_val *shape, unsigned *pidx)
+{
+   if (!shape)
+      return NULL;
+   if (shape->kind == AIR_VAL_SSA)
+      return air_val_ssa(c, nir_load_param(&c->b, (*pidx)++));
+   struct air_val *v = air_val_agg(c, shape->num_elems);
+   for (unsigned i = 0; i < shape->num_elems; i++)
+      v->elems[i] = agg_from_params(c, shape->elems[i], pidx);
+   return v;
+}
+
+static void
+agg_call_srcs(nir_call_instr *call, unsigned *idx, const struct air_val *v)
+{
+   if (!v)
+      return;
+   if (v->kind == AIR_VAL_SSA) {
+      call->params[(*idx)++] = nir_src_for_ssa(v->def);
+      return;
+   }
+   for (unsigned i = 0; i < v->num_elems; i++)
+      agg_call_srcs(call, idx, v->elems[i]);
+}
+
 /* A function of the module, translated as a nir_function so that
  * nir_inline_functions can fold it into its callers afterwards.
  *
@@ -3158,7 +3238,7 @@ val_holds_ptr(const struct air_val *v)
  */
 static nir_function *
 translate_callee(struct air_ctx *c, const struct air_function *f,
-                 struct air_val **argv, bool *is_param, bool *off_param)
+                 struct air_val **argv, bool *is_param, bool *off_param, bool *agg_param)
 {
    /* A texture, sampler or buffer argument is not a value in this frontend: it
     * is resolved at translation time into a binding, and tex_handle wants an
@@ -3194,6 +3274,15 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       }
       if (off_param)
          off_param[i] = off;
+      /* (the K40's, 11-17) a struct or an array of numbers, by value: its leaves as parameters (agg_is_numbers) */
+      bool agg = agg_param && argv && argv[i] && !ptr && argv[i]->kind == AIR_VAL_AGG && agg_is_numbers(argv[i]);
+      if (agg_param)
+         agg_param[i] = agg;
+      if (agg) {
+         is_param[i] = false;
+         specialised = true;
+         continue;
+      }
       /* The same reason, for the two pointers that are values: a chosen
        * pointer's condition is a def of the CALLER's impl, and a slot's
        * soundness rests on every use being in one block of one function.
@@ -3235,6 +3324,9 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       nret = 1;
    }
    unsigned nparams = f->num_args + nret;
+   for (unsigned i = 0; agg_param && i < f->num_args; i++)
+      if (agg_param[i])
+         nparams += agg_leaf_count(argv[i]);   /* (the K40's, 11-17) a by-value aggregate's leaves */
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
@@ -3276,6 +3368,12 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    for (unsigned i = 0; off_param && i < f->num_args; i++) {
       if (off_param[i])
          fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };
+   }
+   /* (the K40's, 11-17) and the number leaves of the aggregates passed by value, after the offsets */
+   unsigned agg_first = idx;
+   for (unsigned i = 0; agg_param && i < f->num_args; i++) {
+      if (agg_param[i])
+         agg_leaf_params(fn, &idx, argv[i]);
    }
    fn->num_params = idx;   /* the pointers took no parameter (their offsets did) */
 
@@ -3339,8 +3437,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       c->ret_deref = nir_build_deref_cast(&c->b, nir_load_param(&c->b, 0),
                                           nir_var_function_temp, ret_glsl, 0);
    }
-   unsigned pidx = nret, oidx = off_first;
+   unsigned pidx = nret, oidx = off_first, aidx = agg_first;
    for (unsigned i = 0; i < f->num_args && ok; i++) {
+      if (!is_param[i] && agg_param && agg_param[i]) {
+         /* (the K40's, 11-17) the aggregate rebuilt from its leaves' parameters */
+         air_set(c, &f->args[i], agg_from_params(c, argv[i], &aidx));
+         continue;
+      }
       if (!is_param[i] && off_param && off_param[i]) {
          /* (the K40's, 11-17) the caller's resolution at the offset it passed */
          struct air_ptr p = argv[i]->ptr;
@@ -3404,13 +3507,14 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
                                          MAX2(f->num_args, 1));
    bool *is_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
    bool *off_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
+   bool *agg_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
    for (unsigned i = 0; i < f->num_args; i++) {
       argv[i] = air_get(c, in->operands[i + 1]);
       if (!argv[i])
          return false;
    }
 
-   nir_function *fn = translate_callee(c, f, argv, is_param, off_param);
+   nir_function *fn = translate_callee(c, f, argv, is_param, off_param, agg_param);
    if (!fn)
       return false;   /* translate_callee has said why */
 
@@ -3456,6 +3560,10 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    for (unsigned i = 0; i < f->num_args; i++)
       if (off_param[i])
          call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
+   /* (the K40's, 11-17) then the leaves of the aggregates passed by value */
+   for (unsigned i = 0; i < f->num_args; i++)
+      if (agg_param[i])
+         agg_call_srcs(call, &idx, argv[i]);
    nir_builder_instr_insert(&c->b, &call->instr);
 
    if (ret_struct) {
@@ -3619,7 +3727,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
                re->kind != AIR_TYPE_INT))
       return air_error(c, "library: the return value is neither a scalar nor a vector");
 
-   nir_function *fn = translate_callee(c, f, argv, is_param, NULL);
+   nir_function *fn = translate_callee(c, f, argv, is_param, NULL, NULL);
    if (!fn)
       return false;   /* translate_callee has said why */
 
@@ -4170,7 +4278,7 @@ run_static_initializers(struct air_ctx *c)
           * also why this could not be reached before the reader learnt to read
           * one.
           */
-         nir_function *fn = translate_callee(c, f, NULL, NULL, NULL);
+         nir_function *fn = translate_callee(c, f, NULL, NULL, NULL, NULL);
          if (!fn)
             return;   /* translate_callee has said why */
          nir_builder_instr_insert(&c->b, &nir_call_instr_create(c->nir, fn)->instr);
@@ -4501,6 +4609,12 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
     * point, which every consumer of this NIR assumes.
     */
    if (_mesa_hash_table_num_entries(c.fns)) {
+      /* (the K40's, 11-17) and before that the RETURNS: nir_lower_goto_ifs turns a callee's goto to its end block
+       * into a return jump wherever it is not the last thing, and nir_inline_function_impl asserts there is none
+       * ("type != nir_jump_return"; spirv_to_nir lowers them first for the same reason). A release build skipped
+       * the assertion and the inlined CFG was wrong -- ir3's register allocator crashed on RenderBox's
+       * filter_blur_fragment and four of its neighbours (wsl/ir3-debug-one.sh, the PC's debug ir3_compiler). */
+      NIR_PASS(_, c.nir, nir_lower_returns);
       NIR_PASS(_, c.nir, nir_inline_functions);
       NIR_PASS(_, c.nir, nir_opt_deref);
       nir_remove_non_entrypoints(c.nir);
