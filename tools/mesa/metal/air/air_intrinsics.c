@@ -1788,6 +1788,26 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
       coord = nir_vec(&c->b, comps, nc + 1);
    }
 
+   /* (the K40's, 11-17) a cube texture's write takes the texel's 2-D coordinate and its FACE as an argument of its
+    * own (texturecube::write(color, uint2 coord, uint face, uint lod)), as an array index is above; NIR's cube image
+    * coordinate is (x, y, face). iOS 16.5's image: 14 modules (ARKitCore, SceneKit, VFX...). The read of one is left
+    * refused: a fetch from a cube TEXTURE (not an image) is nothing GLSL or Vulkan has, and ir3 is not known to take it. */
+   if (t->dim == GLSL_SAMPLER_DIM_CUBE && !t->is_array && !is_float && coord->num_components == 2 && ncoord == 3 &&
+       !strcmp(t->op, "write")) {
+      if (in->num_operands <= *arg) {
+         air_error(c, "intrinsic: air.%s without the face its signature has", n->part[0]);
+         return NULL;
+      }
+      nir_def *face = air_get_ssa(c, in->operands[(*arg)++]);
+      if (!face)
+         return NULL;
+      if (face->num_components != 1) {
+         air_error(c, "intrinsic: air.%s with a %u-component face", n->part[0], face->num_components);
+         return NULL;
+      }
+      coord = nir_vec3(&c->b, nir_channel(&c->b, coord, 0), nir_channel(&c->b, coord, 1), nir_u2u32(&c->b, face));
+   }
+
    if (coord->num_components != ncoord) {
       air_error(c, "intrinsic: air.%s with a %u-component coordinate, wanting %u",
                 n->part[0], coord->num_components, ncoord);
