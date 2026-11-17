@@ -2483,6 +2483,13 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
          res = nir_unpack_32_2x16(&c->b, x);
       else if (sn == 2 && sb == 16 && dn == 1 && db == 32)
          res = nir_pack_32_2x16(&c->b, x);
+      /* (the K40's, 11-17) any other repacking of the same bits between 8-, 16-, 32- and 64-bit lanes, with the
+       * same little-endian rule as the two above (lane 0 the lowest bits): nir_extract_bits, which NIR's own
+       * passes use for the same thing. iOS 16.5's image: i32 -> <4 x i8> (25 modules), <4 x i16> <-> <2 x i32>,
+       * i16 <-> <2 x i8>, <4 x i8> -> i32. */
+      else if (dn * db == sn * sb && db >= 8 && sb >= 8 && util_is_power_of_two_nonzero(db) &&
+               util_is_power_of_two_nonzero(sb) && db <= 64 && sb <= 64 && dn <= NIR_MAX_VEC_COMPONENTS)
+         res = nir_extract_bits(&c->b, &x, 1, 0, dn, db);
       else
          return air_error(c, "instruction: a bitcast from %u x %u bits to %u x %u bits, "
                              "which is a repacking this frontend does not do",
