@@ -558,6 +558,10 @@ static struct {
 	void (*compute_destroy)(struct rwa_compute *);
 	struct rwa_texture *(*texture_create)(struct rwa_device *,
 					      const struct rwa_texture_shape *, char *, size_t);
+	/* (the K40's, 11-17) a memoryless multisample depth/stencil texture: one sample of memory, its samples in the
+	 * tiles (air_metal.h); screen calls only, as texture_create */
+	struct rwa_texture *(*texture_create_tile_only)(struct rwa_device *, const struct rwa_texture_shape *, char *,
+							size_t);
 	int (*texture_write)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
 			     const unsigned[3], const void *, size_t, char *, size_t);
 	int (*texture_read)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
@@ -1342,6 +1346,7 @@ mesa_available(void)
 	*(void **)&mesa.compute_create = dlsym(mesa.handle, "rwa_compute_create");
 	*(void **)&mesa.compute_destroy = dlsym(mesa.handle, "rwa_compute_destroy");
 	*(void **)&mesa.texture_create = dlsym(mesa.handle, "rwa_texture_create");
+	*(void **)&mesa.texture_create_tile_only = dlsym(mesa.handle, "rwa_texture_create_tile_only");
 	*(void **)&mesa.texture_write = dlsym(mesa.handle, "rwa_texture_write");
 	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");
 	*(void **)&mesa.depth_read = dlsym(mesa.handle, "rwa_depth_read");
@@ -2110,6 +2115,7 @@ enum {
 	struct rwa_texture *_texture;
 	struct rwa_texture_shape _shape;
 	BOOL _lazy;                /* (the K40's, 11-16) memoryless: _texture made at the first -mesaTexture */
+	BOOL _noTileOnly;          /* (the K40's, 11-17) a pass resolves its depth: its samples are kept in memory */
 	BOOL _imported;            /* (the K40's, 11-16) over an IOSurface the kernel gave the GPU (a drawable's) */
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
 	id _parent;                /* (the K40's) a view's texture, retained: -parentTexture */
@@ -2124,6 +2130,8 @@ enum {
 @property (readonly) struct rwa_texture *mesaTexture;
 /* (the K40's, 11-16) made with no compiler-library texture yet: memoryless, given memory at the first -mesaTexture */
 - (void)aliothSetLazy;
+/* (the K40's, 11-17) a pass resolves this memoryless depth/stencil texture: not one that lives only in the tiles */
+- (void)aliothNoTileOnly;
 /* (the K40's, 11-16) over an IOSurface (a drawable's), or a view of one: never resolved into in the tiles */
 - (void)aliothSetImported;
 - (BOOL)aliothImported;
@@ -4421,6 +4429,27 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 
 /* (the K40's, 11-16) a memoryless texture's memory, made here at its first real use (-newTextureWithDescriptor:) */
 - (void)aliothSetLazy { _lazy = YES; }
+- (void)aliothNoTileOnly { _noTileOnly = YES; }
+
+/* (the K40's, 11-17) boot-arg metal_tile_depth=0: a memoryless multisample depth/stencil texture gets all its samples
+ * in memory, as before */
+static BOOL
+alioth_tile_depth_on(void)
+{
+	static dispatch_once_t once;
+	static BOOL on = YES;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_tile_depth=0") != NULL) {
+			on = NO;
+			rw_print("metal_tile_depth=0: memoryless multisample depth/stencil textures get every sample in memory\n");
+		}
+	});
+	return on;
+}
 - (void)aliothSetImported { _imported = YES; }
 - (BOOL)aliothImported { return _imported || (_parent != nil && [_parent aliothImported]); }
 - (void)aliothSetImportedSurface:(void *)surface
@@ -4447,7 +4476,17 @@ alioth_surface_plane(void *surface, NSUInteger plane, uint8_t **base, size_t *ro
 			if ((t = _texture) == NULL) {
 				char why[256] = { 0 };
 
-				t = mesa.texture_create([_owner mesaDevice], &_shape, why, sizeof(why));
+				/*
+				 * (the K40's, 11-17) A MEMORYLESS MULTISAMPLE DEPTH/STENCIL texture with one sample of memory: its
+				 * samples live in the GPU's tiles only (the library renders it through a surface of the pass's
+				 * samples, as Metal's tile GPUs keep a memoryless attachment), and nothing may load, store or read
+				 * it. Flutter's Impeller makes a full-screen 4x Depth32Float_Stencil8 one: 55 MB from the kernel,
+				 * ~60 ms at every launch (b46), 13.7 MB this way. Not when a pass resolves its depth
+				 * (-aliothNoTileOnly). metal_tile_depth=0: as before. The library makes any other shape as asked.
+				 */
+				t = !_noTileOnly && mesa.texture_create_tile_only != NULL && alioth_tile_depth_on()
+				    ? mesa.texture_create_tile_only([_owner mesaDevice], &_shape, why, sizeof(why))
+				    : mesa.texture_create([_owner mesaDevice], &_shape, why, sizeof(why));
 				if (t == NULL) {
 					RW_AGAIN("a memoryless texture's memory, made at its first use: %s\n", why);
 				} else {
@@ -8238,6 +8277,10 @@ alioth_tile_resolve_fits(MTLRenderPassColorAttachmentDescriptor *attachment)
 		     [za storeAction] == MTLStoreActionStoreAndMultisampleResolve)) {
 			_depthResolve = alioth_attachment_texture([za resolveTexture], [za resolveLevel],
 			    [za resolveSlice], [za resolveDepthPlane]);
+			/* (the K40's, 11-17) a memoryless one resolved: its samples in memory, not only in the tiles */
+			if ([ztex respondsToSelector:@selector(aliothNoTileOnly)]) {
+				[ztex aliothNoTileOnly];
+			}
 			if ([za depthResolveFilter] != MTLMultisampleDepthResolveFilterSample0) {
 				RW_ONCE("a depth resolve asks for the minimum or maximum of the samples; "
 					"this driver resolves depth to sample 0\n");

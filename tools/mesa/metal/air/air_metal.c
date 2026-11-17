@@ -279,6 +279,10 @@ struct rwa_texture {
    /* (the K40's, 11-16) ... and, for a one-sample texture a multisample pass resolves into in the tiles
     * (rwa_draw.tile_resolve_mask), its surface of that many samples, kept the same way */
    struct pipe_surface *tile_surface;
+   /* (the K40's, 11-17) a multisample depth/stencil texture that lives only in the tiles (rwa_texture_create_tile_only:
+    * Metal's memoryless): its resource has ONE sample, and it is an attachment only through tile_surface at this
+    * many; 0 for every other texture */
+   unsigned tile_only_samples;
 
    /* what MTLTextureUsage allowed, which is checked at every dispatch: a kernel that
     * writes a texture the application declared read-only is an application's mistake,
@@ -1784,6 +1788,34 @@ rwa_texture_create(struct rwa_device *device, const struct rwa_texture_shape *sh
                    char *why, size_t why_size)
 {
    return texture_of_shape(device, shape, NULL, why, why_size);
+}
+
+/* (the K40's, 11-17) air_metal.h */
+struct rwa_texture *
+rwa_texture_create_tile_only(struct rwa_device *device, const struct rwa_texture_shape *shape,
+                             char *why, size_t why_size)
+{
+   unsigned samples = shape->sample_count;
+
+   if (shape->type != RWA_TYPE_2D_MULTISAMPLE || samples < 2 || device->software ||
+       !device->screen->caps.surface_sample_count)
+      return texture_of_shape(device, shape, NULL, why, why_size);
+   struct rwa_texture_shape one = *shape;
+
+   one.type = RWA_TYPE_2D;
+   one.sample_count = 1;
+   struct rwa_texture *t = texture_of_shape(device, &one, NULL, why, why_size);
+
+   if (!t)
+      return NULL;
+   if (!format_is_depth_stencil(t->res->format)) {
+      /* (a colour one is resolved in the tiles already, rwa_draw.tile_resolve_mask: made as asked) */
+      rwa_texture_destroy(t);
+      return texture_of_shape(device, shape, NULL, why, why_size);
+   }
+   t->shape = *shape;
+   t->tile_only_samples = samples;
+   return t;
 }
 
 struct rwa_texture *
@@ -7284,7 +7316,8 @@ attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char 
           texture_type_name(want_type));
       return false;
    }
-   unsigned have = t->res->nr_samples > 1 ? t->res->nr_samples : 1;
+   /* (the K40's, 11-17) a tile-only depth/stencil texture: its samples are the pass's, in the tiles */
+   unsigned have = t->tile_only_samples ? t->tile_only_samples : t->res->nr_samples > 1 ? t->res->nr_samples : 1;
    if (have != samples) {
       say(why, why_size, "%s has %u sample%s per pixel and the pipeline was made for %u",
           what, have, have == 1 ? "" : "s", samples);
@@ -7682,7 +7715,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       fb.cbufs[i] = surf[i];
    }
    if (draw->depth) {
-      zsurf = texture_surface(device, draw->depth);
+      /* (the K40's, 11-17) a tile-only one at the pass's samples over its one-sample resource */
+      zsurf = draw->depth->tile_only_samples ? texture_tile_surface(device, draw->depth, samples)
+                                             : texture_surface(device, draw->depth);
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
@@ -8103,6 +8138,11 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
           (unsigned)PIPE_MAX_COLOR_BUFS);
       return -1;
    }
+   /* (the K40's, 11-17) a tile-only depth/stencil texture (Metal's memoryless) cleared in a pass with no draws: what
+    * it holds is gone at the pass's end and nothing can read it, so there is nothing to do for it */
+   bool tile_only_depth = depth && depth->tile_only_samples;
+   if (tile_only_depth)
+      depth = NULL;
    struct rwa_texture *first_t = NULL;
    for (unsigned i = 0; i < color_count && !first; i++) {
       first = color[i] ? color[i]->res : NULL;
@@ -8113,6 +8153,8 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
       first_t = depth;
    }
    if (!first) {
+      if (tile_only_depth)
+         return 0;
       say(why, why_size, "a pass with nothing to clear");
       return -1;
    }
@@ -8327,6 +8369,12 @@ rwa_texture_resolve(struct rwa_device *device, struct rwa_texture *src, struct r
 {
    if (!device || !src || !dst) {
       say(why, why_size, "a resolve needs a device and two textures");
+      return -1;
+   }
+   /* (the K40's, 11-17) its samples were only ever in the tiles (rwa_texture_create_tile_only) */
+   if (src->tile_only_samples) {
+      say(why, why_size, "a memoryless %s of %u samples lives only in the GPU's tiles on this port, and its resolve "
+                         "is not made", src->format_name, src->tile_only_samples);
       return -1;
    }
    if (texture_width(src) != texture_width(dst) || texture_height(src) != texture_height(dst)) {

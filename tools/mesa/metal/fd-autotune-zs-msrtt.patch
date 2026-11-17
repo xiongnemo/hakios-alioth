@@ -1,0 +1,14 @@
+--- a/src/gallium/drivers/freedreno/freedreno_autotune.c
++++ b/src/gallium/drivers/freedreno/freedreno_autotune.c
+@@ -176,6 +176,11 @@
+       if (pfb->cbufs[i] && pfb->cbufs[i]->nr_samples)
+          return fallback_use_bypass(batch);
+    }
++   /* (hakios, the K40's Metal, 11-17) and the same for a depth/stencil surface of more samples than its one-sample
++    * texture: a memoryless multisample depth/stencil that lives only in the tiles (air_metal.c
++    * rwa_texture_create_tile_only) -- fallback_use_bypass says GMEM for samples > 1 */
++   if (pfb->zsbuf && pfb->zsbuf->nr_samples > 1 && pfb->zsbuf->texture->nr_samples <= 1)
++      return fallback_use_bypass(batch);
+ 
+    struct fd_batch_history *history = get_history(at, batch);
+    if (!history)

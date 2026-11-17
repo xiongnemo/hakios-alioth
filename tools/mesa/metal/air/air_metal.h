@@ -592,6 +592,17 @@ int rwa_dispatch_base(struct rwa_compute *compute, const struct rwa_bindings *bi
 		      char *why, size_t why_size);
 int rwa_compute_grid_split_ok(const struct rwa_compute *compute);
 
+/*
+ * (the K40's, 11-17) A MULTISAMPLE DEPTH/STENCIL TEXTURE THAT LIVES ONLY IN THE TILES -- Metal's memoryless one, whose
+ * contents nothing may load, store or read: its resource has ONE sample, and every pass renders it through a surface
+ * of the pass's samples, so the GPU keeps its samples in tile memory alone (freedreno forces GMEM for such a pass:
+ * fd-autotune-zs-msrtt.patch). A 4x full-screen Depth32Float_Stencil8 is then 13.7 MB of memory, not 55. Its resolve
+ * (a depth resolve store action) is refused; a pass with no draws leaves it alone. Any other shape -- not
+ * multisample, not depth/stencil, softpipe -- is made as rwa_texture_create makes it.
+ */
+struct rwa_texture *rwa_texture_create_tile_only(struct rwa_device *device, const struct rwa_texture_shape *shape,
+						 char *why, size_t why_size);
+
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 
