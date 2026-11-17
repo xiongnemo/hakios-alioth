@@ -70,6 +70,16 @@ bl_auto_pct_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_kern_hakios, OID_AUTO, bl_auto_pct, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
     bl_auto_pct_sysctl, "I", "the auto-brightness's share of Apple's target in dim light, percent (10..100)");
+/*
+ * (11-18) The last auto-brightness step, in hundredths of a nit: what CoreBrightness asked for and what the panel was
+ * given after bl_auto_pct (MiniIOMobileFramebuffer.cpp setProperties) -- read while tuning, since the kernel log
+ * keeps only the first 24 backlight lines of a boot. 0 until the first ramp.
+ */
+uint32_t hakios_bl_auto_target, hakios_bl_auto_given;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_auto_target, CTLFLAG_RD | CTLFLAG_LOCKED, &hakios_bl_auto_target, 0,
+    "the last auto-brightness target CoreBrightness asked for, 1/100 nit");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_auto_given, CTLFLAG_RD | CTLFLAG_LOCKED, &hakios_bl_auto_given, 0,
+    "what the panel was given for it after bl_auto_pct, 1/100 nit");
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void hakios_tl(const char *, ...) __printflike(1, 2);

@@ -41,6 +41,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 extern "C" uint32_t hakios_bl_auto_pct;                 /* bsd/dev/alioth_dsi.c: the auto-brightness in dim light, % */
+extern "C" uint32_t hakios_bl_auto_target, hakios_bl_auto_given; /* ... and its last step, 1/100 nit (sysctls) */
 extern "C" void hakios_screen_power(bool on);           /* bsd/dev/hakios.cpufreq.c */
 extern "C" void hakios_gpu_screen(bool on);             /* iokit/Kernel/hakios.gpu.cpp: the GPU asleep while dark (gpu_sleep=1) */
 extern "C" int alioth_panel_power(bool on);             /* bsd/dev/alioth_dsi.c */
@@ -3462,6 +3463,7 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		 */
 		uint32_t pct = hakios_bl_auto_pct;
 
+		hakios_bl_auto_target = (uint32_t) MIN(((uint64_t) asked_nits * 100) >> 16, (uint64_t) UINT32_MAX);
 		if (pct < 100) {
 			uint64_t max = (uint64_t) ALIOTH_BL_NITS_MAX << 16, t = MIN((uint64_t) asked_nits, max);
 			int64_t was = asked_nits;
@@ -3476,6 +3478,7 @@ AppleARMBacklight::setProperties(OSObject * properties)
 				    ((was & 0xffff) * 100) >> 16, asked_nits >> 16, ((asked_nits & 0xffff) * 100) >> 16, pct);
 			}
 		}
+		hakios_bl_auto_given = (uint32_t) MIN(((uint64_t) asked_nits * 100) >> 16, (uint64_t) UINT32_MAX);
 		/*
 		 * nits in 16.16 (CoreBrightness's _SetBLDriverNitsValue): the DBV is about linear in light, the panel's
 		 * 500 at the top (the calibration above); as a level of iOS's scale, which step() squares, its root
