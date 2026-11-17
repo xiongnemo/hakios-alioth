@@ -387,7 +387,9 @@ struct rwa_compute {
 
    bool dynamic_threadgroup;      /* a threadgroup buffer sized by the dispatch */
    unsigned dynamic_bytes;        /* (the K40's) its size, rwa_compute_set_threadgroup_bytes; 0: none given */
-   unsigned cso_shared;           /* the threadgroup bytes `cso` was compiled with */
+   /* (the K40's, 11-17) the shader reads the grid's shape from its launch's kernel inputs (nir_air.h grid_inputs):
+    * every launch passes them (dispatch_from), and the compute states take AIR_GRID_INPUT_BYTES of input */
+   bool grid_inputs;
 
    /* the texture slots, as above, and the states built for the samplers the shader
     * declares for itself: those are nothing for a driver to create (rwa_compute_info
@@ -404,13 +406,19 @@ struct rwa_compute {
     */
    bool compare_sampler[RWA_MAX_TEXTURES];
 
-   /* One compiled state, not a cache. The threadgroup size is a dispatch argument in
-    * Metal and a shader constant to both Gallium drivers here, so the state belongs to
-    * a size; a caller that alternates two sizes recompiles each time, which is a cost
-    * no caller here pays and cheaper than an eviction policy a library cannot choose.
+   /* The compiled states, one a threadgroup size. The size is a dispatch argument in Metal and a shader constant to
+    * both Gallium drivers here, so a state belongs to a size. (The K40's, 11-17:) a few kept, not one: a dispatch
+    * whose threads do not divide into its threadgroups runs as pieces of up to four sizes in two dimensions (eight in
+    * three), and with one state each piece compiled the kernel again, every dispatch (round b72's perf log: k_nu2d
+    * waited for its variants four times in one dispatch). RWA_COMPUTE_STATES of them, the oldest made replaced.
     */
-   void *cso;
-   unsigned cso_block[3];
+#define RWA_COMPUTE_STATES 8
+   struct {
+      void *cso;
+      unsigned block[3];
+      unsigned shared;            /* the threadgroup bytes it was compiled with */
+   } states[RWA_COMPUTE_STATES];
+   unsigned next_state;           /* the entry made next once all are taken */
 };
 
 /* The argument-buffer recorder, whose own block is further down beside the encode calls
@@ -3361,6 +3369,9 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
     */
    const struct air_to_nir_options options = {
       .module_constants = true,
+      /* (the K40's, 11-17) the grid's shape from kernel inputs on the GPU (softpipe: from its own grid, and no
+       * pieces of grids there: rwa_compute_grid_split_ok) */
+      .grid_inputs = !device->software,
    };
    const char *error;
    /* (the K40's, 11-16) translated without the caller's lock (rwa_device_set_lock) */
@@ -3370,6 +3381,8 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                              device->nir_options, &compute->info, &error);
    if (device->lock)
       device->lock(device->lock_context);
+   if (compute->nir)
+      compute->grid_inputs = options.grid_inputs && compute->info.reads_group_grid;
    if (!compute->nir) {
       /* The sentence the translator wrote, which is the one that matters: it begins
        * with its own category (reader, stage, interface, instruction, intrinsic) and
@@ -3514,8 +3527,9 @@ rwa_compute_destroy(struct rwa_compute *compute)
 {
    if (!compute)
       return;
-   if (compute->cso)
-      delete_compute_state(compute->device, compute->cso);
+   for (unsigned i = 0; i < RWA_COMPUTE_STATES; i++)
+      if (compute->states[i].cso)
+         delete_compute_state(compute->device, compute->states[i].cso);
    /* and the states built for the samplers the shader declared itself. Nothing is
     * unbound first, for the reason rwa_sampler_destroy gives: a dispatch leaves
     * nothing of its own bound.
@@ -3549,14 +3563,23 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned
 {
    struct rwa_device *device = compute->device;
 
-   if (compute->cso && compute->cso_block[0] == block[0] &&
-       compute->cso_block[1] == block[1] && compute->cso_block[2] == block[2] &&
-       compute->cso_shared == shared_extra)
-      return compute->cso;
+   for (unsigned i = 0; i < RWA_COMPUTE_STATES; i++) {
+      if (compute->states[i].cso && compute->states[i].block[0] == block[0] &&
+          compute->states[i].block[1] == block[1] && compute->states[i].block[2] == block[2] &&
+          compute->states[i].shared == shared_extra)
+         return compute->states[i].cso;
+   }
 
-   if (compute->cso) {
-      delete_compute_state(device, compute->cso);
-      compute->cso = NULL;
+   /* (the K40's, 11-17) a free entry, or the oldest made */
+   unsigned slot = RWA_COMPUTE_STATES;
+   for (unsigned i = 0; i < RWA_COMPUTE_STATES && slot == RWA_COMPUTE_STATES; i++)
+      if (!compute->states[i].cso)
+         slot = i;
+   if (slot == RWA_COMPUTE_STATES) {
+      slot = compute->next_state;
+      compute->next_state = (compute->next_state + 1) % RWA_COMPUTE_STATES;
+      delete_compute_state(device, compute->states[slot].cso);
+      compute->states[slot].cso = NULL;
    }
 
    nir_shader *cs = nir_shader_clone(NULL, compute->nir);
@@ -3578,7 +3601,9 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned
    void *cso = device->pipe->create_compute_state(device->pipe,
       &(struct pipe_compute_state){
          .ir_type = PIPE_SHADER_IR_NIR, .prog = cs,
-         .static_shared_mem = cs->info.shared_size });
+         .static_shared_mem = cs->info.shared_size,
+         /* (the K40's, 11-17) the grid's shape (dispatch_from) */
+         .req_input_mem = compute->grid_inputs ? AIR_GRID_INPUT_BYTES : 0 });
    if (!cso) {
       /* The clone is not freed here: a driver that refused it may or may not have taken
        * it already, and neither of the two drivers in this build can reach this at all
@@ -3609,11 +3634,11 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned
       }
    }
 
-   compute->cso = cso;
-   compute->cso_block[0] = block[0];
-   compute->cso_block[1] = block[1];
-   compute->cso_block[2] = block[2];
-   compute->cso_shared = shared_extra;
+   compute->states[slot].cso = cso;
+   compute->states[slot].block[0] = block[0];
+   compute->states[slot].block[1] = block[1];
+   compute->states[slot].block[2] = block[2];
+   compute->states[slot].shared = shared_extra;
    return cso;
 }
 
@@ -4498,6 +4523,7 @@ rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *bindings,
 static int dispatch_from(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                          const struct rwa_buffer_bind *table, unsigned table_count,
                          const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
+                         const unsigned grid_threads[3], const unsigned full_size[3],
                          char *why, size_t why_size);
 
 int
@@ -4506,14 +4532,43 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
                      const unsigned groups[3], const unsigned group_size[3],
                      char *why, size_t why_size)
 {
-   return dispatch_from(compute, bindings, table, table_count, groups, group_size, NULL, why, why_size);
+   return dispatch_from(compute, bindings, table, table_count, groups, group_size, NULL, NULL, NULL, why,
+                        why_size);
+}
+
+/* (the K40's, 11-17) air_metal.h. A kernel that reads the grid's shape in threadgroups can be run as pieces when its
+ * shape comes from kernel inputs (grid_inputs) and the pieces are dispatched with the whole grid (rwa_dispatch_grid). */
+int
+rwa_compute_grid_split_ok(const struct rwa_compute *compute)
+{
+   return compute && !compute->device->software && (!compute->info.reads_group_grid || compute->grid_inputs);
 }
 
 /* (the K40's, 11-17) air_metal.h */
 int
-rwa_compute_grid_split_ok(const struct rwa_compute *compute)
+rwa_dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+                  const struct rwa_buffer_bind *table, unsigned table_count,
+                  const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
+                  const unsigned grid_threads[3], const unsigned full_size[3], char *why, size_t why_size)
 {
-   return compute && !compute->device->software && !compute->info.reads_group_grid;
+   bool piece = base && (base[0] | base[1] | base[2]);
+   if ((piece || grid_threads) && !rwa_compute_grid_split_ok(compute)) {
+      say(why, why_size, "%s cannot be run as pieces of its grid: %s",
+          compute->info.entry_point ? compute->info.entry_point : "the kernel",
+          compute->device->software ? "this library's software rasterizer keeps no grid base"
+                                    : "it reads threadgroup_position_in_grid, threadgroups_per_grid or "
+                                      "threads_per_grid, which a piece would get wrong");
+      return -1;
+   }
+   for (unsigned i = 0; full_size && i < 3; i++) {
+      if (full_size[i] == 0 || (base && base[i] % full_size[i] != 0)) {
+         say(why, why_size, "a piece of a grid starting at thread %u of a dimension whose threadgroups are %u "
+                            "wide", base ? base[i] : 0, full_size[i]);
+         return -1;
+      }
+   }
+   return dispatch_from(compute, bindings, table, table_count, groups, group_size, base, grid_threads, full_size,
+                        why, why_size);
 }
 
 /* (the K40's, 11-17) air_metal.h */
@@ -4523,21 +4578,27 @@ rwa_dispatch_base(struct rwa_compute *compute, const struct rwa_bindings *bindin
                   const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
                   char *why, size_t why_size)
 {
-   if (base && (base[0] | base[1] | base[2]) && !rwa_compute_grid_split_ok(compute)) {
+   /* (11-17) a piece without the whole grid's shape: right only for a kernel that does not read it */
+   if (base && (base[0] | base[1] | base[2]) &&
+       (!rwa_compute_grid_split_ok(compute) || compute->info.reads_group_grid)) {
       say(why, why_size, "%s cannot be run as pieces of its grid: %s",
           compute->info.entry_point ? compute->info.entry_point : "the kernel",
           compute->device->software ? "this library's software rasterizer keeps no grid base"
                                     : "it reads threadgroup_position_in_grid, threadgroups_per_grid or "
-                                      "threads_per_grid, which a piece would get wrong");
+                                      "threads_per_grid, which a piece would get wrong (rwa_dispatch_grid)");
       return -1;
    }
-   return dispatch_from(compute, bindings, table, table_count, groups, group_size, base, why, why_size);
+   return dispatch_from(compute, bindings, table, table_count, groups, group_size, base, NULL, NULL, why,
+                        why_size);
 }
 
+/* (the K40's, 11-17) grid_threads and full_size: the whole grid's threads and threadgroup size when this launch is
+ * a piece of it (rwa_dispatch_grid), NULL for a launch of the whole grid (then its own groups x group size) */
 static int
 dispatch_from(struct rwa_compute *compute, const struct rwa_bindings *bindings,
               const struct rwa_buffer_bind *table, unsigned table_count,
               const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
+              const unsigned grid_threads[3], const unsigned full_size[3],
               char *why, size_t why_size)
 {
    struct rwa_device *device = compute->device;
@@ -4621,6 +4682,20 @@ dispatch_from(struct rwa_compute *compute, const struct rwa_bindings *bindings,
       /* (the K40's, 11-17) a piece's first thread (rwa_dispatch_base; thread_position_in_grid adds it) */
       .grid_base = { base ? base[0] : 0, base ? base[1] : 0, base ? base[2] : 0 },
    };
+   /* (the K40's, 11-17) the whole grid's shape, for a kernel that reads it (grid_inputs; nir_air.h's layout): the
+    * piece's first threadgroup in the grid, the grid's threadgroups (its edges' counted) and its threads. ir3
+    * uploads these as the launch's kernel inputs (ir3_emit_cs_driver_params, ir3-thread-grid-input.patch). */
+   uint32_t input[AIR_GRID_INPUT_BYTES / 4] = { 0 };
+   if (compute->grid_inputs) {
+      for (unsigned i = 0; i < 3; i++) {
+         unsigned full = full_size ? full_size[i] : group_size[i];
+         unsigned threads = grid_threads ? grid_threads[i] : groups[i] * group_size[i];
+         input[AIR_GRID_INPUT_GROUP_BASE / 4 + i] = (base ? base[i] : 0) / full;
+         input[AIR_GRID_INPUT_GROUPS / 4 + i] = DIV_ROUND_UP(threads, full);
+         input[AIR_GRID_INPUT_THREADS / 4 + i] = threads;
+      }
+      grid.input = input;
+   }
    pipe->launch_grid(pipe, &grid);
 
    /* Waited for here, and not left to rwa_finish, because this is the call that can

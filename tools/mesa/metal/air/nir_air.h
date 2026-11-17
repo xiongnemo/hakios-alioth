@@ -384,7 +384,24 @@ struct air_to_nir_options {
     * pipeline spent 0.8-1.8 ms of its 1.1-2.5 ms translating its two stages (round b57), each read twice.
     */
    bool module_constants;
+
+   /* (the K40's, 11-17) A kernel's threadgroup_position_in_grid, threadgroups_per_grid and threads_per_grid from
+    * its launch's kernel inputs (nir load_kernel_input, AIR_GRID_INPUT_* below; Gallium pipe_grid_info.input), not
+    * from the launch's own grid: a dispatch whose threads do not divide into its threadgroups is run as launches of
+    * pieces (rwa_dispatch_grid), and each piece must see the whole grid. thread_position_in_grid keeps its base
+    * (load_base_workgroup_id). For a GPU driver that takes kernel inputs in a compute shader (ir3, with
+    * tools/mesa/metal/ir3-thread-grid-input.patch); air_shader_info.reads_group_grid says whether the shader reads
+    * them, and then the compute state wants AIR_GRID_INPUT_BYTES of input.
+    */
+   bool grid_inputs;
 };
+
+/* (the K40's, 11-17) the kernel inputs of grid_inputs, 32-bit words at these byte offsets: the launch's first
+ * threadgroup in the whole grid (x, y, z), the whole grid's threadgroups (rounded up) and its threads */
+#define AIR_GRID_INPUT_GROUP_BASE 0
+#define AIR_GRID_INPUT_GROUPS     16
+#define AIR_GRID_INPUT_THREADS    32
+#define AIR_GRID_INPUT_BYTES      48
 
 /* (the K40's, 11-17) every array and string of `src` copied under mem_ctx into `dst` (which may be `src`): what
  * air_to_nir does to the info it hands back, for a caller that keeps a translation and hands out copies of it */

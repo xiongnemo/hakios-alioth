@@ -582,15 +582,26 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
  * groups smaller -- and a driver runs it as a launch per region: the whole groups at base 0, then each edge with
  * groups as wide as what is left over, at the region's first thread. Each launch's groups are whole, so a barrier
  * in a kernel sees every thread of its group, and threads_per_threadgroup is the edge group's own size, as Metal's.
- * What a piece cannot get right is the grid's shape in threadgroups (threadgroup_position_in_grid,
- * threadgroups_per_grid, threads_per_grid): rwa_compute_grid_split_ok says 0 for a kernel that reads one, and for
- * softpipe, which keeps no base; this refuses a non-zero base there.
+ * What a piece cannot get right from its own launch is the grid's shape in threadgroups (threadgroup_position_in_grid,
+ * threadgroups_per_grid, threads_per_grid): this refuses a non-zero base for a kernel that reads one -- rwa_dispatch_grid
+ * below is how such a kernel's pieces are run -- and for softpipe, which keeps no base (rwa_compute_grid_split_ok 0).
  */
 int rwa_dispatch_base(struct rwa_compute *compute, const struct rwa_bindings *bindings,
 		      const struct rwa_buffer_bind *table, unsigned table_count,
 		      const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
 		      char *why, size_t why_size);
 int rwa_compute_grid_split_ok(const struct rwa_compute *compute);
+/*
+ * (the K40's, 11-17) rwa_dispatch_base with the WHOLE grid: `grid_threads` its threads (Metal's -dispatchThreads:
+ * grid) and `full_size` its threadgroup size, for every launch of it, the base-0 one too (NULL for both: a launch of
+ * the whole grid). Then a kernel that reads threadgroup_position_in_grid, threadgroups_per_grid or threads_per_grid
+ * gets the grid's values in each piece (kernel inputs, nir_air.h grid_inputs) and rwa_compute_grid_split_ok says 1
+ * for it on the GPU. `base` must be a multiple of `full_size`.
+ */
+int rwa_dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+		      const struct rwa_buffer_bind *table, unsigned table_count,
+		      const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
+		      const unsigned grid_threads[3], const unsigned full_size[3], char *why, size_t why_size);
 
 /*
  * (the K40's, 11-17) A MULTISAMPLE DEPTH/STENCIL TEXTURE THAT LIVES ONLY IN THE TILES -- Metal's memoryless one, whose

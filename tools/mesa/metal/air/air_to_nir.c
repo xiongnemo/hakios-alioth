@@ -869,6 +869,18 @@ static const struct { const char *key; enum air_sysval sv; } sysvals[] = {
    { "air.simdgroups_per_threadgroup", AIR_SV_SIMDS_PER_TG },
 };
 
+/* (the K40's, 11-17) three 32-bit kernel inputs from byte offset `at` (grid_inputs): one word a load, as ir3 takes
+ * them (emit_intrinsic_load_kernel_input writes one component) */
+static nir_def *
+grid_input(struct air_ctx *c, unsigned at)
+{
+   nir_def *w[3];
+   for (unsigned i = 0; i < 3; i++)
+      w[i] = nir_load_kernel_input(&c->b, 1, 32, nir_imm_int(&c->b, 0), .base = at + 4 * i, .range = 4,
+                                   .align_mul = 4, .align_offset = 0);
+   return nir_vec(&c->b, w, 3);
+}
+
 static nir_def *
 load_sysval(struct air_ctx *c, enum air_sysval sv)
 {
@@ -897,11 +909,21 @@ load_sysval(struct air_ctx *c, enum air_sysval sv)
                                nir_load_local_invocation_id(&c->b)),
                       nir_load_base_workgroup_id(&c->b, 32));
    case AIR_SV_THREAD_POS_TG: return nir_load_local_invocation_id(&c->b);
-   case AIR_SV_TG_POS_GRID: return nir_load_workgroup_id(&c->b);
+   /* (the K40's, 11-17) with grid_inputs (nir_air.h): the whole grid's shape from the launch's kernel inputs, which
+    * for a launch of the whole grid are what the launch's own values would be */
+   case AIR_SV_TG_POS_GRID:
+      if (c->options && c->options->grid_inputs)
+         return nir_iadd(&c->b, nir_load_workgroup_id(&c->b), grid_input(c, AIR_GRID_INPUT_GROUP_BASE));
+      return nir_load_workgroup_id(&c->b);
    case AIR_SV_THREADS_PER_TG: return nir_load_workgroup_size(&c->b);
-   case AIR_SV_TGS_PER_GRID: return nir_load_num_workgroups(&c->b);
+   case AIR_SV_TGS_PER_GRID:
+      if (c->options && c->options->grid_inputs)
+         return grid_input(c, AIR_GRID_INPUT_GROUPS);
+      return nir_load_num_workgroups(&c->b);
    case AIR_SV_THREAD_INDEX_TG: return nir_load_local_invocation_index(&c->b);
    case AIR_SV_THREADS_PER_GRID:
+      if (c->options && c->options->grid_inputs)
+         return grid_input(c, AIR_GRID_INPUT_THREADS);
       return nir_imul(&c->b, nir_load_num_workgroups(&c->b), nir_load_workgroup_size(&c->b));
    case AIR_SV_SIMD_LANE: return nir_load_subgroup_invocation(&c->b);
    case AIR_SV_SIMD_INDEX: return nir_load_subgroup_id(&c->b);

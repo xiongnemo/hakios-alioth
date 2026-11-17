@@ -581,6 +581,10 @@ static struct {
 	int (*dispatch_base)(struct rwa_compute *, const struct rwa_bindings *, const struct rwa_buffer_bind *,
 			     unsigned, const unsigned[3], const unsigned[3], const unsigned[3], char *, size_t);
 	int (*compute_grid_split_ok)(const struct rwa_compute *);
+	/* (11-17) and with the whole grid, for a kernel that reads its shape (air_metal.h rwa_dispatch_grid) */
+	int (*dispatch_grid)(struct rwa_compute *, const struct rwa_bindings *, const struct rwa_buffer_bind *,
+			     unsigned, const unsigned[3], const unsigned[3], const unsigned[3], const unsigned[3],
+			     const unsigned[3], char *, size_t);
 	int (*module_argbufs)(struct rwa_device *, const void *, size_t, const char *,
 			      struct rwa_argbuf_layout *, unsigned, unsigned *, char *,
 			      size_t);
@@ -1199,6 +1203,9 @@ GPU_LOCKED(int, dispatch_buffers, (struct rwa_compute *c, const struct rwa_bindi
 GPU_LOCKED(int, dispatch_base, (struct rwa_compute *c, const struct rwa_bindings *b, const struct rwa_buffer_bind *t,
     unsigned n, const unsigned g[3], const unsigned z[3], const unsigned o[3], char *w, size_t ws),
     (c, b, t, n, g, z, o, w, ws))
+GPU_LOCKED(int, dispatch_grid, (struct rwa_compute *c, const struct rwa_bindings *b, const struct rwa_buffer_bind *t,
+    unsigned n, const unsigned g[3], const unsigned z[3], const unsigned o[3], const unsigned gt[3],
+    const unsigned fs[3], char *w, size_t ws), (c, b, t, n, g, z, o, gt, fs, w, ws))
 GPU_LOCKED(int, argbuf_encode_buffer, (struct rwa_buffer *d, size_t o, unsigned i, struct rwa_buffer *b, size_t bo,
     char *w, size_t ws), (d, o, i, b, bo, w, ws))
 GPU_LOCKED(int, argbuf_encode_texture, (struct rwa_buffer *d, size_t o, unsigned i, struct rwa_texture *t, char *w,
@@ -1435,6 +1442,7 @@ mesa_available(void)
 	*(void **)&mesa.dispatch_buffers = dlsym(mesa.handle, "rwa_dispatch_buffers");
 	*(void **)&mesa.dispatch_base = dlsym(mesa.handle, "rwa_dispatch_base");
 	*(void **)&mesa.compute_grid_split_ok = dlsym(mesa.handle, "rwa_compute_grid_split_ok");
+	*(void **)&mesa.dispatch_grid = dlsym(mesa.handle, "rwa_dispatch_grid");
 	*(void **)&mesa.module_argbufs = dlsym(mesa.handle, "rwa_module_argbufs");
 	*(void **)&mesa.argbuf_encode_buffer = dlsym(mesa.handle, "rwa_argbuf_encode_buffer");
 	*(void **)&mesa.argbuf_encode_texture = dlsym(mesa.handle, "rwa_argbuf_encode_texture");
@@ -1518,6 +1526,7 @@ mesa_available(void)
 	GPU_LOCK_WRAP(dispatch);
 	GPU_LOCK_WRAP(dispatch_buffers);
 	GPU_LOCK_WRAP(dispatch_base);   /* (compute_grid_split_ok only reads the pipeline: not wrapped) */
+	GPU_LOCK_WRAP(dispatch_grid);
 	GPU_LOCK_WRAP(argbuf_encode_buffer);
 	GPU_LOCK_WRAP(argbuf_encode_texture);
 	GPU_LOCK_WRAP(argbuf_encode_sampler);
@@ -2169,6 +2178,9 @@ enum {
 	/* (the K40's, 11-17) a piece of a grid that does not divide into its threadgroups: its first thread
 	 * (-dispatchThreads:threadsPerThreadgroup:, rwa_dispatch_base); zero for every other dispatch */
 	unsigned gridBase[3];
+	/* (the K40's, 11-17) and that grid's threads and threadgroup size, for every piece of it (the base-0 one too):
+	 * a kernel that reads the grid's shape gets it from them (rwa_dispatch_grid); zero for every other dispatch */
+	unsigned gridThreads[3], gridSize[3];
 	/* (the K40's) set by -aliothRetainReferences (the command buffer's -recordWork:); keptIndirect is the indirect
 	 * buffer as retained, which outlives indirectBuffer's being cleared once it is read */
 	BOOL retainsReferences;
@@ -7250,9 +7262,15 @@ alioth_strict(void)
 		 * through rwa_dispatch, and then a kernel with a set is refused by name
 		 * there and every offset is read as zero -- which is what an older library
 		 * did with one in any case, out loud. */
-		/* (the K40's, 11-17) a piece of a non-uniform grid by rwa_dispatch_base, at its first thread */
+		/* (the K40's, 11-17) a piece of a non-uniform grid by rwa_dispatch_base, at its first thread -- or by
+		 * rwa_dispatch_grid with the whole grid's shape, every piece of it (the base-0 one too) */
 		BOOL piece = (work->gridBase[0] | work->gridBase[1] | work->gridBase[2]) != 0;
-		int rc = piece && mesa.dispatch_base != NULL
+		BOOL whole = work->gridThreads[0] != 0;
+		int rc = whole && mesa.dispatch_grid != NULL
+			    ? mesa.dispatch_grid([work->pipeline compute], &bindings, table, work->count, work->groups,
+						 work->size, work->gridBase, work->gridThreads, work->gridSize, why,
+						 sizeof(why))
+			    : piece && mesa.dispatch_base != NULL
 			    ? mesa.dispatch_base([work->pipeline compute], &bindings, table, work->count, work->groups,
 						 work->size, work->gridBase, why, sizeof(why))
 			    : mesa.dispatch_buffers != NULL
@@ -10587,7 +10605,8 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 		 * are whole, so barriers see every thread of a group, and threads_per_threadgroup is the edge group's own
 		 * size, as on Apple's. Until 11-17 such a dispatch was dropped with a sentence. A kernel that reads the
 		 * grid's shape in threadgroups (threadgroup_position_in_grid, threadgroups_per_grid, threads_per_grid)
-		 * would get it wrong in a piece, and is still dropped, with why.
+		 * gets the whole grid's from every piece's kernel inputs (rwa_dispatch_grid: gridThreads / gridSize,
+		 * 11-17 evening); with a library older than that it is still dropped, with why.
 		 */
 		struct rwa_compute *compute = [_pipeline respondsToSelector:@selector(compute)] ? [_pipeline compute] : NULL;
 
@@ -10633,6 +10652,10 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 					work->gridBase[0] = (unsigned)first[0][x];
 					work->gridBase[1] = (unsigned)first[1][y];
 					work->gridBase[2] = (unsigned)first[2][z];
+					for (unsigned d = 0; d < 3; d++) {
+						work->gridThreads[d] = (unsigned)t[d];
+						work->gridSize[d] = (unsigned)s[d];
+					}
 					[_commandBuffer recordWork:work];
 				}
 			}

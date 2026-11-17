@@ -1,0 +1,32 @@
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1524,7 +1524,9 @@
+                               align(const_state->image_dims.count, 4) / 4, 1);
+    }
+ 
+-   if (v->type == MESA_SHADER_KERNEL && v->cs.req_input_mem) {
++   /* (hakios, the K40's Metal, 11-17) a compute shader's inputs as well as an OpenCL kernel's: the Metal frontend
++    * passes a non-uniform grid's shape as kernel inputs (tools/mesa/metal/air/air_to_nir.c grid_inputs) */
++   if ((v->type == MESA_SHADER_KERNEL || v->type == MESA_SHADER_COMPUTE) && v->cs.req_input_mem) {
+       ir3_const_reserve_space(&const_state->allocs,
+                               IR3_CONST_ALLOC_KERNEL_PARAMS,
+                               align(v->cs.req_input_mem, 4) / 4, 1);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_const.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_const.cc
+@@ -484,12 +484,11 @@
+                           struct fd6_compute_state *cs,
+                           const struct pipe_grid_info *info)
+ {
+-   /* info->input not handled in the UBO path.  I believe this was only
+-    * ever used by clover
+-    */
+-   assert(!info->input);
+-
+    if (CHIP == A7XX && ctx->screen->info->a7xx.load_shader_consts_via_preamble) {
++      /* info->input not handled in the UBO path.  I believe this was only
++       * ever used by clover -- (hakios, 11-17) and the K40's Metal, whose a6xx takes the path below
++       */
++      assert(!info->input);
+       const struct ir3_const_state *const_state = ir3_const_state(cs->v);
+       struct ir3_driver_params_cs compute_params =
+          ir3_build_driver_params_cs(cs->v, info);
