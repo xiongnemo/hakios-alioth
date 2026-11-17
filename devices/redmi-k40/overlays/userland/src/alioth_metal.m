@@ -707,6 +707,9 @@ static uint64_t alioth_blit_kinds[8];   /* the processor's blits by AliothMetalB
 /* (the K40's, 11-17) the window's longest hold of the library's lock, and by which call (alioth_lock_letting_go) */
 static uint64_t alioth_lock_hold_max;
 static const char *alioth_lock_hold_what;
+/* (the K40's, 11-17) the device whose render pipelines' times the window says (rwa_device_pipeline_times) */
+static struct rwa_device *alioth_stats_device;
+static void (*alioth_pipeline_times)(struct rwa_device *, uint64_t[4]);
 /* (the K40's, 11-16) render passes in the window: all, multisample, resolved in the tiles, resolved by a blit */
 static uint64_t alioth_pass_counts[4];
 /* (the K40's, 11-16) memoryless textures made without memory, and of them given memory at a first real use (counted
@@ -813,6 +816,17 @@ alioth_stats_commit(void)
 		         "%.2f ms, the longest wait for the lock %.2f ms\n",
 		         (unsigned long long)n[ST_PIPELINE], alioth_stat_avg(t, n, ST_PIPELINE), alioth_ms(t[ST_PIPELINE]),
 		         alioth_ms(longest[ST_PIPELINE]), alioth_ms(longest[ST_DRAW]), alioth_ms(longest[ST_LOCK]));
+	}
+	/* (11-17) where making render pipelines went: AIR -> NIR, the two stages, the rest (a NIR cache, if worth it) */
+	if (alioth_pipeline_times != NULL && alioth_stats_device != NULL) {
+		uint64_t pt[4];
+
+		alioth_pipeline_times(alioth_stats_device, pt);
+		if (pt[0] != 0) {
+			rw_print("stats: %llu render pipelines, a pipeline: %.2f ms translating its AIR, %.2f ms making its two "
+			         "stages, %.2f ms the rest\n", (unsigned long long)pt[0], pt[1] / 1e6 / pt[0], pt[2] / 1e6 / pt[0],
+			         pt[3] / 1e6 / pt[0]);
+		}
 	}
 	/* (11-17) who held the lock longest in the window, when that was 2 ms or more */
 	const char *hold_what = alioth_lock_hold_what;
@@ -1347,6 +1361,7 @@ mesa_available(void)
 	*(void **)&mesa.compute_destroy = dlsym(mesa.handle, "rwa_compute_destroy");
 	*(void **)&mesa.texture_create = dlsym(mesa.handle, "rwa_texture_create");
 	*(void **)&mesa.texture_create_tile_only = dlsym(mesa.handle, "rwa_texture_create_tile_only");
+	*(void **)&alioth_pipeline_times = dlsym(mesa.handle, "rwa_device_pipeline_times");
 	*(void **)&mesa.texture_write = dlsym(mesa.handle, "rwa_texture_write");
 	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");
 	*(void **)&mesa.depth_read = dlsym(mesa.handle, "rwa_depth_read");
@@ -2257,6 +2272,7 @@ enum {
 		 * Read when the screen is made, so set before device_open. */
 		alioth_shader_cache_env();
 		_mesa = mesa.device_open(why, sizeof(why));
+		alioth_stats_device = _mesa;   /* (11-17: its pipeline times in the metal_stats window) */
 		rw_print("the compiler library %s\n",
 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
 		/* (the K40's) dispatches not waited for one by one: the command buffer's flush and fence say when its

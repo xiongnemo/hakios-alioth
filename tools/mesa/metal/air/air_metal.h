@@ -603,6 +603,11 @@ int rwa_compute_grid_split_ok(const struct rwa_compute *compute);
 struct rwa_texture *rwa_texture_create_tile_only(struct rwa_device *device, const struct rwa_texture_shape *shape,
 						 char *why, size_t why_size);
 
+/* (the K40's, 11-17) where making render pipelines went since the last call, and zeroed: out[0] pipelines made,
+ * out[1] ns translating both stages' AIR into NIR, out[2] ns making the two stages (NIR passes and the driver's
+ * create_*_state), out[3] ns for the rest (blend, depth, rasterizer and vertex states, reflection) */
+void rwa_device_pipeline_times(struct rwa_device *device, uint64_t out[4]);
+
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 

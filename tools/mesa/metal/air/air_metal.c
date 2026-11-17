@@ -59,6 +59,7 @@
 #include "util/u_inlines.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
+#include "util/os_time.h"
 #include "util/u_gen_mipmap.h"
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
@@ -138,6 +139,11 @@ struct rwa_device {
    void (*lock)(void *);
    void (*unlock)(void *);
    void *lock_context;
+
+   /* (the K40's, 11-17) where a render pipeline's making goes, summed until rwa_device_pipeline_times takes them:
+    * [0] pipelines, [1] AIR -> NIR of both stages, [2] the two stages made (NIR passes, create_*_state), [3] the rest
+    * (blend, depth, rasterizer, vertex states, reflection), in ns; atomics: part of it runs without the lock */
+   uint64_t pipeline_times[4];
 
    /* One sampler for the slots nothing was bound to, made when a dispatch first needs
     * it. See rwa_dispatch: a kernel's read() is a texture fetch and ignores the
@@ -6844,6 +6850,8 @@ rwa_render_create(struct rwa_device *device,
       device->unlock(device->lock_context);
       unlocked = true;
    }
+   /* (the K40's, 11-17) rwa_device_pipeline_times: translated, stages made, done */
+   uint64_t t_begin = os_time_get_nano(), t_translated = 0, t_stages = 0;
 
    struct rwa_render_info out = { 0 };
 
@@ -7020,6 +7028,7 @@ rwa_render_create(struct rwa_device *device,
     * made 67 pipelines, the longest 63.8 ms, and a commit waited 59.3 ms for the lock behind it
     * (round b42) -- a frame lost on the run thread while the raster thread built a pipeline.
     */
+   t_translated = os_time_get_nano();
    render->fs_cso = make_stage_cso(device, fs, why, why_size);
    if (!render->fs_cso)
       goto fail;
@@ -7035,6 +7044,7 @@ rwa_render_create(struct rwa_device *device,
       ralloc_free(vs);
    if (!render->vs_cso)
       goto fail;
+   t_stages = os_time_get_nano();
    if (unlocked) {
       device->lock(device->lock_context);     /* (the K40's: the context's own state from here on) */
       unlocked = false;
@@ -7209,6 +7219,14 @@ rwa_render_create(struct rwa_device *device,
 
    if (info)
       *info = out;
+   {
+      uint64_t t_end = os_time_get_nano();
+
+      __atomic_fetch_add(&device->pipeline_times[0], 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&device->pipeline_times[1], t_translated - t_begin, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&device->pipeline_times[2], t_stages - t_translated, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&device->pipeline_times[3], t_end - t_stages, __ATOMIC_RELAXED);
+   }
    return render;
 
 fail:
@@ -7216,6 +7234,14 @@ fail:
       device->lock(device->lock_context);
    rwa_render_destroy(render);
    return NULL;
+}
+
+/* (the K40's, 11-17) air_metal.h */
+void
+rwa_device_pipeline_times(struct rwa_device *device, uint64_t out[4])
+{
+   for (unsigned i = 0; i < 4; i++)
+      out[i] = device ? __atomic_exchange_n(&device->pipeline_times[i], 0, __ATOMIC_RELAXED) : 0;
 }
 
 /* (the K40's, 11-16) the caller's lock (air_metal.h) */
