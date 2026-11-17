@@ -642,7 +642,9 @@ read_constants_block(struct reader *r)
 static struct air_md *
 new_md(struct reader *r, enum air_md_kind k)
 {
-   struct air_md *md = rzalloc(r->m, struct air_md);
+   /* (the K40's, 11-17) linear too (lin_zalloc): air_md_string parents its copies on md->mem_ctx, the module */
+   struct air_md *md = lin_zalloc(r, sizeof(struct air_md), 1);
+   md->mem_ctx = r->m;
    md->kind = k;
    md->id = r->num_md;
    md->function_local = r->cur_fn != NULL;
@@ -743,8 +745,8 @@ read_metadata_block(struct reader *r)
          md = new_md(r, AIR_MD_NODE);
          md->distinct = e.id == METADATA_DISTINCT_NODE;
          md->num_ops = e.num_ops;
-         md->ops = rzalloc_array(r->m, struct air_md *, MAX2(e.num_ops, 1));
-         md->pending = rzalloc_array(r->m, unsigned, MAX2(e.num_ops, 1));
+         md->ops = lin_zalloc(r, sizeof(struct air_md *), MAX2(e.num_ops, 1));
+         md->pending = lin_zalloc(r, sizeof(unsigned), MAX2(e.num_ops, 1));
          for (unsigned i = 0; i < e.num_ops; i++)
             md->pending[i] = e.ops[i]; /* id + 1, 0 for null */
          break;
@@ -2013,6 +2015,7 @@ air_md_string(const struct air_md *md)
 {
    if (!md || md->kind != AIR_MD_STRING)
       return NULL;
-   /* strings from METADATA_STRINGS point into the blob and are not terminated */
-   return ralloc_strndup((void *)md, md->str, md->len);
+   /* strings from METADATA_STRINGS point into the blob and are not terminated. (The K40's, 11-17:) the copy is
+    * the module's, as the node is: a node from new_md is linear memory and cannot be a ralloc parent. */
+   return ralloc_strndup(md->mem_ctx ? md->mem_ctx : (void *)md, md->str, md->len);
 }

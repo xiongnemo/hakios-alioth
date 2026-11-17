@@ -263,6 +263,7 @@ struct air_md {
    unsigned value_id;        /* while reading */
    const struct air_type *value_type;
    bool function_local;
+   void *mem_ctx;            /* (the K40's, 11-17) the module, air_md_string's copies' parent (a node is not one) */
 };
 
 struct air_named_md {
