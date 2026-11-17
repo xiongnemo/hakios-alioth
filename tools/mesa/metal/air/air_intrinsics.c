@@ -453,6 +453,59 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_bcsel(&c->b, regular,
                     nir_fdiv(&c->b, nir_fsub(&c->b, ex, enx), nir_fadd(&c->b, ex, enx)),
                     a[0]);
+   } else if (!strcmp(op, "fast_asinh") || !strcmp(op, "asinh")) {
+      /* (the K40's, 11-17) sign(x) * ln(|x| + sqrt(x^2 + 1)), the argument itself below 2^-12 (2^-5 for a half)
+       * where the logarithm of a value next to one has no low bits left (asinh(x) = x - x^3/6) */
+      unsigned bits = a[0]->bit_size;
+      nir_def *ax = nir_fabs(&c->b, a[0]);
+      nir_def *at = nir_fmul_imm(&c->b,
+                                 nir_flog2(&c->b, nir_fadd(&c->b, ax,
+                                                           nir_fsqrt(&c->b, nir_fadd_imm(&c->b,
+                                                                                         nir_fmul(&c->b, ax, ax),
+                                                                                         1.0)))),
+                                 1.0 / M_LOG2E);
+      bool was = c->b.exact;
+      c->b.exact = true;
+      nir_def *regular = nir_fge_imm(&c->b, ax, bits > 16 ? 0x1p-12 : 0x1p-5);
+      nir_def *neg = nir_flt_imm(&c->b, a[0], 0.0);
+      c->b.exact = was;
+      r = nir_bcsel(&c->b, regular, nir_bcsel(&c->b, neg, nir_fneg(&c->b, at), at), a[0]);
+   } else if (!strcmp(op, "fast_acosh") || !strcmp(op, "acosh")) {
+      /* (the K40's, 11-17) ln(x + sqrt((x - 1)(x + 1))): the product form for the reason asin's has it; x < 1 takes
+       * the root of a negative and gives NaN, as the domain says; acosh(1) = 0 (MLCompute's unary kernels) */
+      nir_def *x = a[0];
+      nir_def *root = nir_fsqrt(&c->b, nir_fmul(&c->b, nir_fadd_imm(&c->b, x, -1.0), nir_fadd_imm(&c->b, x, 1.0)));
+      r = nir_fmul_imm(&c->b, nir_flog2(&c->b, nir_fadd(&c->b, x, root)), 1.0 / M_LOG2E);
+   } else if (!strcmp(op, "fast_atanh") || !strcmp(op, "atanh")) {
+      /* (the K40's, 11-17) 0.5 * ln((1 + x) / (1 - x)), with tanh's small-argument guard for the same reason: atanh(x)
+       * = x + x^3/3, so below 2^-12 (2^-5 for a half) the argument is the answer, where the logarithm of a ratio
+       * next to one has no low bits left. |x| = 1 gives +-inf and |x| > 1 the logarithm of a negative, NaN, as the
+       * domain says. (iOS 16.5's image: 2 modules refused for it.) */
+      unsigned bits = a[0]->bit_size;
+      nir_def *one = nir_imm_floatN_t(&c->b, 1.0, bits);
+      nir_def *ratio = nir_fdiv(&c->b, nir_fadd(&c->b, one, a[0]), nir_fsub(&c->b, one, a[0]));
+      nir_def *at = nir_fmul_imm(&c->b, nir_flog2(&c->b, ratio), 0.5 / M_LOG2E);
+      bool was = c->b.exact;
+      c->b.exact = true;
+      nir_def *regular = nir_fge_imm(&c->b, nir_fabs(&c->b, a[0]), bits > 16 ? 0x1p-12 : 0x1p-5);
+      c->b.exact = was;
+      r = nir_bcsel(&c->b, regular, at, a[0]);
+   } else if (!strcmp(op, "fast_sinpi") || !strcmp(op, "sinpi") ||
+              !strcmp(op, "fast_cospi") || !strcmp(op, "cospi") ||
+              !strcmp(op, "fast_tanpi") || !strcmp(op, "tanpi")) {
+      /* (the K40's, 11-17) the function of pi * x, the argument first reduced to [-1, 1] by its nearest even
+       * integer (x - 2 * rint(x / 2), exact in a float) so that a large x does not lose its fraction in the
+       * product; then sin / cos / their ratio. (iOS 16.5's image: fast_cospi refused once.) */
+      unsigned bits = a[0]->bit_size;
+      nir_def *red = nir_fsub(&c->b, a[0],
+                              nir_fmul_imm(&c->b, nir_fround_even(&c->b, nir_fmul_imm(&c->b, a[0], 0.5)), 2.0));
+      nir_def *ang = nir_fmul(&c->b, red, nir_imm_floatN_t(&c->b, M_PI, bits));
+      if (strstr(op, "sinpi"))
+         r = nir_fsin(&c->b, ang);
+      else if (strstr(op, "cospi"))
+         r = nir_fcos(&c->b, ang);
+      else
+         r = nir_fdiv(&c->b, nir_fsin(&c->b, ang), nir_fcos(&c->b, ang));
    } else if (!strcmp(op, "fast_exp") || !strcmp(op, "exp")) {
       /* the natural one: Apple's compiler names exp and exp2 separately */
       r = nir_fexp2(&c->b, nir_fmul_imm(&c->b, a[0], M_LOG2E));
@@ -678,6 +731,18 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       nir_def *inside = down ? nir_ult(&c->b, nir_iadd(&c->b, lane, delta), nir_load_subgroup_size(&c->b))
                              : nir_uge(&c->b, lane, delta);
       r = nir_bcsel(&c->b, inside, moved, a[0]);
+   } else if ((!strcmp(op, "quad_shuffle_down") || !strcmp(op, "quad_shuffle_up")) && argc >= 2) {
+      /* (the K40's, 11-17) the same within a quad: the lane delta above / below in its quad of four, the lanes with
+       * none keeping their own value -- as quad_shuffle above, a shuffle to the quad's first lane plus the source's
+       * place (iOS 16.5's VideoProcessing: quad_shuffle_down.u.i32 and .v4f32) */
+      bool down = !strcmp(op, "quad_shuffle_down");
+      nir_def *delta = nir_u2u32(&c->b, a[1]);
+      nir_def *lane = nir_load_subgroup_invocation(&c->b);
+      nir_def *q = nir_iand_imm(&c->b, lane, 3);
+      nir_def *from = down ? nir_iadd(&c->b, q, delta) : nir_isub(&c->b, q, delta);
+      nir_def *inside = down ? nir_ult_imm(&c->b, from, 4) : nir_uge(&c->b, q, delta);
+      nir_def *src = nir_ior(&c->b, nir_iand_imm(&c->b, lane, ~3u), nir_iand_imm(&c->b, from, 3));
+      r = nir_bcsel(&c->b, inside, nir_shuffle(&c->b, a[0], src), a[0]);
    } else if (!strcmp(op, "normalize_function_constant_predicate")) {
       /* Metal's compiler stores the predicates that say whether a dependent
        * function constant applies in `__metal_implicit_fc_pred_N` bytes, and
@@ -709,6 +774,25 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_unpack_unorm_4x8(&c->b, a[0]);
       if (air_nir_bit_size(c, in->base.type) == 16)
          r = nir_f2f16(&c->b, r);
+   } else if (!strcmp(op, "unpack") && n->num >= 2 &&
+              (!strcmp(n->part[1], "snorm4x8") || !strcmp(n->part[1], "unorm2x16") ||
+               !strcmp(n->part[1], "snorm2x16"))) {
+      /* (the K40's, 11-17) the other three, as unorm4x8 above: Metal's unpack_snorm4x8_to_float is
+       * max(byte / 127, -1), GLSL's unpackSnorm4x8 clamp(byte / 127, -1, 1) -- the same numbers, a byte being at
+       * most 127 -- and the 16-bit ones the same over 65535 / 32767, component 0 the low half. ir3 lowers all
+       * three (lower_unpack_*). (iOS 16.5's image: snorm4x8 refused 3 times.) */
+      r = !strcmp(n->part[1], "snorm4x8") ? nir_unpack_snorm_4x8(&c->b, a[0]) :
+          !strcmp(n->part[1], "unorm2x16") ? nir_unpack_unorm_2x16(&c->b, a[0]) :
+                                             nir_unpack_snorm_2x16(&c->b, a[0]);
+      if (air_nir_bit_size(c, in->base.type) == 16)
+         r = nir_f2f16(&c->b, r);
+   } else if ((!strcmp(op, "hadd") || !strcmp(op, "rhadd")) && n->num >= 2 && argc == 2 &&
+              (n->part[1][0] == 's' || n->part[1][0] == 'u')) {
+      /* (the K40's, 11-17) air.[r]hadd.<s|u>.<type>: (x + y) >> 1 without the sum's overflow, rhadd rounding up --
+       * NIR's [iu][r]hadd exactly, which ir3 lowers (lower_hadd). (iOS 16.5's image: rhadd.u.i16 refused once.) */
+      bool s = n->part[1][0] == 's', round = op[0] == 'r';
+      r = round ? (s ? nir_irhadd(&c->b, a[0], a[1]) : nir_urhadd(&c->b, a[0], a[1]))
+                : (s ? nir_ihadd(&c->b, a[0], a[1]) : nir_uhadd(&c->b, a[0], a[1]));
    } else if (!strcmp(op, "convert")) {
       /* air.convert.<dst sign>.<dst type>.<src sign>.<src type> */
       if (n->num < 5) {
@@ -1226,6 +1310,10 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
 {
    if (!strncmp(name, "llvm.lifetime.", 14))
       return true; /* scope markers: nothing to emit */
+   /* (the K40's, 11-17) a promise to the optimizer that its operand is true, which a translation need not keep:
+    * dropping it computes the same values (VectorKit's modules, 4 of the iOS 16.5 image's refused for it) */
+   if (!strcmp(name, "llvm.assume"))
+      return true;
    if (!strncmp(name, "llvm.memcpy.", 12)) {
       /* a copy between two of our pointers, of a constant length */
       struct air_val *dst = air_get(c, in->operands[1]);
@@ -1773,7 +1861,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       uint64_t plane;
       if (!tex_flag(c, in, arg, &plane))
          return false;
-      if (plane != 1)
+      /* (the K40's, 11-17) except for a size: a depth texture's width and height are its own whichever aspect is
+       * named (iOS 16.5's image: get_width / get_height_depth_2d with aspect 0, 3 modules) */
+      if (plane != 1 && strcmp(t.op, "get"))
          return air_error(c, "intrinsic: air.%s with aspect %u (only 1 is understood)",
                           n->part[0], (unsigned)plane);
       arg++;

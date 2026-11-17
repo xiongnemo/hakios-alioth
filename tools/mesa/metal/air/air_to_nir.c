@@ -845,6 +845,7 @@ enum air_sysval {
    AIR_SV_THREADS_PER_TG, AIR_SV_TGS_PER_GRID, AIR_SV_THREAD_INDEX_TG,
    AIR_SV_THREADS_PER_GRID, AIR_SV_SIMD_LANE, AIR_SV_SIMD_INDEX, AIR_SV_SIMD_WIDTH,
    AIR_SV_SIMDS_PER_TG,
+   AIR_SV_QUAD_LANE, AIR_SV_QUAD_INDEX, AIR_SV_QUADS_PER_TG,
 };
 
 static const struct { const char *key; enum air_sysval sv; } sysvals[] = {
@@ -867,6 +868,10 @@ static const struct { const char *key; enum air_sysval sv; } sysvals[] = {
    { "air.simdgroup_index_in_threadgroup", AIR_SV_SIMD_INDEX },
    { "air.threads_per_simdgroup", AIR_SV_SIMD_WIDTH },
    { "air.simdgroups_per_threadgroup", AIR_SV_SIMDS_PER_TG },
+   /* (the K40's, 11-17) a quadgroup is four consecutive threads of a SIMD-group (the quad_* functions' unit) */
+   { "air.thread_index_in_quadgroup", AIR_SV_QUAD_LANE },
+   { "air.quadgroup_index_in_threadgroup", AIR_SV_QUAD_INDEX },
+   { "air.quadgroups_per_threadgroup", AIR_SV_QUADS_PER_TG },
 };
 
 /* (the K40's, 11-17) three 32-bit kernel inputs from byte offset `at` (grid_inputs): one word a load, as ir3 takes
@@ -934,6 +939,16 @@ load_sysval(struct air_ctx *c, enum air_sysval sv)
     * to a constant whenever the workgroup size is one (ir3_nir.c).
     */
    case AIR_SV_SIMDS_PER_TG: return nir_load_num_subgroups(&c->b);
+   /* (the K40's, 11-17) the lane's place in its quad, the quad's in the threadgroup, and the threadgroup's quads
+    * (rounded up: the last may be partly empty) -- iOS 16.5's VideoProcessing kernels read the first */
+   case AIR_SV_QUAD_LANE: return nir_iand_imm(&c->b, nir_load_subgroup_invocation(&c->b), 3);
+   case AIR_SV_QUAD_INDEX: return nir_ushr_imm(&c->b, nir_load_local_invocation_index(&c->b), 2);
+   case AIR_SV_QUADS_PER_TG: {
+      nir_def *size = nir_load_workgroup_size(&c->b);
+      nir_def *threads = nir_imul(&c->b, nir_imul(&c->b, nir_channel(&c->b, size, 0), nir_channel(&c->b, size, 1)),
+                                  nir_channel(&c->b, size, 2));
+      return nir_ushr_imm(&c->b, nir_iadd_imm(&c->b, threads, 3), 2);
+   }
    }
    return NULL;
 }
