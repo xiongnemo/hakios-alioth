@@ -2576,6 +2576,55 @@ agg_slot(struct air_ctx *c, struct air_val *agg, const uint32_t *idx, unsigned n
    return slot;
 }
 
+/* (the K40's, 11-17) the type of an aggregate's member `i` */
+static const struct air_type *
+agg_member_type(const struct air_type *t, uint32_t i)
+{
+   if (!t)
+      return NULL;
+   if (t->kind == AIR_TYPE_STRUCT)
+      return i < t->num_members ? t->members[i] : NULL;
+   if (t->kind == AIR_TYPE_ARRAY)
+      return t->elem;
+   return NULL;
+}
+
+/*
+ * (the K40's, 11-17) agg_slot for a path deeper than one level into a value that is partly undef: an undef
+ * aggregate is an AGG whose fields stay NULL until insertvalue puts something there (air_constant_val), so
+ * `insertvalue %S undef, float %x, 0, 0, 0` -- RenderBox's fragment shaders, CoreRE's debug ones, SceneKit's
+ * standard_frag: 26 of the iOS 16.5 image's entry points -- met a NULL field at its second index. With `create`,
+ * a NULL field on the path that is itself a struct or an array becomes an AGG of its own; without, a NULL field
+ * on the path makes *undef true (a field of an undef aggregate) and returns NULL.
+ */
+static struct air_val **
+agg_slot_typed(struct air_ctx *c, struct air_val *agg, const struct air_type *t, const uint32_t *idx,
+               unsigned n, bool create, bool *undef)
+{
+   if (!n) {
+      air_error(c, "instruction: an aggregate access with no index");
+      return NULL;
+   }
+   struct air_val **slot = &agg;
+   for (unsigned i = 0; i < n; i++) {
+      if (!*slot && i > 0) {
+         if (!create) {
+            *undef = true;
+            return NULL;
+         }
+         if (t && (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY))
+            *slot = air_val_agg(c, t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count);
+      }
+      if (!*slot || (*slot)->kind != AIR_VAL_AGG || idx[i] >= (*slot)->num_elems) {
+         air_error(c, "instruction: an aggregate index out of its value");
+         return NULL;
+      }
+      slot = &(*slot)->elems[idx[i]];
+      t = agg_member_type(t, idx[i]);
+   }
+   return slot;
+}
+
 static struct air_val *
 clone_val(struct air_ctx *c, const struct air_val *v)
 {
@@ -2781,11 +2830,20 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *agg = air_get(c, in->operands[0]);
       if (!agg)
          return false;
-      struct air_val **slot = agg_slot(c, agg, in->indices, in->num_indices);
-      if (!slot)
+      bool undef = false;
+      struct air_val **slot = agg_slot_typed(c, agg, in->operands[0]->type, in->indices, in->num_indices,
+                                             false, &undef);
+      if (!slot && !undef)
          return false;
-      if (!*slot) {
-         /* a field of an undef aggregate */
+      if (undef || !*slot) {
+         /* a field of an undef aggregate -- (the K40's, 11-17) itself an undef aggregate when it is a struct or an
+          * array (fields NULL, as air_constant_val makes one), not a number of no width */
+         const struct air_type *rt = in->base.type;
+         if (rt->kind == AIR_TYPE_STRUCT || rt->kind == AIR_TYPE_ARRAY) {
+            air_set(c, &in->base,
+                    air_val_agg(c, rt->kind == AIR_TYPE_STRUCT ? rt->num_members : (unsigned)rt->count));
+            return true;
+         }
          air_set(c, &in->base,
                  air_val_ssa(c, nir_undef(&c->b, air_nir_components(in->base.type),
                                           air_nir_bit_size(c, in->base.type))));
@@ -2800,7 +2858,9 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       if (!agg || !val)
          return false;
       struct air_val *copy = clone_val(c, agg);
-      struct air_val **slot = agg_slot(c, copy, in->indices, in->num_indices);
+      bool undef = false;
+      struct air_val **slot = agg_slot_typed(c, copy, in->operands[0]->type, in->indices, in->num_indices,
+                                             true, &undef);
       if (!slot)
          return false;
       *slot = val;
