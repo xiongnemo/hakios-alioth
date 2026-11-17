@@ -1655,6 +1655,9 @@ tex_handle(struct air_ctx *c, const struct air_inst *in, unsigned operand,
 static bool
 tex_flag(struct air_ctx *c, const struct air_inst *in, unsigned operand, uint64_t *out)
 {
+   /* (the K40's, 11-18) a call with fewer arguments than its name implies is a refusal, not a read past them */
+   if (operand >= in->num_operands)
+      return air_error(c, "intrinsic: argument %u missing", operand - 1);
    if (!air_const_uint(in->operands[operand], out))
       return air_error(c, "intrinsic: argument %u is not a constant", operand - 1);
    return true;
@@ -1895,7 +1898,13 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
     * and every call in the corpus passes 1. What else it can be is not known
     * from the data, so anything else is refused rather than assumed.
     */
-   if (t.depth) {
+   /* (the K40's, 11-18) except a depth texture's level or sample count, which takes no selector at all:
+    * air.get_num_mip_levels_depth_2d(texture) -- SceneKit's quad_display_depth2D and quad_display_depth_cube, where
+    * reading one read past the call's two operands and crashed the translator (signal 11 in the corpus report: on the
+    * phone, the app making the pipeline) */
+   bool depth_count = t.depth && !strcmp(t.op, "get") &&
+                      (!strcmp(t.query, "num_mip_levels") || !strcmp(t.query, "num_samples"));
+   if (t.depth && !depth_count) {
       uint64_t plane;
       if (!tex_flag(c, in, arg, &plane))
          return false;
