@@ -29,7 +29,7 @@ dimensions -- and hides on the rest, which is presumably why it survived.
  
  #include "pipe/p_context.h"
  
-@@ -247,10 +248,69 @@
+@@ -247,10 +248,74 @@
     return nir;
  }
  
@@ -44,6 +44,11 @@ dimensions -- and hides on the rest, which is presumably why it survived.
 +   void *buf;
 +   size_t size;
 +   read_file(filename, &buf, &size);
++
++   /* GLSL's type cache, which the GLSL road gets from the standalone
++    * compiler: the frontend and its lowering make types (glsl_array_type
++    * asserts "users > 0" without a reference) */
++   glsl_type_singleton_init_or_ref();
 +
 +   const void *bitcode = buf;
 +   size_t bitcode_size = size;
@@ -100,7 +105,7 @@ dimensions -- and hides on the rest, which is presumably why it survived.
     {"help",    no_argument,       0, 'h'},
     {"verbose", no_argument,       0, 'v'},
  };
-@@ -261,6 +314,7 @@
+@@ -261,6 +326,7 @@
     printf("Usage: ir3_compiler [OPTIONS]... <file.tgsi | file.spv entry_point "
            "| (file.vert | file.frag)*>\n");
     printf("    -g, --gpu GPU_ID - specify gpu-id (default 320)\n");
@@ -108,7 +113,7 @@ dimensions -- and hides on the rest, which is presumably why it survived.
     printf("    -h, --help       - show this message\n");
     printf("    -v, --verbose    - verbose compiler/debug messages\n");
  }
-@@ -274,10 +328,12 @@
+@@ -274,10 +340,12 @@
     unsigned stage = 0;
     struct ir3_shader_key key = {};
     unsigned gpu_id = 320;
@@ -121,17 +126,17 @@ dimensions -- and hides on the rest, which is presumably why it survived.
     size_t size;
  
     while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) !=
-@@ -286,6 +342,9 @@
+@@ -285,6 +353,9 @@
+       switch (opt) {
        case 'g':
           gpu_id = strtol(optarg, NULL, 0);
-          break;
++         break;
 +      case 'c':
 +         chip_id = strtoull(optarg, NULL, 0);
-+         break;
+          break;
        case 'v':
           ir3_shader_debug |= IR3_DBG_OPTMSGS | IR3_DBG_DISASM;
-          break;
-@@ -323,6 +382,15 @@
+@@ -323,6 +394,15 @@
              errx(1, "in SPIR-V mode, an entry point must be specified");
           spirv_entry = argv[n];
           n++;
@@ -147,7 +152,7 @@ dimensions -- and hides on the rest, which is presumably why it survived.
        } else if (strcmp(ext, ".comp") == 0) {
           if (from_tgsi || spirv_entry)
              errx(1, "cannot mix GLSL/TGSI/SPIRV");
-@@ -354,12 +422,25 @@
+@@ -354,12 +434,25 @@
     nir_shader *nir;
  
     struct fd_dev_id dev_id = {
@@ -175,7 +180,19 @@ dimensions -- and hides on the rest, which is presumably why it survived.
        struct tgsi_token toks[65536];
        const nir_shader_compiler_options *nir_options =
           ir3_get_compiler_options(compiler);
-@@ -420,8 +501,13 @@
+@@ -416,12 +509,25 @@
+    v->compiler = compiler;
+    v->key = key;
+    v->const_state = rzalloc_size(v, sizeof(*v->const_state));
++   /* the driver UBOs unallocated, as ir3_shader.c's alloc_variant starts a
++    * variant: a zeroed idx reads as "allocated at 0" and ir3_get_driver_ubo
++    * then asserts in ir3_get_shared_driver_ubo for any shader with constant
++    * data (Metal's constant arrays) */
++   v->const_state->consts_ubo.idx = -1;
++   v->const_state->driver_params_ubo.idx = -1;
++   v->const_state->primitive_map_ubo.idx = -1;
++   v->const_state->primitive_param_ubo.idx = -1;
+ 
     shader->variants = v;
     shader->variant_count = 1;
  

@@ -4197,6 +4197,101 @@ air_decode_sampler_state(uint64_t w)
    return s;
 }
 
+/*
+ * (the K40's, 11-18) A constant's bytes as the module's data layout puts them in memory (little-endian), into buf at
+ * off (buf zeroed beforehand: a zeroinitializer, an undef or a poison writes nothing). False for what this cannot lay
+ * out -- a constant expression (a pointer), a vector of i1 (bit-packed) -- and the global stays where it was.
+ */
+static bool
+write_constant_bytes(struct air_ctx *c, const struct air_value *v, const struct air_type *t, uint8_t *buf,
+                     uint64_t off, uint64_t size)
+{
+   if (!v || v->kind != AIR_VALUE_CONSTANT || !t)
+      return false;
+   const struct air_constant *k = (const struct air_constant *)v;
+   switch (k->ckind) {
+   case AIR_CONST_NULL:
+   case AIR_CONST_UNDEF:
+   case AIR_CONST_POISON:
+      return true;
+   case AIR_CONST_INT:
+   case AIR_CONST_FLOAT: {
+      if (t->kind == AIR_TYPE_POINTER)
+         return false;
+      uint64_t bytes = air_type_alloc_size(c->m, t);
+      if (!bytes || bytes > 8 || off + bytes > size)
+         return false;
+      uint64_t u = t->kind == AIR_TYPE_INT && t->bits == 1 ? (k->u & 1) : k->u;
+      for (unsigned i = 0; i < bytes; i++)
+         buf[off + i] = (uint8_t)(u >> (8 * i));
+      return true;
+   }
+   case AIR_CONST_DATA:
+   case AIR_CONST_AGGREGATE: {
+      if (t->kind != AIR_TYPE_ARRAY && t->kind != AIR_TYPE_VECTOR && t->kind != AIR_TYPE_STRUCT)
+         return false;
+      if (t->kind == AIR_TYPE_VECTOR && t->elem && t->elem->kind == AIR_TYPE_INT && t->elem->bits == 1)
+         return false;
+      if (k->ckind == AIR_CONST_DATA && t->kind == AIR_TYPE_STRUCT)
+         return false;
+      for (unsigned i = 0; i < k->num_elems; i++) {
+         const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? (i < t->num_members ? t->members[i] : NULL) : t->elem;
+         if (!et)
+            return false;
+         uint64_t eo = t->kind == AIR_TYPE_STRUCT ? air_struct_member_offset(c->m, t, i)
+                                                  : i * air_type_alloc_size(c->m, et);
+         if (k->ckind == AIR_CONST_DATA) {
+            uint64_t bytes = air_type_alloc_size(c->m, et);
+            if (!bytes || bytes > 8 || off + eo + bytes > size)
+               return false;
+            for (unsigned b = 0; b < bytes; b++)
+               buf[off + eo + b] = (uint8_t)(k->data[i] >> (8 * b));
+         } else if (!write_constant_bytes(c, k->elems[i], et, buf, off + eo, size)) {
+            return false;
+         }
+      }
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/*
+ * (the K40's, 11-18) A CONSTANT GLOBAL WITH AN INITIALIZER into the shader's constant data -- `constant float W[7] =
+ * {...}` at program scope (addrspace 2), or a `const` private one -- read with load_constant, which freedreno serves
+ * from the shader's own constant buffer. Until 11-18 such a global fell to the private-variable road below: scratch
+ * space, and nothing ever wrote the initializer into it, so every load of it at a run-time index read uninitialised
+ * private memory. Nagram's camera and call-screen Gaussian blurs index their BLUR_WEIGHTS / BLUR_OFFSETS that way
+ * (gaussianBlurVertical: 14 ldp of p[], no stp, in the PC's a650 code). False when the initializer cannot be laid
+ * out; the global then stays on the old road.
+ */
+static bool
+plan_constant_data(struct air_ctx *c, const struct air_global *g, struct air_global_plan *pl)
+{
+   if (!g->is_const || !g->init || (g->addrspace != 0 && g->addrspace != 2))
+      return false;
+   uint64_t size = air_type_alloc_size(c->m, g->value_type);
+   if (!size || size > 64 * 1024)
+      return false;
+   unsigned align = MAX2(MAX2(g->align, air_type_abi_align(c->m, g->value_type)), 4);
+   uint64_t at = ALIGN_POT((uint64_t)c->nir->constant_data_size, align);
+   uint8_t *bytes = rzalloc_size(c->mem_ctx, size);
+   if (!write_constant_bytes(c, g->init, g->value_type, bytes, 0, size))
+      return false;
+   uint8_t *data = reralloc_size(c->nir, c->nir->constant_data, at + size);
+   if (!data)
+      return false;
+   memset(data + c->nir->constant_data_size, 0, at - c->nir->constant_data_size);
+   memcpy(data + at, bytes, size);
+   c->nir->constant_data = data;
+   c->nir->constant_data_size = at + size;
+   pl->class = AIR_PTR_CONSTANT_DATA;
+   pl->offset = at;
+   pl->has_offset = true;
+   return true;
+}
+
 static void
 plan_globals(struct air_ctx *c)
 {
@@ -4265,6 +4360,8 @@ plan_globals(struct air_ctx *c)
          pl->offset = c->shared_size;
          pl->has_offset = true;
          c->shared_size += air_type_alloc_size(c->m, g->value_type);
+      } else if (plan_constant_data(c, g, pl)) {
+         /* a constant with an initializer: the shader's constant data (plan_constant_data) */
       } else {
          /* a program-scope variable: private to the invocation, written by
           * the static initializers below
