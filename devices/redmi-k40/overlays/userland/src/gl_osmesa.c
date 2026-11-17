@@ -142,7 +142,35 @@ shader_cache_env_once(void)
 	size_t len = sizeof(args) - 1;
 	const char *home = getenv("HOME");
 
-	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "mesa_cache=0") != NULL) {
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		args[0] = 0;
+	}
+	/*
+	 * (the K40's, 11-17) gl_gpu_trace=NAME: freedreno's GPU timestamps around every render pass of the processes whose
+	 * name has NAME in it (1: every one) -- Mesa's u_trace "print", only render_pass, binning_ib, render_gmem /
+	 * render_sysmem and flush_batch, as metal_gpu_trace=1 for Metal -- into /var/tmp/gputrace-PROGRAM-PID.txt: the
+	 * compositor's GPU time a pass while the screen moves (tools/gputrace-report.py). A test road.
+	 */
+	const char *trace = strstr(args, "gl_gpu_trace=");
+
+	if (trace != NULL && getenv("MESA_GPU_TRACES") == NULL) {
+		char name[64] = "", file[160];
+		size_t n = 0;
+
+		trace += strlen("gl_gpu_trace=");
+		while (n + 1 < sizeof(name) && trace[n] != 0 && trace[n] != ' ') {
+			name[n] = trace[n];
+			n++;
+		}
+		name[n] = 0;
+		if (strcmp(name, "1") == 0 || (n != 0 && strstr(getprogname(), name) != NULL)) {
+			snprintf(file, sizeof(file), "/var/tmp/gputrace-%s-%d.txt", getprogname(), (int)getpid());
+			setenv("MESA_GPU_TRACES", "print", 0);
+			setenv("MESA_GPU_TRACEFILE", file, 0);
+			setenv("FD_GPU_TRACEPOINT", "-all,render_pass,binning_ib,render_gmem,render_sysmem,flush_batch", 0);
+		}
+	}
+	if (strstr(args, "mesa_cache=0") != NULL) {
 		setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
 		return;
 	}
