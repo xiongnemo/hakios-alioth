@@ -1813,8 +1813,10 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
     * own (texturecube::write(color, uint2 coord, uint face, uint lod)), as an array index is above; NIR's cube image
     * coordinate is (x, y, face). iOS 16.5's image: 14 modules (ARKitCore, SceneKit, VFX...). The read of one is left
     * refused: a fetch from a cube TEXTURE (not an image) is nothing GLSL or Vulkan has, and ir3 is not known to take it. */
+   /* (11-18) and a read of one bound as a read-only image (air_to_nir.c: a texturecube<T, access::read> argument),
+    * at the same (x, y, face); texture_op refuses a cube read through a sampler view before this */
    if (t->dim == GLSL_SAMPLER_DIM_CUBE && !t->is_array && !is_float && coord->num_components == 2 && ncoord == 3 &&
-       !strcmp(t->op, "write")) {
+       (!strcmp(t->op, "write") || !strcmp(t->op, "read"))) {
       if (in->num_operands <= *arg) {
          air_error(c, "intrinsic: air.%s without the face its signature has", n->part[0]);
          return NULL;
@@ -1991,6 +1993,12 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       return true;
    }
 
+   /* (the K40's, 11-18) a cube's texels are read through a read-only image (air_to_nir.c) and through nothing else:
+    * NIR has no texel fetch of a cube sampler */
+   if (!strcmp(t.op, "read") && t.dim == GLSL_SAMPLER_DIM_CUBE && !tex.is_image)
+      return air_error(c, "intrinsic: air.%s from a cube texture bound for sampling (a cube is read as a read-only "
+                          "image only: a texturecube<T, access::read> argument)", n->part[0]);
+
    /* sample, gather, read: a texture instruction, or an image load */
    nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
    if (!coord)
@@ -2000,6 +2008,11 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       uint64_t extra;
       if (!tex_flag(c, in, arg, &extra))
          return false;
+      /* (the K40's, 11-18) an image binds one level, as for the write above: a read of another one would read
+       * level 0 without a word */
+      if (!t.is_ms && extra != 0)
+         return air_error(c, "intrinsic: air.%s of mip level %u through an image (only 0 is handled)",
+                          n->part[0], (unsigned)extra);
       nir_def *res = nir_image_load(&c->b, 4, dest_bits, nir_imm_int(&c->b, tex.binding),
                                     nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
                                     nir_imm_int(&c->b, t.is_ms ? extra : 0),

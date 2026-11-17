@@ -1835,13 +1835,22 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       bool write = md_key(node, "air.write") >= 0 || md_key(node, "air.read_write") >= 0;
       /* A texture the shader writes is an image to Gallium, with its own
        * binding space; one it only samples or reads is a sampler view.
+       *
+       * (the K40's, 11-18) And a CUBE it only reads (texturecube<T, access::read>): a texel fetch from a cube
+       * sampler is nothing NIR or ir3 has (GLSL has no texelFetch of a samplerCube), while a cube IMAGE is read at
+       * (x, y, face) like the cube image a kernel writes (ab1b032). So it is bound as a read-only image -- freedreno
+       * takes a sampler-only texture as one, uncompressing a UBWC one first (fd6_set_shader_images). SceneKit's
+       * texturecube_copy_kernel, CoreRE's probe-mip and specular-map kernels and ARKit's cube histograms were refused
+       * for it.
        */
+      const char *tname = md_key_str(node, "air.arg_type_name");
+      bool cube_read = read && !sample && !write && tname && !strncmp(tname, "texturecube<", 12);
       struct air_ptr p = {
          .class = AIR_PTR_TEXTURE,
          .binding = index,
-         .is_image = write,
+         .is_image = write || cube_read,
       };
-      add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
+      add_resource(c, write || cube_read ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
                    sample || read, write, param, node);
       c->params[param] = air_val_ptr(c, p);
       return true;
