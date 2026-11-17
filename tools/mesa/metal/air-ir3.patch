@@ -147,7 +147,7 @@ dimensions -- and hides on the rest, which is presumably why it survived.
        } else if (strcmp(ext, ".comp") == 0) {
           if (from_tgsi || spirv_entry)
              errx(1, "cannot mix GLSL/TGSI/SPIRV");
-@@ -354,12 +422,24 @@
+@@ -354,12 +422,25 @@
     nir_shader *nir;
  
     struct fd_dev_id dev_id = {
@@ -164,17 +164,18 @@ dimensions -- and hides on the rest, which is presumably why it survived.
 +      stage = nir->info.stage;
 +
 +      /* The frontend emits NIR's own system values, as the SPIR-V one does;
-+       * lowering them to what the hardware has is the consumer's job.
++       * lowering them to what the hardware has is the consumer's job -- the
++       * same function the Metal library calls before it hands a shader to
++       * freedreno (air_finalize.c): system values, [[point_coord]] as PNTC, a
++       * vertex stage's outputs by slot, I/O as intrinsics. One road, so that a
++       * shader ir3 takes here is the shader the phone's ir3 is given.
 +       */
-+      NIR_PASS(_, nir, nir_lower_system_values);
-+      NIR_PASS(_, nir, nir_lower_compute_system_values, NULL);
-+      NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-+               ir3_glsl_type_size, nir_lower_io_use_interpolated_input_intrinsics);
++      air_finalize_for_gallium(nir, true, stage == MESA_SHADER_COMPUTE);
 +   } else if (from_tgsi) {
        struct tgsi_token toks[65536];
        const nir_shader_compiler_options *nir_options =
           ir3_get_compiler_options(compiler);
-@@ -420,8 +500,13 @@
+@@ -420,8 +501,13 @@
     shader->variants = v;
     shader->variant_count = 1;
  
