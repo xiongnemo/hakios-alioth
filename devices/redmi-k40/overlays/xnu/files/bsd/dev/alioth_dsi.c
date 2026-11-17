@@ -50,6 +50,7 @@
  */
 SYSCTL_DECL(_kern_hakios);
 uint32_t hakios_bl_auto_pct = 100;
+extern void hakios_bl_auto_reapply(void);       /* iokit/Kernel/MiniIOMobileFramebuffer.cpp */
 
 static int
 bl_auto_pct_sysctl SYSCTL_HANDLER_ARGS
@@ -66,6 +67,7 @@ bl_auto_pct_sysctl SYSCTL_HANDLER_ARGS
 	}
 	hakios_bl_auto_pct = (uint32_t) value;
 	printf("backlight: auto-brightness at %d%% of Apple's target in dim light\n", value);
+	hakios_bl_auto_reapply();               /* (11-18) shown now, not at the next ramp */
 	return 0;
 }
 SYSCTL_PROC(_kern_hakios, OID_AUTO, bl_auto_pct, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,

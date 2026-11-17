@@ -3263,6 +3263,7 @@ public:
 OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
 
 static AppleARMBacklight * gBacklight;
+static int64_t gLastAutoNits;                           /* (11-18) hakios_bl_auto_reapply()'s: 16.16 nits, 0 none */
 
 void
 AppleARMBacklight::publish(uint32_t level)
@@ -3456,6 +3457,12 @@ AppleARMBacklight::setProperties(OSObject * properties)
 	uint32_t to;
 	int64_t asked_nits = nits != NULL ? (int32_t) nits->unsigned32BitValue() : 0;
 
+	/* (11-18) for hakios_bl_auto_reapply(): the last auto-brightness target, or 0 once the slider set a level */
+	if (asked_nits > 0) {
+		gLastAutoNits = asked_nits;
+	} else if (b != NULL && (int32_t) b->unsigned32BitValue() >= 0) {
+		gLastAutoNits = 0;
+	}
 	if (asked_nits > 0) {
 		/*
 		 * (11-18) Apple's target dimmed in dim light by kern.hakios.bl_auto_pct (alioth_dsi.c): t * (p + (1 - p) *
@@ -3527,6 +3534,35 @@ AppleARMBacklight::setProperties(OSObject * properties)
 	publish(to);
 	fTimer->setTimeoutUS(1);
 	return kIOReturnSuccess;
+}
+
+/*
+ * (11-18) bl_auto_pct changed (alioth_dsi.c's sysctl): CoreBrightness's last target again, through the same road, so a
+ * new share shows at once rather than at the next ramp -- which, in a room whose light does not change, may not come
+ * for minutes, and tuning by eye needs the answer now. Only when the panel's level last came from that road: after
+ * the slider ("brightness"), the slider's level stays. A one-second fade.
+ */
+extern "C" void
+hakios_bl_auto_reapply(void)
+{
+	AppleARMBacklight * bl = gBacklight;
+	int64_t nits = gLastAutoNits;
+
+	if (bl == NULL || nits <= 0) {
+		return;
+	}
+	OSDictionary * d = OSDictionary::withCapacity(2);
+	OSNumber * n = OSNumber::withNumber((unsigned long long) (uint32_t) nits, 32);
+	OSNumber * f = OSNumber::withNumber((unsigned long long) (1u << 16), 32);
+
+	if (d != NULL && n != NULL && f != NULL) {
+		d->setObject("brightness-nits", n);
+		d->setObject("FadePeriod", f);
+		bl->setProperties(d);
+	}
+	OSSafeReleaseNULL(n);
+	OSSafeReleaseNULL(f);
+	OSSafeReleaseNULL(d);
 }
 
 void
