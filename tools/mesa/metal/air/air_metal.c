@@ -494,6 +494,33 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+/* (the K40's, 11-17) load_point_coord -> a load of the input at VARYING_SLOT_PNTC, made at its first use */
+struct pntc_lowering {
+   nir_shader *nir;
+   nir_variable *var;
+};
+
+static bool
+lower_point_coord(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct pntc_lowering *st = data;
+   if (intr->intrinsic != nir_intrinsic_load_point_coord)
+      return false;
+   if (!st->var) {
+      st->var = nir_variable_create(st->nir, nir_var_shader_in, glsl_vec_type(2), "point_coord");
+      st->var->data.location = VARYING_SLOT_PNTC;
+      st->var->data.driver_location = st->nir->num_inputs++;
+      st->var->data.interpolation = INTERP_MODE_NONE;   /* as GL's gl_PointCoord varying: replaced, not interpolated */
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *v = nir_load_var(b, st->var);
+   if (intr->def.bit_size != 32)
+      v = nir_f2fN(b, v, intr->def.bit_size);
+   nir_def_rewrite_uses(&intr->def, v);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 static void
 finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen, bool base_group)
 {
@@ -522,14 +549,11 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen, bool base_grou
     * fragment of a point (ir3_point_sprite: PNTC is always replaced; the origin at the top left, Metal's as GL's
     * default). */
    if (nir->info.stage == MESA_SHADER_FRAGMENT && screen->caps.fs_position_is_sysval) {
-      static const struct nir_lower_sysvals_to_varyings_options pntc_opts = {
-         .point_coord = true,
-      };
-      if (nir_lower_sysvals_to_varyings(nir, &pntc_opts)) {
-         nir_foreach_shader_in_variable(var, nir)
-            if (var->data.location == VARYING_SLOT_PNTC)
-               var->data.driver_location = nir->num_inputs++;
-      }
+      /* the frontend emits load_point_coord itself, not a system-value variable, so this is its own small pass:
+       * nir_lower_sysvals_to_varyings rewrites only variables (round b84: "Unhandled intrinsic type:
+       * load_point_coord" on the phone with that one, and System Check stopped at metal.point.coord) */
+      struct pntc_lowering st = { .nir = nir };
+      nir_shader_intrinsics_pass(nir, lower_point_coord, nir_metadata_control_flow, &st);
    }
    NIR_PASS(_, nir, nir_lower_system_values);
    /* An options struct of all-false and not NULL, which are not the same thing here and
