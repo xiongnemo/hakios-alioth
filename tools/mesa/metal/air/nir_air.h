@@ -403,6 +403,12 @@ struct air_to_nir_options {
 #define AIR_GRID_INPUT_THREADS    32
 #define AIR_GRID_INPUT_BYTES      48
 
+/* (the K40's, 11-18) a translated shader made what a Gallium driver takes: system values lowered (on the GPU
+ * -- fs_position_is_sysval -- [[point_coord]] as the input at VARYING_SLOT_PNTC), a vertex stage's outputs numbered
+ * by slot, I/O as intrinsics. The Metal library's (air_metal.c) and the PC ir3_compiler's (air-ir3.patch) one road;
+ * base_group keeps a kernel's load_base_workgroup_id (air_finalize.c). */
+void air_finalize_for_gallium(nir_shader *nir, bool fs_position_is_sysval, bool base_group);
+
 /* (the K40's, 11-17) every array and string of `src` copied under mem_ctx into `dst` (which may be `src`): what
  * air_to_nir does to the info it hands back, for a caller that keeps a translation and hands out copies of it */
 void air_shader_info_copy(void *mem_ctx, struct air_shader_info *dst, const struct air_shader_info *src);
