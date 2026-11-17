@@ -53,9 +53,88 @@ lower_point_coord(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* a load_scratch / store_scratch this pass can turn into array elements: 32-bit words at a 4-byte-aligned offset */
+static bool
+scratch_word_access(nir_intrinsic_instr *intr)
+{
+   bool load = intr->intrinsic == nir_intrinsic_load_scratch;
+   unsigned bits = load ? intr->def.bit_size : intr->src[0].ssa->bit_size;
+   return bits == 32 && nir_intrinsic_align_mul(intr) >= 4 && nir_intrinsic_align_offset(intr) % 4 == 0;
+}
+
+/*
+ * (the K40's, 11-18) A SHADER'S SCRATCH AS A LOCAL ARRAY, for ir3 to keep in registers. The frontend makes every alloca
+ * (a local array, a struct reached by pointer) byte-addressed scratch -- load_scratch / store_scratch, which ir3 emits
+ * as ldp / stp of private memory, through the caches. Given the same array as a function_temp variable, ir3 does what
+ * Mesa's own frontends get: nir_opt_large_constants, vars_to_ssa for the elements reached at constant indices, an
+ * indirect register array (nir_lower_locals_to_regs) for the rest, and private memory only past 256 bytes
+ * (nir_lower_vars_to_scratch's threshold in ir3_nir.c). So a shader whose scratch is at most 256 bytes and only ever
+ * read and written as aligned 32-bit words gets a uint[size / 4] instead: each word of an access one element, at the
+ * offset / 4. Anything else -- 8-, 16- or 64-bit accesses, more than 256 bytes, scratch in a second function -- stays
+ * as it was. The owner's apps had 28 such functions after a26c7b5 (Flutter's Porter-Duff and advanced blends,
+ * Telegram's media editor, premium and liquid-glass shaders).
+ */
+static bool
+scratch_to_local_array(nir_shader *nir)
+{
+   if (!nir->scratch_size || nir->scratch_size > 256 || nir->scratch_size % 4)
+      return false;
+   nir_function_impl *entry = nir_shader_get_entrypoint(nir);
+   if (!entry)
+      return false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_scratch && intr->intrinsic != nir_intrinsic_store_scratch)
+               continue;
+            if (impl != entry || !scratch_word_access(intr))
+               return false;
+         }
+      }
+   }
+
+   nir_variable *var = nir_local_variable_create(entry, glsl_array_type(glsl_uint_type(), nir->scratch_size / 4, 4),
+                                                 "air_scratch");
+   nir_builder b = nir_builder_create(entry);
+   nir_foreach_block(block, entry) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         bool load = intr->intrinsic == nir_intrinsic_load_scratch;
+         if (!load && intr->intrinsic != nir_intrinsic_store_scratch)
+            continue;
+         b.cursor = nir_before_instr(instr);
+         nir_def *word = nir_ushr_imm(&b, intr->src[load ? 0 : 1].ssa, 2);
+         nir_deref_instr *array = nir_build_deref_var(&b, var);
+         if (load) {
+            nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned i = 0; i < intr->def.num_components; i++)
+               comps[i] = nir_load_deref(&b, nir_build_deref_array(&b, array, nir_iadd_imm(&b, word, i)));
+            nir_def_rewrite_uses(&intr->def, nir_vec(&b, comps, intr->def.num_components));
+         } else {
+            nir_def *value = intr->src[0].ssa;
+            unsigned mask = nir_intrinsic_write_mask(intr);
+            for (unsigned i = 0; i < value->num_components; i++)
+               if (mask & (1u << i))
+                  nir_store_deref(&b, nir_build_deref_array(&b, array, nir_iadd_imm(&b, word, i)),
+                                  nir_channel(&b, value, i), 1);
+         }
+         nir_instr_remove(instr);
+      }
+   }
+   nir->scratch_size = 0;
+   nir_metadata_preserve(entry, nir_metadata_control_flow);
+   return true;
+}
+
 void
 air_finalize_for_gallium(nir_shader *nir, bool fs_position_is_sysval, bool base_group)
 {
+   NIR_PASS(_, nir, scratch_to_local_array);
    /* A fragment shader's [[position]]: the frontend hands it over as a system-value
     * variable, because that is the one form both of the drivers behind this library can
     * be served from (the long version is beside air.position in air_to_nir.c and in
