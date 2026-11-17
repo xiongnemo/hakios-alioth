@@ -3614,18 +3614,45 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
  * a missing operand from a reachable block is a refusal and only an edge the
  * entry cannot reach at all is passed over.
  */
+/* (the K40's, 11-17) the resource two pointers are in, offsets aside */
+static bool
+same_place(const struct air_ptr *a, const struct air_ptr *b)
+{
+   return a->class == b->class && a->binding == b->binding && a->is_image == b->is_image;
+}
+
+/* (the K40's, 11-17) the classes whose offset is a run-time byte offset that a load or a store takes as it is */
+static bool
+ptr_offset_is_runtime(enum air_ptr_class k)
+{
+   return k == AIR_PTR_UBO || k == AIR_PTR_SSBO || k == AIR_PTR_SHARED || k == AIR_PTR_SCRATCH ||
+          k == AIR_PTR_CONSTANT_DATA;
+}
+
+/*
+ * (the K40's, 11-17) AND A LOOP-CARRIED POINTER: `%p = phi [%base, %pre], [%p.next, %latch]`, %p.next a GEP of %p --
+ * a pointer walked through a buffer, the most common refusal of the iOS 16.5 image's entry points after calls (81:
+ * ACT, CameraColorProcessing, CoreRE, MLCompute, MPSMatrix...). Its operand over the back edge has not been
+ * translated when the phi is, so the phi cannot be resolved to it; but when every operand that HAS been names the
+ * same buffer, the phi is that buffer at an offset carried like any other phi's value: a 32-bit register, loaded
+ * here and stored at the end of each predecessor (translate_body's phi stores), where the back edge's operand --
+ * translated by then -- is checked to name the same buffer too. The same register serves two operands of one
+ * buffer at different offsets ("pointers that name different places" before). Not for a texture, a sampler, a
+ * function constant or an argument buffer, whose offset is not a run-time number.
+ */
 static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
 {
    struct air_val *first = NULL;
+   bool missing = false, differ = false;
    for (unsigned k = 0; k < in->num_operands; k++) {
       if (!in->targets[k] || !reachable[in->targets[k]->index])
          continue;
       struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
-      if (!e)
-         return air_error(c, "instruction: a phi of pointers whose operand comes in over "
-                             "a loop edge, so which resource it is depends on the "
-                             "iteration");
+      if (!e) {
+         missing = true;
+         continue;
+      }
       struct air_val *v = e->data;
       if (!v || v->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a phi of pointers one of whose operands is "
@@ -3634,13 +3661,33 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
                                       : "not a resolved pointer");
       if (!first)
          first = v;
-      else if (!same_ptr(&first->ptr, &v->ptr))
-         return air_error(c, "instruction: a phi between pointers that name different "
-                             "places, which would have to be chosen at run time");
+      else if (!same_ptr(&first->ptr, &v->ptr)) {
+         if (!same_place(&first->ptr, &v->ptr))
+            return air_error(c, "instruction: a phi between pointers that name different "
+                                "places, which would have to be chosen at run time");
+         differ = true;
+      }
    }
    if (!first)
-      return air_error(c, "instruction: a phi of pointers with no reachable operand");
-   air_set(c, &in->base, first);
+      return air_error(c, missing ? "instruction: a phi of pointers whose every operand comes in over a loop "
+                                    "edge"
+                                  : "instruction: a phi of pointers with no reachable operand");
+   if (!missing && !differ) {
+      air_set(c, &in->base, first);
+      return true;
+   }
+   if (!ptr_offset_is_runtime(first->ptr.class))
+      return air_error(c, missing ? "instruction: a phi of pointers whose operand comes in over "
+                                    "a loop edge, so which resource it is depends on the "
+                                    "iteration"
+                                  : "instruction: a phi between pointers that name different "
+                                    "places, which would have to be chosen at run time");
+   nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
+   nir_def *reg = nir_decl_reg(&entry, 1, 32, 0);
+   _mesa_hash_table_insert(c->phi_regs, in, reg);
+   struct air_ptr p = first->ptr;
+   p.offset = nir_load_reg(&c->b, reg);
+   air_set(c, &in->base, air_val_ptr(c, p));
    return true;
 }
 
@@ -3836,7 +3883,21 @@ translate_body(struct air_ctx *c)
             if (!ce)
                continue; /* an edge from a block the entry cannot reach */
             c->b.cursor = *(nir_cursor *)ce->data;
-            nir_def *val = air_get_ssa(c, in->operands[k]);
+            nir_def *val;
+            if (in->base.type->kind == AIR_TYPE_POINTER) {
+               /* (the K40's, 11-17) a pointer phi's offset register (resolve_pointer_phi): this operand's
+                * offset, and the operand must name the phi's own buffer -- the back edge's is checked here */
+               struct air_val *self = air_get(c, &in->base);
+               struct air_val *v = air_get(c, in->operands[k]);
+               if (!self || !v)
+                  return false;
+               if (v->kind != AIR_VAL_PTR || self->kind != AIR_VAL_PTR || !same_place(&self->ptr, &v->ptr))
+                  return air_error(c, "instruction: a phi of pointers whose operand over a loop edge names "
+                                      "another place than the others");
+               val = v->ptr.offset ? v->ptr.offset : nir_imm_int(&c->b, 0);
+            } else {
+               val = air_get_ssa(c, in->operands[k]);
+            }
             if (!val)
                return false;
             nir_store_reg(&c->b, val, re->data);
