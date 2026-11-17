@@ -711,6 +711,7 @@ static const char *alioth_lock_hold_what;
 static struct rwa_device *alioth_stats_device;
 static void (*alioth_pipeline_times)(struct rwa_device *, uint64_t[4]);
 static void (*alioth_pipeline_modules)(struct rwa_device *, uint64_t[3]);
+static void (*alioth_translation_times)(uint64_t[4]);
 /* (the K40's, 11-16) render passes in the window: all, multisample, resolved in the tiles, resolved by a blit */
 static uint64_t alioth_pass_counts[4];
 /* (the K40's, 11-16) memoryless textures made without memory, and of them given memory at a first real use (counted
@@ -834,6 +835,17 @@ alioth_stats_commit(void)
 			         "fragment modules\n", (unsigned long long)pt[0], pt[1] / 1e6 / pt[0], pt[2] / 1e6 / pt[0],
 			         pt[3] / 1e6 / pt[0], (unsigned long long)mods[0], (unsigned long long)mods[1],
 			         (unsigned long long)mods[2]);
+		}
+		/* (11-17) and the frontend's own split of each translation: reading, the body, the rest */
+		uint64_t tt[4] = { 0 };
+
+		if (alioth_translation_times != NULL) {
+			alioth_translation_times(tt);
+		}
+		if (tt[0] != 0) {
+			rw_print("stats: %llu translations, one: %.3f ms reading the module, %.3f ms translating its body, %.3f ms "
+			         "structurizing and the rest\n", (unsigned long long)tt[0], tt[1] / 1e6 / tt[0], tt[2] / 1e6 / tt[0],
+			         tt[3] / 1e6 / tt[0]);
 		}
 	}
 	/* (11-17) who held the lock longest in the window, when that was 2 ms or more */
@@ -1377,6 +1389,7 @@ mesa_available(void)
 	*(void **)&mesa.texture_create_tile_only = dlsym(mesa.handle, "rwa_texture_create_tile_only");
 	*(void **)&alioth_pipeline_times = dlsym(mesa.handle, "rwa_device_pipeline_times");
 	*(void **)&alioth_pipeline_modules = dlsym(mesa.handle, "rwa_device_pipeline_modules");
+	*(void **)&alioth_translation_times = dlsym(mesa.handle, "rwa_translation_times");
 	*(void **)&mesa.texture_write = dlsym(mesa.handle, "rwa_texture_write");
 	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");
 	*(void **)&mesa.depth_read = dlsym(mesa.handle, "rwa_depth_read");

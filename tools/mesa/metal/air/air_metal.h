@@ -611,6 +611,10 @@ void rwa_device_pipeline_times(struct rwa_device *device, uint64_t out[4]);
  * among them, out[2] distinct fragment ones (by their bitcode and entry point) -- how much a translation cache would
  * have saved */
 void rwa_device_pipeline_modules(struct rwa_device *device, uint64_t out[3]);
+/* (the K40's, 11-17) every translation's split since the last call, zeroed (all devices, compute too): out[0]
+ * translations, out[1] ns reading modules, out[2] ns translating bodies, out[3] ns structurizing / inlining /
+ * copying the info out */
+void rwa_translation_times(uint64_t out[4]);
 
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);

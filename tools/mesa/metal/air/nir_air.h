@@ -390,6 +390,10 @@ struct air_to_nir_options {
  * air_to_nir does to the info it hands back, for a caller that keeps a translation and hands out copies of it */
 void air_shader_info_copy(void *mem_ctx, struct air_shader_info *dst, const struct air_shader_info *src);
 
+/* (the K40's, 11-17) where translations' time went since the last call, zeroed: out[0] translations, out[1] ns
+ * reading modules, out[2] ns translating bodies, out[3] ns structurizing, inlining and copying infos out */
+void air_translation_times(uint64_t out[4]);
+
 /* Translates one AIR module (one function of a .metallib). entry_point may
  * be NULL: the module's own entry point is taken. On failure returns NULL
  * and sets *error (allocated under mem_ctx) to "<category>: <what>", where

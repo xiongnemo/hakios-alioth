@@ -7356,6 +7356,13 @@ fail:
    return NULL;
 }
 
+/* (the K40's, 11-17) air_metal.h: the frontend's own split of a translation (nir_air.h air_translation_times) */
+void
+rwa_translation_times(uint64_t out[4])
+{
+   air_translation_times(out);
+}
+
 /* (the K40's, 11-17) air_metal.h */
 void
 rwa_device_pipeline_modules(struct rwa_device *device, uint64_t out[3])

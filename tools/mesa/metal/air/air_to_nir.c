@@ -18,6 +18,7 @@
 
 #include "util/hash_table.h"
 #include "util/u_math.h"
+#include "util/os_time.h"
 
 bool
 air_error(struct air_ctx *c, const char *fmt, ...)
@@ -4041,6 +4042,18 @@ air_shader_info_copy(void *mem_ctx, struct air_shader_info *info, const struct a
    info->entry_point = ralloc_strdup(mem_ctx, info->entry_point);
 }
 
+/* (the K40's, 11-17) where a translation's time goes, summed over every successful one until air_translation_times
+ * takes it: [0] translations, [1] ns reading the module (air_module_read), [2] ns translating its body, [3] ns
+ * structurizing, inlining and copying the info out */
+static uint64_t air_times[4];
+
+void
+air_translation_times(uint64_t out[4])
+{
+   for (unsigned i = 0; i < 4; i++)
+      out[i] = __atomic_exchange_n(&air_times[i], 0, __ATOMIC_RELAXED);
+}
+
 /* -- the entry point ---------------------------------------------------- */
 
 nir_shader *
@@ -4049,6 +4062,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
            const nir_shader_compiler_options *nir_options,
            struct air_shader_info *info, const char **error)
 {
+   uint64_t t_begin = os_time_get_nano(), t_read = 0, t_body = 0;   /* (air_translation_times) */
    void *ctx = ralloc_context(mem_ctx);
    struct air_shader_info local_info = { 0 };
    struct air_ctx c = {
@@ -4066,6 +4080,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       ralloc_free(ctx);
       return NULL;
    }
+   t_read = os_time_get_nano();
    /* (the K40's, 11-17) the module's own constants, as air_module_function_constants reads them, from this parse
     * (air_to_nir_options.module_constants) */
    struct air_to_nir_options own;
@@ -4273,6 +4288,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       c.nir->info.workgroup_size_variable = true;
    }
 
+   t_body = os_time_get_nano();
    nir_lower_goto_ifs(c.nir);
 
    /* Fold in any function of the module the shader called, and then drop the
@@ -4318,5 +4334,13 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    ralloc_free(ctx);
    if (error)
       *error = NULL;
+   {
+      uint64_t t_end = os_time_get_nano();   /* (air_translation_times) */
+
+      __atomic_fetch_add(&air_times[0], 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&air_times[1], t_read - t_begin, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&air_times[2], t_body - t_read, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&air_times[3], t_end - t_body, __ATOMIC_RELAXED);
+   }
    return c.nir;
 }
