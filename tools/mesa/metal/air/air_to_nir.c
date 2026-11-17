@@ -2065,6 +2065,21 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
        */
       if (c->nir->info.stage == MESA_SHADER_VERTEX)
          return translate_vertex_attribute(c, node, param, t);
+      /* (the K40's, 11-18) A KERNEL's [[stage_in]]: Metal's compute vertex fetch, laid out by the compute pipeline's
+       * stageInputDescriptor (a format, an offset, a buffer index and a step function per attribute -- the
+       * pipeline's, not the module's), which nothing here fetches yet. Made an input variable as below, it reached
+       * ir3, which has no inputs for a compute shader: setup_input's assertion, ir3_context_error, and in a release
+       * build a trap that takes the whole app (SceneKit's skinning and copy kernels -- skin_LBS, copy_generic and
+       * eight more -- in the PC's debug ir3). Refused by name, so the pipeline fails with an error the app can take. */
+      if (c->nir->info.stage == MESA_SHADER_COMPUTE) {
+         if (md_key(node, "air.arg_unused") >= 0) {
+            c->params[param] = air_val_ssa(c, nir_undef(&c->b, air_nir_components(t),
+                                                        air_nir_bit_size(c, t)));
+            return true;
+         }
+         return air_error(c, "interface: a kernel's [[stage_in]] (the compute pipeline's stageInputDescriptor "
+                             "vertex fetch) is not supported");
+      }
       unsigned slot = VARYING_SLOT_VAR0 + (*next_varying)++;
       const char *name = md_key_str(node, "air.arg_name");
       nir_variable *var = make_io_var(c, nir_var_shader_in, t, slot, name);
