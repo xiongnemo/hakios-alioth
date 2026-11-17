@@ -573,6 +573,10 @@ static struct {
 	int (*dispatch_buffers)(struct rwa_compute *, const struct rwa_bindings *,
 				const struct rwa_buffer_bind *, unsigned, const unsigned[3],
 				const unsigned[3], char *, size_t);
+	/* (the K40's, 11-17) a piece of a grid that does not divide into its threadgroups (air_metal.h) */
+	int (*dispatch_base)(struct rwa_compute *, const struct rwa_bindings *, const struct rwa_buffer_bind *,
+			     unsigned, const unsigned[3], const unsigned[3], const unsigned[3], char *, size_t);
+	int (*compute_grid_split_ok)(const struct rwa_compute *);
 	int (*module_argbufs)(struct rwa_device *, const void *, size_t, const char *,
 			      struct rwa_argbuf_layout *, unsigned, unsigned *, char *,
 			      size_t);
@@ -1154,6 +1158,9 @@ GPU_LOCKED(int, dispatch, (struct rwa_compute *c, const struct rwa_bindings *b, 
 GPU_LOCKED(int, dispatch_buffers, (struct rwa_compute *c, const struct rwa_bindings *b,
     const struct rwa_buffer_bind *t, unsigned n, const unsigned g[3], const unsigned z[3], char *w, size_t ws),
     (c, b, t, n, g, z, w, ws))
+GPU_LOCKED(int, dispatch_base, (struct rwa_compute *c, const struct rwa_bindings *b, const struct rwa_buffer_bind *t,
+    unsigned n, const unsigned g[3], const unsigned z[3], const unsigned o[3], char *w, size_t ws),
+    (c, b, t, n, g, z, o, w, ws))
 GPU_LOCKED(int, argbuf_encode_buffer, (struct rwa_buffer *d, size_t o, unsigned i, struct rwa_buffer *b, size_t bo,
     char *w, size_t ws), (d, o, i, b, bo, w, ws))
 GPU_LOCKED(int, argbuf_encode_texture, (struct rwa_buffer *d, size_t o, unsigned i, struct rwa_texture *t, char *w,
@@ -1348,6 +1355,8 @@ mesa_available(void)
 	 * to load. What must not happen is answering an encoder and then binding nothing,
 	 * so -newArgumentEncoder... checks for these before it makes one. */
 	*(void **)&mesa.dispatch_buffers = dlsym(mesa.handle, "rwa_dispatch_buffers");
+	*(void **)&mesa.dispatch_base = dlsym(mesa.handle, "rwa_dispatch_base");
+	*(void **)&mesa.compute_grid_split_ok = dlsym(mesa.handle, "rwa_compute_grid_split_ok");
 	*(void **)&mesa.module_argbufs = dlsym(mesa.handle, "rwa_module_argbufs");
 	*(void **)&mesa.argbuf_encode_buffer = dlsym(mesa.handle, "rwa_argbuf_encode_buffer");
 	*(void **)&mesa.argbuf_encode_texture = dlsym(mesa.handle, "rwa_argbuf_encode_texture");
@@ -1430,6 +1439,7 @@ mesa_available(void)
 	GPU_LOCK_WRAP(sampler_destroy);
 	GPU_LOCK_WRAP(dispatch);
 	GPU_LOCK_WRAP(dispatch_buffers);
+	GPU_LOCK_WRAP(dispatch_base);   /* (compute_grid_split_ok only reads the pipeline: not wrapped) */
 	GPU_LOCK_WRAP(argbuf_encode_buffer);
 	GPU_LOCK_WRAP(argbuf_encode_texture);
 	GPU_LOCK_WRAP(argbuf_encode_sampler);
@@ -2078,6 +2088,9 @@ enum {
 	id samplers[RW_MAX_BUFFERS];
 	unsigned count, textureCount, samplerCount;
 	unsigned groups[3], size[3];
+	/* (the K40's, 11-17) a piece of a grid that does not divide into its threadgroups: its first thread
+	 * (-dispatchThreads:threadsPerThreadgroup:, rwa_dispatch_base); zero for every other dispatch */
+	unsigned gridBase[3];
 	/* (the K40's) set by -aliothRetainReferences (the command buffer's -recordWork:); keptIndirect is the indirect
 	 * buffer as retained, which outlives indirectBuffer's being cleared once it is read */
 	BOOL retainsReferences;
@@ -7124,7 +7137,12 @@ alioth_strict(void)
 		 * through rwa_dispatch, and then a kernel with a set is refused by name
 		 * there and every offset is read as zero -- which is what an older library
 		 * did with one in any case, out loud. */
-		int rc = mesa.dispatch_buffers != NULL
+		/* (the K40's, 11-17) a piece of a non-uniform grid by rwa_dispatch_base, at its first thread */
+		BOOL piece = (work->gridBase[0] | work->gridBase[1] | work->gridBase[2]) != 0;
+		int rc = piece && mesa.dispatch_base != NULL
+			    ? mesa.dispatch_base([work->pipeline compute], &bindings, table, work->count, work->groups,
+						 work->size, work->gridBase, why, sizeof(why))
+			    : mesa.dispatch_buffers != NULL
 			    ? mesa.dispatch_buffers([work->pipeline compute], &bindings,
 						    table, work->count, work->groups,
 						    work->size, why, sizeof(why))
@@ -10439,15 +10457,74 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 {
 	MTLSize groups;
 
-	if (size.width == 0 || size.height == 0 || size.depth == 0 ||
-	    threads.width % size.width != 0 || threads.height % size.height != 0 ||
-	    threads.depth % size.depth != 0) {
-		rw_print("%lux%lux%lu threads do not divide into groups of "
-		         "%lux%lux%lu, and this driver does not have the partial-group support "
-		         "that would need\n", (unsigned long)threads.width,
-		         (unsigned long)threads.height, (unsigned long)threads.depth,
-		         (unsigned long)size.width, (unsigned long)size.height,
-		         (unsigned long)size.depth);
+	if (threads.width == 0 || threads.height == 0 || threads.depth == 0) {
+		return;         /* no threads: Metal runs nothing */
+	}
+	if (size.width != 0 && size.height != 0 && size.depth != 0 &&
+	    (threads.width % size.width != 0 || threads.height % size.height != 0 || threads.depth % size.depth != 0)) {
+		/*
+		 * (the K40's, 11-17) NON-UNIFORM THREADGROUPS, which Metal gives every GPU this API runs on: the groups at
+		 * the grid's far edges are smaller. Run as a launch per region -- in each dimension the whole groups, then
+		 * one group as wide as what is left over -- up to 8 for a 3D grid, each a work of its own whose
+		 * thread_position_in_grid starts at the region's first thread (rwa_dispatch_base). Each launch's groups
+		 * are whole, so barriers see every thread of a group, and threads_per_threadgroup is the edge group's own
+		 * size, as on Apple's. Until 11-17 such a dispatch was dropped with a sentence. A kernel that reads the
+		 * grid's shape in threadgroups (threadgroup_position_in_grid, threadgroups_per_grid, threads_per_grid)
+		 * would get it wrong in a piece, and is still dropped, with why.
+		 */
+		struct rwa_compute *compute = [_pipeline respondsToSelector:@selector(compute)] ? [_pipeline compute] : NULL;
+
+		if (_pipeline == nil || mesa.dispatch_base == NULL || mesa.compute_grid_split_ok == NULL || compute == NULL ||
+		    !mesa.compute_grid_split_ok(compute)) {
+			RW_ONCE("%lux%lux%lu threads do not divide into groups of %lux%lux%lu: %s; dropped\n",
+			        (unsigned long)threads.width, (unsigned long)threads.height, (unsigned long)threads.depth,
+			        (unsigned long)size.width, (unsigned long)size.height, (unsigned long)size.depth,
+			        mesa.dispatch_base == NULL ? "the compiler library is older than non-uniform grids" :
+			        "its kernel reads threadgroup_position_in_grid, threadgroups_per_grid or threads_per_grid, "
+			        "which a piece of the grid would get wrong");
+			return;
+		}
+		const NSUInteger t[3] = { threads.width, threads.height, threads.depth };
+		const NSUInteger s[3] = { size.width, size.height, size.depth };
+		/* per dimension: [0] the whole groups (count, width, first thread), [1] the edge group */
+		NSUInteger count[3][2], width[3][2], first[3][2];
+		unsigned parts[3];
+
+		for (unsigned d = 0; d < 3; d++) {
+			NSUInteger whole = t[d] / s[d], left = t[d] % s[d];
+
+			parts[d] = 0;
+			if (whole != 0) {
+				count[d][parts[d]] = whole, width[d][parts[d]] = s[d], first[d][parts[d]] = 0, parts[d]++;
+			}
+			if (left != 0) {
+				count[d][parts[d]] = 1, width[d][parts[d]] = left, first[d][parts[d]] = whole * s[d], parts[d]++;
+			}
+		}
+		for (unsigned z = 0; z < parts[2]; z++) {
+			for (unsigned y = 0; y < parts[1]; y++) {
+				for (unsigned x = 0; x < parts[0]; x++) {
+					AliothMetalWork *work = [self aliothDispatchWork:MTLSizeMake(width[0][x], width[1][y],
+												width[2][z])];
+
+					if (work == nil) {
+						return;
+					}
+					work->groups[0] = (unsigned)count[0][x];
+					work->groups[1] = (unsigned)count[1][y];
+					work->groups[2] = (unsigned)count[2][z];
+					work->gridBase[0] = (unsigned)first[0][x];
+					work->gridBase[1] = (unsigned)first[1][y];
+					work->gridBase[2] = (unsigned)first[2][z];
+					[_commandBuffer recordWork:work];
+				}
+			}
+		}
+		return;
+	}
+	if (size.width == 0 || size.height == 0 || size.depth == 0) {
+		rw_print("a threadgroup of %lux%lux%lu threads has no threads in it; the dispatch is dropped\n",
+		         (unsigned long)size.width, (unsigned long)size.height, (unsigned long)size.depth);
 		return;
 	}
 	groups.width = threads.width / size.width;

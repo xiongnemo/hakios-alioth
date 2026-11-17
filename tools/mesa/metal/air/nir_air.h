@@ -343,6 +343,12 @@ struct air_shader_info {
    const char **notes;
 
    unsigned threadgroup_bytes; /* static threadgroup memory */
+
+   /* (the K40's, 11-17) The kernel reads threadgroup_position_in_grid, threadgroups_per_grid or threads_per_grid: the
+    * grid's shape in threadgroups, which a dispatch split into pieces (a grid that does not divide into its
+    * threadgroups: rwa_dispatch_base) would give each piece wrongly. thread_position_in_grid is right in a piece.
+    */
+   bool reads_group_grid;
 };
 
 /* The word, field by field. A runtime that holds only `sampler_state` can call

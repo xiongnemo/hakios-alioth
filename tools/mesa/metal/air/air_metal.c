@@ -454,7 +454,7 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
 }
 
 static void
-finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
+finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen, bool base_group)
 {
    /* A fragment shader's [[position]]: the frontend hands it over as a system-value
     * variable, because that is the one form both of the drivers behind this library can
@@ -491,7 +491,12 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
     * launches its grid from the origin, as Metal's own dispatch does.
     */
    static const nir_lower_compute_system_values_options cs_options = { 0 };
-   NIR_PASS(_, nir, nir_lower_compute_system_values, &cs_options);
+   /* (the K40's, 11-17) and on the GPU (not softpipe: nir_to_tgsi has no base) a kernel's load_base_workgroup_id is
+    * kept, for ir3's base_group driver param: thread_position_in_grid's thread offset (air_to_nir.c), Gallium's
+    * grid_base, which rwa_dispatch_base sets for the pieces of a grid that does not divide into its threadgroups and
+    * every other dispatch leaves zero. Nothing else reads it: the translator makes no load_global_invocation_id. */
+   static const nir_lower_compute_system_values_options cs_options_base = { .has_base_workgroup_id = true };
+   NIR_PASS(_, nir, nir_lower_compute_system_values, base_group ? &cs_options_base : &cs_options);
    /*
     * nir_lower_io_use_interpolated_input_intrinsics, and WITHOUT it every varying this
     * library drew was FLAT on the Adreno while softpipe interpolated it -- the mistake
@@ -3504,7 +3509,7 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned
     * and the dispatch path has refused a kernel that also declares threadgroup memory of its own */
    cs->info.shared_size += shared_extra;
 
-   finalize_for_gallium(cs, device->screen);
+   finalize_for_gallium(cs, device->screen, !device->software);
 
    void *cso = device->pipe->create_compute_state(device->pipe,
       &(struct pipe_compute_state){
@@ -4426,11 +4431,50 @@ rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                                why_size);
 }
 
+static int dispatch_from(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+                         const struct rwa_buffer_bind *table, unsigned table_count,
+                         const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
+                         char *why, size_t why_size);
+
 int
 rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                      const struct rwa_buffer_bind *table, unsigned table_count,
                      const unsigned groups[3], const unsigned group_size[3],
                      char *why, size_t why_size)
+{
+   return dispatch_from(compute, bindings, table, table_count, groups, group_size, NULL, why, why_size);
+}
+
+/* (the K40's, 11-17) air_metal.h */
+int
+rwa_compute_grid_split_ok(const struct rwa_compute *compute)
+{
+   return compute && !compute->device->software && !compute->info.reads_group_grid;
+}
+
+/* (the K40's, 11-17) air_metal.h */
+int
+rwa_dispatch_base(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+                  const struct rwa_buffer_bind *table, unsigned table_count,
+                  const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
+                  char *why, size_t why_size)
+{
+   if (base && (base[0] | base[1] | base[2]) && !rwa_compute_grid_split_ok(compute)) {
+      say(why, why_size, "%s cannot be run as pieces of its grid: %s",
+          compute->info.entry_point ? compute->info.entry_point : "the kernel",
+          compute->device->software ? "this library's software rasterizer keeps no grid base"
+                                    : "it reads threadgroup_position_in_grid, threadgroups_per_grid or "
+                                      "threads_per_grid, which a piece would get wrong");
+      return -1;
+   }
+   return dispatch_from(compute, bindings, table, table_count, groups, group_size, base, why, why_size);
+}
+
+static int
+dispatch_from(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+              const struct rwa_buffer_bind *table, unsigned table_count,
+              const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
+              char *why, size_t why_size)
 {
    struct rwa_device *device = compute->device;
    struct pipe_context *pipe = device->pipe;
@@ -4510,6 +4554,8 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       .work_dim = 3,
       .block = { group_size[0], group_size[1], group_size[2] },
       .grid = { groups[0], groups[1], groups[2] },
+      /* (the K40's, 11-17) a piece's first thread (rwa_dispatch_base; thread_position_in_grid adds it) */
+      .grid_base = { base ? base[0] : 0, base ? base[1] : 0, base ? base[2] : 0 },
    };
    pipe->launch_grid(pipe, &grid);
 
@@ -5870,7 +5916,7 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why
       say(why, why_size, "out of memory compiling a shader stage");
       return NULL;
    }
-   finalize_for_gallium(clone, device->screen);
+   finalize_for_gallium(clone, device->screen, false);
 
    struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };
    struct pipe_context *pipe = device->pipe;

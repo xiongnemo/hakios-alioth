@@ -871,7 +871,19 @@ load_sysval(struct air_ctx *c, enum air_sysval sv)
    case AIR_SV_SAMPLE_ID: return nir_load_sample_id(&c->b);
    case AIR_SV_SAMPLE_MASK_IN: return nir_load_sample_mask_in(&c->b);
    case AIR_SV_POINT_COORD: return nir_load_point_coord(&c->b);
-   case AIR_SV_THREAD_POS_GRID: return nir_load_global_invocation_id(&c->b, 32);
+   /*
+    * (the K40's, 11-17) The group's first thread plus the thread's place in it, plus load_base_workgroup_id read as a
+    * THREAD offset: a dispatch whose threads do not divide into its threadgroups (Metal's non-uniform threadgroups,
+    * -dispatchThreads:) is run as a launch per region -- the whole groups, then the edges with groups as wide as
+    * what is left over -- each launch's base the region's first thread (rwa_dispatch_base, Gallium's grid_base,
+    * ir3's base_group driver param). Every other dispatch has a base of zero; softpipe's lowering makes it zero too
+    * (finalize_for_gallium). Not load_global_invocation_id, whose lowering multiplies a base by the group size.
+    */
+   case AIR_SV_THREAD_POS_GRID:
+      return nir_iadd(&c->b,
+                      nir_iadd(&c->b, nir_imul(&c->b, nir_load_workgroup_id(&c->b), nir_load_workgroup_size(&c->b)),
+                               nir_load_local_invocation_id(&c->b)),
+                      nir_load_base_workgroup_id(&c->b, 32));
    case AIR_SV_THREAD_POS_TG: return nir_load_local_invocation_id(&c->b);
    case AIR_SV_TG_POS_GRID: return nir_load_workgroup_id(&c->b);
    case AIR_SV_THREADS_PER_TG: return nir_load_workgroup_size(&c->b);
@@ -1797,6 +1809,10 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       nir_def *def = load_sysval(c, sysvals[i].sv);
       if (!def)
          return air_error(c, "interface: %s", sysvals[i].key);
+      /* (the K40's, 11-17) the grid's shape in threadgroups: air_shader_info.reads_group_grid says why */
+      if (sysvals[i].sv == AIR_SV_TG_POS_GRID || sysvals[i].sv == AIR_SV_TGS_PER_GRID ||
+          sysvals[i].sv == AIR_SV_THREADS_PER_GRID)
+         c->info->reads_group_grid = true;
       c->params[param] = air_val_ssa(c, fit(c, def, t));
       return true;
    }

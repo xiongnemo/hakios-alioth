@@ -575,6 +575,23 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 			 const unsigned groups[3], const unsigned group_size[3],
 			 char *why, size_t why_size);
 
+/*
+ * (the K40's, 11-17) A PIECE OF A GRID: rwa_dispatch_buffers with `base`, the piece's first thread in each dimension,
+ * added to every thread_position_in_grid (Gallium's grid_base; NULL or zero: an ordinary dispatch). Metal's
+ * -dispatchThreads: takes a grid that does not divide into its threadgroups -- non-uniform threadgroups, the edge
+ * groups smaller -- and a driver runs it as a launch per region: the whole groups at base 0, then each edge with
+ * groups as wide as what is left over, at the region's first thread. Each launch's groups are whole, so a barrier
+ * in a kernel sees every thread of its group, and threads_per_threadgroup is the edge group's own size, as Metal's.
+ * What a piece cannot get right is the grid's shape in threadgroups (threadgroup_position_in_grid,
+ * threadgroups_per_grid, threads_per_grid): rwa_compute_grid_split_ok says 0 for a kernel that reads one, and for
+ * softpipe, which keeps no base; this refuses a non-zero base there.
+ */
+int rwa_dispatch_base(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+		      const struct rwa_buffer_bind *table, unsigned table_count,
+		      const unsigned groups[3], const unsigned group_size[3], const unsigned base[3],
+		      char *why, size_t why_size);
+int rwa_compute_grid_split_ok(const struct rwa_compute *compute);
+
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 
