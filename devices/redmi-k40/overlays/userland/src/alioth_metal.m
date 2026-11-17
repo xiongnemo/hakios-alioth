@@ -1381,7 +1381,11 @@ mesa_available(void)
 			flags[n] = '\0';
 			if (n != 0 && getenv("FD_MESA_DEBUG") == NULL) {
 				setenv("FD_MESA_DEBUG", flags, 0);
-				rw_print("metal_fd_debug=%s: freedreno's FD_MESA_DEBUG for this process (a test road)\n", flags);
+				/* (11-17) and what freedreno then says (mesa_log: "perf" is "recompiling at draw time", a stall's
+				 * reason, ...) to the console as rw_print's sentences: an application's stderr goes nowhere */
+				setenv("MESA_LOG_FILE", "/dev/console", 0);
+				rw_print("metal_fd_debug=%s: freedreno's FD_MESA_DEBUG for this process (a test road), its log to "
+				         "the console\n", flags);
 			}
 		}
 	}
