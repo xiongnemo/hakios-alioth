@@ -59,6 +59,11 @@ struct air_type {
    bool opaque;                   /* STRUCT without a body */
    bool vararg;                   /* FUNCTION */
    const char *name;              /* named STRUCT */
+   /* (the K40's, 11-17) air_layout.c's memo: the ABI alignment (0 = not worked out yet) and the allocation size
+    * (when layout_size_known) -- a GEP asked for them member by member, a sixth of a translation (callgrind) */
+   unsigned layout_align;
+   bool layout_size_known;
+   uint64_t layout_size;
 };
 
 enum air_value_kind {
@@ -273,6 +278,10 @@ struct air_module {
    const char *triple;
    const char *datalayout;
    const char *source_filename;
+   /* (the K40's, 11-17) the datalayout's i / f / v entries, parsed once (air_layout.c layout_lookup) */
+   bool layout_parsed;
+   unsigned num_layout;
+   struct air_layout_entry { char kind; unsigned bits, abi_bits; } *layout;
 
    unsigned num_types;
    struct air_type *types;

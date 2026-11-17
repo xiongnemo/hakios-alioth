@@ -16,42 +16,62 @@
 #include <string.h>
 
 #include "util/macros.h"
+#include "util/ralloc.h"
 #include "util/u_math.h"
 
-struct layout_entry {
-   char kind;           /* 'i', 'f', 'v' */
-   unsigned bits;
-   unsigned abi_bits;
-};
-
-static unsigned
-layout_lookup(const struct air_module *m, char kind, unsigned bits, bool *found)
+/* (the K40's, 11-17) the datalayout's i / f / v entries into m->layout, once a module: this used to be parsed on
+ * every lookup ("the string is short and this is not hot") -- it was a sixth of every translation (callgrind over
+ * Impeller's 65 shaders: strtoul, strchr and this loop, half a million calls), GEPs asking member by member */
+static void
+layout_parse(struct air_module *m)
 {
-   /* parsed on every call: the string is short and this is not hot */
    const char *s = m->datalayout ? m->datalayout : "";
-   unsigned best_bigger = 0, best_bigger_bits = ~0u, largest = 0, largest_bits = 0;
-   *found = false;
-   while (*s) {
+   unsigned n = 0;
+
+   for (const char *p = s; *p; p++)
+      n += *p == '-';
+   m->layout = ralloc_array(m, struct air_layout_entry, n + 1);
+   m->num_layout = 0;
+   while (*s && m->layout) {
       const char *end = strchr(s, '-');
       size_t len = end ? (size_t)(end - s) : strlen(s);
-      if (len > 1 && s[0] == kind && s[1] >= '0' && s[1] <= '9') {
+      char kind = s[0];
+      if (len > 1 && (kind == 'i' || kind == 'f' || kind == 'v') && s[1] >= '0' && s[1] <= '9') {
          char *q;
          unsigned b = strtoul(s + 1, &q, 10);
          unsigned abi = (*q == ':') ? strtoul(q + 1, NULL, 10) : b;
-         if (b == bits) {
-            *found = true;
-            return abi;
-         }
-         if (b > bits && b < best_bigger_bits) {
-            best_bigger_bits = b;
-            best_bigger = abi;
-         }
-         if (b > largest_bits) {
-            largest_bits = b;
-            largest = abi;
-         }
+         m->layout[m->num_layout++] = (struct air_layout_entry) { kind, b, abi };
       }
       s += len + (end != NULL);
+   }
+   m->layout_parsed = true;
+}
+
+static unsigned
+layout_lookup(const struct air_module *cm, char kind, unsigned bits, bool *found)
+{
+   struct air_module *m = (struct air_module *)cm;   /* the parse is a memo of the module's own string */
+   unsigned best_bigger = 0, best_bigger_bits = ~0u, largest = 0, largest_bits = 0;
+   *found = false;
+   if (!m->layout_parsed)
+      layout_parse(m);
+   for (unsigned i = 0; i < m->num_layout; i++) {
+      const struct air_layout_entry *e = &m->layout[i];
+      if (e->kind != kind)
+         continue;
+      unsigned b = e->bits, abi = e->abi_bits;
+      if (b == bits) {
+         *found = true;
+         return abi;
+      }
+      if (b > bits && b < best_bigger_bits) {
+         best_bigger_bits = b;
+         best_bigger = abi;
+      }
+      if (b > largest_bits) {
+         largest_bits = b;
+         largest = abi;
+      }
    }
    if (kind == 'i') {
       /* the smallest wider integer's, or failing that the widest */
@@ -92,8 +112,38 @@ store_size(const struct air_module *m, const struct air_type *t)
    }
 }
 
+static unsigned type_abi_align(const struct air_module *m, const struct air_type *t);
+static uint64_t type_alloc_size(const struct air_module *m, const struct air_type *t);
+
+/* (the K40's, 11-17) the two below are memos in the type (air_module.h layout_align / layout_size): a type belongs
+ * to one module and one translation, and its layout never changes once it has a body (an opaque struct is not
+ * kept) */
 unsigned
 air_type_abi_align(const struct air_module *m, const struct air_type *t)
+{
+   if (t->layout_align)
+      return t->layout_align;
+   unsigned a = type_abi_align(m, t);
+   if (a && !(t->kind == AIR_TYPE_STRUCT && t->opaque))
+      ((struct air_type *)t)->layout_align = a;
+   return a;
+}
+
+uint64_t
+air_type_alloc_size(const struct air_module *m, const struct air_type *t)
+{
+   if (t->layout_size_known)
+      return t->layout_size;
+   uint64_t size = type_alloc_size(m, t);
+   if (!(t->kind == AIR_TYPE_STRUCT && t->opaque)) {
+      ((struct air_type *)t)->layout_size = size;
+      ((struct air_type *)t)->layout_size_known = true;
+   }
+   return size;
+}
+
+static unsigned
+type_abi_align(const struct air_module *m, const struct air_type *t)
 {
    bool found;
    switch (t->kind) {
@@ -148,8 +198,8 @@ air_struct_member_offset(const struct air_module *m, const struct air_type *t, u
    return off;
 }
 
-uint64_t
-air_type_alloc_size(const struct air_module *m, const struct air_type *t)
+static uint64_t
+type_alloc_size(const struct air_module *m, const struct air_type *t)
 {
    switch (t->kind) {
    case AIR_TYPE_ARRAY:

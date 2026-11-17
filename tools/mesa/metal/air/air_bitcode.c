@@ -12,6 +12,7 @@
 
 #include "util/macros.h"
 #include "util/ralloc.h"
+#include "util/u_endian.h"
 
 enum {
    ABBREV_ID_END_BLOCK = 0,
@@ -46,6 +47,26 @@ read_fixed(struct air_bitstream *bs, unsigned width)
    if (width > 64 || bs->pos + width > bs->size_bits) {
       bs_fail(bs, "read of %u bits past the end at bit %" PRIu64, width, bs->pos);
       return 0;
+   }
+
+   /* (the K40's, 11-17) up to 57 bits are in the 8 bytes from the current one: one load and a shift, not a loop
+    * a byte at a time -- reading the bitstream was a sixth of a translation (callgrind, Impeller's shaders), the
+    * most of it here. The check above keeps every bit read inside the data; the load takes only the bytes there. */
+   if (width <= 57) {
+      size_t byte = bs->pos >> 3;
+      size_t avail = (size_t)(bs->size_bits >> 3) - byte;
+      const uint8_t *p = bs->data + byte;
+      uint64_t w = 0;
+#if UTIL_ARCH_LITTLE_ENDIAN
+      if (avail >= 8)
+         memcpy(&w, p, 8);
+      else
+#endif
+         for (size_t i = 0; i < MIN2(avail, 8); i++)
+            w |= (uint64_t)p[i] << (8 * i);
+      uint64_t v = (w >> (bs->pos & 7)) & ((1ull << width) - 1);
+      bs->pos += width;
+      return v;
    }
 
    uint64_t v = 0;

@@ -198,7 +198,21 @@ struct reader {
    struct air_inst **fn_insts;
 
    const char *pending_md_name;
+
+   /* (the K40's, 11-17) the instructions, constants and their operand arrays come from here: hundreds a module,
+    * each its own malloc and free under ralloc before -- with the frees at the end of a translation, a third of
+    * its time went to the allocator (callgrind, Impeller's shaders). None of them is ever grown, freed alone or
+    * a ralloc parent (a metadata node is one, air_md_string: those stay ralloc'd). A child of the module. */
+   linear_ctx *lin;
 };
+
+static void *
+lin_zalloc(struct reader *r, size_t size, size_t count)
+{
+   if (r->lin)
+      return linear_zalloc_child_array(r->lin, size, count);
+   return rzalloc_array_size(r->m, size, count);
+}
 
 static bool
 fail(struct reader *r, const char *fmt, ...)
@@ -416,7 +430,7 @@ truncate_to(const struct air_type *t, uint64_t v)
 static struct air_constant *
 new_constant(struct reader *r, const struct air_type *t, enum air_const_kind k)
 {
-   struct air_constant *c = rzalloc(r->m, struct air_constant);
+   struct air_constant *c = lin_zalloc(r, sizeof(struct air_constant), 1);
    c->base.kind = AIR_VALUE_CONSTANT;
    c->base.type = t;
    c->ckind = k;
@@ -428,8 +442,8 @@ static void
 expr_operands(struct reader *r, struct air_constant *c, unsigned n)
 {
    c->num_operands = n;
-   c->operands = rzalloc_array(r->m, struct air_value *, MAX2(n, 1));
-   c->pending = rzalloc_array(r->m, unsigned, MAX2(n, 1));
+   c->operands = lin_zalloc(r, sizeof(struct air_value *), MAX2(n, 1));
+   c->pending = lin_zalloc(r, sizeof(unsigned), MAX2(n, 1));
 }
 
 static bool
@@ -487,8 +501,8 @@ read_constants_block(struct reader *r)
       case CST_CODE_AGGREGATE:
          c = new_constant(r, cur, AIR_CONST_AGGREGATE);
          c->num_elems = e.num_ops;
-         c->elems = rzalloc_array(r->m, struct air_value *, MAX2(e.num_ops, 1));
-         c->pending = rzalloc_array(r->m, unsigned, MAX2(e.num_ops, 1));
+         c->elems = lin_zalloc(r, sizeof(struct air_value *), MAX2(e.num_ops, 1));
+         c->pending = lin_zalloc(r, sizeof(unsigned), MAX2(e.num_ops, 1));
          for (unsigned i = 0; i < e.num_ops; i++)
             c->pending[i] = e.ops[i];
          break;
@@ -498,7 +512,7 @@ read_constants_block(struct reader *r)
          unsigned n = e.num_ops + (e.id == CST_CODE_CSTRING);
          c = new_constant(r, cur, AIR_CONST_DATA);
          c->num_elems = n;
-         c->data = rzalloc_array(r->m, uint64_t, MAX2(n, 1));
+         c->data = lin_zalloc(r, sizeof(uint64_t), MAX2(n, 1));
          for (unsigned i = 0; i < e.num_ops; i++)
             c->data[i] = e.ops[i];
          break;
@@ -1019,13 +1033,13 @@ take_value_type(struct reader *r, struct rec *rc)
 static struct air_inst *
 new_inst(struct reader *r, enum air_opcode op, const struct air_type *type, unsigned num_operands)
 {
-   struct air_inst *in = rzalloc(r->m, struct air_inst);
+   struct air_inst *in = lin_zalloc(r, sizeof(struct air_inst), 1);
    in->base.kind = AIR_VALUE_INSTRUCTION;
    in->base.type = type;
    in->op = op;
    in->num_operands = num_operands;
-   in->operands = rzalloc_array(r->m, struct air_value *, MAX2(num_operands, 1));
-   in->operand_ids = rzalloc_array(r->m, unsigned, MAX2(num_operands, 1));
+   in->operands = lin_zalloc(r, sizeof(struct air_value *), MAX2(num_operands, 1));
+   in->operand_ids = lin_zalloc(r, sizeof(unsigned), MAX2(num_operands, 1));
    return in;
 }
 
@@ -1668,7 +1682,7 @@ read_function_block(struct reader *r)
             unsigned id = in->operand_ids[k];
             if (id >= r->num_md)
                return fail(r, "metadata argument !%u", id);
-            struct air_value *v = rzalloc(r->m, struct air_value);
+            struct air_value *v = lin_zalloc(r, sizeof(struct air_value), 1);
             v->kind = AIR_VALUE_METADATA;
             v->type = in->aux_type->members[k - 1];
             v->id = id;
@@ -1903,7 +1917,7 @@ struct air_module *
 air_module_read(void *mem_ctx, const void *data, size_t size, const char **error)
 {
    struct air_module *m = rzalloc(mem_ctx, struct air_module);
-   struct reader r = { .m = m };
+   struct reader r = { .m = m, .lin = m ? linear_context(m) : NULL };
    m->mem_ctx = m;
 
    const uint8_t *p = data;

@@ -682,13 +682,24 @@ md_int(const struct air_md *node, unsigned i, uint64_t *out)
    return air_const_uint(node->ops[i]->value, out);
 }
 
+/* (the K40's, 11-17) whether metadata operand MD is the string KEY, compared in place: md_key used to take a copy
+ * of every operand it looked at (air_md_string), ~590 allocations a translation (callgrind over Impeller's
+ * shaders) for strings it only compared. As the copy did, the string ends at its length or its first NUL. */
+static bool
+md_is(const struct air_md *md, const char *key)
+{
+   if (!md || md->kind != AIR_MD_STRING || !md->str)
+      return false;
+   size_t n = strnlen(md->str, md->len);
+   return n == strlen(key) && !memcmp(md->str, key, n);
+}
+
 /* the index of the operand after the key, or -1 */
 static int
 md_key(const struct air_md *node, const char *key)
 {
    for (unsigned i = 0; i < (node ? node->num_ops : 0); i++) {
-      const char *s = md_str(node, i);
-      if (s && !strcmp(s, key))
+      if (md_is(node->ops[i], key))
          return i;
    }
    return -1;
