@@ -40,6 +40,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+extern "C" uint32_t hakios_bl_auto_pct;                 /* bsd/dev/alioth_dsi.c: the auto-brightness in dim light, % */
 extern "C" void hakios_screen_power(bool on);           /* bsd/dev/hakios.cpufreq.c */
 extern "C" void hakios_gpu_screen(bool on);             /* iokit/Kernel/hakios.gpu.cpp: the GPU asleep while dark (gpu_sleep=1) */
 extern "C" int alioth_panel_power(bool on);             /* bsd/dev/alioth_dsi.c */
@@ -3302,6 +3303,12 @@ AppleARMBacklight::startBacklight(uint32_t initial)
 	 */
 	uint32_t nits_path = 0;
 	PE_parse_boot_argn("panel_bl_nits", &nits_path, sizeof(nits_path));
+	/* (11-18) the auto-brightness in dim light, % of Apple's target (bsd/dev/alioth_dsi.c, kern.hakios.bl_auto_pct) */
+	uint32_t auto_pct = 0;
+	if (PE_parse_boot_argn("bl_auto_pct", &auto_pct, sizeof(auto_pct)) && auto_pct >= 10 && auto_pct <= 100) {
+		hakios_bl_auto_pct = auto_pct;
+		hakios_tl("backlight: auto-brightness at %u%% of Apple's target in dim light (bl_auto_pct)\n", auto_pct);
+	}
 	if (nits_path) {
 		setProperty("new-backlight-architecture", true);
 	}
@@ -3449,6 +3456,26 @@ AppleARMBacklight::setProperties(OSObject * properties)
 	int64_t asked_nits = nits != NULL ? (int32_t) nits->unsigned32BitValue() : 0;
 
 	if (asked_nits > 0) {
+		/*
+		 * (11-18) Apple's target dimmed in dim light by kern.hakios.bl_auto_pct (alioth_dsi.c): t * (p + (1 - p) *
+		 * t / max), so a dark room gets p of it and the panel's top all of it
+		 */
+		uint32_t pct = hakios_bl_auto_pct;
+
+		if (pct < 100) {
+			uint64_t max = (uint64_t) ALIOTH_BL_NITS_MAX << 16, t = MIN((uint64_t) asked_nits, max);
+			int64_t was = asked_nits;
+
+			asked_nits = (int64_t) (t * (pct * max + (100 - pct) * t) / (100 * max));
+			if (asked_nits < 1 << 16) {
+				asked_nits = 1 << 16;           /* (a nit at least: the dimmest step is about 2) */
+			}
+			if (fLogged < 24) {
+				fLogged++;
+				hakios_tl("backlight: Apple's target %lld.%02lld nits -> %lld.%02lld (bl_auto_pct %u)\n", was >> 16,
+				    ((was & 0xffff) * 100) >> 16, asked_nits >> 16, ((asked_nits & 0xffff) * 100) >> 16, pct);
+			}
+		}
 		/*
 		 * nits in 16.16 (CoreBrightness's _SetBLDriverNitsValue): the DBV is about linear in light, the panel's
 		 * 500 at the top (the calibration above); as a level of iOS's scale, which step() squares, its root

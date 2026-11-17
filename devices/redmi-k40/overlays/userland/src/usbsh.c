@@ -550,6 +550,25 @@ execute(char *line)
 		const char *value = getenv(argv[1]);
 
 		out("%s=%s\n", argv[1], value ? value : "(not set)");
+	} else if (!strcmp(argv[0], "sysctl") && argc > 1 && strchr(argv[1], '=') != NULL) {
+		/* (11-18) sysctl NAME=VALUE: set an integer sysctl (kern.hakios.bl_auto_pct, the auto-brightness) */
+		char name[128];
+		const char *eq = strchr(argv[1], '=');
+		size_t n = (size_t)(eq - argv[1]);
+		int value = atoi(eq + 1), old = 0;
+		size_t size = sizeof(old);
+
+		if (n == 0 || n >= sizeof(name)) {
+			out("sysctl: a name, then =VALUE\n");
+		} else {
+			memcpy(name, argv[1], n);
+			name[n] = '\0';
+			if (sysctlbyname(name, &old, &size, &value, sizeof(value)) != 0) {
+				out("%s: %s\n", name, strerror(errno));
+			} else {
+				out("%s: %d -> %d\n", name, old, value);
+			}
+		}
 	} else if (!strcmp(argv[0], "sysctl") && argc > 1) {
 		/* sysctl NAME [COUNT [MS]]: an integer sysctl, COUNT times MS apart (default once) */
 		int times = argc > 2 ? atoi(argv[2]) : 1, gap = argc > 3 ? atoi(argv[3]) : 500;
