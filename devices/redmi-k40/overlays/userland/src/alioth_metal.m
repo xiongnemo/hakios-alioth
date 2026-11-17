@@ -1339,17 +1339,29 @@ mesa_available(void)
 		}
 		/* (11-17) metal_ir3_threads=N: N shader compile threads (ir3q; freedreno's own is half the processors
 		 * online, 3) -- tools/mesa/metal/ir3-compile-threads.patch, HAKIOS_IR3_THREADS; a launch's first frames
-		 * wait for that queue */
-		if ((at = strstr(args, "metal_ir3_threads=")) != NULL && getenv("HAKIOS_IR3_THREADS") == NULL) {
-			int threads = atoi(at + strlen("metal_ir3_threads="));
+		 * wait for that queue. THE DEFAULT is one fewer than the processors online (6 of 7): rounds b70/b71, every
+		 * Flutter launch cold (mesa_cache=0), 3 -> 6 threads: its 10th frame 136 / 267 / 235 -> 107 / 169 / 210 ms
+		 * after its first, the slowest frame 96 / 73 / 70 -> 77 / 61 / 48 ms, 120/s after either way.
+		 * metal_ir3_threads=3 is freedreno's own again. */
+		if (getenv("HAKIOS_IR3_THREADS") == NULL) {
+			long online = sysconf(_SC_NPROCESSORS_ONLN);
+			int threads = online > 1 ? (int)online - 1 : 1;
 
-			if (threads > 0 && threads <= 16) {
-				char value[8];
+			if ((at = strstr(args, "metal_ir3_threads=")) != NULL) {
+				int asked = atoi(at + strlen("metal_ir3_threads="));
 
-				snprintf(value, sizeof(value), "%d", threads);
-				setenv("HAKIOS_IR3_THREADS", value, 0);
-				rw_print("metal_ir3_threads=%d: %d shader compile threads\n", threads, threads);
+				if (asked > 0 && asked <= 16) {
+					threads = asked;
+					rw_print("metal_ir3_threads=%d: %d shader compile threads\n", asked, asked);
+				}
 			}
+			if (threads > 16) {
+				threads = 16;
+			}
+			char value[8];
+
+			snprintf(value, sizeof(value), "%d", threads);
+			setenv("HAKIOS_IR3_THREADS", value, 0);
 		}
 		/* (11-16) metal_fd_vsc=DRAW,PRIM: freedreno's visibility streams' starting sizes a pipe (fd6_context.cc,
 		 * HAKIOS_FD_VSC; tools/mesa/metal/fd6-msrtt-trace.patch) -- a test road */
