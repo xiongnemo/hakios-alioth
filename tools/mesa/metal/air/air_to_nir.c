@@ -3091,7 +3091,7 @@ val_holds_ptr(const struct air_val *v)
  */
 static nir_function *
 translate_callee(struct air_ctx *c, const struct air_function *f,
-                 struct air_val **argv, bool *is_param)
+                 struct air_val **argv, bool *is_param, bool *off_param)
 {
    /* A texture, sampler or buffer argument is not a value in this frontend: it
     * is resolved at translation time into a binding, and tex_handle wants an
@@ -3100,9 +3100,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     * callee to its call site -- so it is not cached. Each of the four modules
     * that needs this has exactly one call site, counted beforehand.
     *
-    * A pointer carrying a byte offset is refused instead: that offset is an
-    * nir_def of the CALLER's impl, and using it here would be the same
-    * cross-function def/use that the globals used to cause.
+    * A pointer carrying a byte offset: that offset is an nir_def of the CALLER's
+    * impl, and using it here would be the same cross-function def/use that the
+    * globals used to cause. (The K40's, 11-17:) so the offset is passed as a
+    * parameter of its own (off_param, after the others), and the callee's
+    * pointer is the caller's resolution at that parameter -- 145 entry points of
+    * the iOS 16.5 image were refused here (ACT, CMImaging, MLCompute, Video-
+    * Processing...). A caller passing no off_param gets the old refusal.
     */
    bool specialised = false;
    for (unsigned i = 0; i < f->num_args; i++) {
@@ -3115,11 +3119,14 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
        */
       bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
                                      val_holds_ptr(argv[i]));
-      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
+      bool off = ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset;
+      if (off && !off_param) {
          air_error(c, "intrinsic: a call passing a pointer at a computed offset as "
                       "argument %u, which would use the caller's own value here", i);
          return NULL;
       }
+      if (off_param)
+         off_param[i] = off;
       /* The same reason, for the two pointers that are values: a chosen
        * pointer's condition is a def of the CALLER's impl, and a slot's
        * soundness rests on every use being in one block of one function.
@@ -3197,7 +3204,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          .bit_size = (uint8_t)air_nir_bit_size(c, at),
       };
    }
-   fn->num_params = idx;   /* the pointers took no parameter */
+   /* (the K40's, 11-17) and the byte offsets of the pointers that have one: 32-bit, as air_ptr.offset is */
+   unsigned off_first = idx;
+   for (unsigned i = 0; off_param && i < f->num_args; i++) {
+      if (off_param[i])
+         fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };
+   }
+   fn->num_params = idx;   /* the pointers took no parameter (their offsets did) */
 
    /* cached before the body is translated, so that a callee which calls itself
     * meets its own declaration rather than being translated for ever */
@@ -3259,8 +3272,15 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       c->ret_deref = nir_build_deref_cast(&c->b, nir_load_param(&c->b, 0),
                                           nir_var_function_temp, ret_glsl, 0);
    }
-   unsigned pidx = nret;
+   unsigned pidx = nret, oidx = off_first;
    for (unsigned i = 0; i < f->num_args && ok; i++) {
+      if (!is_param[i] && off_param && off_param[i]) {
+         /* (the K40's, 11-17) the caller's resolution at the offset it passed */
+         struct air_ptr p = argv[i]->ptr;
+         p.offset = nir_load_param(&c->b, oidx++);
+         air_set(c, &f->args[i], air_val_ptr(c, p));
+         continue;
+      }
       if (!is_param[i]) {
          air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
          continue;
@@ -3316,13 +3336,14 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *,
                                          MAX2(f->num_args, 1));
    bool *is_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
+   bool *off_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
    for (unsigned i = 0; i < f->num_args; i++) {
       argv[i] = air_get(c, in->operands[i + 1]);
       if (!argv[i])
          return false;
    }
 
-   nir_function *fn = translate_callee(c, f, argv, is_param);
+   nir_function *fn = translate_callee(c, f, argv, is_param, off_param);
    if (!fn)
       return false;   /* translate_callee has said why */
 
@@ -3364,6 +3385,10 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
                           i, name);
       call->params[idx++] = nir_src_for_ssa(a);
    }
+   /* (the K40's, 11-17) then the offsets of the pointers passed at one, in translate_callee's order */
+   for (unsigned i = 0; i < f->num_args; i++)
+      if (off_param[i])
+         call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
    nir_builder_instr_insert(&c->b, &call->instr);
 
    if (ret_struct) {
@@ -3527,7 +3552,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
                re->kind != AIR_TYPE_INT))
       return air_error(c, "library: the return value is neither a scalar nor a vector");
 
-   nir_function *fn = translate_callee(c, f, argv, is_param);
+   nir_function *fn = translate_callee(c, f, argv, is_param, NULL);
    if (!fn)
       return false;   /* translate_callee has said why */
 
@@ -4017,7 +4042,7 @@ run_static_initializers(struct air_ctx *c)
           * also why this could not be reached before the reader learnt to read
           * one.
           */
-         nir_function *fn = translate_callee(c, f, NULL, NULL);
+         nir_function *fn = translate_callee(c, f, NULL, NULL, NULL);
          if (!fn)
             return;   /* translate_callee has said why */
          nir_builder_instr_insert(&c->b, &nir_call_instr_create(c->nir, fn)->instr);
