@@ -3996,7 +3996,9 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
 
       case AIR_RESOURCE_TEXTURE:
       case AIR_RESOURCE_IMAGE: {
-         bool stored = r->kind == AIR_RESOURCE_IMAGE;
+         /* (11-18) an image the shader writes; a read-only one (a texturecube<T, access::read>, air_to_nir.c) is
+          * bound as an image and asks only for ShaderRead -- round b104's metal.cube.read was refused here */
+         bool stored = r->kind == AIR_RESOURCE_IMAGE && r->write;
          if (r->index >= RWA_MAX_TEXTURES) {
             say(why, why_size, "%s binds a texture at index %u, past the %u slots this "
                                "library fills", name, r->index, RWA_MAX_TEXTURES);
@@ -5049,7 +5051,8 @@ rwa_module_textures(struct rwa_device *device, const void *bitcode, size_t size,
        */
       if (slots[i].sampled || slots[i].read)
          d->usage |= RWA_USAGE_SHADER_READ;
-      if (slots[i].stored || slots[i].write)
+      /* (11-18: write, not stored -- a read-only image is stored, as an image view, and not written) */
+      if (slots[i].write)
          d->usage |= RWA_USAGE_SHADER_WRITE;
 
       if (slots[i].shape_known)
@@ -8911,7 +8914,8 @@ reflect_arguments(const struct air_shader_info *info, void *mem_ctx, struct rwa_
       case AIR_RESOURCE_TEXTURE:
       case AIR_RESOURCE_IMAGE:
          a->kind = RWA_ARGUMENT_TEXTURE;
-         a->access = r->kind == AIR_RESOURCE_IMAGE ? (r->read ? 1 : 2) : 0;
+         /* (11-18) a read-only image (a cube the kernel reads) is MTLArgumentAccessReadOnly, as a texture is */
+         a->access = r->kind == AIR_RESOURCE_IMAGE && r->write ? (r->read ? 1 : 2) : 0;
          a->type_known = reflect_texture_name(r->type_name, &a->texture_type, &a->element,
                                               &a->element_bits, &a->is_depth);
          break;
