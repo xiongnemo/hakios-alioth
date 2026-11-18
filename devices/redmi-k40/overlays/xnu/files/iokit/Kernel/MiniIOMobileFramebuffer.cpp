@@ -3227,10 +3227,18 @@ extern "C" bool hakios_board_is_alioth(void);
  * still blinding at night in a lit room, the owner said.
  */
 #define ALIOTH_BL_INIT          400
-#define ALIOTH_BL_STEP_MS       33
+/*
+ * (11-19) a fade's step: a frame at 120 Hz (33 until 11-18: a fast brightening went up in jumps of a few DBV). The
+ * panel is written only when the DBV changes (apply()), so a slow ramp costs no more DSI commands than before.
+ */
+#define ALIOTH_BL_STEP_MS       8
 #define ALIOTH_BL_NITS_MAX      500             /* (the K11A's light at DBV 0x7ff, outside its high-brightness mode) */
 #define ALIOTH_BL_NITS_MIN      2               /* (its dimmest step, about; CoreBrightness's lMinPanel / lMinProduct) */
-#define ALIOTH_BL_FADE_MAX_MS   5000
+/*
+ * (11-19) 5000 until 11-18, which squeezed CoreBrightness's slow ramps: it dims over 6-39 s ("2.0 nits over 38.9 s")
+ * and brightens over 2.5-4 s, logs of 10-31 .. 11-01. A minute now: its own times.
+ */
+#define ALIOTH_BL_FADE_MAX_MS   60000
 
 class AppleARMBacklight : public IOService
 {
@@ -3239,7 +3247,8 @@ class AppleARMBacklight : public IOService
 	IOWorkLoop *            fWL;
 	IOTimerEventSource *    fTimer;
 	IOSimpleLock *          fState;         /* the requests below */
-	uint32_t                fTarget, fFadeFrom, fLastLit;
+	uint32_t                fTarget;        /* iOS's level (published) */
+	uint32_t                fTargetDbv, fFadeFromDbv, fLastLitDbv; /* (11-19) the panel's: a fade runs in these */
 	uint64_t                fFadeStart, fFadePeriod;
 	bool                    fDisplayOn, fPowerEdge;
 	uint32_t                fLogged;
@@ -3252,6 +3261,7 @@ class AppleARMBacklight : public IOService
 	void step(void);
 	void apply(uint32_t level, bool final);
 	void publish(uint32_t level);
+	uint32_t dbvOf(uint32_t level);
 
 public:
 	bool                    fCurve;
@@ -3265,6 +3275,70 @@ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
 
 static AppleARMBacklight * gBacklight;
 static int64_t gLastAutoNits;                           /* (11-18) hakios_bl_auto_reapply()'s: 16.16 nits, 0 none */
+
+/*
+ * iOS's level to the panel's DBV: squared (boot-arg panel_bl_curve=1: as it is). The data volume is new at every
+ * boot, so iOS starts at its default, half way (1055): linear that was too bright in a dark room; squared it is a
+ * quarter of the panel's light, and the slider's lower half has finer steps. Never 0 (the display is on: never dark).
+ */
+uint32_t
+AppleARMBacklight::dbvOf(uint32_t level)
+{
+	uint32_t dbv = fCurve ? (uint32_t) ((uint64_t) level * level / ALIOTH_BL_MAX) : level;
+
+	return dbv == 0 ? 1 : MIN(dbv, (uint32_t) ALIOTH_BL_MAX);
+}
+
+/* log2 of x (1 .. 2^20), 16.16 */
+static uint32_t
+bl_log2(uint32_t x)
+{
+	uint32_t msb = 31 - (uint32_t) __builtin_clz(x), r = msb << 16;
+	uint64_t y = ((uint64_t) x << 30) >> msb;       /* x / 2^msb in 2.30: [1, 2) */
+
+	for (uint32_t bit = 1u << 15; bit != 0; bit >>= 1) {
+		y = (y * y) >> 30;
+		if (y >= 2ULL << 30) {
+			y >>= 1;
+			r |= bit;
+		}
+	}
+	return r;
+}
+
+/*
+ * (11-19, the owner: "can the auto-brightness change more smoothly?") A fade's DBV at t of period, in even steps of
+ * the light's logarithm -- the eye's terms: every step the same share brighter or darker. Until 11-18 a fade ran in
+ * even steps of iOS's level (the DBV's square root): in a dark room the first steps of a brightening were +11% of
+ * the light each at 30 a second, the top of a ramp crept. The DBV nearest to the even point.
+ */
+static uint32_t
+bl_fade(uint32_t from, uint32_t to, uint64_t t, uint64_t period)
+{
+	from = from < 1 ? 1 : MIN(from, (uint32_t) ALIOTH_BL_MAX);
+	to = to < 1 ? 1 : MIN(to, (uint32_t) ALIOTH_BL_MAX);
+	if (period == 0 || t >= period || from == to) {
+		return to;
+	}
+	int64_t lf = bl_log2(from), lt = bl_log2(to);
+	/* (|lt - lf| < 2^20, t < a minute of ticks < 2^31: the product fits) */
+	int64_t want = lf + (lt - lf) * (int64_t) t / (int64_t) period;
+	uint32_t lo = MIN(from, to), hi = MAX(from, to), top = hi;
+
+	while (lo < hi) {                       /* the largest DBV whose log2 is at most want */
+		uint32_t mid = (lo + hi + 1) / 2;
+
+		if ((int64_t) bl_log2(mid) <= want) {
+			lo = mid;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	if (lo < top && (int64_t) bl_log2(lo + 1) - want < want - (int64_t) bl_log2(lo)) {
+		lo++;
+	}
+	return lo;
+}
 
 void
 AppleARMBacklight::publish(uint32_t level)
@@ -3295,7 +3369,8 @@ AppleARMBacklight::startBacklight(uint32_t initial)
 		return false;
 	}
 	fDisplayOn = true;
-	fTarget = fLastLit = fFadeFrom = initial;
+	fTarget = initial;
+	fTargetDbv = fLastLitDbv = fFadeFromDbv = dbvOf(initial);
 	setProperty("backlight-control", true);
 	/*
 	 * The legacy path: CoreBrightness sends the slider's level ("brightness"). Its auto-brightness ramps, in nits,
@@ -3389,7 +3464,7 @@ AppleARMBacklight::step(void)
 	uint64_t now = mach_absolute_time();
 	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
 	bool on = fDisplayOn, edge = fPowerEdge;
-	uint32_t to = fTarget, from = fFadeFrom, lit = fLastLit;
+	uint32_t to = fTargetDbv, from = fFadeFromDbv, lit = fLastLitDbv;
 	uint64_t t = now - fFadeStart, period = fFadePeriod;
 
 	fPowerEdge = false;
@@ -3402,25 +3477,17 @@ AppleARMBacklight::step(void)
 		}
 		return;
 	}
-	uint32_t level = to;
+	uint32_t level = to;                    /* (the panel's DBV, dbvOf() above) */
 	bool more = false;
 
 	if (period != 0 && t < period) {
-		level = (uint32_t)((int64_t)from + ((int64_t)to - (int64_t)from) * (int64_t)t / (int64_t)period);
+		level = bl_fade(from, to, t, period);
 		more = true;
 	}
 	if (edge) {
 		level = to != 0 ? to : lit;     /* the level from before the display went off, until iOS sets one */
 		more = false;
 		hakios_tl("backlight: the display on: panel DBV %u\n", level);
-	}
-	/*
-	 * iOS's level to the panel's: squared (boot-arg panel_bl_curve=1: as it is). The data volume is new at
-	 * every boot, so iOS starts at its default, half way (1055): linear that was too bright in a dark
-	 * room; squared it is a quarter of the panel's light, and the slider's lower half has finer steps.
-	 */
-	if (level != 0 && fCurve) {
-		level = (uint32_t)((uint64_t)level * level / ALIOTH_BL_MAX);
 	}
 	level = level == 0 ? 1 : level;         /* (the display is on: never dark) */
 	apply(level, !more);
@@ -3456,7 +3523,7 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		hakios_tl("backlight: %s sets %u keys: brightness %d FadePeriod %#x brightness-nits %#x\n", name, d->getCount(),
 		    b ? (int) b->unsigned32BitValue() : -1, f ? f->unsigned32BitValue() : 0, nits ? nits->unsigned32BitValue() : 0);
 	}
-	uint32_t to;
+	uint32_t to, to_dbv;                    /* iOS's level, the panel's DBV */
 	int64_t asked_nits = nits != NULL ? (int32_t) nits->unsigned32BitValue() : 0;
 
 	/* (11-18) for hakios_bl_auto_reapply(): the last auto-brightness target, or 0 once the slider set a level */
@@ -3498,11 +3565,13 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		hakios_bl_auto_given = (uint32_t) MIN(((uint64_t) asked_nits * 100) >> 16, (uint64_t) UINT32_MAX);
 		/*
 		 * nits in 16.16 (CoreBrightness's _SetBLDriverNitsValue): the DBV is about linear in light, the panel's
-		 * 500 at the top (the calibration above); as a level of iOS's scale, which step() squares, its root
+		 * 500 at the top (the calibration above); the panel is given that DBV (11-19: as it is, not by way of
+		 * iOS's level), and iOS's level, published, is its root where the levels are squared (dbvOf())
 		 */
 		uint64_t dbv = MIN((uint64_t) asked_nits * ALIOTH_BL_MAX / ((uint64_t) ALIOTH_BL_NITS_MAX << 16), (uint64_t) ALIOTH_BL_MAX);
 		uint64_t root = 0;
 
+		to_dbv = dbv == 0 ? 1 : (uint32_t) dbv;
 		if (fCurve) {
 			for (uint64_t bit = 1ULL << 22; bit != 0; bit >>= 1) {
 				if ((root + bit) * (root + bit) <= dbv * ALIOTH_BL_MAX) {
@@ -3520,6 +3589,7 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		}
 		/* (the slider's bottom is the dimmest light, not none: 0 is for the display going off) */
 		to = v < 1 ? 1 : MIN((uint32_t) v, (uint32_t) ALIOTH_BL_MAX);
+		to_dbv = dbvOf(to);
 	} else {
 		return kIOReturnSuccess;
 	}
@@ -3527,18 +3597,19 @@ AppleARMBacklight::setProperties(OSObject * properties)
 
 	nanoseconds_to_absolutetime(MIN(ms, (uint64_t) ALIOTH_BL_FADE_MAX_MS) * NSEC_PER_MSEC, &period);
 	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
-	uint32_t cur = fTarget;
+	uint32_t cur = fTargetDbv;
 
 	if (fFadePeriod != 0 && now - fFadeStart < fFadePeriod) {
-		cur = (uint32_t)((int64_t)fFadeFrom + ((int64_t)fTarget - (int64_t)fFadeFrom) * (int64_t)(now - fFadeStart) /
-		    (int64_t)fFadePeriod);
+		/* (a fade under way: the new one starts where the panel is now; bl_fade is about 200 multiplications) */
+		cur = bl_fade(fFadeFromDbv, fTargetDbv, now - fFadeStart, fFadePeriod);
 	}
-	fFadeFrom = cur;
+	fFadeFromDbv = cur;
 	fTarget = to;
+	fTargetDbv = to_dbv;
 	fFadeStart = now;
 	fFadePeriod = period;
 	if (to != 0 && fDisplayOn) {
-		fLastLit = to;
+		fLastLitDbv = to_dbv;
 	}
 	IOSimpleLockUnlockEnableInterrupt(fState, is);
 	publish(to);

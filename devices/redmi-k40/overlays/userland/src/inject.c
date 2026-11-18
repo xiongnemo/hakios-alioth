@@ -776,7 +776,7 @@ extern char *os_log_copy_message_string(void *message);
  * ("new-backlight-architecture") waits for display hardware this phone has not, and the screen stopped drawing.
  * So that message, which CoreBrightness says at the default level whenever an ALS ramp begins, is taken at its
  * word: the target goes to the backlight in nits ("brightness-nits", 16.16, which the kernel's AppleARMBacklight
- * maps on its calibration), faded over the ramp's time (the kernel caps a fade at 5 s).
+ * maps on its calibration), faded over the ramp's time (the kernel caps a fade at a minute; 5 s until 11-18).
  */
 static io_service_t cb_backlight;
 /* (the SDK marks it unavailable on iOS; IOKit has it, and CoreBrightness sets the backlight with it) */
@@ -787,7 +787,8 @@ static void
 ramp_to(double nits, double seconds)
 {
 	static unsigned said;
-	int32_t value = (int32_t)(nits * 65536.0), fade = (int32_t)((seconds > 5.0 ? 5.0 : seconds < 0.0 ? 0.0 : seconds) * 65536.0);
+	/* (11-19) its own ramp time up to a minute -- 5 s until 11-18 squeezed its slow dimming (6-39 s) */
+	int32_t value = (int32_t)(nits * 65536.0), fade = (int32_t)((seconds > 60.0 ? 60.0 : seconds < 0.0 ? 0.0 : seconds) * 65536.0);
 	CFNumberRef value_number, fade_number;
 	CFMutableDictionaryRef properties;
 	kern_return_t kr;
