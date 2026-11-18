@@ -222,6 +222,8 @@ static struct {
 	uint32_t gpuonly_skips;                 /* (11-19) interval pushes left out for surfaces said GPU-only (gpu_push_gpuonly) */
 	uint64_t gpuonly_bytes;
 	uint32_t wrapped;                       /* (11-19) surfaces around a program's memory made GPU buffers (gpu_wrap=1) */
+	uint32_t scan_held, scan_gave_up;       /* (11-19, fb_swap_async) submissions held for the surface on the panel */
+	uint64_t scan_holding;                  /* ... and for how long together (processor's clock) */
 } gGPUStat;
 static uint64_t gIrqSeen, gIrqEmptySeen;        /* (11-19) the interrupt's counts at the last 5-s line */
 static TUNABLE(uint32_t, gInvalScan, "gpu_inval_scan", 0);
@@ -247,6 +249,30 @@ static TUNABLE(uint32_t, gWrapImport, "gpu_wrap", 0);
  * much later at most. 0: gpu_push_ms's.
  */
 static TUNABLE(uint32_t, gWrapAgainMs, "gpu_wrap_ms", 0);
+
+/*
+ * (11-19) fb_swap_async=1 (MiniIOMobileFramebuffer.cpp): CoreAnimation is back from SwapEnd before the GPU has drawn its
+ * frame, and may have the next one drawn into the surface still on the panel (it draws into two or three in turn). So
+ * while a newer frame is on its way there, the display's driver names the surface on the panel here (0: none), and a
+ * submission that names it waits in submit() until that is over -- the newer frame's flip taken -- SCAN_GUARD_MS at most.
+ * (freedreno names every buffer for reading and writing alike: a submission that only reads it waits too; none should:
+ * a frame reads the one before it, not the one before that.)
+ */
+#define SCAN_GUARD_MS           20
+static uint32_t gScanGuard;
+static IOLock * gScanGuardLock;
+
+extern "C" void
+hakios_gpu_scan_guard(uint32_t sid)
+{
+	if (gScanGuardLock == NULL || __atomic_load_n(&gScanGuard, __ATOMIC_RELAXED) == sid) {
+		return;
+	}
+	IOLockLock(gScanGuardLock);
+	__atomic_store_n(&gScanGuard, sid, __ATOMIC_RELEASE);
+	IOLockWakeup(gScanGuardLock, &gScanGuard, false);
+	IOLockUnlock(gScanGuardLock);
+}
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -507,6 +533,7 @@ HakiosGPUStart(void)
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	gGPULock = IOLockAlloc();
+	gScanGuardLock = IOLockAlloc();
 	uint32_t sleepWanted = 0;
 	if (gGPULock != NULL && PE_parse_boot_argn("gpu_sleep", &sleepWanted, sizeof(sleepWanted)) && sleepWanted != 0) {
 		gGPUSleepCall = thread_call_allocate_with_options(gpuSleepWork, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
@@ -1284,6 +1311,42 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		ret = kIOReturnNotResponding;
 		goto out;
 	}
+	if (__atomic_load_n(&gScanGuard, __ATOMIC_ACQUIRE) != 0) {
+		/* (fb_swap_async) not into the surface on the panel while a newer frame is on its way: see gScanGuard */
+		uint32_t guard = __atomic_load_n(&gScanGuard, __ATOMIC_ACQUIRE);
+		bool names = false;
+
+		for (uint32_t i = 0; guard != 0 && !names && i < request->nr_bos; i++) {
+			struct gpu_buffer * b = buffer(bos[i].handle);
+
+			names = b != NULL && b->surface != NULL && b->surface->sid == guard;
+		}
+		if (names) {
+			uint64_t held = mach_absolute_time();
+			AbsoluteTime until;
+			bool gaveUp = false;
+
+			IOLockUnlock(gGPULock);
+			clock_interval_to_deadline(SCAN_GUARD_MS, kMillisecondScale, &until);
+			IOLockLock(gScanGuardLock);
+			while (__atomic_load_n(&gScanGuard, __ATOMIC_ACQUIRE) == guard) {
+				if (IOLockSleepDeadline(gScanGuardLock, &gScanGuard, until, THREAD_UNINT) == THREAD_TIMED_OUT) {
+					gaveUp = __atomic_load_n(&gScanGuard, __ATOMIC_ACQUIRE) == guard;
+					break;
+				}
+			}
+			IOLockUnlock(gScanGuardLock);
+			IOLockLock(gGPULock);
+			gGPUStat.scan_held++;
+			gGPUStat.scan_gave_up += gaveUp;
+			gGPUStat.scan_holding += mach_absolute_time() - held;
+			if (hakios_gpu_space_faulted(fSpace)) {
+				IOLockUnlock(gGPULock);
+				ret = kIOReturnNotResponding;
+				goto out;
+			}
+		}
+	}
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
@@ -1458,6 +1521,14 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.push_n[0], gGPUStat.push_bytes[0] >> 20, gGPUStat.push_n[1], gGPUStat.push_bytes[1] >> 20, gPushAgainMs,
 		    gGPUStat.push_n[3], gGPUStat.push_bytes[3] >> 20, gGPUStat.push_n[2], gGPUStat.push_bytes[2] >> 20,
 		    gGPUStat.gpuonly_skips, gGPUStat.gpuonly_bytes >> 20, gGPUStat.wrapped);
+		if (gGPUStat.scan_held != 0) {
+			uint64_t holding;
+
+			absolutetime_to_nanoseconds(gGPUStat.scan_holding, &holding);
+			IOLog("HakiosGPU: %u submissions waited for the surface on the panel to be replaced (fb_swap_async), %llu us "
+			    "each; %u gave up after %u ms\n", gGPUStat.scan_held, holding / NSEC_PER_USEC / gGPUStat.scan_held,
+			    gGPUStat.scan_gave_up, SCAN_GUARD_MS);
+		}
 		IOLog("HakiosGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "

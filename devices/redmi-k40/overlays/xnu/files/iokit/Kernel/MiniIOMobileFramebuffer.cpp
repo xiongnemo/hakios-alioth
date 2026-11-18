@@ -77,6 +77,7 @@ extern "C" uint32_t alioth_panel_line(void);
 extern "C" void alioth_pcc_set(const int32_t m[3][3], const int32_t c[3], int on);
 extern "C" void alioth_pcc_test(unsigned mode);
 extern "C" void hakios_gpu_to_memory(void * start, uint64_t size);
+extern "C" void hakios_gpu_scan_guard(uint32_t sid);    /* iokit/Kernel/hakios.gpu.cpp: fb_swap_async's guard (0: none) */
 extern "C" uint64_t gPhysBase, gPhysSize;       /* (osfmk/arm: the physical memory XNU has) */
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
@@ -353,6 +354,13 @@ public:
 	void aliothMoreSlots(void);
 	bool aliothSlotSeen(uint64_t phys, uint8_t * pixels);
 	MiniIOSurface * directSurface(const uint8_t * swap, MiniIOSurface ** surfaces);
+	bool likelyDirect(const uint8_t * swap, MiniIOSurface ** surfaces);
+	/* (11-19, fb_swap_async=1) the surface on the panel and the swap it came in (0: none, or the frame was copied); which
+	 * queued swaps' bottom surface was marked in use at SwapEnd (dropped once its flip is issued); how many were over at
+	 * once / still waited for */
+	uint32_t        fPanelSid, fPanelSwap;
+	bool            fAsyncMarked[SWAP_QUEUE];
+	uint32_t        fStatAsync, fStatAsyncNot;
 	bool topHides(const uint8_t * swap, MiniIOSurface * s);
 	uint32_t        fStatHidden;            /* frames whose layers under a whole-display opaque layer 0 were left out */
 	uint32_t        fNoDirectUntil;         /* (the K40's) no direct scan-out before this many frames shown (show()) */
@@ -898,6 +906,24 @@ IOMobileFramebuffer::directSurface(const uint8_t * swap, MiniIOSurface ** surfac
 	return s;
 }
 
+/* (fb_swap_async, at SwapEnd) a frame show() will scan out of its own surface, CoreAnimation's alone: one layer of the
+ * display's size in a surface with a slot (directSurface()'s test without its count; an application's layers stay out) */
+bool
+IOMobileFramebuffer::likelyDirect(const uint8_t * swap, MiniIOSurface ** surfaces)
+{
+	MiniIOSurface * s = surfaces[0];
+
+	if (!fDirect || fRecBase != NULL || fDiff || s == NULL || s->scanPhys == 0 || !wholeDisplay(swap, s, fWidth, fHeight)) {
+		return false;
+	}
+	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
+		if (swapWord(swap, SWAP_SURFACE(layer)) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /*
  * fb_swap_early (default 2 since 2026-11-07: measured, CoreAnimation does draw the next frame into the surface shown
  * until the TE -- every frame came in it, logs/231648-fpsq2e2b.log -- but the owner, scrolling and flicking pages, saw no
@@ -955,6 +981,20 @@ static TUNABLE(uint32_t, gPresentNow, "fb_present_now", 2);
 static TUNABLE(uint32_t, gSwapWaitTruth, "fb_swap_wait", 0);
 static uint32_t gSwapDoneID, gSwapMadeID;      /* the newest swap done, the newest made (SwapEnd) */
 static uint32_t gStatSwapWaitBusy, gStatSwapWaitAsked;
+
+/*
+ * fb_swap_async=1 (2026-11-19; 0 the default until the owner has looked at it): CoreAnimation's own frames (one layer of
+ * the display's size, in a surface with a scan-out slot) are over in SwapEnd once they are queued here, not once the GPU
+ * has drawn them and their flip is issued. Measured before (census c16, Control Center): its display thread waited in
+ * SwapEnd 38% of the time -- 3.7 ms a frame for the GPU, which drew each frame in 6 ms (median; p90 9) -- so that its
+ * ~4.5 ms of processor and the GPU's 6 ms came one after the other: 11 ms, every other refresh, 56 fps, 55-65% of the
+ * swaps a refresh late. Over at once, CoreAnimation prepares the next frame while the GPU draws this one.
+ * What then keeps it from drawing into the surface on the panel (it draws into two or three in turn): while a newer
+ * frame is on its way, the GPU's driver holds any submission that names the surface on the panel until that frame's
+ * flip is taken (hakios.gpu.cpp, hakios_gpu_scan_guard(); 20 ms at most). The queued frame's surface reads as in use
+ * (IOSurfaceIsInUse) from SwapEnd on, as one on the panel does.
+ */
+static TUNABLE(uint32_t, gSwapAsync, "fb_swap_async", 0);
 
 static void
 swapDone(uint32_t id)
@@ -1756,11 +1796,28 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	fSwapsWaiting++;
 	uint64_t ticket = ++fNextTicket;
 	IOLockWakeup(fSwapLock, fSwap, true);
+	/*
+	 * fb_swap_async: CoreAnimation's own frame is over now (gSwapAsync), its surface in use until the presenter is done
+	 * with it; and the surface on the panel is not to be drawn into until this frame's flip is taken (the presenter gives
+	 * the guard up then, show()). (The presenter takes this slot only once the lock is let go: fAsyncMarked is set first.)
+	 */
+	bool async = gSwapAsync != 0 && likelyDirect(fSwap[slot], fSwapSurfaces[slot]);
+
+	fAsyncMarked[slot] = async;
+	if (async) {
+		MiniIOSurfaceUse(fSwapSurfaces[slot][0], 1);
+		fStatAsync++;
+	} else if (gSwapAsync != 0) {
+		fStatAsyncNot++;
+	}
+	if (gSwapAsync != 0 && fPanelSid != 0 && fPanelSid != swapWord(fSwap[slot], SWAP_SURFACE(0))) {
+		hakios_gpu_scan_guard(fPanelSid);
+	}
 	/* A source surface must not be handed back to CoreAnimation while the CPU
 	 * is still scaling it into the command-mode staging buffer. Once staged,
 	 * the panel wait no longer needs the source and can overlap the next render.
 	 */
-	while (fComposeBase != NULL && fCompletedTicket < ticket) {
+	while (!async && fComposeBase != NULL && fCompletedTicket < ticket) {
 		if (IOLockSleepDeadline(fSwapLock, &fCompletedTicket, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
 		    fCompletedTicket < ticket) {
 			hakios_tl("display: staged swap completion timed out\n");
@@ -1801,8 +1858,14 @@ IOMobileFramebuffer::presenter(void)
 		}
 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
+		bool marked = fAsyncMarked[fSwapFirst];         /* (fb_swap_async: in use since SwapEnd) */
+
+		fAsyncMarked[fSwapFirst] = false;
 		IOLockUnlock(fSwapLock);
 		show(swap, surfaces);
+		if (marked) {
+			MiniIOSurfaceUse(surfaces[0], -1);      /* (on the panel now, in use as such: show()) */
+		}
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 			if (surfaces[layer] != NULL) {
 				MiniIOSurfaceDrop(surfaces[layer]);
@@ -2009,6 +2072,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		fDirectHeld = held;
 		fDirectHeldID = swapWord(swap, SWAP_ID);
+		if (gSwapAsync != 0) {
+			/* (fb_swap_async) this frame is on the panel: its surface is the one guarded, if a newer frame has come since */
+			IOLockLock(fSwapLock);
+			fPanelSid = direct->sid;
+			fPanelSwap = fDirectHeldID;
+			hakios_gpu_scan_guard(__atomic_load_n(&gSwapMadeID, __ATOMIC_ACQUIRE) != fPanelSwap ? fPanelSid : 0);
+			IOLockUnlock(fSwapLock);
+		}
 		/* the frames' surfaces, here too: how many CoreAnimation turns (fb_swap_wait) */
 		for (unsigned i = 0; i < 8; i++) {
 			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == direct->sid) {
@@ -2023,6 +2094,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatDirect++;
 		bzero(fJobChunks, sizeof(fJobChunks));
 		bzero(fJobStartUs, sizeof(fJobStartUs));
+	}
+	if (gSwapAsync != 0 && direct == NULL && fPanelSid != 0) {
+		/* (fb_swap_async) a frame drawn here: no surface of CoreAnimation's is on the panel, none is guarded */
+		IOLockLock(fSwapLock);
+		fPanelSid = fPanelSwap = 0;
+		hakios_gpu_scan_guard(0);
+		IOLockUnlock(fSwapLock);
 	}
 	/* Staged sources stay owned until the CPU has consumed every layer. */
 	if (fComposeBase == NULL && direct == NULL) completeSwap();
@@ -2236,6 +2314,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatDirect = 0;
 		fStatHeldBack = 0;
 		fStatHidden = 0;
+		if (gSwapAsync != 0) {
+			unsigned turned = 0;
+
+			while (turned < 8 && fStatSurfaces[turned] != 0) {
+				turned++;
+			}
+			IOLog("MiniIOMobileFramebuffer: fb_swap_async: %u swaps over once queued, %u waited as before; scanned-out "
+			    "frames in %u surfaces in turn (the GPU's held submissions: HakiosGPU's line)\n", fStatAsync, fStatAsyncNot,
+			    turned);
+			fStatAsync = fStatAsyncNot = 0;
+		}
 		if (fStatEarly != 0 || fStatEarlyRisk != 0 || gSwapWaitTruth != 0) {
 			uint32_t asked = __atomic_exchange_n(&gStatSwapWaitAsked, 0, __ATOMIC_RELAXED);
 			uint32_t busy = __atomic_exchange_n(&gStatSwapWaitBusy, 0, __ATOMIC_RELAXED);
@@ -3731,6 +3820,7 @@ backlightDisplayPower(bool on)
 		/* (the cores and the memory slower while nobody looks: there is nothing else that lowers them) */
 		hakios_screen_power(false);
 		hakios_gpu_screen(false);       /* (asleep in two seconds, if it has done all it was given) */
+		hakios_gpu_scan_guard(0);       /* (fb_swap_async: nothing is sent to a dark panel) */
 	}
 }
 
