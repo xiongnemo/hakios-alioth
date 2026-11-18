@@ -45,6 +45,11 @@
 #include "null/null_sw_winsys.h"
 #ifdef GALLIUM_FREEDRENO
 #include "freedreno/drm/freedreno_drm_public.h"
+/* (11-18) freedreno's ir3_gallium.h's, declared here (its header wants src/freedreno on the include path): a shader
+ * state's initial-variant compile waited for, on its fence; the threaded context calls it from the app's thread */
+struct ir3_shader;
+struct ir3_shader_state;
+struct ir3_shader *ir3_get_shader(struct ir3_shader_state *hwcso);
 /* for rwa_texture_from_surface: a resource over memory somebody else allocated is a
  * winsys_handle, and the one modifier an IOSurface of this port's kernel can carry is
  * linear (MINISURF has no tiling and no compression at all). */
@@ -3575,6 +3580,15 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], const un
    compute->states[slot].block[1] = block[1];
    compute->states[slot].block[2] = block[2];
    memcpy(compute->states[slot].shared, shared_extra, sizeof(compute->states[slot].shared));
+   /* (the K40's, 11-18) and its compile waited for without the caller's lock, as a render pipeline's first draw
+    * (rwa_render_draw): the launch would wait for it inside, holding the lock */
+   if (!device->software) {
+      if (device->unlock)
+         device->unlock(device->lock_context);
+      ir3_get_shader((struct ir3_shader_state *)cso);
+      if (device->lock)
+         device->lock(device->lock_context);
+   }
    return cso;
 }
 
@@ -5965,6 +5979,7 @@ struct rwa_render {
     * compute state there is no threadgroup size to recompile for
     */
    void *vs_cso, *fs_cso;
+   bool stages_ready;             /* (11-18) their compile waited for once, without the lock: rwa_render_draw */
    void *blend, *dsa, *rast, *velem;
 
    /* (the K40's) the encoder's rasterizer state -- -setCullMode:, -setFrontFacingWinding:,
@@ -7729,6 +7744,21 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    if (!draw) {
       say(why, why_size, "a draw with no description");
       return -1;
+   }
+   /* (the K40's, 11-18) A pipeline's first draw waits for its stages' compile -- freedreno's initial variants, on the
+    * ir3q threads -- WITHOUT the caller's lock. Inside the draw it waited holding it (ir3_get_shader, from fd6's
+    * program emit), and every other thread's Metal call stood behind it: metal_stats "the library's lock held
+    * longest 11.24 ms, for render_draw" in Flutter Check's later launch (round b100). The caller takes the lock for
+    * each call, so letting it go here, before this call has touched the context, is what happens between two calls
+    * anyway. ir3_get_shader is what freedreno's threaded context calls from the application's thread. */
+   if (!render->stages_ready && !device->software) {
+      if (device->unlock)
+         device->unlock(device->lock_context);
+      ir3_get_shader((struct ir3_shader_state *)render->vs_cso);
+      ir3_get_shader((struct ir3_shader_state *)render->fs_cso);
+      if (device->lock)
+         device->lock(device->lock_context);
+      render->stages_ready = true;
    }
    /* The attachments of the pass must be the attachments the pipeline was compiled for:
     * Metal requires the render pass descriptor's colour formats to match the pipeline
