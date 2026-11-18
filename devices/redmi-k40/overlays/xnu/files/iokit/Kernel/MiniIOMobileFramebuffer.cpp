@@ -42,6 +42,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 extern "C" uint32_t hakios_bl_auto_pct;                 /* bsd/dev/alioth_dsi.c: the auto-brightness in dim light, % */
 extern "C" uint32_t hakios_bl_auto_target, hakios_bl_auto_given; /* ... and its last step, 1/100 nit (sysctls) */
+extern "C" uint32_t hakios_bl_dim_ms;                   /* (11-19) bsd/dev/alioth_dsi.c: the longest a dimming fade takes */
 extern "C" void hakios_screen_power(bool on);           /* bsd/dev/hakios.cpufreq.c */
 extern "C" void hakios_gpu_screen(bool on);             /* iokit/Kernel/hakios.gpu.cpp: the GPU asleep while dark (gpu_sleep=1) */
 extern "C" int alioth_panel_power(bool on);             /* bsd/dev/alioth_dsi.c */
@@ -3387,6 +3388,11 @@ AppleARMBacklight::startBacklight(uint32_t initial)
 		hakios_bl_auto_pct = auto_pct;
 		hakios_tl("backlight: auto-brightness at %u%% of Apple's target in dim light (bl_auto_pct)\n", auto_pct);
 	}
+	/* (11-19) the longest a dimming fade takes, ms (bsd/dev/alioth_dsi.c, kern.hakios.bl_dim_ms) */
+	uint32_t dim_ms = 0;
+	if (PE_parse_boot_argn("bl_dim_ms", &dim_ms, sizeof(dim_ms)) && dim_ms <= ALIOTH_BL_FADE_MAX_MS) {
+		hakios_bl_dim_ms = dim_ms;
+	}
 	if (nits_path) {
 		setProperty("new-backlight-architecture", true);
 	}
@@ -3594,8 +3600,9 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		return kIOReturnSuccess;
 	}
 	uint64_t ms = f != NULL ? ((uint64_t) f->unsigned32BitValue() * 1000) >> 16 : 0, period, now = mach_absolute_time();
+	uint32_t dim_ms = hakios_bl_dim_ms;
 
-	nanoseconds_to_absolutetime(MIN(ms, (uint64_t) ALIOTH_BL_FADE_MAX_MS) * NSEC_PER_MSEC, &period);
+	ms = MIN(ms, (uint64_t) ALIOTH_BL_FADE_MAX_MS);
 	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
 	uint32_t cur = fTargetDbv;
 
@@ -3603,6 +3610,11 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		/* (a fade under way: the new one starts where the panel is now; bl_fade is about 200 multiplications) */
 		cur = bl_fade(fFadeFromDbv, fTargetDbv, now - fFadeStart, fFadePeriod);
 	}
+	/* (11-19) a fade that dims: at most kern.hakios.bl_dim_ms (bsd/dev/alioth_dsi.c says why); brightening as asked */
+	if (to_dbv < cur && dim_ms != 0) {
+		ms = MIN(ms, (uint64_t) dim_ms);
+	}
+	nanoseconds_to_absolutetime(ms * NSEC_PER_MSEC, &period);
 	fFadeFromDbv = cur;
 	fTarget = to;
 	fTargetDbv = to_dbv;

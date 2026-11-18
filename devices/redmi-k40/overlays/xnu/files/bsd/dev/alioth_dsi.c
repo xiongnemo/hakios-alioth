@@ -83,6 +83,16 @@ SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_auto_target, CTLFLAG_RD | CTLFLAG_LOCKED,
     "the last auto-brightness target CoreBrightness asked for, 1/100 nit");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_auto_given, CTLFLAG_RD | CTLFLAG_LOCKED, &hakios_bl_auto_given, 0,
     "what the panel was given for it after bl_auto_pct, 1/100 nit");
+/*
+ * (11-19, the owner: "dimming is too slow, and every step shows; brightening is much better") The longest a fade
+ * that DIMS the panel may take, ms (MiniIOMobileFramebuffer.cpp setProperties): CoreBrightness dims over 6-39 s and
+ * brightens over 2.5-4 s, and near the bottom one DBV step is ~12% of the light (8 -> 9) -- spread over half a
+ * minute, a step a second, each one seen. Brightening keeps CoreBrightness's own time. Boot-arg bl_dim_ms=N; sysctl
+ * kern.hakios.bl_dim_ms=N (writable: usbsh/netsh) from the next fade; 0 = CoreBrightness's own time (capped at 60 s).
+ */
+uint32_t hakios_bl_dim_ms = 4000;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_dim_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &hakios_bl_dim_ms, 0,
+    "the longest a dimming fade of the backlight may take, ms (0: CoreBrightness's own time)");
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
