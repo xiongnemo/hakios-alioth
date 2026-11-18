@@ -170,6 +170,39 @@ are on each repository's Releases page.
 
 How each part works, what was measured and what comes next: [docs/alioth/status.md](docs/alioth/status.md).
 
+## The phone it is developed on
+
+This port is developed and tested on one phone, and parts of it are still fitted to that phone rather than read from
+yours:
+
+| | |
+|---|---|
+| Model | Redmi K40, `M2012K11AC` (China), `hwc=CN`, SKU `nfc` |
+| Memory, storage | 12 GB RAM, 256 GB UFS |
+| Android on it | PixelOS 17.0 (Android 17, the build of 2026-11-12) |
+| Modem firmware | `2.5.c1-gl-21664.3-0307_0159_075a1c585d` (Android's baseband version) |
+| `reserved-memory` | as in [`prebuilt/device-tree.dtb`](devices/redmi-k40/prebuilt/device-tree.dtb): `removed_region@80b00000` (0x5300000 long), then `pil_gpu_region@8681a000`, `pil_slpi_region@88c00000`, `pil_adsp_region@8bb00000` among the others |
+
+What is fitted to this phone so far:
+
+- The device tree the boot stage hands the kernel is this phone's (`devices/redmi-k40/prebuilt/device-tree.dtb`), not
+  your phone's.
+- Three drivers put their firmware at addresses taken from this phone's `reserved-memory`: the GPU's zap shader
+  (`pil_gpu_region`, `0x8681a000`), the sensor DSP (`pil_slpi_region`, `0x88c00000`) and the audio DSP
+  (`pil_adsp_region`, `0x8bb00000`). Firmware can move these regions: on an 8 GB K40 with HyperOS 1.0 global firmware
+  every region from `pil_camera_region` up is `0x5c00000` higher, and the GPU stalled at its start until it was given
+  the right address ([#1](https://github.com/xiongnemo/hakios-alioth/issues/1)). Taking them from your own phone is
+  planned.
+
+To compare yours, in Android: `adb shell ls /proc/device-tree/reserved-memory/` lists the regions with their
+addresses (no root needed); with root, `adb shell su -c 'cat /sys/firmware/fdt' > fdt.bin` gives the whole tree
+(`dtc -I dtb -O dts fdt.bin`).
+
+**If you try it on your own phone and something goes wrong, please
+[open an issue](https://github.com/xiongnemo/hakios-alioth/issues).** Say which phone it is (model, RAM, region,
+Android and firmware version) and what happened, and attach your `reserved-memory` list. Leave out anything personal:
+the serial number, IMEI, Wi-Fi names and passwords, Bluetooth and MAC addresses.
+
 ## Getting a package you can boot
 
 > The kits: [Releases](https://github.com/xiongnemo/hakios-alioth/releases) (`alioth-kit-<version>.zip`). Built by
@@ -193,7 +226,8 @@ phone's firmware (the vendor's), the loader's iPhone identity (taken from Apple'
 What you need: a Redmi K40 / POCO F3 with its bootloader unlocked, USB debugging on and root in Android (Magisk or the
 like: the DSPs' firmware, the Bluetooth firmware and the sensors' calibration are readable by root only; nothing is
 written to the phone); a PC with Windows 10 or 11 and WSL, or Linux; about 15 GB of free disk space; an Internet
-connection.
+connection. Your phone may differ from the one this is developed on: see
+[The phone it is developed on](#the-phone-it-is-developed-on) above.
 
 1. Download the kit from the Releases page and unpack it.
 2. With the phone in Android and connected, run `assemble.bat` (or `assemble/assemble.sh` on Linux). It

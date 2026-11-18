@@ -161,6 +161,33 @@ IPA 在各个仓库的 Releases 页面。
 
 各部分怎么实现、测到了什么、接下来做什么：[docs/alioth/status.zh.md](docs/alioth/status.zh.md)。
 
+## 开发用的这台手机
+
+这个移植是在一台手机上开发和测试的，其中有些部分还是按这台手机写死的，而不是从你的手机读出来的：
+
+| | |
+|---|---|
+| 型号 | Redmi K40，`M2012K11AC`（国行），`hwc=CN`，SKU `nfc` |
+| 内存、存储 | 12 GB RAM，256 GB UFS |
+| 上面的 Android | PixelOS 17.0（Android 17，2026-11-12 的版本） |
+| 基带固件 | `2.5.c1-gl-21664.3-0307_0159_075a1c585d`（Android 里显示的基带版本） |
+| `reserved-memory` | 与 [`prebuilt/device-tree.dtb`](devices/redmi-k40/prebuilt/device-tree.dtb) 相同：`removed_region@80b00000`（长 0x5300000），其后有 `pil_gpu_region@8681a000`、`pil_slpi_region@88c00000`、`pil_adsp_region@8bb00000` 等 |
+
+目前按这台手机写死的地方：
+
+- 启动阶段交给内核的设备树是这台手机的（`devices/redmi-k40/prebuilt/device-tree.dtb`），不是你那台的。
+- 有三个驱动把固件放到从这台手机的 `reserved-memory` 取来的地址上：GPU 的 zap shader（`pil_gpu_region`，`0x8681a000`）、
+  传感器 DSP（`pil_slpi_region`，`0x88c00000`）和音频 DSP（`pil_adsp_region`，`0x8bb00000`）。固件可能会挪动这些区：在一台
+  8 GB、HyperOS 1.0 国际版固件的 K40 上，从 `pil_camera_region` 往上的每个区都高了 `0x5c00000`，GPU 在启动时卡住，直到给了它
+  正确的地址（[#1](https://github.com/xiongnemo/hakios-alioth/issues/1)）。改成从你自己的手机读取已在计划中。
+
+比较你那台的办法，在 Android 下：`adb shell ls /proc/device-tree/reserved-memory/` 会列出各个区和它们的地址（不需要 root）；
+有 root 的话，`adb shell su -c 'cat /sys/firmware/fdt' > fdt.bin` 可以拿到整棵树（`dtc -I dtb -O dts fdt.bin`）。
+
+**如果你在自己的手机上试了、出了问题，请[开一个 issue](https://github.com/xiongnemo/hakios-alioth/issues)。** 写明是哪台手机
+（型号、内存、国行/国际版、Android 和固件版本）、发生了什么，并附上你的 `reserved-memory` 列表。请不要带上任何个人信息：序列号、
+IMEI、Wi-Fi 名称和密码、蓝牙和 MAC 地址。
+
 ## 怎样得到能启动的包
 
 > 套件在 [Releases](https://github.com/xiongnemo/hakios-alioth/releases) 页面（`alioth-kit-<版本>.zip`），由 [kit 工作流](.github/workflows/kit.yml) 在打上 `kit-v<版本>` 标签时构建。
@@ -180,7 +207,7 @@ IPA 在各个仓库的 Releases 页面。
 （取自苹果的设备树），以及你的 Wi-Fi 密码。
 
 你需要：已解锁 Bootloader、打开了 USB 调试、Android 里有 root（Magisk 之类：DSP 固件、蓝牙固件和传感器校准数据只有 root 能读；不会往手机写任何东西）的 Redmi K40 / POCO F3；一台装有 WSL 的 Windows 10 或 11 电脑，或者 Linux；
-约 15 GB 可用磁盘空间；能上网。
+约 15 GB 可用磁盘空间；能上网。你的手机可能和开发用的这台不一样：见上面的[开发用的这台手机](#开发用的这台手机)。
 
 1. 从 Releases 页面下载套件并解压。
 2. 手机开机进 Android 并连上电脑，运行 `assemble.bat`（Linux 上运行 `assemble/assemble.sh`）。它会：
