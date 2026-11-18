@@ -2151,6 +2151,57 @@ enum {
 - (unsigned)vertexElementAttribute:(unsigned)index;
 @end
 
+/*
+ * (11-19) What a command buffer's works refer to, kept by the command buffer ONCE each instead of by every work:
+ * Flutter's 48 draws a buffer name the same pipeline, buffers and textures over and over, and each work retained ~10
+ * of them at -recordWork: and released them again when it went (objc_release 3.9% and -[AliothMetalWork dealloc]
+ * 2.5% of the Metal run thread in round b114, the retains on the encoding thread besides). A small cache of the
+ * objects kept last catches the repeats; a miss keeps an object twice, which is only a second retain. Released when
+ * the command buffer goes, with its works -- what they refer to lives until then, as Metal's retained references
+ * promise. Works recorded by a parallel encoder's sub-encoders (AliothMetalRecorder) still retain their own.
+ */
+struct alioth_keep {
+	id *items;
+	unsigned count, room;
+	id cache[64];
+};
+
+static void
+alioth_keep(struct alioth_keep *k, id object)
+{
+	if (object == nil) {
+		return;
+	}
+	unsigned h = (unsigned)(((uintptr_t)object >> 4) ^ ((uintptr_t)object >> 11)) & 63;
+
+	if (k->cache[h] == object) {
+		return;
+	}
+	k->cache[h] = object;
+	if (k->count == k->room) {
+		unsigned room = k->room != 0 ? k->room * 2 : 64;
+		id *items = realloc(k->items, room * sizeof(id));
+
+		if (items == NULL) {
+			[object retain];        /* (no room to note it: kept for good rather than let go of too early) */
+			return;
+		}
+		k->items = items;
+		k->room = room;
+	}
+	k->items[k->count++] = [object retain];
+}
+
+static void
+alioth_keep_release(struct alioth_keep *k)
+{
+	for (unsigned i = 0; i < k->count; i++) {
+		[k->items[i] release];
+	}
+	free(k->items);
+	bzero(k, sizeof(*k));
+}
+
 @interface AliothMetalWork : NSObject {
 @public
 	AliothMetalComputePipeline *pipeline;
@@ -2222,6 +2273,7 @@ enum {
 	/* (the K40's) set by -aliothRetainReferences (the command buffer's -recordWork:); keptIndirect is the indirect
 	 * buffer as retained, which outlives indirectBuffer's being cleared once it is read */
 	BOOL retainsReferences;
+	BOOL keptByBuffer;                      /* (11-19) its references kept by its command buffer (alioth_keep) instead */
 	id keptIndirect;
 	/* (the K40's) a draw's vertex stage's textures and samplers (rwa_draw.vertex): until 11-09 never bound */
 	id vertexTextures[RW_MAX_BUFFERS];
@@ -2231,6 +2283,8 @@ enum {
 /* (the K40's) everything this work refers to kept alive until the work is let go of, as Metal keeps what a command
  * buffer references (retainedReferences) */
 - (void)aliothRetainReferences;
+/* (11-19) ... or kept by the command buffer it is recorded in, once per object (struct alioth_keep) */
+- (void)aliothKeepReferencesIn:(struct alioth_keep *)keep;
 @end
 
 @interface AliothMetalTexture : _MTLResource {
@@ -5835,6 +5889,42 @@ alioth_work_pool_on(void)
 	}
 }
 
+/* (11-19) The same objects, kept by the command buffer once each (struct alioth_keep says why); nothing to let go here. */
+- (void)aliothKeepReferencesIn:(struct alioth_keep *)keep
+{
+	if (retainsReferences || keptByBuffer) {
+		return;
+	}
+	keptByBuffer = YES;
+	alioth_keep(keep, pipeline);
+	alioth_keep(keep, render);
+	alioth_keep(keep, depth);
+	alioth_keep(keep, depthStencilState);
+	alioth_keep(keep, indexBuffer);
+	alioth_keep(keep, indirectBuffer);      /* (read at the run and cleared then: the buffer's keep outlives that) */
+	for (unsigned i = 0; i < colorCount && i < 8; i++) {
+		alioth_keep(keep, color[i]);
+	}
+	for (unsigned i = 0; i < vertexBufferCount && i < RW_MAX_BUFFERS; i++) {
+		alioth_keep(keep, vertexBuffers[i]);
+	}
+	for (unsigned i = 0; i < count && i < RW_MAX_BUFFERS; i++) {
+		alioth_keep(keep, buffers[i]);
+	}
+	for (unsigned i = 0; i < textureCount && i < RW_MAX_BUFFERS; i++) {
+		alioth_keep(keep, textures[i]);
+	}
+	for (unsigned i = 0; i < samplerCount && i < RW_MAX_BUFFERS; i++) {
+		alioth_keep(keep, samplers[i]);
+	}
+	for (unsigned i = 0; i < vertexTextureCount && i < RW_MAX_BUFFERS; i++) {
+		alioth_keep(keep, vertexTextures[i]);
+	}
+	for (unsigned i = 0; i < vertexSamplerCount && i < RW_MAX_BUFFERS; i++) {
+		alioth_keep(keep, vertexSamplers[i]);
+	}
+}
+
 - (void)dealloc
 {
 	if (retainsReferences) {
@@ -6388,6 +6478,7 @@ enum {
 	/* (the K40's, 11-16) render passes made on it; the visibility step whose query runs now (-aliothQueryStep:) */
 	unsigned _passes;
 	AliothMetalQuery *_activeQuery;
+	struct alioth_keep _keep;       /* (11-19) what its works refer to, kept once each until it goes */
 }
 
 - (unsigned)aliothNextPass
@@ -6617,6 +6708,7 @@ enum {
 {
 	[self aliothReturnSlot];
 	[_work release];
+	alioth_keep_release(&_keep);    /* (11-19: after the works, which no longer let go of these themselves) */
 	[_error release];
 	[_scheduled release];
 	[_completed release];
@@ -6714,7 +6806,8 @@ enum {
 
 - (void)recordWork:(AliothMetalWork *)work
 {
-	[work aliothRetainReferences];   /* (the K40's: what it refers to lives until it has run, as in Metal) */
+	/* (the K40's: what it refers to lives until it has run, as in Metal; 11-19: kept by this buffer, once each) */
+	[work aliothKeepReferencesIn:&_keep];
 	[_work addObject:work];
 }
 
@@ -7156,9 +7249,19 @@ alioth_strict(void)
 	_kernelStart = committed;
 	alioth_stat(ST_ENCODE, _created);
 	_status = RW_CB_COMMITTED;
+	/*
+	 * (11-19) A draw or a dispatch -- nearly every item -- is an AliothMetalWork exactly (it has no subclasses; the
+	 * queries, blits and signals are classes of their own): known by its class alone, without the three
+	 * -isKindOfClass: and three +class sends each item took on its way to the draw.
+	 */
+	Class work_class = [AliothMetalWork class];
+
 	for (id item in _work) {
 		AliothMetalWork *work = item;
 
+		if (object_getClass(item) == work_class) {
+			goto a_work;
+		}
 		if ([item isKindOfClass:[AliothMetalQuery class]]) {
 			[self aliothQueryStep:item];
 			continue;
@@ -7205,6 +7308,7 @@ alioth_strict(void)
 			[_signals addObject:s];
 			continue;
 		}
+	a_work:
 		if (work->render != nil) {
 			if (![self runDraw:work why:why size:sizeof(why)]) {
 				if ([self aliothSkipRefused:work why:why]) {
@@ -7428,33 +7532,69 @@ alioth_tile_skips(NSString *label)
 	return NO;
 }
 
+/* (11-19) Whether metal_tile_skip= is there at all: runDraw asks this first, before the four sends the test takes. */
+static BOOL
+alioth_tile_skip_any(void)
+{
+	static dispatch_once_t once;
+	static BOOL any;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t len = sizeof(args) - 1;
+
+		any = sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && strstr(args, "metal_tile_skip=") != NULL;
+	});
+	return any;
+}
+
 - (BOOL)runDraw:(AliothMetalWork *)work why:(char *)why size:(size_t)size
 {
 	/* (metal_tile_skip=*: the pass's first draw, which carries its clears, into the top-left pixel only) */
 	static const unsigned one_pixel[4] = { 0, 0, 1, 1 };
 	BOOL pixel_only = NO;
 
-	if (work->tileMask != 0 && [work->color[0] isKindOfClass:[AliothMetalTexture class]] &&
+	if (work->tileMask != 0 && alioth_tile_skip_any() && [work->color[0] isKindOfClass:[AliothMetalTexture class]] &&
 	    [(AliothMetalTexture *)work->color[0] aliothImported] && alioth_tile_skips([work->render label])) {
 		if (!work->clears && !work->clearsDepth && !work->clearsStencil) {
 			return YES;
 		}
 		pixel_only = alioth_tile_skips(@"*");  /* (true only when the list has "*": no label begins with it) */
 	}
-	struct rwa_texture *color[8] = { NULL };
-	struct rwa_buffer *vertex_buffers[RW_MAX_BUFFERS] = { NULL };
-	struct rwa_vertex_stream vertex_streams[RW_MAX_BUFFERS] = { { NULL, 0 } };
-	struct rwa_buffer *fragment_buffers[RW_MAX_BUFFERS] = { NULL };
-	struct rwa_texture *fragment_textures[RW_MAX_BUFFERS] = { NULL };
-	struct rwa_sampler *fragment_samplers[RW_MAX_BUFFERS] = { NULL };
-	struct rwa_texture *vertex_textures[RW_MAX_BUFFERS] = { NULL };     /* (the K40's) the vertex stage's */
-	struct rwa_sampler *vertex_samplers[RW_MAX_BUFFERS] = { NULL };
+	/*
+	 * (11-19) The tables are filled below for every index up to their counts, and the library reads none past its
+	 * count (an index is checked against buffer_count / texture_count / sampler_count, a stream against
+	 * vertex_stream_count) -- so only what a vertex loop may leave unwritten is zeroed: the vertex buffers' and the
+	 * vertex table's indices, and the streams up to the larger count. Until 11-18 all ten tables, ~3 KB, were zeroed
+	 * at every draw (~31700 a second in Flutter's frame test). The pipeline's stream mask and count: asked once.
+	 */
+	unsigned stream_mask = [work->render vertexStreamMask], stream_count = [work->render vertexStreamCount];
+
+	if (stream_count > RW_MAX_BUFFERS) {
+		snprintf(why, size, "this pipeline fetches from %u vertex stream slots and this driver's table holds %u",
+		         stream_count, RW_MAX_BUFFERS);
+		[self failWith:why];
+		return NO;
+	}
+	unsigned vertex_count = MIN(work->vertexBufferCount, (unsigned)RW_MAX_BUFFERS);
+	struct rwa_texture *color[8];
+	struct rwa_buffer *vertex_buffers[RW_MAX_BUFFERS];
+	struct rwa_vertex_stream vertex_streams[RW_MAX_BUFFERS];
+	struct rwa_buffer *fragment_buffers[RW_MAX_BUFFERS];
+	struct rwa_texture *fragment_textures[RW_MAX_BUFFERS];
+	struct rwa_sampler *fragment_samplers[RW_MAX_BUFFERS];
+	struct rwa_texture *vertex_textures[RW_MAX_BUFFERS];     /* (the K40's) the vertex stage's */
+	struct rwa_sampler *vertex_samplers[RW_MAX_BUFFERS];
 	/* and Metal's own table for each stage: the same entries as the arrays above with
 	 * the OFFSET beside each, which rwa_bindings has nowhere to put. One array for
 	 * both of the things an offset means -- which encoding of an argument buffer, and
 	 * which block of a buffer argument -- because Metal has one call behind both. */
-	struct rwa_buffer_bind vertex_table[RW_MAX_BUFFERS] = { { NULL, 0 } };
-	struct rwa_buffer_bind fragment_table[RW_MAX_BUFFERS] = { { NULL, 0 } };
+	struct rwa_buffer_bind vertex_table[RW_MAX_BUFFERS];
+	struct rwa_buffer_bind fragment_table[RW_MAX_BUFFERS];
+
+	memset(vertex_buffers, 0, sizeof(vertex_buffers[0]) * vertex_count);
+	memset(vertex_table, 0, sizeof(vertex_table[0]) * vertex_count);
+	memset(vertex_streams, 0, sizeof(vertex_streams[0]) * MAX(vertex_count, stream_count));
 
 	if (mesa.render_draw == NULL) {
 		snprintf(why, size, "this compiler library can compute but not yet draw");
@@ -7527,8 +7667,6 @@ alioth_tile_skips(NSString *label)
 	 * library takes a stream's offset as Metal's own `offset:` and rwa_bindings has
 	 * nowhere to put one.
 	 */
-	unsigned stream_mask = [work->render vertexStreamMask];
-
 	for (unsigned i = 0; i < work->vertexBufferCount; i++) {
 		/* Metal's own offset, for whichever of the other two things index i is: an
 		 * argument buffer (which encoding to read) or a buffer argument (which
@@ -7554,13 +7692,6 @@ alioth_tile_skips(NSString *label)
 			continue;
 		}
 		vertex_buffers[i] = [work->vertexBuffers[i] mesaBuffer];
-	}
-	if ([work->render vertexStreamCount] > RW_MAX_BUFFERS) {
-		snprintf(why, size, "this pipeline fetches from %u vertex stream slots and "
-				    "this driver's table holds %u", [work->render
-				    vertexStreamCount], RW_MAX_BUFFERS);
-		[self failWith:why];
-		return NO;
 	}
 	for (unsigned i = 0; i < work->count; i++) {
 		fragment_buffers[i] = [work->buffers[i] mesaBuffer];
@@ -7610,7 +7741,7 @@ alioth_tile_skips(NSString *label)
 		 * Metal's own offsets; the count is what the library needs covered, which
 		 * is the highest index the pipeline fetches from plus one. */
 		.vertex_streams = vertex_streams,
-		.vertex_stream_count = [work->render vertexStreamCount],
+		.vertex_stream_count = stream_count,
 		.fragment = {
 			.buffers = fragment_buffers, .buffer_count = work->count,
 			.textures = fragment_textures, .texture_count = work->textureCount,
