@@ -3875,7 +3875,16 @@ alioth_keep_release(struct alioth_keep *k)
 	 * 11-19 night measured those pushes of drawables at 12 GB in 5 s while Flutter animates. A video frame's planes
 	 * (CVMetalTextureCache: written by a processor) are not drawables and are not said so.
 	 */
-	if (p == 0 && [d respondsToSelector:@selector(isDrawable)] && ((BOOL (*)(id, SEL))objc_msgSend)(d, @selector(isDrawable))) {
+	/*
+	 * (11-19, census c4) ... and plane 0 of any surface the app asked for as a RENDER TARGET (its own usage, before this
+	 * driver adds RenderTarget above): Flutter's FlutterMetalLayer makes its own IOSurfaces and draws into them -- no
+	 * isDrawable -- and those were the 10.8 MB surfaces pushed 1133 times in 5 s while it animated. A processor that
+	 * writes one through IOSurfaceLock moves its seed (pushed for that); a video frame's planes (CVMetalTextureCache)
+	 * come as ShaderRead textures and are not said so.
+	 */
+	BOOL drawable = [d respondsToSelector:@selector(isDrawable)] && ((BOOL (*)(id, SEL))objc_msgSend)(d, @selector(isDrawable));
+
+	if (p == 0 && (drawable || ([d usage] & MTLTextureUsageRenderTarget))) {
 		static void (*set_value)(void *, CFStringRef, CFTypeRef);
 		static dispatch_once_t once;
 		/* (CoreAnimation keeps a few drawables' surfaces and comes back with them: each said once, not every frame --
