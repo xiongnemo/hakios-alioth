@@ -616,13 +616,19 @@ umi_firmware() {
 		done
 	fi
 	# Hastings Bluetooth uses its own firmware partition, separate from Wi-Fi.
+	# (11-19, issue #1: without ../fw-bluetooth the build went on quietly and the driver found /fw/qca6390-bt/ empty,
+	# which looks like a transport fault -- said now; kit/pull-firmware.sh stages it, the phone's BD address included)
+	bt_files=0
 	if [ -d ../fw-bluetooth ]; then
 		mkdir -p "$destination/qca6390-bt"
 		for f in htbtfw10.tlv htbtfw20.tlv htnv10.bin htnv20.bin; do
 			[ -f "../fw-bluetooth/$f" ] || continue
 			install -m 0644 "../fw-bluetooth/$f" "$destination/qca6390-bt/"
+			bt_files=$((bt_files + 1))
 		done
 	fi
+	[ "$bt_files" -gt 0 ] ||
+		echo "build.sh: no Bluetooth firmware in ../fw-bluetooth (htbtfw*.tlv, htnv*.bin; kit/pull-firmware.sh pulls it from the phone): umi_bt=1 will find /fw/qca6390-bt/ empty"
 	if [ -d ../fw-audio/acdbdata ]; then
 		mkdir -p "$destination/acdbdata"
 		cp -a ../fw-audio/acdbdata/. "$destination/acdbdata/"
