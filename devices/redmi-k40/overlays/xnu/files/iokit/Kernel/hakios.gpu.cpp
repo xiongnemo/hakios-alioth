@@ -67,6 +67,10 @@ void hakios_gpu_unmap_in(void * space, uint64_t address, uint64_t size);
 uint32_t hakios_gpu_submit_in(void * space, const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
+/* (11-19) the 3D core's interrupt, boot-arg gpu_irq=1: whether the waits may sleep until it, on what, and its counts */
+bool hakios_gpu_irq_ready(void);
+int hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t * held);
+void hakios_gpu_irq_counts(uint64_t * arrived, uint64_t * empty);
 uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
@@ -209,7 +213,9 @@ static struct {
 	uint64_t invalidating;                  /* ... and the time that took */
 	uint32_t pushes;                        /* (11-17) surfaces pushed out of the cache for a submission ... */
 	uint64_t biggest_push;                  /* ... and the biggest of them, bytes */
+	uint32_t irq_woken, irq_timed;          /* (11-19, gpu_irq=1) waits' sleeps ended by the interrupt / by the 2 ms */
 } gGPUStat;
+static uint64_t gIrqSeen, gIrqEmptySeen;        /* (11-19) the interrupt's counts at the last 5-s line */
 static TUNABLE(uint32_t, gInvalScan, "gpu_inval_scan", 0);
 /*
  * (the K40's, 11-17) Test roads for the cache pass of a submission (submit()). It pushes a surface's every line out of
@@ -250,6 +256,25 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		 */
 		uint64_t waited_ns;
 
+		/*
+		 * (11-19, boot-arg gpu_irq=1) Or asleep until the 3D core's interrupt says that a submission has ended
+		 * (bsd/dev/hakios.adreno.c, gpu_irq_arrived()): no processor kept busy for it. At most 2 ms at a time, so
+		 * that a lost interrupt costs that and no more, and never past the patience.
+		 */
+		if (hakios_gpu_irq_ready()) {
+			uint64_t now = mach_absolute_time(), step, deadline;
+
+			nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &step);
+			deadline = MIN(now + step, began + patience);
+			int woken = hakios_gpu_irq_wait(fence, deadline, IOLockGetMachLock(gGPULock));
+
+			if (woken > 0) {
+				gGPUStat.irq_woken++;
+			} else if (woken == 0) {
+				gGPUStat.irq_timed++;
+			}
+			continue;
+		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &waited_ns);
 		uint32_t again = waited_ns < 1000000 ? GPU_ASK_AGAIN_US : waited_ns < 4000000 ? 200 : 500;
 
@@ -1296,6 +1321,16 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
 		    fBufferBytes >> 20);
+		uint64_t irqs, empty;
+
+		hakios_gpu_irq_counts(&irqs, &empty);
+		if (irqs != gIrqSeen || gGPUStat.irq_woken != 0 || gGPUStat.irq_timed != 0) {
+			IOLog("HakiosGPU: the 3D core's interrupt: %llu arrived (%llu without a submission's end); the waits slept %u times "
+			    "until it and %u times until their 2 ms look%s\n", irqs - gIrqSeen, empty - gIrqEmptySeen, gGPUStat.irq_woken,
+			    gGPUStat.irq_timed, hakios_gpu_irq_ready() ? "" : "; NOW LOOKING AS BEFORE (the line was let go of)");
+			gIrqSeen = irqs;
+			gIrqEmptySeen = empty;
+		}
 		bzero(&gGPUStat, sizeof(gGPUStat));
 	}
 	IOLockUnlock(gGPULock);

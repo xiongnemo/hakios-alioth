@@ -97,6 +97,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -3313,6 +3314,165 @@ core_bus_halt(bool for_good)
 
 static bool core_stuck;                 /* the 3D core has not finished what it was given, and is not waited for */
 
+/* ---- (11-19) the 3D core's interrupt: a submission's end told, not looked for ------------------------------ */
+
+/*
+ * The owner (11-19): GPU completion interrupts. Until now every wait for the core (HakiosGPU's gpuWait,
+ * iokit/Kernel/hakios.gpu.cpp) looked at the fence word again and again -- every 50 us for the first millisecond,
+ * then every 200 and 500 us -- with a processor kept busy for it: 7.8% of Flutter's Metal run thread in round b114,
+ * and the compositor's waits for drawn surfaces the same. Linux's a6xx_submit asks for an interrupt with the fence
+ * (CP_EVENT_WRITE CACHE_FLUSH_TS with its IRQ bit) and unmasks CP_CACHE_FLUSH_TS in RBBM_INT_0_MASK; a6xx_irq reads
+ * RBBM_INT_0_STATUS, writes it to RBBM_INT_CLEAR_CMD and retires. Here the same, with boot-arg gpu_irq=1: the core's
+ * line attached (dt: kgsl-3d0 interrupts <0 0x12c 4>, SPI 300, level, the GIC's 332), the fence's event asking for
+ * the interrupt, the handler clearing RBBM and waking the waits (hakios_gpu_irq_event()), which sleep until then --
+ * and look again at most every 2 ms, should one ever be lost.
+ * The handler reads the core's registers, which hangs the bus when GX has no power: the line is let go of (and a
+ * handler under way waited for) on every road that takes the power or the core away -- the sleep with the screen
+ * off, the recovery of a hung GPU, the GPU given back, the run's end -- and taken again when the core runs. A level
+ * line that the clear does not quiet would come back for ever: 64 handlers in a row that still find the bit set and
+ * it is given up for the run, the waits looking as before.
+ */
+#define RBBM_INT_CLEAR_CMD      GPU_WORD(0x0037)
+#define RBBM_INT_0_MASK         GPU_WORD(0x0038)
+#define RBBM_INT_CACHE_FLUSH_TS (1u << 20)
+#define CP_EVENT_IRQ            (1u << 31)
+#define GPU_IRQ_INTID           (32 + 300)
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_detach(uint32_t intid);
+
+static uint32_t gpu_irq_wanted;                 /* boot-arg gpu_irq=1 (read when the GPU is kept) */
+static volatile bool gpu_irq_live;              /* attached, the core powered and running: the handler may read RBBM */
+static bool gpu_irq_attached, gpu_irq_given_up;
+static uint32_t gpu_irq_still;                  /* handlers in a row that found the bit set again after the clear */
+static volatile uint64_t gpu_irq_count, gpu_irq_empty;
+static int gpu_irq_event;                       /* what the waits sleep on */
+
+/* In interrupt context, interrupts off: RBBM cleared, the waits woken. */
+static void
+gpu_irq_arrived(__unused void *context, uint32_t intid)
+{
+	if (!gpu_irq_live) {
+		gic_v3_spi_mask(intid);         /* (nobody may read the core now; taken again when it runs) */
+		return;
+	}
+	uint32_t status = rd(gpu.base + RBBM_INT_0_STATUS);
+
+	wr(gpu.base + RBBM_INT_CLEAR_CMD, status);
+	gpu_irq_count++;
+	if (!(status & RBBM_INT_CACHE_FLUSH_TS)) {
+		gpu_irq_empty++;
+	}
+	if (rd(gpu.base + RBBM_INT_0_STATUS) & RBBM_INT_CACHE_FLUSH_TS) {
+		if (++gpu_irq_still >= 64) {
+			gpu_irq_live = false;
+			gpu_irq_given_up = true;
+			gic_v3_spi_mask(intid);
+		}
+	} else {
+		gpu_irq_still = 0;
+	}
+	thread_wakeup((event_t)&gpu_irq_event);
+}
+
+/* The core runs (kept, woken, brought back): its line taken, CP_CACHE_FLUSH_TS unmasked. */
+static void
+gpu_irq_on(void)
+{
+	static bool said;
+	kern_return_t kr;
+
+	if (!gpu_irq_wanted || gpu_irq_given_up || gpu_irq_attached || !core_runs || !core_is_on) {
+		return;
+	}
+	wr(gpu.base + RBBM_INT_CLEAR_CMD, rd(gpu.base + RBBM_INT_0_STATUS));
+	wr(gpu.base + RBBM_INT_0_MASK, RBBM_INT_CACHE_FLUSH_TS);
+	gpu_irq_still = 0;
+	gpu_irq_live = true;
+	if ((kr = gic_v3_spi_attach(GPU_IRQ_INTID, false, gpu_irq_arrived, NULL)) != KERN_SUCCESS) {
+		gpu_irq_live = false;
+		gpu_irq_given_up = true;
+		wr(gpu.base + RBBM_INT_0_MASK, 0);
+		printf("adreno: the 3D core's interrupt (GIC %u) is not taken (%d): the waits look for the fence as before\n",
+		    GPU_IRQ_INTID, kr);
+		return;
+	}
+	gpu_irq_attached = true;
+	if (!said) {
+		said = true;
+		printf("adreno: THE 3D CORE'S INTERRUPT (GIC %u, level) tells the waits of each submission's end (gpu_irq=1)\n",
+		    GPU_IRQ_INTID);
+	}
+}
+
+/*
+ * Before the core loses its power or is stopped: the line let go of, no handler of it still reading the core, and
+ * CP_CACHE_FLUSH_TS masked while the core can still be written. `wait`: false on the way back to the loader (a panic
+ * included), where the line is only masked.
+ */
+static void
+gpu_irq_off(bool wait)
+{
+	if (!gpu_irq_attached) {
+		return;
+	}
+	gpu_irq_live = false;
+	if (!wait) {
+		gic_v3_spi_mask(GPU_IRQ_INTID);
+		return;
+	}
+	gic_v3_spi_detach(GPU_IRQ_INTID);
+	gpu_irq_attached = false;
+	if (core_runs && core_is_on) {
+		wr(gpu.base + RBBM_INT_0_MASK, 0);
+		wr(gpu.base + RBBM_INT_CLEAR_CMD, rd(gpu.base + RBBM_INT_0_STATUS));
+	}
+	thread_wakeup((event_t)&gpu_irq_event);  /* (the waits look for themselves again) */
+}
+
+/* For HakiosGPU's waits (iokit/Kernel/hakios.gpu.cpp): whether to sleep until the interrupt, the sleep, the counts. */
+bool hakios_gpu_done(uint32_t fence);
+bool hakios_gpu_irq_ready(void);
+int hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t *held);
+void hakios_gpu_irq_counts(uint64_t *arrived, uint64_t *empty);
+
+bool
+hakios_gpu_irq_ready(void)
+{
+	return gpu_irq_live;
+}
+
+/*
+ * Asleep, `held` let go of meanwhile, until the interrupt or `deadline` (mach_absolute_time): 1 woken, 0 the deadline,
+ * -1 not asleep at all (the fence was done, or the line went, after the wait was asserted). Asserted BEFORE the fence
+ * is looked at, as hakios.lx.c's thread does: an interrupt between the look and the sleep is not lost.
+ */
+int
+hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t *held)
+{
+	wait_result_t result = assert_wait_deadline((event_t)&gpu_irq_event, THREAD_UNINT, deadline);
+
+	if (result != THREAD_WAITING) {
+		return -1;
+	}
+	if (hakios_gpu_done(fence) || !gpu_irq_live) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		return -1;
+	}
+	lck_mtx_unlock(held);
+	result = thread_block(THREAD_CONTINUE_NULL);
+	lck_mtx_lock(held);
+	return result == THREAD_AWAKENED ? 1 : 0;
+}
+
+void
+hakios_gpu_irq_counts(uint64_t *arrived, uint64_t *empty)
+{
+	*arrived = gpu_irq_count;
+	*empty = gpu_irq_empty;
+}
+
 static void
 gpu_block_stop(void)
 {
@@ -3321,6 +3481,7 @@ gpu_block_stop(void)
 
 	step = 0;
 	newest_step = ~0u;
+	gpu_irq_off(true);                      /* (11-19: before anything takes the core away) */
 	if (core_runs && core_is_on) {
 		/* (what the core looks like when it is given back: a GMU that then does not answer may have its reasons here) */
 		printf("adreno: %u: the 3D core before it is stopped: status %#x, interrupts %#x, ring read up to %u of %u; the GMU "
@@ -3413,6 +3574,7 @@ gpu_block_stop(void)
 void
 hakios_adreno_quiesce(void)
 {
+	gpu_irq_off(false);                     /* (11-19: masked only; no time to wait for anything here) */
 	if (cx_off) {
 		return;
 	}
@@ -3563,6 +3725,7 @@ gpu_sleep_core(void)
 	quiet = gpu_sleeps >= 2;                /* (the first two in full: what the block said on the way) */
 	step = 0;
 	newest_step = 0;
+	gpu_irq_off(true);                      /* (11-19: GX goes; taken again by gpu_wake_core()) */
 	core_bus_halt(false);
 	put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, 1u << 31);
 	core_is_on = core_runs = false;
@@ -3633,6 +3796,7 @@ gpu_wake_core(void)
 	}
 	step = 0;
 	gpu_asleep = false;
+	gpu_irq_on();                           /* (11-19: let go of by gpu_sleep_core() or the recovery) */
 	gpu_wakes++;
 	gpu_wake_us_last = ns / NSEC_PER_USEC;
 	gpu_wake_us_most = MAX(gpu_wake_us_most, gpu_wake_us_last);
@@ -4279,7 +4443,8 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	ring_time(gpu_fence, 1);
 	ring_register(CP_SCRATCH_REG2, gpu_fence);
 	ring_command(CP_EVENT_WRITE, 4);
-	ring(EVENT_CACHE_FLUSH);
+	/* (11-19) with the interrupt asked for when the waits sleep on it (gpu_irq_on() above; unmasked or not, harmless) */
+	ring(EVENT_CACHE_FLUSH | (gpu_irq_wanted && !gpu_irq_given_up ? CP_EVENT_IRQ : 0));
 	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
 	ring(0);
 	ring(gpu_fence);
@@ -4368,6 +4533,7 @@ hakios_gpu_recover(void)
 	    gpu_recoveries + 1);
 	hakios_gpu_report("hung");
 	lck_mtx_lock(&gpu_gov_mtx);
+	gpu_irq_off(true);                      /* (11-19: the core is reset and loses its power; gpu_wake_core() takes it again) */
 	step = 0;
 	newest_step = 0;
 	/*
@@ -4407,6 +4573,7 @@ hakios_gpu_recover(void)
 		gpu_failed_any = true;
 		*word = gpu_fence;              /* (every waiter let go: what it waited for will not come) */
 		to_memory((vm_offset_t)word, 4);
+		thread_wakeup((event_t)&gpu_irq_event);  /* (11-19: ... at once, not at their next look) */
 		gpu_recoveries++;
 		gpu_recovered_at[2] = gpu_recovered_at[1];
 		gpu_recovered_at[1] = gpu_recovered_at[0];
@@ -4843,7 +5010,9 @@ hakios_adreno_init(void)
 			to_memory(core_scratch.memory, 4096);
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+			PE_parse_boot_argn("gpu_irq", &gpu_irq_wanted, sizeof(gpu_irq_wanted));
 			gpu_kept = true;
+			gpu_irq_on();                   /* (11-19: boot-arg gpu_irq=1) */
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
 			HakiosGPUStart();
