@@ -240,6 +240,13 @@ static TUNABLE(uint32_t, gPushAgainMs, "gpu_push_ms", GPU_PUSH_AGAIN_MS);
 static TUNABLE(uint32_t, gPushGPUOnly, "gpu_push_gpuonly", 0);
 /* (11-19) a surface around a program's memory made a GPU buffer when its rows and start allow (surfaceBuffer()) */
 static TUNABLE(uint32_t, gWrapImport, "gpu_wrap", 0);
+/*
+ * (11-19) ... and its own interval: census c6 (gpu_wrap=1) moved the compositor's cost from copying and hashing those
+ * surfaces to pushing them -- 3-5 GB in 5 s in home flicks, Control Center and the app switcher on the 4 ms rule. They
+ * are pictures (decoded images, the apps' snapshots) seldom drawn again; one drawn again without a seed shows that
+ * much later at most. 0: gpu_push_ms's.
+ */
+static TUNABLE(uint32_t, gWrapAgainMs, "gpu_wrap_ms", 0);
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -1290,6 +1297,12 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 	 */
 	began = mach_absolute_time();
 	nanoseconds_to_absolutetime((uint64_t) gPushAgainMs * NSEC_PER_MSEC, &again);
+	uint64_t wrapAgain;                     /* (no initializer: the gotos to `out` above jump past it) */
+
+	wrapAgain = 0;
+	if (gWrapAgainMs != 0) {
+		nanoseconds_to_absolutetime((uint64_t) gWrapAgainMs * NSEC_PER_MSEC, &wrapAgain);
+	}
 	for (uint32_t i = 0; i < request->nr_bos; i++) {
 		struct gpu_buffer * b = buffer(bos[i].handle);
 
@@ -1307,8 +1320,10 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		if (b->surface != NULL) {
 			uint32_t seed = b->surface->shared()->seed;
+			/* (11-19) a surface around a program's memory, a GPU buffer since gpu_wrap=1: gpu_wrap_ms's interval */
+			uint64_t again_here = b->surface->client != NULL && wrapAgain != 0 ? wrapAgain : again;
 
-			if (seed == b->seed && !b->seen && began - b->pushed < again &&
+			if (seed == b->seed && !b->seen && began - b->pushed < again_here &&
 			    (!gPushWrite || !(bos[i].flags & MSM_SUBMIT_BO_WRITE))) {
 				continue;
 			}
@@ -1325,7 +1340,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			}
 			/* (11-19) why, the first reason that holds: the seed moved, mapped by this program, the interval, named for
 			 * writing -- for the 5-s line, to know which rule the pushes that are left come from */
-			unsigned why = seed != b->seed ? 0 : b->seen ? 1 : began - b->pushed >= again ? 3 : 2;
+			unsigned why = seed != b->seed ? 0 : b->seen ? 1 : began - b->pushed >= again_here ? 3 : 2;
 
 			gGPUStat.push_n[why]++;
 			gGPUStat.push_bytes[why] += b->size;
