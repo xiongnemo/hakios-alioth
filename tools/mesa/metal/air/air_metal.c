@@ -394,7 +394,10 @@ struct rwa_compute {
    struct rwa_compute_info caps;
 
    bool dynamic_threadgroup;      /* a threadgroup buffer sized by the dispatch */
-   unsigned dynamic_bytes;        /* (the K40's) its size, rwa_compute_set_threadgroup_bytes; 0: none given */
+   /* (the K40's) their sizes, rwa_compute_set_threadgroup_bytes(_at), by [[threadgroup(n)]]; 0: none given -- and
+    * (11-18) which n the shader declares (up to AIR_TG_BUFFERS: air_place_threadgroup_buffers lays them out) */
+   unsigned dynamic_bytes[AIR_TG_BUFFERS];
+   unsigned dynamic_mask;
    /* (the K40's, 11-17) the shader reads the grid's shape from its launch's kernel inputs (nir_air.h grid_inputs):
     * every launch passes them (dispatch_from), and the compute states take AIR_GRID_INPUT_BYTES of input */
    bool grid_inputs;
@@ -424,7 +427,7 @@ struct rwa_compute {
    struct {
       void *cso;
       unsigned block[3];
-      unsigned shared;            /* the threadgroup bytes it was compiled with */
+      unsigned shared[AIR_TG_BUFFERS];  /* the threadgroup buffers' lengths it was compiled with */
    } states[RWA_COMPUTE_STATES];
    unsigned next_state;           /* the entry made next once all are taken */
 };
@@ -3370,6 +3373,8 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
           * asked for yet.
           */
          compute->dynamic_threadgroup = true;
+         if (r->index < AIR_TG_BUFFERS)          /* (the front end refuses any other) */
+            compute->dynamic_mask |= 1u << r->index;
          break;
       case AIR_RESOURCE_TEXTURE:
          compute->caps.textures = MAX2(compute->caps.textures, r->index + 1);
@@ -3489,7 +3494,7 @@ rwa_compute_destroy(struct rwa_compute *compute)
  * the next size.
  */
 static void *
-compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned shared_extra,
+compute_state_for(struct rwa_compute *compute, const unsigned block[3], const unsigned shared_extra[AIR_TG_BUFFERS],
                   char *why, size_t why_size)
 {
    struct rwa_device *device = compute->device;
@@ -3497,7 +3502,7 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned
    for (unsigned i = 0; i < RWA_COMPUTE_STATES; i++) {
       if (compute->states[i].cso && compute->states[i].block[0] == block[0] &&
           compute->states[i].block[1] == block[1] && compute->states[i].block[2] == block[2] &&
-          compute->states[i].shared == shared_extra)
+          !memcmp(compute->states[i].shared, shared_extra, sizeof(compute->states[i].shared)))
          return compute->states[i].cso;
    }
 
@@ -3522,10 +3527,10 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned
    cs->info.workgroup_size[1] = block[1];
    cs->info.workgroup_size[2] = block[2];
    cs->info.workgroup_size_variable = false;
-   /* (the K40's) the dispatch's threadgroup buffer, baked in like the block size: the front end puts the one
-    * [[threadgroup(0)]] argument at shared offset 0 (air_to_nir.c), so the shader's shared size is that buffer's,
-    * and the dispatch path has refused a kernel that also declares threadgroup memory of its own */
-   cs->info.shared_size += shared_extra;
+   /* (the K40's) the dispatch's threadgroup buffers, baked in like the block size -- (11-18) all of them, after the
+    * shader's own static threadgroup memory, each base marker of the front end's replaced by its offset
+    * (air_place_threadgroup_buffers); until 11-18 one buffer at offset 0, and a kernel with both refused */
+   air_place_threadgroup_buffers(cs, shared_extra);
 
    finalize_for_gallium(cs, device->screen, !device->software);
 
@@ -3569,7 +3574,7 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], unsigned
    compute->states[slot].block[0] = block[0];
    compute->states[slot].block[1] = block[1];
    compute->states[slot].block[2] = block[2];
-   compute->states[slot].shared = shared_extra;
+   memcpy(compute->states[slot].shared, shared_extra, sizeof(compute->states[slot].shared));
    return cso;
 }
 
@@ -4571,16 +4576,20 @@ dispatch_from(struct rwa_compute *compute, const struct rwa_bindings *bindings,
 
    /* (the K40's) the threadgroup buffer is sized by the dispatch now: rwa_compute_set_threadgroup_bytes, which a
     * driver calls from -setThreadgroupMemoryLength:atIndex:. Without a size it is still refused, by name. */
-   if (compute->dynamic_threadgroup && compute->dynamic_bytes == 0) {
-      say(why, why_size, "%s takes a threadgroup buffer whose size only the dispatch can "
-                         "give (Metal's -setThreadgroupMemoryLength:atIndex:), and none was set",
-          name);
-      return -1;
+   /* (11-18) every buffer the kernel declares, by index, after its own static threadgroup memory
+    * (air_place_threadgroup_buffers) -- no longer one buffer at offset 0, nor a kernel with both refused */
+   unsigned tg_total = ALIGN_POT(compute->nir->info.shared_size, 16);
+   for (unsigned i = 0; i < AIR_TG_BUFFERS; i++) {
+      if ((compute->dynamic_mask & (1u << i)) && compute->dynamic_bytes[i] == 0) {
+         say(why, why_size, "%s takes a threadgroup buffer at index %u whose size only the dispatch can "
+                            "give (Metal's -setThreadgroupMemoryLength:atIndex:), and none was set", name, i);
+         return -1;
+      }
+      tg_total += compute->dynamic_bytes[i];
    }
-   if (compute->dynamic_threadgroup && compute->nir->info.shared_size != 0) {
-      say(why, why_size, "%s takes a threadgroup buffer and declares %u bytes of threadgroup memory "
-                         "of its own, and this library places both at offset 0", name,
-          compute->nir->info.shared_size);
+   if (tg_total > 32768) {
+      say(why, why_size, "%s's threadgroup memory comes to %u bytes with its buffers, and this GPU has 32768",
+          name, tg_total);
       return -1;
    }
 
@@ -4591,8 +4600,11 @@ dispatch_from(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                       name, why, why_size) != 0)
       return -1;
 
-   void *cso = compute_state_for(compute, group_size,
-                                 compute->dynamic_threadgroup ? compute->dynamic_bytes : 0, why, why_size);
+   /* (the lengths of buffers the kernel declares; another index's length takes no room) */
+   unsigned tg_lengths[AIR_TG_BUFFERS];
+   for (unsigned i = 0; i < AIR_TG_BUFFERS; i++)
+      tg_lengths[i] = (compute->dynamic_mask & (1u << i)) ? compute->dynamic_bytes[i] : 0;
+   void *cso = compute_state_for(compute, group_size, tg_lengths, why, why_size);
    if (!cso)
       return -1;
    pipe->bind_compute_state(pipe, cso);
@@ -8685,20 +8697,33 @@ rwa_query_destroy(struct rwa_query *q)
  * places (air_to_nir.c): kept on the pipeline, baked into the compiled state at the next dispatch as the block size
  * is. Rounded up to 16 as Metal requires of the length, and held to what the GPU has. */
 int
-rwa_compute_set_threadgroup_bytes(struct rwa_compute *compute, unsigned bytes, char *why, size_t why_size)
+rwa_compute_set_threadgroup_bytes_at(struct rwa_compute *compute, unsigned index, unsigned bytes, char *why,
+                                     size_t why_size)
 {
    if (!compute) {
       say(why, why_size, "no pipeline");
       return -1;
    }
+   if (index >= AIR_TG_BUFFERS) {
+      say(why, why_size, "threadgroup memory at index %u, and this library places %u buffers", index,
+          AIR_TG_BUFFERS);
+      return -1;
+   }
    bytes = ALIGN_POT(bytes, 16);
-   /* (32 KB: the Adreno 6xx's shared memory, what MTLDevice.maxThreadgroupMemoryLength says here) */
+   /* (32 KB: the Adreno 6xx's shared memory, what MTLDevice.maxThreadgroupMemoryLength says here; the sum is held to
+    * it at the dispatch) */
    if (bytes > 32768) {
       say(why, why_size, "%u bytes of threadgroup memory, and this GPU has 32768", bytes);
       return -1;
    }
-   compute->dynamic_bytes = bytes;
+   compute->dynamic_bytes[index] = bytes;
    return 0;
+}
+
+int
+rwa_compute_set_threadgroup_bytes(struct rwa_compute *compute, unsigned bytes, char *why, size_t why_size)
+{
+   return rwa_compute_set_threadgroup_bytes_at(compute, 0, bytes, why, why_size);
 }
 
 /* (the K40's) A blit encoder's -generateMipmapsForTexture: by the GPU: each of the texture's levels after its first

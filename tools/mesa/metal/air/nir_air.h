@@ -403,6 +403,18 @@ struct air_to_nir_options {
 #define AIR_GRID_INPUT_THREADS    32
 #define AIR_GRID_INPUT_BYTES      48
 
+/* (the K40's, 11-18) a [[threadgroup(n)]] argument's base offset in shared memory, n < AIR_TG_BUFFERS: a 32-bit
+ * load_kernel_input at AIR_TG_BASE_INPUT + 4 * n, a MARKER the runtime replaces with the constant when it makes the
+ * compute state for a dispatch's lengths (static threadgroup memory first, then each buffer in index order) -- never
+ * uploaded, and far from the grid inputs above */
+#define AIR_TG_BUFFERS            8
+#define AIR_TG_BASE_INPUT         256
+
+/* (the K40's, 11-18) the markers above replaced for one dispatch's lengths (bytes, index by index; 0 for a buffer
+ * the shader does not declare): static threadgroup memory first, then the buffers in index order; returns the whole
+ * shared size, which nir->info.shared_size becomes (air_finalize.c) */
+unsigned air_place_threadgroup_buffers(nir_shader *nir, const unsigned lengths[AIR_TG_BUFFERS]);
+
 /* (the K40's, 11-18) a translated shader made what a Gallium driver takes: system values lowered (on the GPU
  * -- fs_position_is_sysval -- [[point_coord]] as the input at VARYING_SLOT_PNTC), a vertex stage's outputs numbered
  * by slot, I/O as intrinsics. The Metal library's (air_metal.c) and the PC ir3_compiler's (air-ir3.patch) one road;

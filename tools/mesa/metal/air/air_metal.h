@@ -1449,6 +1449,10 @@ int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
  * -setThreadgroupMemoryLength:atIndex: with index 0, in bytes (rounded up to 16, as Metal's own rule says). Kept on
  * the pipeline until set again; 0 refuses a dispatch of a kernel that takes one. 0, or -1 and why. */
 int rwa_compute_set_threadgroup_bytes(struct rwa_compute *compute, unsigned bytes, char *why, size_t why_size);
+/* (the K40's, 11-18) the same for [[threadgroup(index)]], index < 8: each buffer after the kernel's static
+ * threadgroup memory, in index order (the first call is index 0's) */
+int rwa_compute_set_threadgroup_bytes_at(struct rwa_compute *compute, unsigned index, unsigned bytes, char *why,
+                                         size_t why_size);
 
 /* (the K40's) a multisample attachment resolved into a one-sample texture of its size and format (MTLStoreAction-
  * MultisampleResolve), by the GPU. 0, or -1 and why. */

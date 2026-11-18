@@ -131,6 +131,43 @@ scratch_to_local_array(nir_shader *nir)
    return true;
 }
 
+/* a threadgroup buffer's base marker (nir_air.h AIR_TG_BASE_INPUT) -> its offset */
+static bool
+place_tg_marker(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const unsigned *base = data;
+   if (intr->intrinsic != nir_intrinsic_load_kernel_input)
+      return false;
+   unsigned at = nir_intrinsic_base(intr);
+   if (at < AIR_TG_BASE_INPUT || at >= AIR_TG_BASE_INPUT + 4 * AIR_TG_BUFFERS || (at - AIR_TG_BASE_INPUT) % 4)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_rewrite_uses(&intr->def, nir_imm_int(b, base[(at - AIR_TG_BASE_INPUT) / 4]));
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+/*
+ * (the K40's, 11-18) Where a compute shader's threadgroup buffers go, for one dispatch's lengths (Metal's
+ * -setThreadgroupMemoryLength:atIndex:, each rounded up to 16): the shader's static threadgroup memory first
+ * (nir->info.shared_size, aligned to 16), then every buffer in index order -- one the shader does not declare has
+ * length 0 and takes no room. Each base marker becomes its offset, and nir->info.shared_size the whole, which is
+ * returned. The Metal library calls it as it makes the compute state for those lengths (air_metal.c
+ * compute_state_for), the PC's ir3_compiler with lengths of its own (air-ir3.patch).
+ */
+unsigned
+air_place_threadgroup_buffers(nir_shader *nir, const unsigned lengths[AIR_TG_BUFFERS])
+{
+   unsigned base[AIR_TG_BUFFERS], at = ALIGN_POT(nir->info.shared_size, 16);
+   for (unsigned i = 0; i < AIR_TG_BUFFERS; i++) {
+      base[i] = at;
+      at += ALIGN_POT(lengths[i], 16);
+   }
+   nir_shader_intrinsics_pass(nir, place_tg_marker, nir_metadata_control_flow, base);
+   nir->info.shared_size = at;
+   return at;
+}
+
 void
 air_finalize_for_gallium(nir_shader *nir, bool fs_position_is_sysval, bool base_group)
 {

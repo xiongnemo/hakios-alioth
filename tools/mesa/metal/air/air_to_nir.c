@@ -1809,12 +1809,20 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          p.class = AIR_PTR_SHARED;
          rk = AIR_RESOURCE_THREADGROUP_BUFFER;
          /* a threadgroup argument is sized at dispatch; its base is where the
-          * previous ones end, which only the runtime knows. One is all the
-          * corpus uses, so its base is zero and anything else is refused.
+          * previous ones end, which only the runtime knows.
+          *
+          * (the K40's, 11-18) So its base is a marker -- a kernel input at AIR_TG_BASE_INPUT + 4 * index, which
+          * the runtime REPLACES with the constant when it makes the compute state for a dispatch's lengths
+          * (air_metal.c tg_bases), as it already bakes the block size and the length in: the static threadgroup
+          * memory first, then each buffer in index order. One buffer at offset 0 was all this took until now, and a
+          * second (MPSMatrix, CoreRE, ACT, TSReading: 7 kernels of the iOS 16.5 image) was refused.
           */
-         if (index != 0)
-            return air_error(c, "interface: a second threadgroup buffer (index %u)",
-                             (unsigned)index);
+         if (index >= AIR_TG_BUFFERS)
+            return air_error(c, "interface: threadgroup buffer %u (this takes %u)", (unsigned)index,
+                             AIR_TG_BUFFERS);
+         p.offset = nir_load_kernel_input(&c->b, 1, 32, nir_imm_int(&c->b, 0),
+                                          .base = AIR_TG_BASE_INPUT + 4 * (unsigned)index, .range = 4,
+                                          .align_mul = 4, .align_offset = 0);
          break;
       default:
          return air_error(c, "interface: a buffer in address space %u", (unsigned)as);

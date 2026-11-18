@@ -611,6 +611,8 @@ static struct {
 	int (*finish)(struct rwa_device *, char *, size_t);
 	/* (the K40's) a kernel's [[threadgroup(0)]] size for its next dispatch; looked up, not required */
 	int (*compute_threadgroup_bytes)(struct rwa_compute *, unsigned, char *, size_t);
+	/* (11-18) ... and any [[threadgroup(n)]]'s, n < 8; looked up, not required */
+	int (*compute_threadgroup_bytes_at)(struct rwa_compute *, unsigned, unsigned, char *, size_t);
 	/* (the K40's) a multisample attachment resolved by the GPU; looked up, not required */
 	int (*texture_resolve)(struct rwa_device *, struct rwa_texture *, struct rwa_texture *, char *, size_t);
 	/* (the K40's) pipeline reflection, by stage; looked up, not required */
@@ -1236,6 +1238,8 @@ GPU_LOCKED(struct rwa_depth_stencil *, depth_stencil_create, (struct rwa_device 
 GPU_LOCKED_VOID(depth_stencil_destroy, (struct rwa_depth_stencil *s), (s))
 GPU_LOCKED(int, finish, (struct rwa_device *d, char *w, size_t ws), (d, w, ws))
 GPU_LOCKED(int, compute_threadgroup_bytes, (struct rwa_compute *c, unsigned n, char *w, size_t ws), (c, n, w, ws))
+GPU_LOCKED(int, compute_threadgroup_bytes_at, (struct rwa_compute *c, unsigned i, unsigned n, char *w, size_t ws),
+    (c, i, n, w, ws))
 GPU_LOCKED(int, texture_resolve, (struct rwa_device *d, struct rwa_texture *s, struct rwa_texture *t, char *w,
     size_t ws), (d, s, t, w, ws))
 GPU_LOCKED(struct rwa_texture *, texture_view, (struct rwa_texture *t, const struct rwa_texture_shape *s, char *w,
@@ -1495,6 +1499,7 @@ mesa_available(void)
 	*(void **)&mesa.depth_stencil_destroy = dlsym(mesa.handle, "rwa_depth_stencil_destroy");
 	*(void **)&mesa.finish = dlsym(mesa.handle, "rwa_finish");
 	*(void **)&mesa.compute_threadgroup_bytes = dlsym(mesa.handle, "rwa_compute_set_threadgroup_bytes");
+	*(void **)&mesa.compute_threadgroup_bytes_at = dlsym(mesa.handle, "rwa_compute_set_threadgroup_bytes_at");
 	*(void **)&mesa.texture_resolve = dlsym(mesa.handle, "rwa_texture_resolve");
 	*(void **)&mesa.render_arguments = dlsym(mesa.handle, "rwa_render_arguments");
 	*(void **)&mesa.compute_arguments = dlsym(mesa.handle, "rwa_compute_arguments");
@@ -1570,6 +1575,7 @@ mesa_available(void)
 	GPU_LOCK_WRAP(depth_stencil_destroy);
 	GPU_LOCK_WRAP(finish);
 	GPU_LOCK_WRAP(compute_threadgroup_bytes);
+	GPU_LOCK_WRAP(compute_threadgroup_bytes_at);
 	GPU_LOCK_WRAP(texture_resolve);
 	GPU_LOCK_WRAP(texture_view);
 	GPU_LOCK_WRAP(texture_subview);
@@ -2176,7 +2182,7 @@ enum {
 	BOOL hasDepthRange;
 	float viewport[4];                      /* (the K40's) MTLViewport's rectangle, when hasViewport */
 	BOOL hasViewport;
-	unsigned threadgroupBytes;              /* (the K40's) a dispatch's -setThreadgroupMemoryLength: for index 0 */
+	unsigned threadgroupBytes[8];           /* (the K40's) a dispatch's -setThreadgroupMemoryLength: by index (11-18: 8) */
 	unsigned cullMode, frontCCW, fillLines; /* (the K40's) the encoder's rasterizer state (rwa_draw says how) */
 	unsigned scissor[4];                    /* ... and its MTLScissorRect, when hasScissor */
 	BOOL hasScissor;
@@ -7281,13 +7287,28 @@ alioth_strict(void)
 			}
 		}
 
-		/* (the K40's) the threadgroup buffer's size for this dispatch, kept on the pipeline by the library */
-		if (work->threadgroupBytes != 0 && mesa.compute_threadgroup_bytes != NULL &&
-		    mesa.compute_threadgroup_bytes([work->pipeline compute], work->threadgroupBytes, why,
-						   sizeof(why)) != 0) {
-			rw_print("the dispatch's threadgroup memory: %s\n", why);
-			[self failWith:why];
-			goto done;
+		/* (the K40's) the threadgroup buffers' sizes for this dispatch, kept on the pipeline by the library --
+		 * (11-18) every index given (rwa_compute_set_threadgroup_bytes_at); a library without it takes index 0 */
+		{
+			BOOL tg_failed = NO;
+
+			for (unsigned i = 0; i < 8 && !tg_failed; i++) {
+				if (work->threadgroupBytes[i] == 0) {
+					continue;
+				}
+				if (mesa.compute_threadgroup_bytes_at != NULL) {
+					tg_failed = mesa.compute_threadgroup_bytes_at([work->pipeline compute], i,
+					    work->threadgroupBytes[i], why, sizeof(why)) != 0;
+				} else if (i == 0 && mesa.compute_threadgroup_bytes != NULL) {
+					tg_failed = mesa.compute_threadgroup_bytes([work->pipeline compute],
+					    work->threadgroupBytes[0], why, sizeof(why)) != 0;
+				}
+			}
+			if (tg_failed) {
+				rw_print("the dispatch's threadgroup memory: %s\n", why);
+				[self failWith:why];
+				goto done;
+			}
 		}
 		/* rwa_dispatch_buffers when the library has it, which is the same call with
 		 * Metal's offsets passed as well; a library too old to have it is used
@@ -10431,7 +10452,7 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 	id _textures[RW_MAX_BUFFERS];
 	id _samplers[RW_MAX_BUFFERS];
 	unsigned _highest, _highestTexture, _highestSampler;
-	unsigned _threadgroupBytes;     /* (the K40's) -setThreadgroupMemoryLength: for index 0 */
+	unsigned _threadgroupBytes[8];  /* (the K40's) -setThreadgroupMemoryLength: by index (11-18: up to 8, as the library) */
 }
 
 - (instancetype)initWithAliothCommandBuffer:(AliothMetalCommandBuffer *)commandBuffer
@@ -10579,7 +10600,7 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 	work->size[0] = (unsigned)size.width;
 	work->size[1] = (unsigned)size.height;
 	work->size[2] = (unsigned)size.depth;
-	work->threadgroupBytes = _threadgroupBytes;
+	memcpy(work->threadgroupBytes, _threadgroupBytes, sizeof(_threadgroupBytes));
 	return work;
 }
 
@@ -10713,13 +10734,13 @@ destinationBytesPerImage:(NSUInteger)image options:(NSUInteger)options
 - (void)memoryBarrierWithScope:(NSUInteger)scope { (void)scope; }
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	/* (the K40's) index 0, the one threadgroup argument the compiler library places, is carried to the dispatch
-	 * (rwa_compute_set_threadgroup_bytes); another index is said once and not given */
-	if (index == 0) {
-		_threadgroupBytes = (unsigned)MIN(length, (NSUInteger)UINT32_MAX);
+	/* (the K40's) carried to the dispatch (rwa_compute_set_threadgroup_bytes_at) -- (11-18) indices 0 to 7, the
+	 * buffers the compiler library lays out after a kernel's own threadgroup memory; another index is said once */
+	if (index < sizeof(_threadgroupBytes) / sizeof(_threadgroupBytes[0])) {
+		_threadgroupBytes[index] = (unsigned)MIN(length, (NSUInteger)UINT32_MAX);
 	} else {
-		RW_ONCE("threadgroup memory at index %lu is not given: the compiler library places one threadgroup "
-			"argument, index 0\n", (unsigned long)index);
+		RW_ONCE("threadgroup memory at index %lu is not given: the compiler library places indices 0 to 7\n",
+			(unsigned long)index);
 	}
 }
 

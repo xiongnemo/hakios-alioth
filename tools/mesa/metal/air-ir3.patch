@@ -152,7 +152,7 @@ dimensions -- and hides on the rest, which is presumably why it survived.
        } else if (strcmp(ext, ".comp") == 0) {
           if (from_tgsi || spirv_entry)
              errx(1, "cannot mix GLSL/TGSI/SPIRV");
-@@ -354,12 +434,25 @@
+@@ -354,12 +434,32 @@
     nir_shader *nir;
  
     struct fd_dev_id dev_id = {
@@ -168,6 +168,13 @@ dimensions -- and hides on the rest, which is presumably why it survived.
 +      nir = load_air(air_file, air_entry);
 +      stage = nir->info.stage;
 +
++      /* a kernel's [[threadgroup(n)]] buffers laid out as the library lays
++       * them out for a dispatch (air_place_threadgroup_buffers), 256 bytes
++       * each standing in for the lengths a dispatch would give */
++      if (stage == MESA_SHADER_COMPUTE) {
++         const unsigned tg_lengths[AIR_TG_BUFFERS] = { 256, 256, 256, 256, 256, 256, 256, 256 };
++         air_place_threadgroup_buffers(nir, tg_lengths);
++      }
 +      /* The frontend emits NIR's own system values, as the SPIR-V one does;
 +       * lowering them to what the hardware has is the consumer's job -- the
 +       * same function the Metal library calls before it hands a shader to
@@ -180,7 +187,7 @@ dimensions -- and hides on the rest, which is presumably why it survived.
        struct tgsi_token toks[65536];
        const nir_shader_compiler_options *nir_options =
           ir3_get_compiler_options(compiler);
-@@ -416,12 +509,25 @@
+@@ -416,12 +516,25 @@
     v->compiler = compiler;
     v->key = key;
     v->const_state = rzalloc_size(v, sizeof(*v->const_state));
