@@ -949,10 +949,51 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
     * can make a wrong compare-exchange show, and an atomic that is only
     * compiled is the one kind this project will not claim.
     */
-   if (!strcmp(op, "cmpxchg"))
-      return air_error(c, "intrinsic: air.atomic.%s.cmpxchg -- compare-exchange, whose "
-                          "result is the old value and whose `expected` is a pointer "
-                          "this does not write back yet", where);
+   /* (the K40's, 11-18) ... and now lowered so, with the check the paragraph above asks for: System Check's
+    * metal.atomic.cmpxchg (build 27) runs a compare-exchange retry loop over 64 threads on the phone's GPU, and a
+    * compare that must fail and one that must succeed, the failed one's `expected` read back. Relaxed orders only, as
+    * every other atomic here. The store back through `expected` is unconditional: on success it writes the value
+    * that is there already. A result of i1 (a variant that returns the success) is the comparison. */
+   if (!strcmp(op, "cmpxchg")) {
+      uint64_t success_order, failure_order;
+      if (in->num_operands < 6 || !air_const_uint(in->operands[4], &success_order) ||
+          !air_const_uint(in->operands[5], &failure_order))
+         return air_error(c, "intrinsic: air.atomic.%s.cmpxchg without constant memory orders", where);
+      if (success_order != 0 || failure_order != 0)
+         return air_error(c, "intrinsic: air.atomic.%s.cmpxchg with memory orders %u/%u; only relaxed (0) is "
+                             "translated", where, (unsigned)success_order, (unsigned)failure_order);
+      struct air_val *ev = air_get(c, in->operands[2]);
+      if (!ev)
+         return false;
+      if (ev->kind != AIR_VAL_PTR)
+         return air_error(c, "intrinsic: air.atomic.%s.cmpxchg whose `expected` is not a pointer", where);
+      nir_def *desired = air_get_ssa(c, in->operands[3]);
+      if (!desired)
+         return false;
+      nir_def *expected = air_load_ptr(c, ev->ptr, in->operands[3]->type, 0);
+      if (!expected)
+         return false;
+      if (expected->bit_size != desired->bit_size || expected->num_components != 1 || desired->num_components != 1)
+         return air_error(c, "intrinsic: air.atomic.%s.cmpxchg of %u-bit values with a %u-bit `expected`", where,
+                          desired->bit_size, expected->bit_size);
+      nir_def *old;
+      if (shared)
+         old = nir_shared_atomic_swap(&c->b, desired->bit_size, off, expected, desired,
+                                      .atomic_op = nir_atomic_op_cmpxchg);
+      else if (p.class == AIR_PTR_SSBO)
+         old = nir_ssbo_atomic_swap(&c->b, desired->bit_size, nir_imm_int(&c->b, p.binding), off, expected,
+                                    desired, .atomic_op = nir_atomic_op_cmpxchg);
+      else
+         return air_error(c, "intrinsic: a compare-exchange on a pointer that is not a buffer");
+      if (!air_store_ptr(c, ev->ptr, old, 0))
+         return false;
+      const struct air_type *rt = in->base.type;
+      if (rt && rt->kind == AIR_TYPE_INT && rt->bits == 1)
+         air_set(c, &in->base, air_val_ssa(c, nir_ieq(&c->b, old, expected)));
+      else if (rt && rt->kind != AIR_TYPE_VOID)
+         air_set(c, &in->base, air_val_ssa(c, old));
+      return true;
+   }
 
    /* The memory order, which this lowering is right for exactly one value of.
     * That argument is Metal's memory_order, and every atomic in the corpus
