@@ -786,10 +786,20 @@ surface_shared(struct eagl *e, struct image *image)
 		static unsigned said;
 
 		if (image->width * image->height >= 256 * 256 && said < 12) {
+			/*
+			 * (11-19) with the surface's own rows and where its pixels begin: freedreno takes a buffer only in rows of
+			 * a multiple of 64 bytes (fd_resource_from_handle: pitchalign = 4 bytes x gmem_align_w 16) -- the copied
+			 * ones' hashing (surface_changed) was 13% of CoreAnimation's display thread in home flicks (b117)
+			 */
+			size_t row = IOSurfaceGetBytesPerRow(surface);
+			uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(surface);
+
 			said++;
 			say("hakios-gl: surface %u (%d x %d, pixel format %#x) is copied into its texture, not used in place: "
-			    "%s (format %#x, type %#x)\n", IOSurfaceGetID(surface), image->width, image->height,
-			    (unsigned)IOSurfaceGetPixelFormat(surface), why, image->format, image->type);
+			    "%s (format %#x, type %#x; %zu bytes a row = %ld more than its pixels, %s 64; pixels at +%#lx in a page)\n",
+			    IOSurfaceGetID(surface), image->width, image->height, (unsigned)IOSurfaceGetPixelFormat(surface), why,
+			    image->format, image->type, row, (long)row - (long)image->width * 4,
+			    row % 64 == 0 ? "a multiple of" : "NOT a multiple of", (unsigned long)(base & 0xfff));
 		}
 		e->refused++;
 		return false;
