@@ -1088,7 +1088,27 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 		return kIOReturnNotFound;
 	}
 	if (s->client != NULL && s->scanPhys == 0) {
-		/* (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes) */
+		/*
+		 * (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes)
+		 * (11-19) said, the first 16 and then one every 30 s: the compositor copies and hashes every such surface with
+		 * the processor (eagl.c surface_to_texture / surface_changed: 18% of CA's display thread in the app switcher,
+		 * 13% in home flicks, census c1) -- how many of them the GPU could take in place, rows of a multiple of 64 bytes
+		 * from wherever in a page they begin, is what this is for.
+		 */
+		static uint32_t told;
+		static uint64_t told_at;
+		uint64_t now = mach_absolute_time(), thirty;
+
+		nanoseconds_to_absolutetime(30 * NSEC_PER_SEC, &thirty);
+		if (told < 16 || now - told_at >= thirty) {
+			told++;
+			told_at = now;
+			IOLog("HakiosGPU: surface %u (%u x %u, format %#x) wraps a program's memory, %u bytes from a page's start, "
+			    "%u bytes a row (%s 64; %u for its pixels): no GPU buffer of it (%u asked so far)\n", s->sid,
+			    s->info.width, s->info.height, s->info.pixelFormat, (uint32_t) (s->clientAddress & PAGE_MASK),
+			    s->info.bytesPerRow, s->info.bytesPerRow % 64 == 0 ? "a multiple of" : "NOT a multiple of",
+			    s->info.width * 4, told);
+		}
 		MiniIOSurfaceDrop(s);
 		return kIOReturnUnsupported;
 	}
