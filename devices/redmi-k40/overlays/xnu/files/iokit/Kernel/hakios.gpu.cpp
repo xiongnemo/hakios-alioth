@@ -214,6 +214,7 @@ static struct {
 	uint32_t pushes;                        /* (11-17) surfaces pushed out of the cache for a submission ... */
 	uint64_t biggest_push;                  /* ... and the biggest of them, bytes */
 	uint32_t irq_woken, irq_timed;          /* (11-19, gpu_irq=1) waits' sleeps ended by the interrupt / by the 2 ms */
+	uint32_t irq_missed;                    /* ... of the latter, those that found the fence done (an interrupt lost) */
 } gGPUStat;
 static uint64_t gIrqSeen, gIrqEmptySeen;        /* (11-19) the interrupt's counts at the last 5-s line */
 static TUNABLE(uint32_t, gInvalScan, "gpu_inval_scan", 0);
@@ -272,6 +273,10 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 				gGPUStat.irq_woken++;
 			} else if (woken == 0) {
 				gGPUStat.irq_timed++;
+				/* (a look that finds the fence done: the interrupt that should have said so did not come) */
+				if (hakios_gpu_done(fence)) {
+					gGPUStat.irq_missed++;
+				}
 			}
 			continue;
 		}
@@ -1326,8 +1331,9 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		hakios_gpu_irq_counts(&irqs, &empty);
 		if (irqs != gIrqSeen || gGPUStat.irq_woken != 0 || gGPUStat.irq_timed != 0) {
 			IOLog("HakiosGPU: the 3D core's interrupt: %llu arrived (%llu without a submission's end); the waits slept %u times "
-			    "until it and %u times until their 2 ms look%s\n", irqs - gIrqSeen, empty - gIrqEmptySeen, gGPUStat.irq_woken,
-			    gGPUStat.irq_timed, hakios_gpu_irq_ready() ? "" : "; NOW LOOKING AS BEFORE (the line was let go of)");
+			    "until it and %u times until their 2 ms look (%u of those found the fence done: interrupts lost)%s\n",
+			    irqs - gIrqSeen, empty - gIrqEmptySeen, gGPUStat.irq_woken, gGPUStat.irq_timed, gGPUStat.irq_missed,
+			    hakios_gpu_irq_ready() ? "" : "; NOW LOOKING AS BEFORE (the line was let go of)");
 			gIrqSeen = irqs;
 			gIrqEmptySeen = empty;
 		}
