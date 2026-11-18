@@ -221,6 +221,7 @@ static struct {
 	uint64_t push_bytes[4];                 /* ... and their bytes */
 	uint32_t gpuonly_skips;                 /* (11-19) interval pushes left out for surfaces said GPU-only (gpu_push_gpuonly) */
 	uint64_t gpuonly_bytes;
+	uint32_t wrapped;                       /* (11-19) surfaces around a program's memory made GPU buffers (gpu_wrap=1) */
 } gGPUStat;
 static uint64_t gIrqSeen, gIrqEmptySeen;        /* (11-19) the interrupt's counts at the last 5-s line */
 static TUNABLE(uint32_t, gInvalScan, "gpu_inval_scan", 0);
@@ -237,6 +238,8 @@ static TUNABLE(uint32_t, gPushWrite, "gpu_push_write", 1);
 static TUNABLE(uint32_t, gPushAgainMs, "gpu_push_ms", GPU_PUSH_AGAIN_MS);
 /* (11-19) the interval rule left out for surfaces said GPU-only (MiniIOSurface.h gpu_only; submit() says why) */
 static TUNABLE(uint32_t, gPushGPUOnly, "gpu_push_gpuonly", 0);
+/* (11-19) a surface around a program's memory made a GPU buffer when its rows and start allow (surfaceBuffer()) */
+static TUNABLE(uint32_t, gWrapImport, "gpu_wrap", 0);
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -748,6 +751,10 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 
 			if (b->surface == NULL) {
 				b->memory->retain();
+			} else if (b->surface->client != NULL && b->surface->scanPhys == 0) {
+				/* (11-19, gpu_wrap=1: the GPU reads a program's memory, held in place by the surface: the surface is kept
+				 * for good, so that the memory under it stays held while the GPU may still read it) */
+				b->surface = NULL;
 			} else {
 				b->surface->memory->retain();
 			}
@@ -1087,6 +1094,58 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
+	/*
+	 * (11-19, boot-arg gpu_wrap=1) ... unless it begins on a 4 KB boundary (the GPU's pages: this kernel's are 16 KB,
+	 * so a 16 KB page's 4, 8 and 12 KB marks are boundaries too) and its rows are a multiple of 64 bytes (what freedreno
+	 * takes): census c4 found 13 of the 22 refused so -- the home screen's 87x87 icons, and the 1326 x 1160 / 1326 x 1326
+	 * pictures of the app switcher, which the compositor copied and hashed every frame. The GPU then reads the program's
+	 * memory in place (held by the surface for its life, prepare()d where it was made, MiniIOSurface.cpp), read-only
+	 * if that is how it was held; submit()'s cache pass pushes it like any other surface (the seed, the interval).
+	 */
+	if (s->client != NULL && s->scanPhys == 0 && gWrapImport && (s->clientAddress & 4095) == 0 &&
+	    s->info.bytesPerRow % 64 == 0 && s->info.planeCount == 0) {
+		uint64_t wsize = ((uint64_t) s->info.allocSize + 4095) & ~4095ULL;
+		uint32_t wflags = s->client->getDirection() == kIODirectionOut ? MSM_BO_GPU_READONLY : 0;
+
+		request->size = wsize;
+		request->offset = s->info.offset;
+		request->rowBytes = s->info.bytesPerRow;
+		request->width = s->info.width;
+		request->height = s->info.height;
+		request->pixelFormat = s->info.pixelFormat;
+		request->planes = s->info.planeCount;
+		if (request->handle == kHakiosDescribe) {
+			request->handle = 0;
+			MiniIOSurfaceDrop(s);
+			return kIOReturnSuccess;
+		}
+		IOLockLock(gGPULock);
+		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+			if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
+				b = &fBuffers[i];
+				request->handle = i + 1;
+				break;
+			}
+		}
+		if (b != NULL) {
+			MiniIOSurfaceDrop(s);
+		} else if ((memory = IOSubMemoryDescriptor::withSubRange(s->client, 0, s->info.allocSize,
+		    s->client->getDirection())) != NULL && (b = newBuffer(s->client, 0, wsize, wflags, &request->handle)) != NULL) {
+			b->memory = memory;
+			b->kernel = s->kpixels;
+			b->surface = s;
+			gGPUStat.surfaces++;
+			gGPUStat.wrapped++;
+		}
+		gGPUStat.taking += mach_absolute_time() - began;
+		IOLockUnlock(gGPULock);
+		if (b == NULL) {
+			OSSafeReleaseNULL(memory);
+			MiniIOSurfaceDrop(s);
+			return kIOReturnNoMemory;
+		}
+		return kIOReturnSuccess;
+	}
 	if (s->client != NULL && s->scanPhys == 0) {
 		/*
 		 * (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes)
@@ -1379,10 +1438,11 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.biggest_push >> 10);
 		/* (11-19) which rule pushed them: the seed moved / mapped by the program / gpu_push_ms's interval / named for writing */
 		IOLog("HakiosGPU: surfaces pushed for: the seed moved %u (%llu MB), mapped by the program %u (%llu MB), the %u ms "
-		    "interval %u (%llu MB), named for writing %u (%llu MB); interval pushes left out, GPU-only: %u (%llu MB)\n",
+		    "interval %u (%llu MB), named for writing %u (%llu MB); interval pushes left out, GPU-only: %u (%llu MB); "
+		    "surfaces around a program's memory taken as buffers: %u\n",
 		    gGPUStat.push_n[0], gGPUStat.push_bytes[0] >> 20, gGPUStat.push_n[1], gGPUStat.push_bytes[1] >> 20, gPushAgainMs,
 		    gGPUStat.push_n[3], gGPUStat.push_bytes[3] >> 20, gGPUStat.push_n[2], gGPUStat.push_bytes[2] >> 20,
-		    gGPUStat.gpuonly_skips, gGPUStat.gpuonly_bytes >> 20);
+		    gGPUStat.gpuonly_skips, gGPUStat.gpuonly_bytes >> 20, gGPUStat.wrapped);
 		IOLog("HakiosGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
