@@ -57,6 +57,12 @@ jobs:
           ln -s ../sdks-git/iPhoneOS16.5.sdk $T/sdks/iPhoneOS16.5.sdk
           echo "THEOS=$T" >> "$GITHUB_ENV"
           $T/toolchain/linux/iphone/bin/clang --version | head -1
+      # (2026-11-19) the Wi-Fi build's two source archives, fetched ahead with retries and checked: tools/mk-ath11k.sh's
+      # own fetch (curl -s, no retry) failed two dev runs in a row with nothing in the log
+      - name: The Wi-Fi build's sources
+        run: |
+          bash devices/redmi-k40/kit/fetch-ath11k-sources.sh "$RUNNER_TEMP/ath11k"
+          echo "ATH11K_CACHE=$RUNNER_TEMP/ath11k" >> "$GITHUB_ENV"
       - name: The kit
         run: |
           v=${GITHUB_REF_NAME#kit-v}

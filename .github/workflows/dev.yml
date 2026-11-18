@@ -32,7 +32,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/dl
-          key: dl-7z2501-iostc210562a-v1
+          key: dl-7z2501-iostc210562a-ath11k7014-fbsd151-v1
       - name: Packages
         run: |
           sudo apt-get update -qq
@@ -75,12 +75,19 @@ jobs:
           git -C $T/sdks-git sparse-checkout set iPhoneOS16.5.sdk
           ln -s ../sdks-git/iPhoneOS16.5.sdk $T/sdks/iPhoneOS16.5.sdk
           echo "THEOS=$T" >> "$GITHUB_ENV"
+      # (2026-11-19) the Wi-Fi build's two source archives, fetched with retries, checked, and kept in the cache with
+      # the others: tools/mk-ath11k.sh's own fetch (curl -s, no retry) failed two runs in a row ("Wi-Fi did not build",
+      # nothing in the log); ATH11K_CACHE hands them to devices/redmi-k40/tools/stage-wifi.py
+      - name: The Wi-Fi build's sources
+        run: |
+          bash devices/redmi-k40/kit/fetch-ath11k-sources.sh ~/dl/ath11k
+          echo "ATH11K_CACHE=$HOME/dl/ath11k" >> "$GITHUB_ENV"
       - name: Downloads, into the cache
         if: steps.dl.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/dl
-          key: dl-7z2501-iostc210562a-v1
+          key: dl-7z2501-iostc210562a-ath11k7014-fbsd151-v1
       - name: The kernel and the programs (METAL=1)
         env:
           METAL: '1'
