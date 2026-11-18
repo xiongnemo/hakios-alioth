@@ -122,6 +122,9 @@ public:
 	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
 	uint32_t                        drawn;          /* the GPU's last submission that names the pixels (0: none; HakiosGPU.cpp) */
 	bool                            gpu_written;    /* CPU cache lines may be stale after that submission */
+	/* (11-19) its maker's GPU user said only GPUs touch the pixels (the value "HakiosGPUOnly": a CAMetalLayer drawable,
+	 * libhakios.metal): hakios.gpu.cpp's cache pass need not push it on the gpu_push_ms interval (gpu_push_gpuonly=1) */
+	bool                            gpu_only;
 	struct minisurf_result          info;           /* addresses not filled in */
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
 	OSDictionary *                  values;
@@ -143,6 +146,7 @@ public:
 	{
 		drawn = 0;
 		gpu_written = false;
+		gpu_only = false;
 		scanPhys = 0;
 		readMap = NULL;
 		kreadPixels = NULL;

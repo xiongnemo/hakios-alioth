@@ -218,6 +218,8 @@ static struct {
 	uint32_t irq_soon, irq_soon_done;       /* (11-19) 0.2 ms looks after a wake without the fence, and those that found it */
 	uint32_t push_n[4];                     /* (11-19) surfaces pushed for: the seed moved, mapped here, written, interval */
 	uint64_t push_bytes[4];                 /* ... and their bytes */
+	uint32_t gpuonly_skips;                 /* (11-19) interval pushes left out for surfaces said GPU-only (gpu_push_gpuonly) */
+	uint64_t gpuonly_bytes;
 } gGPUStat;
 static uint64_t gIrqSeen, gIrqEmptySeen;        /* (11-19) the interrupt's counts at the last 5-s line */
 static TUNABLE(uint32_t, gInvalScan, "gpu_inval_scan", 0);
@@ -232,6 +234,8 @@ static TUNABLE(uint32_t, gInvalScan, "gpu_inval_scan", 0);
  */
 static TUNABLE(uint32_t, gPushWrite, "gpu_push_write", 1);
 static TUNABLE(uint32_t, gPushAgainMs, "gpu_push_ms", GPU_PUSH_AGAIN_MS);
+/* (11-19) the interval rule left out for surfaces said GPU-only (MiniIOSurface.h gpu_only; submit() says why) */
+static TUNABLE(uint32_t, gPushGPUOnly, "gpu_push_gpuonly", 0);
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -1226,6 +1230,17 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			    (!gPushWrite || !(bos[i].flags & MSM_SUBMIT_BO_WRITE))) {
 				continue;
 			}
+			/*
+			 * (11-19, boot-arg gpu_push_gpuonly=1) A surface said to be touched by GPUs alone (MiniIOSurface.h gpu_only: a
+			 * CAMetalLayer drawable, said by libhakios.metal) has no writer that keeps quiet: the interval is for those,
+			 * and is not its reason. Its seed moving and this program mapping it still are.
+			 */
+			if (gPushGPUOnly && b->surface->gpu_only && seed == b->seed && !b->seen &&
+			    (!gPushWrite || !(bos[i].flags & MSM_SUBMIT_BO_WRITE))) {
+				gGPUStat.gpuonly_skips++;
+				gGPUStat.gpuonly_bytes += b->size;
+				continue;
+			}
 			/* (11-19) why, the first reason that holds: the seed moved, mapped by this program, the interval, named for
 			 * writing -- for the 5-s line, to know which rule the pushes that are left come from */
 			unsigned why = seed != b->seed ? 0 : b->seen ? 1 : began - b->pushed >= again ? 3 : 2;
@@ -1341,9 +1356,10 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.biggest_push >> 10);
 		/* (11-19) which rule pushed them: the seed moved / mapped by the program / gpu_push_ms's interval / named for writing */
 		IOLog("HakiosGPU: surfaces pushed for: the seed moved %u (%llu MB), mapped by the program %u (%llu MB), the %u ms "
-		    "interval %u (%llu MB), named for writing %u (%llu MB)\n", gGPUStat.push_n[0], gGPUStat.push_bytes[0] >> 20,
-		    gGPUStat.push_n[1], gGPUStat.push_bytes[1] >> 20, gPushAgainMs, gGPUStat.push_n[3], gGPUStat.push_bytes[3] >> 20,
-		    gGPUStat.push_n[2], gGPUStat.push_bytes[2] >> 20);
+		    "interval %u (%llu MB), named for writing %u (%llu MB); interval pushes left out, GPU-only: %u (%llu MB)\n",
+		    gGPUStat.push_n[0], gGPUStat.push_bytes[0] >> 20, gGPUStat.push_n[1], gGPUStat.push_bytes[1] >> 20, gPushAgainMs,
+		    gGPUStat.push_n[3], gGPUStat.push_bytes[3] >> 20, gGPUStat.push_n[2], gGPUStat.push_bytes[2] >> 20,
+		    gGPUStat.gpuonly_skips, gGPUStat.gpuonly_bytes >> 20);
 		IOLog("HakiosGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "

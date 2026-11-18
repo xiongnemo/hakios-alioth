@@ -1706,6 +1706,10 @@ IOSurfaceRootUserClient::methodSetValue(IOExternalMethodArguments * args, const 
 		if (array->getCount() == 2 && key != NULL) {
 			s->values->setObject(key, array->getObject(0));         /* [value, key] */
 			ret = kIOReturnSuccess;
+			/* (11-19) said by a CAMetalLayer drawable's GPU user: only GPUs touch the pixels (MiniIOSurface.h gpu_only) */
+			if (key->isEqualTo("HakiosGPUOnly")) {
+				s->gpu_only = array->getObject(0) == kOSBooleanTrue;
+			}
 		} else if (array->getCount() == 1 && all != NULL) {
 			s->values->merge(all);                                   /* [all the values] */
 			ret = kIOReturnSuccess;

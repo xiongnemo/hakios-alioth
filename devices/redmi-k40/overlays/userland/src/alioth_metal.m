@@ -3867,6 +3867,34 @@ alioth_keep_release(struct alioth_keep *k)
 	AliothMetalTexture *made = [[AliothMetalTexture alloc] initWithAliothDevice:self texture:texture shape:&shape];
 
 	[made aliothSetImportedSurface:s];
+	/*
+	 * (11-19) A CAMetalLayer's drawable (the descriptor's private isDrawable, plane 0): only GPUs touch its pixels --
+	 * the app draws into it through this driver, and a processor read or write of ours maps the GPU's buffer, which the
+	 * kernel sees (b->seen). Said to the kernel ("HakiosGPUOnly"), whose cache pass then need not push it out of this
+	 * processor's cache every gpu_push_ms for writers that say nothing (boot-arg gpu_push_gpuonly=1): the census of
+	 * 11-19 night measured those pushes of drawables at 12 GB in 5 s while Flutter animates. A video frame's planes
+	 * (CVMetalTextureCache: written by a processor) are not drawables and are not said so.
+	 */
+	if (p == 0 && [d respondsToSelector:@selector(isDrawable)] && ((BOOL (*)(id, SEL))objc_msgSend)(d, @selector(isDrawable))) {
+		static void (*set_value)(void *, CFStringRef, CFTypeRef);
+		static dispatch_once_t once;
+		/* (CoreAnimation keeps a few drawables' surfaces and comes back with them: each said once, not every frame --
+		 * a pointer seen again that is another surface by now is only left unsaid, which is the old road) */
+		static void *said[16];
+		static _Atomic unsigned next;
+		BOOL known = NO;
+
+		dispatch_once(&once, ^{
+			set_value = (void (*)(void *, CFStringRef, CFTypeRef))dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+		});
+		for (unsigned i = 0; i < 16 && !known; i++) {
+			known = __atomic_load_n(&said[i], __ATOMIC_RELAXED) == s;
+		}
+		if (set_value != NULL && !known) {
+			set_value(s, CFSTR("HakiosGPUOnly"), kCFBooleanTrue);
+			__atomic_store_n(&said[next++ % 16], s, __ATOMIC_RELAXED);
+		}
+	}
 	return made;
 }
 - (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
