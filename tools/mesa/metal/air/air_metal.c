@@ -3580,15 +3580,9 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3], const un
    compute->states[slot].block[1] = block[1];
    compute->states[slot].block[2] = block[2];
    memcpy(compute->states[slot].shared, shared_extra, sizeof(compute->states[slot].shared));
-   /* (the K40's, 11-18) and its compile waited for without the caller's lock, as a render pipeline's first draw
-    * (rwa_render_draw): the launch would wait for it inside, holding the lock */
-   if (!device->software) {
-      if (device->unlock)
-         device->unlock(device->lock_context);
-      ir3_get_shader((struct ir3_shader_state *)cso);
-      if (device->lock)
-         device->lock(device->lock_context);
-   }
+   /* (11-18) NOT waited for here as a render pipeline's stages are (rwa_render_draw): a6xx's compute state is an
+    * fd6_compute_state WRAPPING its ir3_shader_state (fd6_compute.cc), and ir3_get_shader on it waited on a fence that
+    * is not one -- round b111 hung at System Check's metal.heap (28be3d1, fixed in the next commit) */
    return cso;
 }
 
@@ -7750,7 +7744,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * program emit), and every other thread's Metal call stood behind it: metal_stats "the library's lock held
     * longest 11.24 ms, for render_draw" in Flutter Check's later launch (round b100). The caller takes the lock for
     * each call, so letting it go here, before this call has touched the context, is what happens between two calls
-    * anyway. ir3_get_shader is what freedreno's threaded context calls from the application's thread. */
+    * anyway. ir3_get_shader is what freedreno's threaded context calls from the application's thread. A vertex and
+    * a fragment state ARE ir3_shader_states (ir3_gallium.c's create_vs/fs_state); a compute one is not (b111). */
    if (!render->stages_ready && !device->software) {
       if (device->unlock)
          device->unlock(device->lock_context);
