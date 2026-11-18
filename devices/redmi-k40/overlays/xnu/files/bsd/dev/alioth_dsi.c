@@ -42,11 +42,12 @@
 
 /*
  * (11-18, the owner: "the auto-brightness is still too bright in this light") How much of Apple's own auto-brightness
- * target the panel shows in dim light, in percent: AppleARMBacklight (iokit/Kernel/MiniIOMobileFramebuffer.cpp) takes
- * CoreBrightness's target t (nits) to t * (p + (1 - p) * t / max) -- p of it in a dark room, all of it at the panel's
- * top, so the sun is still met. 100 = Apple's curve as it is. Boot-arg bl_auto_pct=N sets it at boot; sysctl
- * kern.hakios.bl_auto_pct (10..100, writable: usbsh/netsh "sysctl kern.hakios.bl_auto_pct=60") changes it live, from
- * CoreBrightness's next ramp. The slider (auto-brightness off) is not touched.
+ * target the panel shows between its ends, in percent: AppleARMBacklight (iokit/Kernel/MiniIOMobileFramebuffer.cpp)
+ * takes CoreBrightness's target t (nits) to min + d * (p + (1 - p) * d / (max - min)), d = t - min -- Apple's bottom
+ * (the panel's 2 nits) and top (500) unchanged, the owner said, p of the rise just above the bottom, less dimming as
+ * the light goes up. 100 = Apple's curve as it is; the owner's pick is 40 (the daily boot-args). Boot-arg
+ * bl_auto_pct=N sets it at boot; sysctl kern.hakios.bl_auto_pct (10..100, writable: usbsh/netsh
+ * "sysctl kern.hakios.bl_auto_pct=60") changes it at once. The slider (auto-brightness off) is not touched.
  */
 SYSCTL_DECL(_kern_hakios);
 uint32_t hakios_bl_auto_pct = 100;

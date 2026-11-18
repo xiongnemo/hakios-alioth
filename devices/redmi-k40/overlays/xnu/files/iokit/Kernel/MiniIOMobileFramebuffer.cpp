@@ -3229,6 +3229,7 @@ extern "C" bool hakios_board_is_alioth(void);
 #define ALIOTH_BL_INIT          400
 #define ALIOTH_BL_STEP_MS       33
 #define ALIOTH_BL_NITS_MAX      500             /* (the K11A's light at DBV 0x7ff, outside its high-brightness mode) */
+#define ALIOTH_BL_NITS_MIN      2               /* (its dimmest step, about; CoreBrightness's lMinPanel / lMinProduct) */
 #define ALIOTH_BL_FADE_MAX_MS   5000
 
 class AppleARMBacklight : public IOService
@@ -3326,8 +3327,9 @@ AppleARMBacklight::startBacklight(uint32_t initial)
 	OSDictionary * cal = OSDictionary::withCapacity(10);
 	if (cal != NULL) {
 		static const struct { const char * key; uint32_t value; } values[] = {
-			{ "lMaxPanel", ALIOTH_BL_NITS_MAX }, { "lMidPanel", ALIOTH_BL_NITS_MAX / 4 }, { "lMinPanel", 2 },
-			{ "lMaxProduct", ALIOTH_BL_NITS_MAX }, { "lMidProduct", ALIOTH_BL_NITS_MAX / 4 }, { "lMinProduct", 2 },
+			{ "lMaxPanel", ALIOTH_BL_NITS_MAX }, { "lMidPanel", ALIOTH_BL_NITS_MAX / 4 }, { "lMinPanel", ALIOTH_BL_NITS_MIN },
+			{ "lMaxProduct", ALIOTH_BL_NITS_MAX }, { "lMidProduct", ALIOTH_BL_NITS_MAX / 4 },
+			{ "lMinProduct", ALIOTH_BL_NITS_MIN },
 			{ "current-for-max-backlight", 20 }, { "current-for-mid-backlight", 5 },
 			{ "hardware-max-current-limit", 25 }, { "milliAmps2NitsScaleFactor", ALIOTH_BL_NITS_MAX / 20 },
 		};
@@ -3465,19 +3467,27 @@ AppleARMBacklight::setProperties(OSObject * properties)
 	}
 	if (asked_nits > 0) {
 		/*
-		 * (11-18) Apple's target dimmed in dim light by kern.hakios.bl_auto_pct (alioth_dsi.c): t * (p + (1 - p) *
-		 * t / max), so a dark room gets p of it and the panel's top all of it
+		 * (11-18) Apple's target dimmed between the ends by kern.hakios.bl_auto_pct (alioth_dsi.c): with d = t - min
+		 * and span = max - min, min + d * (p + (1 - p) * d / span) -- the bottom (min, the panel's dimmest that
+		 * CoreBrightness is told of) and the top (max) stay Apple's own, the owner said (11-18); just above the
+		 * bottom p of the rise, less dimming as the light goes up. At or below min: as asked. (11-18 first form
+		 * t * (p + (1 - p) * t / max) kept only the top: a dark room got p of Apple's dimmest.)
 		 */
 		uint32_t pct = hakios_bl_auto_pct;
 
 		hakios_bl_auto_target = (uint32_t) MIN(((uint64_t) asked_nits * 100) >> 16, (uint64_t) UINT32_MAX);
 		if (pct < 100) {
-			uint64_t max = (uint64_t) ALIOTH_BL_NITS_MAX << 16, t = MIN((uint64_t) asked_nits, max);
+			uint64_t max = (uint64_t) ALIOTH_BL_NITS_MAX << 16, min = (uint64_t) ALIOTH_BL_NITS_MIN << 16;
+			uint64_t t = MIN((uint64_t) asked_nits, max);
 			int64_t was = asked_nits;
 
-			asked_nits = (int64_t) (t * (pct * max + (100 - pct) * t) / (100 * max));
-			if (asked_nits < 1 << 16) {
-				asked_nits = 1 << 16;           /* (a nit at least: the dimmest step is about 2) */
+			if (t > min) {
+				uint64_t d = t - min, span = max - min;
+
+				/* (16.16: d < 2^25, pct * span < 2^32 -- the product fits) */
+				asked_nits = (int64_t) (min + d * (pct * span + (100 - pct) * d) / (100 * span));
+			} else {
+				asked_nits = (int64_t) t;
 			}
 			if (fLogged < 24) {
 				fLogged++;
