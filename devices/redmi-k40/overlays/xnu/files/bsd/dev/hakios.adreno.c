@@ -3347,6 +3347,7 @@ static volatile bool gpu_irq_live;              /* attached, the core powered an
 static bool gpu_irq_attached, gpu_irq_given_up;
 static uint32_t gpu_irq_still;                  /* handlers in a row that found the bit set again after the clear */
 static volatile uint64_t gpu_irq_count, gpu_irq_empty;
+static volatile uint64_t gpu_irq_last;          /* (11-19) mach_absolute_time of the last one (hakios_gpu_irq_last()) */
 static int gpu_irq_event;                       /* what the waits sleep on */
 
 /* In interrupt context, interrupts off: RBBM cleared, the waits woken. */
@@ -3361,6 +3362,7 @@ gpu_irq_arrived(__unused void *context, uint32_t intid)
 
 	wr(gpu.base + RBBM_INT_CLEAR_CMD, status);
 	gpu_irq_count++;
+	gpu_irq_last = mach_absolute_time();
 	if (!(status & RBBM_INT_CACHE_FLUSH_TS)) {
 		gpu_irq_empty++;
 	}
@@ -3464,6 +3466,16 @@ hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t *held)
 	result = thread_block(THREAD_CONTINUE_NULL);
 	lck_mtx_lock(held);
 	return result == THREAD_AWAKENED ? 1 : 0;
+}
+
+/* (11-19) when the last interrupt came (0: none yet): a wait that begins just after one may meet its fence's word not
+ * yet in memory, and no interrupt more for it (hakios.gpu.cpp gpuWait) */
+uint64_t hakios_gpu_irq_last(void);
+
+uint64_t
+hakios_gpu_irq_last(void)
+{
+	return gpu_irq_last;
 }
 
 void

@@ -69,6 +69,7 @@ extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
 /* (11-19) the 3D core's interrupt, boot-arg gpu_irq=1: whether the waits may sleep until it, on what, and its counts */
 bool hakios_gpu_irq_ready(void);
+uint64_t hakios_gpu_irq_last(void);
 int hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t * held);
 void hakios_gpu_irq_counts(uint64_t * arrived, uint64_t * empty);
 uint32_t hakios_gpu_last(void);
@@ -271,22 +272,24 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		 * that a lost interrupt costs that and no more, and never past the patience.
 		 */
 		if (hakios_gpu_irq_ready()) {
-			uint64_t now = mach_absolute_time(), step, deadline;
-			bool was_soon = soon;
+			uint64_t now = mach_absolute_time(), step, deadline, recent;
 
 			/*
-			 * (11-19) b117: in some 5-s windows every 2 ms look found the fence done (108 of 108) -- woken by an
-			 * interrupt, the fence not yet seen in memory (the core's word lands a little after its interrupt), and
-			 * then no interrupt more for it. So after a wake that finds the fence not there, one look 0.2 ms later.
+			 * (11-19) b117 / census c2: in Metal apps' windows most 2 ms looks found the fence done (270 of 334) --
+			 * waits that BEGAN just after an interrupt, when the fence's word was not yet in memory: they slept, and
+			 * no interrupt more came for it. (a27b630's look 0.2 ms after a WAKE found the fence 11 times in 53047:
+			 * not that road.) So a wait that begins within 0.3 ms of an interrupt looks again 0.3 ms on.
 			 */
-			nanoseconds_to_absolutetime(soon ? 200 * NSEC_PER_USEC : 2 * NSEC_PER_MSEC, &step);
-			soon = false;
+			nanoseconds_to_absolutetime(300 * NSEC_PER_USEC, &recent);
+			soon = now - hakios_gpu_irq_last() < recent;
+			bool was_soon = soon;
+
+			nanoseconds_to_absolutetime(soon ? 300 * NSEC_PER_USEC : 2 * NSEC_PER_MSEC, &step);
 			deadline = MIN(now + step, began + patience);
 			int woken = hakios_gpu_irq_wait(fence, deadline, IOLockGetMachLock(gGPULock));
 
 			if (woken > 0) {
 				gGPUStat.irq_woken++;
-				soon = true;
 			} else if (woken == 0 && was_soon) {
 				gGPUStat.irq_soon++;
 				if (hakios_gpu_done(fence)) {
@@ -1376,7 +1379,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		if (irqs != gIrqSeen || gGPUStat.irq_woken != 0 || gGPUStat.irq_timed != 0) {
 			IOLog("HakiosGPU: the 3D core's interrupt: %llu arrived (%llu without a submission's end); the waits slept %u times "
 			    "until it and %u times until their 2 ms look (%u of those found the fence done: interrupts lost); %u looks "
-			    "0.2 ms after a wake without the fence, %u of them found it%s\n",
+			    "0.3 ms on, for waits begun just after an interrupt, %u of them found the fence%s\n",
 			    irqs - gIrqSeen, empty - gIrqEmptySeen, gGPUStat.irq_woken, gGPUStat.irq_timed, gGPUStat.irq_missed,
 			    gGPUStat.irq_soon, gGPUStat.irq_soon_done,
 			    hakios_gpu_irq_ready() ? "" : "; NOW LOOKING AS BEFORE (the line was let go of)");
