@@ -4297,6 +4297,14 @@ hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 #define GPU_GOV_TOUCH_MS        500
 
 extern volatile uint64_t hakios_input_at;       /* hakios.input.c: the last touch or button */
+/*
+ * (11-19, census c10) The numbers above as boot-args, for A/B censuses (the defaults are the numbers above):
+ * gpugov_up, gpugov_down (percent), gpugov_down_ms, gpugov_touch_ms; gpugov_jump=1: from gpugov_up% straight to the
+ * top, not one level. The GPU held at its top (gpugov=0) took the Effects tab's late swaps 9-12% -> 5.9% (Control
+ * Center unchanged): the governor's steps cost frames in animations no finger drives. Speed against power: the owner's.
+ */
+static uint32_t gov_up = GPU_GOV_UP, gov_down = GPU_GOV_DOWN, gov_down_ms = GPU_GOV_DOWN_MS;
+static uint32_t gov_touch_ms = GPU_GOV_TOUCH_MS, gov_jump;
 static uint64_t gov_level_us[16];               /* since the last minute's line */
 static uint32_t gov_votes, gov_refused;
 static bool gov_running;
@@ -4326,12 +4334,12 @@ gpu_gov_thread(void *arg __unused, wait_result_t wr __unused)
 	uint64_t idle_window, down_window;
 	uint32_t fence_then = gpu_fence, refused_in_row = 0, top = gov_levels - 1;
 
-	nanoseconds_to_absolutetime((uint64_t)GPU_GOV_TOUCH_MS * NSEC_PER_MSEC, &touch_window);
+	nanoseconds_to_absolutetime((uint64_t)gov_touch_ms * NSEC_PER_MSEC, &touch_window);
 	nanoseconds_to_absolutetime((uint64_t)GPU_GOV_IDLE_MS * NSEC_PER_MSEC, &idle_window);
-	nanoseconds_to_absolutetime((uint64_t)GPU_GOV_DOWN_MS * NSEC_PER_MSEC, &down_window);
-	printf("adreno: gpugov: the GPU's speed follows its load: every %u ms, a level up from %u%% busy, down after %u ms "
+	nanoseconds_to_absolutetime((uint64_t)gov_down_ms * NSEC_PER_MSEC, &down_window);
+	printf("adreno: gpugov: the GPU's speed follows its load: every %u ms, %s from %u%% busy, down after %u ms "
 	    "under %u%%, the lowest after %u ms with nothing to do, the top for %u ms after a touch; levels", GPU_GOV_MS,
-	    GPU_GOV_UP, GPU_GOV_DOWN_MS, GPU_GOV_DOWN, GPU_GOV_IDLE_MS, GPU_GOV_TOUCH_MS);
+	    gov_jump ? "the top" : "a level up", gov_up, gov_down_ms, gov_down, GPU_GOV_IDLE_MS, gov_touch_ms);
 	for (uint32_t i = 1; i < gov_levels; i++) {
 		printf(" %u", gov_khz[i] / 1000);
 	}
@@ -4358,10 +4366,10 @@ gpu_gov_thread(void *arg __unused, wait_result_t wr __unused)
 		} else if (now - idle_since >= idle_window) {
 			want = 1;
 			low_since = 0;
-		} else if (pct >= GPU_GOV_UP) {
-			want = MIN(top, gov_level + 1);
+		} else if (pct >= gov_up) {
+			want = gov_jump ? top : MIN(top, gov_level + 1);
 			low_since = 0;
-		} else if (pct < GPU_GOV_DOWN) {
+		} else if (pct < gov_down) {
 			if (low_since == 0) {
 				low_since = now;
 			} else if (now - low_since >= down_window) {
@@ -4398,6 +4406,22 @@ gpu_gov_start(void)
 	if (!PE_parse_boot_argn("gpugov", &on, sizeof(on)) || !on || gov_levels < 3 || gov_level == 0) {
 		return;
 	}
+	/* (11-19) the governor's numbers as boot-args (gov_up's comment says why); nonsense keeps the default */
+	uint32_t v;
+
+	if (PE_parse_boot_argn("gpugov_up", &v, sizeof(v)) && v >= 10 && v <= 100) {
+		gov_up = v;
+	}
+	if (PE_parse_boot_argn("gpugov_down", &v, sizeof(v)) && v < gov_up) {
+		gov_down = v;
+	}
+	if (PE_parse_boot_argn("gpugov_down_ms", &v, sizeof(v)) && v >= GPU_GOV_MS && v <= 5000) {
+		gov_down_ms = v;
+	}
+	if (PE_parse_boot_argn("gpugov_touch_ms", &v, sizeof(v)) && v <= 5000) {
+		gov_touch_ms = v;
+	}
+	PE_parse_boot_argn("gpugov_jump", &gov_jump, sizeof(gov_jump));
 	gov_running = true;
 	if (kernel_thread_start(gpu_gov_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
