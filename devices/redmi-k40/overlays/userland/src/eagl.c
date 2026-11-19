@@ -282,6 +282,8 @@ struct app_drawable {
 	 * surface, about to be drawn into again, read as in use (IOSurfaceIsInUse: the render server still holds it?) */
 	unsigned window_in_use;
 	unsigned window_last_in_use;    /* ... and those whose previous frame's surface (likeliest on the screen) did */
+	unsigned window_waited;         /* (appgl_wait_ms) presents that waited for their surface, and how long together */
+	uint64_t window_waited_us;
 };
 
 struct eagl {
@@ -494,6 +496,30 @@ app_held_end(void *context)
  * nothing for a game on a 60 Hz CADisplayLink (Minecraft's frames come 16.5 ms apart), 62 a second for the rest.
  */
 static uint64_t app_period_us = 1000000 / 62;
+/*
+ * (11-19) boot-arg appgl_wait_ms=N (0, the default: no wait): a present waits, N ms at most, until the surface it is
+ * about to draw into reads as not in use (IOSurfaceIsInUse) -- the display's driver says so of a surface it scans
+ * out, from its flip until the one after is taken (MiniIOSurfaceUse). Census c37 (appgl_fps=122): Map drew ~110 frames
+ * a second, ~145 of each 2 s's ~220 into a surface still in use -- into the one on the panel -- and the screen showed
+ * 30-37. Waiting there holds an application to what the screen takes (an iPhone's present waits on its layer) and
+ * keeps it from drawing into the picture being sent; with it appgl_fps may go up to the display's rate.
+ */
+static uint64_t app_wait_us;
+
+static void
+app_wait_surface(struct app_drawable *d, IOSurfaceRef surface)
+{
+	if (app_wait_us == 0 || surface == NULL || !IOSurfaceIsInUse(surface)) {
+		return;
+	}
+	uint64_t began = now_us(), until = began + app_wait_us;
+
+	while (IOSurfaceIsInUse(surface) && now_us() < until) {
+		usleep(250);
+	}
+	d->window_waited++;
+	d->window_waited_us += now_us() - began;
+}
 static unsigned app_way;                /* boot-arg appgl_way=N: how a frame is copied into its surface (app_present()) */
 static int app_ways;                    /* boot-arg appgl_ways=1: each way in turn, 600 frames each */
 static const char *const app_way_names[] = {
@@ -5776,6 +5802,7 @@ present_now(id self, SEL selector, unsigned long target)
 		i = d->next;
 		way = 0;
 		d->window_in_use += d->surface[i] != NULL && IOSurfaceIsInUse(d->surface[i]);
+		app_wait_surface(d, d->surface[i]);     /* (appgl_wait_ms) */
 		if (d->presents == 0) {
 			say("hakios-gl: %s: OpenGL ES 1 frames copied by the library (hakios_gl_copy)\n", getprogname());
 		}
@@ -5805,6 +5832,7 @@ present_now(id self, SEL selector, unsigned long target)
 
 		d->window_last_in_use += last != NULL && IOSurfaceIsInUse(last);
 	}
+	app_wait_surface(d, d->surface[i]);             /* (appgl_wait_ms) */
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->app_read);
 	glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, (GLuint)renderbuffer);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->app_draw);
@@ -6090,14 +6118,16 @@ handed:
 
 		say("hakios-gl: %s: %.1f frames a second (%u so far); a present %.2f ms, of it the GPU's copy + %s %.2f ms; "
 		    "%u put on the layer by the main thread, %.1f ms after; %u drawn into a surface still in use, %u with the "
-		    "frame before's in use\n", getprogname(),
+		    "frame before's in use; %u waited for theirs, %.2f ms each (appgl_wait_ms)\n", getprogname(),
 		    (double)d->window_frames * 1e6 / (double)span,
 		    d->presents, (double)d->present_us / 1000.0 / d->window_frames, app_finish ? "glFinish" : "glFlush",
 		    (double)d->wait_us / 1000.0 / d->window_frames, shown, shown ? (double)d->shown_late_us / 1000.0 / shown : 0.0,
-		    d->window_in_use, d->window_last_in_use);
+		    d->window_in_use, d->window_last_in_use, d->window_waited,
+		    d->window_waited ? (double)d->window_waited_us / 1000.0 / d->window_waited : 0.0);
 		d->window_us = now_us();
 		d->window_frames = 0;
-		d->window_in_use = d->window_last_in_use = 0;
+		d->window_in_use = d->window_last_in_use = d->window_waited = 0;
+		d->window_waited_us = 0;
 		d->wait_us = d->present_us = 0;
 	}
 	/* held to a display's pace (app_period_us): back no sooner than that after the last present came back */
@@ -6284,6 +6314,9 @@ install(void)
 				unsigned long fps = strtoul(argument + 10, NULL, 10);
 
 				app_period_us = fps != 0 ? 1000000 / fps : 0;
+			}
+			if ((argument = strstr(arguments, "appgl_wait_ms=")) != NULL) {    /* (11-19: app_wait_surface()) */
+				app_wait_us = strtoull(argument + 14, NULL, 10) * 1000;
 			}
 			/* appgl_errors=1: the first 60 errors logged, with the call (the application no longer gets them) */
 			check_errors = strstr(arguments, "appgl_errors=1") != NULL;
