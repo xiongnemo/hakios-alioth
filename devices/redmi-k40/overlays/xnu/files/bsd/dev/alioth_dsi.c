@@ -89,10 +89,27 @@ SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_auto_given, CTLFLAG_RD | CTLFLAG_LOCKED, 
  * brightens over 2.5-4 s, and near the bottom one DBV step is ~12% of the light (8 -> 9) -- spread over half a
  * minute, a step a second, each one seen. Brightening keeps CoreBrightness's own time. Boot-arg bl_dim_ms=N; sysctl
  * kern.hakios.bl_dim_ms=N (writable: usbsh/netsh) from the next fade; 0 = CoreBrightness's own time (capped at 60 s).
+ * (11-20) 3000: the owner tried 4, 2 and 6 s by eye (rounds/bright-dim.ps1) and picked 3.
  */
-uint32_t hakios_bl_dim_ms = 4000;
+uint32_t hakios_bl_dim_ms = 3000;
 SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_dim_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &hakios_bl_dim_ms, 0,
     "the longest a dimming fade of the backlight may take, ms (0: CoreBrightness's own time)");
+/*
+ * (11-20, the owner: "the lower the brightness, the less smooth the dimming, the last few levels most") The panel's DBV
+ * is linear in light, so at the bottom one step is 10-12% of it (8 -> 9 at 2 nits) and a fade shows each one. The
+ * panel can smooth a change of DBV itself: WRCTRLD (DCS 0x53) bit 3, DD, beside BCTRL (bit 5). Its on-command leaves
+ * DD off (53 20); Xiaomi's kernel turns it on 120 ms after the first brightness of a wake (the DT's
+ * mi,mdss-dsi-dimmingon-command 15 01 .. 53 28, hs mode; mi,mdss-panel-on-dimming-delay 0x78). Ours never did.
+ * bl_panel_dim=1 (boot-arg; sysctl kern.hakios.bl_panel_dim=1/0 live): the backlight's next write sends 53 28 first
+ * (0: 53 20 again), and so after every wake, 120 ms after it (MiniIOMobileFramebuffer.cpp AppleARMBacklight::apply).
+ * Off by default until the owner has seen the low levels with it.
+ */
+uint32_t hakios_bl_panel_dim;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_panel_dim, CTLFLAG_RW | CTLFLAG_LOCKED, &hakios_bl_panel_dim, 0,
+    "the panel's own smoothing of brightness changes (DCS 53 28): 1 on, 0 off; from the next backlight write");
+/* what WRCTRLD last went to the panel as (0: not since the kernel's start), and when it last woke (the backlight's) */
+uint8_t alioth_panel_ctrl;
+uint64_t alioth_panel_woke_at;
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
@@ -728,6 +745,7 @@ panel_wake_steps(void)                  /* (panel_mtx held, or alone: the kernel
 		rc = alioth_dsi_dcs_write(display_on, 2, true, 0x05);
 	}
 	panel_asleep = false;
+	alioth_panel_woke_at = mach_absolute_time();
 	return rc;
 }
 
@@ -752,6 +770,7 @@ alioth_panel_power(bool on)
 		delay_for_interval(20, NSEC_PER_MSEC);
 		if (rc == 0) {
 			rc = alioth_dsi_dcs_write(control, 2, true, 0x39);
+			alioth_panel_ctrl = control[1];
 		}
 		if (rc == 0) {
 			rc = alioth_dsi_dcs_write(sleep_in, 2, true, 0x05);

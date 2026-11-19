@@ -43,6 +43,9 @@ extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 extern "C" uint32_t hakios_bl_auto_pct;                 /* bsd/dev/alioth_dsi.c: the auto-brightness in dim light, % */
 extern "C" uint32_t hakios_bl_auto_target, hakios_bl_auto_given; /* ... and its last step, 1/100 nit (sysctls) */
 extern "C" uint32_t hakios_bl_dim_ms;                   /* (11-19) bsd/dev/alioth_dsi.c: the longest a dimming fade takes */
+extern "C" uint32_t hakios_bl_panel_dim;                /* (11-20) bsd/dev/alioth_dsi.c: the panel's own smoothing (53 28) */
+extern "C" uint8_t alioth_panel_ctrl;                   /* ... WRCTRLD as last sent (0: never) */
+extern "C" uint64_t alioth_panel_woke_at;               /* ... the panel's last wake */
 extern "C" void hakios_screen_power(bool on);           /* bsd/dev/hakios.cpufreq.c */
 extern "C" void hakios_gpu_screen(bool on);             /* iokit/Kernel/hakios.gpu.cpp: the GPU asleep while dark (gpu_sleep=1) */
 extern "C" int alioth_panel_power(bool on);             /* bsd/dev/alioth_dsi.c */
@@ -3367,7 +3370,7 @@ class AppleARMBacklight : public IOService
 	bool                    fDisplayOn, fPowerEdge;
 	uint32_t                fLogged;
 	/* the work loop's */
-	bool                    fKnown, fBctrl;
+	bool                    fKnown;
 	uint32_t                fLevel, fChanges, fWrites;
 	uint64_t                fLastLog;
 
@@ -3506,6 +3509,11 @@ AppleARMBacklight::startBacklight(uint32_t initial)
 	if (PE_parse_boot_argn("bl_dim_ms", &dim_ms, sizeof(dim_ms)) && dim_ms <= ALIOTH_BL_FADE_MAX_MS) {
 		hakios_bl_dim_ms = dim_ms;
 	}
+	/* (11-20) the panel's own smoothing of brightness changes (bsd/dev/alioth_dsi.c, kern.hakios.bl_panel_dim) */
+	uint32_t panel_dim = 0;
+	if (PE_parse_boot_argn("bl_panel_dim", &panel_dim, sizeof(panel_dim))) {
+		hakios_bl_panel_dim = panel_dim != 0;
+	}
 	if (nits_path) {
 		setProperty("new-backlight-architecture", true);
 	}
@@ -3554,11 +3562,27 @@ AppleARMBacklight::apply(uint32_t level, bool final)
 	if (fKnown && level == fLevel) {
 		return;
 	}
-	if (!fBctrl) {
-		/* WRITE_CTRL_DISPLAY: brightness control on (BCTRL), as the panel's own power-up has it */
-		const uint8_t c53[2] = { 0x53, 0x20 };
+	/*
+	 * WRITE_CTRL_DISPLAY: brightness control on (BCTRL), as the panel's own power-up has it; (11-20) with the panel's
+	 * dimming (DD) when kern.hakios.bl_panel_dim says so (bsd/dev/alioth_dsi.c), not before 120 ms after a wake: as
+	 * Xiaomi's, the first brightness of a wake is not faded in from dark.
+	 */
+	uint64_t woke = alioth_panel_woke_at, settle;
+	nanoseconds_to_absolutetime(120 * NSEC_PER_MSEC, &settle);
+	uint8_t ctrl = hakios_bl_panel_dim && (woke == 0 || mach_absolute_time() - woke >= settle) ? 0x28 : 0x20;
+	if (alioth_panel_ctrl != ctrl) {
+		const uint8_t c53[2] = { 0x53, ctrl };
+		int crc = alioth_dsi_dcs_write(c53, 2, true, 0);
 
-		fBctrl = alioth_dsi_dcs_write(c53, 2, true, 0) == 0;
+		static uint32_t ctrl_failed;
+
+		if (crc == 0) {
+			alioth_panel_ctrl = ctrl;
+		}
+		if (crc == 0 || ctrl_failed++ < 4) {   /* (a failure is tried again at every write) */
+			hakios_tl("backlight: the panel's own dimming %s (DCS 53 %02x)%s\n", ctrl == 0x28 ? "on" : "off", ctrl,
+			    crc == 0 ? "" : " FAILED");
+		}
 	}
 	const uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
 	int rc = alioth_dsi_dcs_write(cmd, 3, true, 0);
