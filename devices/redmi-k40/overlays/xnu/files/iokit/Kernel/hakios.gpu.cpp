@@ -220,6 +220,8 @@ static struct {
 	uint32_t irq_soon, irq_soon_done;       /* (11-19) 0.2 ms looks after a wake without the fence, and those that found it */
 	uint32_t irq_missed_woke;               /* (11-19) of irq_missed: an interrupt came during the sleep all the same */
 	uint32_t irq_missed_raised;             /* ... none came, and the core's interrupt bit was set at the look */
+	uint32_t irq_missed_after;              /* ... one came after the sleep's deadline, before the look (gGPULock taken again) */
+	uint64_t irq_missed_late;               /* ... how late the looks came after their deadlines, together */
 	uint32_t push_n[4];                     /* (11-19) surfaces pushed for: the seed moved, mapped here, written, interval */
 	uint64_t push_bytes[4];                 /* ... and their bytes */
 	uint32_t gpuonly_skips;                 /* (11-19) interval pushes left out for surfaces said GPU-only (gpu_push_gpuonly) */
@@ -347,8 +349,17 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 					 * wait); or none came and the core's bit is set now (raised, not taken: the line's delivery);
 					 * or none came and the bit is clear (nothing raised for this fence)
 					 */
-					if (hakios_gpu_irq_last() > now) {
+					/*
+					 * (census c23: nearly all "slept through" one -- but an interrupt after the deadline, while this
+					 * took gGPULock again, counted the same: told apart now, with how late the look came)
+					 */
+					uint64_t last = hakios_gpu_irq_last(), look = mach_absolute_time();
+
+					gGPUStat.irq_missed_late += look > deadline ? look - deadline : 0;
+					if (last > now && last < deadline) {
 						gGPUStat.irq_missed_woke++;
+					} else if (last >= deadline) {
+						gGPUStat.irq_missed_after++;
 					} else if (hakios_gpu_irq_raised()) {
 						gGPUStat.irq_missed_raised++;
 					}
@@ -1558,14 +1569,19 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		uint64_t irqs, empty;
 
 		hakios_gpu_irq_counts(&irqs, &empty);
+		uint64_t missedLate;
+
+		absolutetime_to_nanoseconds(gGPUStat.irq_missed_late, &missedLate);
 		if (irqs != gIrqSeen || gGPUStat.irq_woken != 0 || gGPUStat.irq_timed != 0) {
 			IOLog("HakiosGPU: the 3D core's interrupt: %llu arrived (%llu without a submission's end); the waits slept %u times "
 			    "until it and %u times until their 2 ms look (%u of those found the fence done: interrupts lost); %u looks "
 			    "0.3 ms on, for waits begun just after an interrupt, %u of them found the fence; of the lost: %u slept "
-			    "through an interrupt, %u found the core's bit set (raised, not taken), %u neither%s\n",
+			    "through an interrupt, %u had one after the deadline (the look %llu us after it on average), %u found "
+			    "the core's bit set (raised, not taken), %u neither%s\n",
 			    irqs - gIrqSeen, empty - gIrqEmptySeen, gGPUStat.irq_woken, gGPUStat.irq_timed, gGPUStat.irq_missed,
-			    gGPUStat.irq_soon, gGPUStat.irq_soon_done, gGPUStat.irq_missed_woke, gGPUStat.irq_missed_raised,
-			    gGPUStat.irq_missed - gGPUStat.irq_missed_woke - gGPUStat.irq_missed_raised,
+			    gGPUStat.irq_soon, gGPUStat.irq_soon_done, gGPUStat.irq_missed_woke, gGPUStat.irq_missed_after,
+			    gGPUStat.irq_missed ? missedLate / NSEC_PER_USEC / gGPUStat.irq_missed : 0, gGPUStat.irq_missed_raised,
+			    gGPUStat.irq_missed - gGPUStat.irq_missed_woke - gGPUStat.irq_missed_after - gGPUStat.irq_missed_raised,
 			    hakios_gpu_irq_ready() ? "" : "; NOW LOOKING AS BEFORE (the line was let go of)");
 			gIrqSeen = irqs;
 			gIrqEmptySeen = empty;
