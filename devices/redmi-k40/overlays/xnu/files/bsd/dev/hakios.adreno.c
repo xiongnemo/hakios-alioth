@@ -3478,6 +3478,19 @@ hakios_gpu_irq_last(void)
 	return gpu_irq_last;
 }
 
+/*
+ * (11-19) For a wait whose 2 ms look found its fence done with no interrupt since it fell asleep (hakios.gpu.cpp
+ * gpuWait): is the core's CP_CACHE_FLUSH_TS bit set now -- raised and not taken (the line's delivery), or not raised
+ * at all? Only while the line is live, under HakiosGPU's lock, which the GPU's sleep and recovery take too.
+ */
+bool hakios_gpu_irq_raised(void);
+
+bool
+hakios_gpu_irq_raised(void)
+{
+	return gpu_irq_live && core_runs && core_is_on && (rd(gpu.base + RBBM_INT_0_STATUS) & RBBM_INT_CACHE_FLUSH_TS) != 0;
+}
+
 void
 hakios_gpu_irq_counts(uint64_t *arrived, uint64_t *empty)
 {
