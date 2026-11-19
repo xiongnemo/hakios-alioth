@@ -71,6 +71,7 @@ bool hakios_gpu_done(uint32_t fence);
 bool hakios_gpu_irq_ready(void);
 uint64_t hakios_gpu_irq_last(void);
 bool hakios_gpu_irq_raised(void);
+void hakios_gpu_irq_late(uint32_t * n, uint64_t * sched, uint64_t * lock);
 int hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t * held);
 void hakios_gpu_irq_counts(uint64_t * arrived, uint64_t * empty);
 uint32_t hakios_gpu_last(void);
@@ -1585,6 +1586,17 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			    hakios_gpu_irq_ready() ? "" : "; NOW LOOKING AS BEFORE (the line was let go of)");
 			gIrqSeen = irqs;
 			gIrqEmptySeen = empty;
+		}
+		uint32_t lateN;
+		uint64_t lateSched, lateLock;
+
+		hakios_gpu_irq_late(&lateN, &lateSched, &lateLock);
+		if (lateN != 0) {
+			/* (11-19, census c24: those looks 1.1-3.4 ms after their deadlines) a core, or the lock? */
+			absolutetime_to_nanoseconds(lateSched, &lateSched);
+			absolutetime_to_nanoseconds(lateLock, &lateLock);
+			IOLog("HakiosGPU: %u sleeps of the waits ran out: back on a core %llu us after the deadline, then %llu us for "
+			    "the lock, on average\n", lateN, lateSched / NSEC_PER_USEC / lateN, lateLock / NSEC_PER_USEC / lateN);
 		}
 		bzero(&gGPUStat, sizeof(gGPUStat));
 	}

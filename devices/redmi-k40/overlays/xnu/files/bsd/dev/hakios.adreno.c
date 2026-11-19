@@ -3349,6 +3349,9 @@ static uint32_t gpu_irq_still;                  /* handlers in a row that found 
 static volatile uint64_t gpu_irq_count, gpu_irq_empty;
 static volatile uint64_t gpu_irq_last;          /* (11-19) mach_absolute_time of the last one (hakios_gpu_irq_last()) */
 static int gpu_irq_event;                       /* what the waits sleep on */
+/* (11-19) timed-out sleeps: how many, and how long after the deadline the thread ran again, then had the lock again */
+static uint32_t gpu_irq_late_n;
+static uint64_t gpu_irq_late_sched, gpu_irq_late_lock;
 
 /* In interrupt context, interrupts off: RBBM cleared, the waits woken. */
 static void
@@ -3464,8 +3467,29 @@ hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t *held)
 	}
 	lck_mtx_unlock(held);
 	result = thread_block(THREAD_CONTINUE_NULL);
+	uint64_t ran = mach_absolute_time();
 	lck_mtx_lock(held);
+	if (result != THREAD_AWAKENED) {
+		/* (11-19, census c24: the looks after a timed-out sleep came 1.1-3.4 ms after the deadline) where that goes:
+		 * back on a core, then the lock -- counted under it */
+		gpu_irq_late_n++;
+		gpu_irq_late_sched += ran > deadline ? ran - deadline : 0;
+		gpu_irq_late_lock += mach_absolute_time() - ran;
+	}
 	return result == THREAD_AWAKENED ? 1 : 0;
+}
+
+/* (11-19) ... and those numbers, taken (zeroed); the caller holds the lock the waits take again */
+void hakios_gpu_irq_late(uint32_t *n, uint64_t *sched, uint64_t *lock);
+
+void
+hakios_gpu_irq_late(uint32_t *n, uint64_t *sched, uint64_t *lock)
+{
+	*n = gpu_irq_late_n;
+	*sched = gpu_irq_late_sched;
+	*lock = gpu_irq_late_lock;
+	gpu_irq_late_n = 0;
+	gpu_irq_late_sched = gpu_irq_late_lock = 0;
 }
 
 /* (11-19) when the last interrupt came (0: none yet): a wait that begins just after one may meet its fence's word not
