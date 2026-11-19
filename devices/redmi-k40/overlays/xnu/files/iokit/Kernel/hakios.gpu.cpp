@@ -257,8 +257,11 @@ static TUNABLE(uint32_t, gWrapAgainMs, "gpu_wrap_ms", 0);
  * submission that names it waits in submit() until that is over -- the newer frame's flip taken -- SCAN_GUARD_MS at most.
  * (freedreno names every buffer for reading and writing alike: a submission that only reads it waits too; none should:
  * a frame reads the one before it, not the one before that.)
+ * 50 ms (20 in 298a95e: census c19, 24,371 held, one gave up -- as Flutter Check started, its frame slow to draw): the
+ * newer frame was handed over before the held submission was made, so its flip never waits for it; the bound is only
+ * for a frame never shown.
  */
-#define SCAN_GUARD_MS           20
+#define SCAN_GUARD_MS           50
 static uint32_t gScanGuard;
 static IOLock * gScanGuardLock;
 

@@ -361,6 +361,7 @@ public:
 	uint32_t        fPanelSid, fPanelSwap;
 	bool            fAsyncMarked[SWAP_QUEUE];
 	uint32_t        fStatAsync, fStatAsyncNot;
+	uint32_t        fStatAsyncFreed;        /* (fb_swap_async=2) guards given up as the panel had been sent the surface */
 	bool topHides(const uint8_t * swap, MiniIOSurface * s);
 	uint32_t        fStatHidden;            /* frames whose layers under a whole-display opaque layer 0 were left out */
 	uint32_t        fNoDirectUntil;         /* (the K40's) no direct scan-out before this many frames shown (show()) */
@@ -991,8 +992,12 @@ static uint32_t gStatSwapWaitBusy, gStatSwapWaitAsked;
  * swaps a refresh late. Over at once, CoreAnimation prepares the next frame while the GPU draws this one.
  * What then keeps it from drawing into the surface on the panel (it draws into two or three in turn): while a newer
  * frame is on its way, the GPU's driver holds any submission that names the surface on the panel until that frame's
- * flip is taken (hakios.gpu.cpp, hakios_gpu_scan_guard(); 20 ms at most). The queued frame's surface reads as in use
+ * flip is taken (hakios.gpu.cpp, hakios_gpu_scan_guard(); 50 ms at most). The queued frame's surface reads as in use
  * (IOSurfaceIsInUse) from SwapEnd on, as one on the panel does.
+ * Census c18/c19 (=1): Control Center 57-65% -> 8% late, launches 36 -> 19%, the switcher 16 -> 5%, Effects 12 -> 0.6%;
+ * CA's frames in two surfaces in turn, so with =1 the next frame's GPU work waits for the TE that takes this one.
+ * fb_swap_async=2: the guard is given up as soon as fb_swap_early=3's test says the surface on the panel is read no
+ * more (sent whole), not at the TE (show()). (fb_swap_wait=1 on top, census c20: still two surfaces, 11% late.)
  */
 static TUNABLE(uint32_t, gSwapAsync, "fb_swap_async", 0);
 
@@ -2021,6 +2026,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatEarlyRisk += fEarlyShown != 0 && direct->sid == fEarlyShown;
 		fEarlyShown = 0;
 		bool early = swapEarly(direct->sid);
+		bool freed = false;             /* (the loop below saw the surface shown until now read no more) */
 		if (!early && gSwapEarly == 3 && fDirectHeld != NULL) {
 			/* fb_swap_early=3: the surface shown until now is free once the panel has been sent all of it, or the
 			 * flip is taken -- a frame at most (a still panel with refresh_idle sends nothing: free at once) */
@@ -2033,10 +2039,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fStatSentMax = line > fStatSentMax ? line : fStatSentMax;
 				if (alioth_flip_taken()) {
 					fStatEarlyTaken++;
+					freed = true;
 					break;
 				}
 				if (line >= fPanelHeight) {
 					fStatEarlySent++;
+					freed = true;
 					break;
 				}
 				if (mach_absolute_time() - asked >= limit) {
@@ -2051,6 +2059,21 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			completeSwap();
 			stagedReleased = true;
 			fStatEarly++;
+		}
+		if (gSwapAsync >= 2 && freed) {
+			/*
+			 * fb_swap_async=2: the surface shown until now is read no more -- fb_swap_early=3's own test above: the panel
+			 * has been sent all of it (the engine takes this flip at the next TE), or the flip is taken -- so it is not
+			 * guarded any longer, and this frame's is from now if a newer frame has come. With two surfaces in turn,
+			 * the next frame's GPU work then starts as soon as this one's is done, not at the TE that takes it.
+			 * (Only when the test said so: frames in three in turn and the test's timeout keep =1's road below.)
+			 */
+			IOLockLock(fSwapLock);
+			fPanelSid = direct->sid;
+			fPanelSwap = swapWord(swap, SWAP_ID);
+			hakios_gpu_scan_guard(__atomic_load_n(&gSwapMadeID, __ATOMIC_ACQUIRE) != fPanelSwap ? fPanelSid : 0);
+			IOLockUnlock(fSwapLock);
+			fStatAsyncFreed++;
 		}
 		shown = mach_absolute_time();
 		if (alioth_flip_wait(40000)) {
@@ -2320,10 +2343,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			while (turned < 8 && fStatSurfaces[turned] != 0) {
 				turned++;
 			}
-			IOLog("MiniIOMobileFramebuffer: fb_swap_async: %u swaps over once queued, %u waited as before; scanned-out "
-			    "frames in %u surfaces in turn (the GPU's held submissions: HakiosGPU's line)\n", fStatAsync, fStatAsyncNot,
-			    turned);
-			fStatAsync = fStatAsyncNot = 0;
+			IOLog("MiniIOMobileFramebuffer: fb_swap_async=%u: %u swaps over once queued, %u waited as before; scanned-out "
+			    "frames in %u surfaces in turn; %u guards given up before the flip was taken, the panel sent the surface "
+			    "(=2) (the GPU's held submissions: HakiosGPU's line)\n", gSwapAsync, fStatAsync, fStatAsyncNot, turned,
+			    fStatAsyncFreed);
+			fStatAsync = fStatAsyncNot = fStatAsyncFreed = 0;
 		}
 		if (fStatEarly != 0 || fStatEarlyRisk != 0 || gSwapWaitTruth != 0) {
 			uint32_t asked = __atomic_exchange_n(&gStatSwapWaitAsked, 0, __ATOMIC_RELAXED);
