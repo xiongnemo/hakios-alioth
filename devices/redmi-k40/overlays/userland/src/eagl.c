@@ -410,6 +410,7 @@ static float probe_box[4];                      /* X0, Y0, X1, Y1: the display's
 static void probe_poll(struct eagl *e);
 static void probe_frame(struct eagl *e);
 static void probe_frame_done(struct eagl *e);
+static bool probe_copy(const void *from, size_t size, void *to);
 static void probe_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices, GLint first, GLsizei count);
 static void probe_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void probe_ink(const uint8_t *base, size_t row, int width, int height, unsigned pixel, int alpha, char *out,
@@ -5362,15 +5363,21 @@ probe_dump_memory(struct eagl *e, struct image *image, unsigned unit)
 		return;
 	}
 	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
-	if (base != NULL) {
-		probe_ink(base, row, image->width, image->height, pixel, pixel == 4 ? (image->alpha_first ? 0 : 3) :
+	size_t span = row * (size_t)(image->height - 1) + (size_t)image->width * pixel;
+	uint8_t *copy = base != NULL && image->height > 0 && span <= (64u << 20) ? malloc(span) : NULL;
+
+	if (copy != NULL && !probe_copy(base, span, copy)) {
+		probe_say("glprobe:     [%u] surface %u's memory (%zu bytes at %p) cannot be read\n", unit, id, span, (const void *)base);
+	} else if (copy != NULL) {
+		probe_ink(copy, row, image->width, image->height, pixel, pixel == 4 ? (image->alpha_first ? 0 : 3) :
 		    image->format == 0x190a ? 1 : image->format == 0x1906 ? 0 : -1, ink, sizeof(ink));
 		snprintf(name, sizeof(name), "p%u-f%u-d%u-u%u-mem-s%u-%dx%d-%s.raw", probe_id, probe_frame_number, e->draws, unit, id,
 		    image->width, image->height, probe_kind(image, pixel));
 		probe_say("glprobe:     [%u] surface %u's memory (%zu bytes a row, %u a pixel%s): %s -> %s\n", unit, id, row, pixel,
 		    image->invert ? ", turned over in its texture" : "", ink,
-		    probe_write(name, base, row, (size_t)image->width * pixel, image->height) ? name : "NOT WRITTEN");
+		    probe_write(name, copy, row, (size_t)image->width * pixel, image->height) ? name : "NOT WRITTEN");
 	}
+	free(copy);
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 }
 
@@ -5439,8 +5446,13 @@ probe_dump_texture(struct eagl *e, unsigned unit, GLuint texture, GLint width, G
 	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+	/* (read as it is only where RGBA bytes are what it holds: a float or other kind is drawn into ours first) */
+	bool bytes = internal == GL_RGBA || internal == GL_RGBA8_P || internal == GL_BGRA || internal == 0x93a1;
+
+	if (bytes) {
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	}
+	if (bytes && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
 		glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 		done = true;
 	} else {
@@ -5634,6 +5646,73 @@ probe_frame_done(struct eagl *e)
 	(void)e;
 }
 
+/* A copy of this process's own memory that is an answer, not a crash, where a page is not there (vm_read_overwrite). */
+static bool
+probe_copy(const void *from, size_t size, void *to)
+{
+	vm_size_t got = 0;
+
+	return size == 0 || (vm_read_overwrite(mach_task_self(), (vm_address_t)from, (vm_size_t)size, (vm_address_t)to, &got) ==
+	    KERN_SUCCESS && got == size);
+}
+
+#define GL_VERTEX_ATTRIB_ARRAY_SIZE_P           0x8623
+#define GL_VERTEX_ATTRIB_ARRAY_STRIDE_P         0x8624
+#define GL_VERTEX_ATTRIB_ARRAY_TYPE_P           0x8625
+#define GL_VERTEX_ATTRIB_ARRAY_POINTER_P        0x8645
+#define GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING_P 0x889f
+
+/* A vertex array as OpenGL ES has it at the draw: `ok` if it is on and in the program's own memory (no buffer behind). */
+struct probe_array {
+	bool ok;
+	const uint8_t *pointer;
+	size_t stride, element;
+	GLint size;
+	GLenum type;
+};
+
+static struct probe_array
+probe_array_of(GLuint index)
+{
+	struct probe_array a = { false, NULL, 0, 0, 0, 0 };
+	GLint on = 0, buffer = 0, size = 0, stride = 0, type = 0;
+	void *pointer = NULL;
+	size_t part;
+
+	glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+	glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING_P, &buffer);
+	glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_SIZE_P, &size);
+	glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_STRIDE_P, &stride);
+	glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_TYPE_P, &type);
+	glGetVertexAttribPointerv(index, GL_VERTEX_ATTRIB_ARRAY_POINTER_P, &pointer);
+	part = type == GL_FLOAT || type == 0x1404 || type == 0x1405 || type == 0x140c ? 4 : type == GL_HALF_FLOAT ||
+	    type == GL_UNSIGNED_SHORT || type == 0x1402 ? 2 : type == GL_UNSIGNED_BYTE || type == 0x1400 ? 1 : 0;
+	a.size = size;
+	a.type = (GLenum)type;
+	a.element = (size_t)(size > 0 ? size : 0) * part;
+	a.stride = stride > 0 ? (size_t)stride : a.element;
+	a.pointer = pointer;
+	a.ok = on && buffer == 0 && pointer != NULL && a.element != 0;
+	return a;
+}
+
+/* Vertices lo to hi of an array, copied (probe_copy()); NULL if they cannot be read. The caller frees it. */
+static uint8_t *
+probe_array_copy(const struct probe_array *a, unsigned lo, unsigned hi)
+{
+	size_t bytes = (size_t)(hi - lo) * a->stride + a->element;
+	uint8_t *copy;
+
+	if (hi < lo || bytes > (8u << 20) || (copy = malloc(bytes)) == NULL) {
+		return NULL;
+	}
+	if (!probe_copy(a->pointer + (size_t)lo * a->stride, bytes, copy)) {
+		free(copy);
+		return NULL;
+	}
+	return copy;
+}
+
 /* One draw: what it draws into and with, where; the textures of those touching the box (or not into the display) dumped. */
 static void
 probe_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices, GLint first, GLsizei count)
@@ -5664,43 +5743,71 @@ probe_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices, GLint 
 	glGetIntegerv(GL_BLEND_DST_RGB, &blend[1]);
 	glGetIntegerv(GL_ARRAY_BUFFER_BINDING_P, &vbo);
 	glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING_P, &ebo);
-	/* (the arrays are CoreAnimation's own memory: not when a buffer is bound, where the pointers are places in it) */
-	if (vbo == 0 && (indices == NULL || ebo == 0) && e->arrays[0].pointer != NULL && e->arrays[0].type == GL_FLOAT &&
-	    (uintptr_t)e->arrays[0].pointer > 0x100000) {
-		GLsizei stride0 = e->arrays[0].stride != 0 ? e->arrays[0].stride : e->arrays[0].size * 4;
-		bool coords = e->arrays[2].pointer != NULL && e->arrays[2].type == GL_FLOAT && (uintptr_t)e->arrays[2].pointer > 0x100000;
-		GLsizei stride2 = e->arrays[2].stride != 0 ? e->arrays[2].stride : e->arrays[2].size * 4;
+	/*
+	 * (11-20) The arrays as OpenGL ES has them now (not as last given: an array that is off may point at memory long
+	 * gone), and only those in CoreAnimation's own memory (no buffer behind them), copied through the kernel so that a
+	 * page that is not there is an answer, not a crash -- reading them in place took the render server down (SIGBUS,
+	 * glprobe 113305, the feed).
+	 */
+	struct probe_array array0 = probe_array_of(0), array1 = probe_array_of(1), array2 = probe_array_of(2);
+	unsigned vertices[4096], n = count < 4096 ? (unsigned)count : 4096, lo = ~0u, hi = 0;
+	bool indexed_ok = true;
 
-		for (GLsizei i = 0; i < count && i < 4096; i++) {
-			unsigned vertex = indices == NULL ? (unsigned)(first + i) : type == GL_UNSIGNED_SHORT ?
-			    ((const uint16_t *)indices)[i] : type == GL_UNSIGNED_BYTE ? ((const uint8_t *)indices)[i] :
-			    ((const uint32_t *)indices)[i];
+	(void)vbo;
+	if (indices != NULL) {
+		size_t each = type == GL_UNSIGNED_SHORT ? 2 : type == GL_UNSIGNED_BYTE ? 1 : 4;
+		static uint8_t copied[4096 * 4];
+
+		indexed_ok = ebo == 0 && probe_copy(indices, each * n, copied);
+		for (unsigned i = 0; indexed_ok && i < n; i++) {
+			vertices[i] = each == 2 ? ((const uint16_t *)copied)[i] : each == 1 ? copied[i] : ((const uint32_t *)copied)[i];
+		}
+	} else {
+		for (unsigned i = 0; i < n; i++) {
+			vertices[i] = (unsigned)(first + (GLint)i);
+		}
+	}
+	for (unsigned i = 0; indexed_ok && i < n; i++) {
+		lo = vertices[i] < lo ? vertices[i] : lo;
+		hi = vertices[i] > hi ? vertices[i] : hi;
+	}
+	if (indexed_ok && n > 0 && array0.ok && array0.type == GL_FLOAT && array0.size >= 2) {
+		uint8_t *places = probe_array_copy(&array0, lo, hi), *coords = NULL, *colours = NULL;
+
+		if (array2.ok && array2.type == GL_FLOAT && array2.size >= 2) {
+			coords = probe_array_copy(&array2, lo, hi);
+		}
+		if (array1.ok && array1.type == GL_HALF_FLOAT && array1.size >= 4) {
+			colours = probe_array_copy(&array1, vertices[0], vertices[0]);
+		}
+		for (unsigned i = 0; places != NULL && i < n; i++) {
 			float place[2];
 
-			memcpy(place, (const uint8_t *)e->arrays[0].pointer + (size_t)vertex * (size_t)stride0, sizeof(place));
+			memcpy(place, places + (size_t)(vertices[i] - lo) * array0.stride, sizeof(place));
 			for (unsigned axis = 0; axis < 2; axis++) {
 				low[axis] = place[axis] < low[axis] ? place[axis] : low[axis];
 				high[axis] = place[axis] > high[axis] ? place[axis] : high[axis];
 			}
-			if (coords) {
-				memcpy(place, (const uint8_t *)e->arrays[2].pointer + (size_t)vertex * (size_t)stride2, sizeof(place));
+			if (coords != NULL) {
+				memcpy(place, coords + (size_t)(vertices[i] - lo) * array2.stride, sizeof(place));
 				for (unsigned axis = 0; axis < 2; axis++) {
 					tlow[axis] = place[axis] < tlow[axis] ? place[axis] : tlow[axis];
 					thigh[axis] = place[axis] > thigh[axis] ? place[axis] : thigh[axis];
 				}
 			}
-			if (i == 0 && e->arrays[1].pointer != NULL && e->arrays[1].type == GL_HALF_FLOAT &&
-			    (uintptr_t)e->arrays[1].pointer > 0x100000) {
-				uint16_t halves[4];
-				GLsizei stride1 = e->arrays[1].stride != 0 ? e->arrays[1].stride : 8;
+		}
+		if (colours != NULL) {
+			uint16_t halves[4];
 
-				memcpy(halves, (const uint8_t *)e->arrays[1].pointer + (size_t)vertex * (size_t)stride1, 8);
-				for (unsigned part = 0; part < 4; part++) {
-					colour[part] = half_float(halves[part]);
-				}
+			memcpy(halves, colours, 8);
+			for (unsigned part = 0; part < 4; part++) {
+				colour[part] = half_float(halves[part]);
 			}
 		}
-		placed = count > 0;
+		placed = places != NULL;
+		free(places);
+		free(coords);
+		free(colours);
 	}
 	if (placed) {
 		/* its corners as the viewport has them (y up, as OpenGL counts), by CoreAnimation's last matrix */
