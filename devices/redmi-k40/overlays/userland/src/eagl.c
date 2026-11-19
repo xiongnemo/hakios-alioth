@@ -62,6 +62,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -392,6 +393,27 @@ static GLsizei trace_corners = 12;              /* boot-arg gltrace_corners=N: h
 static float trace_middle[2];                   /* ... which is here, as CoreAnimation counts */
 static int trace_listed;                        /* the draw at hand is one of them */
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
+/*
+ * (11-20) boot-arg glprobe=1: a look at a frame when asked, not at a time fixed at boot (Apple News's text, blank but
+ * for one band: work/TODO.md "APPLE NEWS TEXT MISSING"). The program glprobe (work/ios-tools/glprobe) writes
+ * PROBE_DIR/go; the render server looks for it every 30 frames and then writes down the next frames' draws -- every
+ * framebuffer's, with what each reads -- and dumps the textures of those that touch a box of the screen, and the
+ * memory they were filled from, into PROBE_DIR (tools/glprobe-png.py makes pictures of them). Or "refill": every
+ * texture copied from an IOSurface is filled again from it at the next frame. Nothing of this without the boot-arg.
+ */
+#define PROBE_DIR       "/var/tmp/hakios-glprobe"
+static int probe_on;                            /* boot-arg glprobe=1 */
+static unsigned probe_left;                     /* frames still to be written down */
+static int probe_active;                        /* this frame is one of them */
+static unsigned probe_id;                       /* the request's number (in the files' names) */
+static float probe_box[4];                      /* X0, Y0, X1, Y1: the display's pixels, as in a screenshot */
+static void probe_poll(struct eagl *e);
+static void probe_frame(struct eagl *e);
+static void probe_frame_done(struct eagl *e);
+static void probe_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices, GLint first, GLsizei count);
+static void probe_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void probe_ink(const uint8_t *base, size_t row, int width, int height, unsigned pixel, int alpha, char *out,
+    size_t size);
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
 /*
@@ -1017,6 +1039,16 @@ surface_to_texture(struct eagl *e, struct image *image)
 		}
 		base = flipped;
 	}
+	if (probe_active) {
+		char ink[240];
+
+		probe_ink(base, row, image->width, image->height, pixel, pixel == 4 ? 3 : image->format == 0x190a ? 1 :
+		    image->format == 0x1906 ? 0 : -1, ink, sizeof(ink));
+		probe_say("glprobe: frame %u: texture %u filled from surface %u ('%.4s' %d x %d, %zu bytes a row, format %#x type %#x%s%s): "
+		    "%s\n", e->frames + 1, image->texture, IOSurfaceGetID(surface),
+		    (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) }, image->width, image->height, row,
+		    image->format, image->type, image->wrapped ? ", wrapped memory" : "", alpha_first ? ", opacity first" : "", ink);
+	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / pixel));
@@ -1290,6 +1322,19 @@ frame_begin(struct eagl *e)
 		trace_function_met = 0;
 		trace_function = -1;
 	}
+	if (probe_on && !app_role) {
+		if (probe_active) {
+			probe_frame_done(e);    /* (the frame before was written down) */
+		}
+		probe_active = 0;
+		if (probe_left != 0) {
+			probe_left--;
+			probe_active = 1;
+			probe_frame(e);
+		} else if (e->frames % 30 == 0) {
+			probe_poll(e);          /* (a request is taken up at the next frame's start) */
+		}
+	}
 	trace_placing = 0;
 	if (trace_left != 0) {
 		trace_left--;
@@ -1531,6 +1576,17 @@ my_glClear(void *context, GLbitfield mask)
 	e->clears++;
 	if (eagl_tracing) {
 		eagl_trace("glClear(%#x)\n", mask);
+	}
+	if (probe_active) {
+		GLint box[4] = { 0, 0, 0, 0 };
+		GLfloat colour[4] = { 0, 0, 0, 0 };
+
+		glGetIntegerv(GL_SCISSOR_BOX, box);
+		glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
+		probe_say("glprobe: frame %u: clear %#x of framebuffer %u (texture %u), scissor %s %d,%d %dx%d, colour %g %g %g %g%s\n",
+		    e->frames + 1, mask, e->framebuffer, e->colour, glIsEnabled(GL_SCISSOR_TEST) ? "on" : "off", box[0], box[1],
+		    box[2], box[3], (double)colour[0], (double)colour[1], (double)colour[2], (double)colour[3],
+		    e->colour != 0 ? " (put off until the next draw)" : "");
 	}
 	clear_now(e);
 	if ((mask & GL_COLOR_BUFFER_BIT) && e->colour != 0) {
@@ -3426,6 +3482,9 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	if (trace_placing) {
 		trace_placed_draw(e, mode, 0, NULL, first, count);
 	}
+	if (probe_active) {
+		probe_draw(e, mode, 0, NULL, first, count);
+	}
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: nothing is drawn, so that what this program puts there can be seen missing */
 	} else if (group_draw_begin(e, enabled)) {
@@ -3465,6 +3524,9 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	}
 	if (trace_placing) {
 		trace_placed_draw(e, mode, type, indices, 0, count);
+	}
+	if (probe_active) {
+		probe_draw(e, mode, type, indices, 0, count);
 	}
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: see my_glDrawArrays */
@@ -4968,6 +5030,13 @@ tex_image_now(id self, SEL selector, IOSurfaceRef surface, unsigned long target,
 	} else {
 		gl_check(image);                        /* (glcheck=1 only) */
 	}
+	if (probe_active) {
+		probe_say("glprobe: frame %u: -texImageIOSurface: texture %d <- surface %u ('%.4s' %zu x %zu, %zu bytes a row, seed %u) "
+		    "as %d x %d, internal %#lx format %#lx type %#lx, plane %u%s: %s\n", e->frames + 1, texture, IOSurfaceGetID(surface),
+		    (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) }, IOSurfaceGetWidth(surface),
+		    IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface), IOSurfaceGetSeed(surface), width, height,
+		    internal, format, type, plane, invert ? ", inverted" : "", image->shared ? "its memory" : "a copy");
+	}
 	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
 	return YES;
@@ -5093,6 +5162,13 @@ attach_image_now(id self, SEL selector, unsigned long target, IOSurfaceRef surfa
 		surface_to_texture(e, image);
 	}
 	e->attaching += now_us() - began;
+	if (probe_active) {
+		probe_say("glprobe: frame %u: -attachImage: texture %d <- surface %u ('%.4s' %d x %d, %zu bytes a row)%s: %s\n",
+		    e->frames + 1, texture, IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) },
+		    image->width, image->height, IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "",
+		    image->shared ? "its memory" : image->mirror != 0 ? "a texture of ours, copied into its memory by the GPU" :
+		    "a copy");
+	}
 	if (attached++ < 24) {
 		say("hakios-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
@@ -5112,6 +5188,601 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 		app_settle("-attachImage:");
 	}
 	return done;
+}
+
+/* ---- glprobe=1: a look at a frame when asked (see PROBE_DIR at the top) --------------------------- */
+
+#define GL_ACTIVE_TEXTURE_P             0x84e0
+#define GL_CURRENT_PROGRAM_P            0x8b8d
+#define GL_ARRAY_BUFFER_BINDING_P       0x8894
+#define GL_ELEMENT_ARRAY_BUFFER_BINDING_P 0x8895
+#define GL_PIXEL_PACK_BUFFER_P          0x88eb
+#define GL_PIXEL_PACK_BUFFER_BINDING_P  0x88ed
+#define GL_PIXEL_UNPACK_BUFFER_P        0x88ec
+#define GL_PIXEL_UNPACK_BUFFER_BINDING_P 0x88ef
+#define GL_DEPTH_TEST_P                 0x0b71
+#define GL_STENCIL_TEST_P               0x0b90
+#define GL_CULL_FACE_P                  0x0b44
+#define GL_SAMPLE_ALPHA_TO_COVERAGE_P   0x809e
+#define GL_RGBA8_P                      0x8058
+#define GL_TEXTURE_MIN_FILTER_P         0x2801
+#define PROBE_MAX_DUMPS                 40              /* files a request, at most */
+#define PROBE_MAX_BYTES                 (64u << 20)     /* ... and bytes (/var of a test root is not large) */
+
+static int probe_fd = -1;                       /* the request's own file, PROBE_DIR/pID.txt */
+static unsigned probe_frame_number, probe_frame_draws, probe_dumps;
+static uint64_t probe_bytes;
+static GLuint probe_seen_texture[PROBE_MAX_DUMPS];     /* dumped in this frame already */
+static uint32_t probe_seen_surface[PROBE_MAX_DUMPS];
+static unsigned probe_seen_textures, probe_seen_surfaces;
+
+/* A line into the request's file (the console only gets what says how it went: a frame's draws are many). */
+static void
+probe_say(const char *format, ...)
+{
+	char line[1400];
+	va_list ap;
+	int n;
+
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 1) {
+		n = sizeof(line) - 1;
+	}
+	if (n > 0) {
+		write(probe_fd >= 0 ? probe_fd : 2, line, (size_t)n);
+	}
+}
+
+/* Which rows of a picture have anything in them (its opacity, or any byte with `alpha` -1), as runs of rows. */
+static void
+probe_ink(const uint8_t *base, size_t row, int width, int height, unsigned pixel, int alpha, char *out, size_t size)
+{
+	size_t used = 0;
+	int start = -1, rows = 0, runs = 0, left = width, right = -1;
+
+	used += (size_t)snprintf(out, size, "rows with ink:");
+	for (int y = 0; y <= height; y++) {
+		bool ink = false;
+
+		if (y < height) {
+			const uint8_t *p = base + row * (size_t)y;
+
+			for (int x = 0; x < width; x++) {
+				const uint8_t *q = p + (size_t)x * pixel;
+				bool here = false;
+
+				if (alpha >= 0) {
+					here = q[alpha] != 0;
+				} else {
+					for (unsigned b = 0; b < pixel; b++) {
+						here |= q[b] != 0;
+					}
+				}
+				if (here) {
+					ink = true;
+					left = x < left ? x : left;
+					right = x > right ? x : right;
+				}
+			}
+		}
+		if (ink && start < 0) {
+			start = y;
+		} else if (!ink && start >= 0) {
+			rows += y - start;
+			if (runs++ < 12 && used < size) {
+				used += (size_t)snprintf(out + used, size - used, " %d-%d", start, y - 1);
+			}
+			start = -1;
+		}
+	}
+	if (used < size) {
+		if (rows == 0) {
+			snprintf(out + used, size - used, " none (of %d)", height);
+		} else {
+			snprintf(out + used, size - used, "%s (%d of %d rows, in %d runs; columns %d-%d of %d)", runs > 12 ? " ..." : "",
+			    rows, height, runs, left, right, width);
+		}
+	}
+}
+
+/* A dump into PROBE_DIR: rows of `used` bytes, `row` bytes apart. */
+static bool
+probe_write(const char *name, const uint8_t *base, size_t row, size_t used, int height)
+{
+	char path[256];
+	int fd;
+	bool good = true;
+
+	snprintf(path, sizeof(path), PROBE_DIR "/%s", name);
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) {
+		say("hakios-gl: glprobe: %s cannot be written (%s)\n", path, strerror(errno));
+		return false;
+	}
+	for (int y = 0; y < height && good; y++) {
+		good = write(fd, base + row * (size_t)y, used) == (ssize_t)used;
+	}
+	close(fd);
+	probe_dumps++;
+	probe_bytes += used * (size_t)height;
+	return good;
+}
+
+static const char *
+probe_kind(const struct image *image, unsigned pixel)
+{
+	static char other[16];
+
+	switch (image->format) {
+	case GL_BGRA:
+		return image->alpha_first ? "abgr" : "bgra";
+	case GL_RGBA:
+		return pixel == 4 ? "rgba" : "rgba16";
+	case 0x1906:
+		return "a8";
+	case 0x1909:
+		return "l8";
+	case 0x190a:
+		return "la8";
+	case 0x1903:
+		return "r8";
+	case 0x8227:
+		return "rg8";
+	default:
+		snprintf(other, sizeof(other), "b%u", pixel);
+		return other;
+	}
+}
+
+/* The memory a texture is filled from, as surface_to_texture() reads it (before turning it over, or reordering it). */
+static void
+probe_dump_memory(struct eagl *e, struct image *image, unsigned unit)
+{
+	IOSurfaceRef surface = image->surface;
+	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
+	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
+	unsigned pixel = bytes_a_pixel(image->format, image->type);
+	uint32_t id = IOSurfaceGetID(surface);
+	const uint8_t *base;
+	char name[160], ink[240];
+
+	for (unsigned i = 0; i < probe_seen_surfaces; i++) {
+		if (probe_seen_surface[i] == id) {
+			return;
+		}
+	}
+	if (probe_seen_surfaces == PROBE_MAX_DUMPS || probe_dumps >= PROBE_MAX_DUMPS ||
+	    probe_bytes + row * (size_t)image->height > PROBE_MAX_BYTES) {
+		return;
+	}
+	probe_seen_surface[probe_seen_surfaces++] = id;
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+		probe_say("glprobe:     surface %u cannot be locked\n", id);
+		return;
+	}
+	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
+	if (base != NULL) {
+		probe_ink(base, row, image->width, image->height, pixel, pixel == 4 ? (image->alpha_first ? 0 : 3) :
+		    image->format == 0x190a ? 1 : image->format == 0x1906 ? 0 : -1, ink, sizeof(ink));
+		snprintf(name, sizeof(name), "p%u-f%u-d%u-u%u-mem-s%u-%dx%d-%s.raw", probe_id, probe_frame_number, e->draws, unit, id,
+		    image->width, image->height, probe_kind(image, pixel));
+		probe_say("glprobe:     [%u] surface %u's memory (%zu bytes a row, %u a pixel%s): %s -> %s\n", unit, id, row, pixel,
+		    image->invert ? ", turned over in its texture" : "", ink,
+		    probe_write(name, base, row, (size_t)image->width * pixel, image->height) ? name : "NOT WRITTEN");
+	}
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+}
+
+/* A program of ours that copies a texture as it is (texelFetch), for those that cannot be a framebuffer's (GL_ALPHA). */
+static GLuint
+probe_copy_program(void)
+{
+	static const char *const vertex = "#version 300 es\n"
+	    "void main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+	    "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+	static const char *const fragment = "#version 300 es\nprecision highp float;\nuniform highp sampler2D picture;\n"
+	    "out vec4 colour;\nvoid main() { colour = texelFetch(picture, ivec2(gl_FragCoord.xy), 0); }\n";
+	GLuint program = glCreateProgram(), shader;
+	GLint good = 0;
+
+	shader = glCreateShader(GL_VERTEX_SHADER);
+	glShaderSource(shader, 1, &vertex, NULL);
+	glCompileShader(shader);
+	glAttachShader(program, shader);
+	shader = glCreateShader(GL_FRAGMENT_SHADER);
+	glShaderSource(shader, 1, &fragment, NULL);
+	glCompileShader(shader);
+	glAttachShader(program, shader);
+	glLinkProgram(program);
+	glGetProgramiv(program, GL_LINK_STATUS, &good);
+	say("hakios-gl: glprobe: the program that copies textures: %s\n", good ? "made" : "NOT MADE");
+	return good ? program : 0;
+}
+
+/*
+ * What a texture holds, read back by the GPU: through a framebuffer of its own, or, for a kind that cannot be one,
+ * drawn into a texture of ours first. Everything that is changed for it is put back after (CoreAnimation keeps
+ * its own idea of the state). Rows as the texture has them: row 0 is the first of its memory.
+ */
+static void
+probe_dump_texture(struct eagl *e, unsigned unit, GLuint texture, GLint width, GLint height, GLint internal)
+{
+	static const GLenum caps[] = { GL_SCISSOR_TEST, GL_BLEND, GL_DEPTH_TEST_P, GL_STENCIL_TEST_P, GL_CULL_FACE_P,
+		                       GL_RASTERIZER_DISCARD, GL_SAMPLE_ALPHA_TO_COVERAGE_P };
+	static GLuint copier, copy;
+	GLint drawn_into = 0, read_from = 0, pack_alignment = 4, pack_row = 0, pack_buffer = 0;
+	size_t size = (size_t)width * (size_t)height * 4;
+	const char *way = "read";
+	bool done = false;
+	GLuint fbo = 0;
+	uint8_t *pixels;
+	char name[160], ink[240];
+
+	for (unsigned i = 0; i < probe_seen_textures; i++) {
+		if (probe_seen_texture[i] == texture) {
+			return;
+		}
+	}
+	if (width <= 0 || height <= 0 || width > 4096 || height > 4096 || probe_seen_textures == PROBE_MAX_DUMPS ||
+	    probe_dumps >= PROBE_MAX_DUMPS || probe_bytes + size > PROBE_MAX_BYTES || (pixels = malloc(size)) == NULL) {
+		return;
+	}
+	probe_seen_texture[probe_seen_textures++] = texture;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawn_into);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_from);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
+	glGetIntegerv(GL_PACK_ROW_LENGTH, &pack_row);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING_P, &pack_buffer);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER_P, 0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+		glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+		done = true;
+	} else {
+		GLint active = 0, bound = 0, program = 0, view[4] = { 0, 0, 0, 0 }, unpack_buffer = 0, enabled[8];
+		GLboolean mask[4] = { 1, 1, 1, 1 }, on[sizeof(caps) / sizeof(caps[0])];
+
+		way = "drawn into a texture of ours, then read";
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+		if (copier == 0) {
+			copier = probe_copy_program();
+		}
+		glGetIntegerv(GL_ACTIVE_TEXTURE_P, &active);
+		glGetIntegerv(GL_CURRENT_PROGRAM_P, &program);
+		glGetIntegerv(GL_VIEWPORT, view);
+		glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING_P, &unpack_buffer);
+		glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+		for (unsigned i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
+			on[i] = glIsEnabled(caps[i]);
+		}
+		for (GLuint i = 0; i < 8; i++) {
+			enabled[i] = 0;
+			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+		}
+		glActiveTexture(GL_TEXTURE0);
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER_P, 0);
+		if (copy == 0) {
+			glGenTextures(1, &copy);
+		}
+		glBindTexture(GL_TEXTURE_2D, copy);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8_P, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_P, GL_NEAREST);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, copy, 0);
+		if (copier != 0 && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+			glBindTexture(GL_TEXTURE_2D, texture);
+			glUseProgram(copier);
+			glViewport(0, 0, width, height);
+			for (unsigned i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
+				glDisable(caps[i]);
+			}
+			glColorMask(1, 1, 1, 1);
+			for (GLuint i = 0; i < 8; i++) {
+				if (enabled[i]) {
+					glDisableVertexAttribArray(i);
+				}
+			}
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+			glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+			done = true;
+			for (GLuint i = 0; i < 8; i++) {
+				if (enabled[i]) {
+					glEnableVertexAttribArray(i);
+				}
+			}
+		}
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+		/* back as it was */
+		for (unsigned i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
+			(on[i] ? glEnable : glDisable)(caps[i]);
+		}
+		glColorMask(mask[0], mask[1], mask[2], mask[3]);
+		glViewport(view[0], view[1], view[2], view[3]);
+		glUseProgram((GLuint)program);
+		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+		glActiveTexture((GLenum)active);
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER_P, (GLuint)unpack_buffer);
+	}
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)drawn_into);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_from);
+	glDeleteFramebuffers(1, &fbo);
+	glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
+	glPixelStorei(GL_PACK_ROW_LENGTH, pack_row);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER_P, (GLuint)pack_buffer);
+	if (done) {
+		probe_ink(pixels, (size_t)width * 4, width, height, 4, 3, ink, sizeof(ink));
+		snprintf(name, sizeof(name), "p%u-f%u-d%u-u%u-tex%u-%dx%d-rgba.raw", probe_id, probe_frame_number, e->draws, unit,
+		    texture, width, height);
+		probe_say("glprobe:     [%u] texture %u as the GPU has it (internal format %#x; %s): %s -> %s\n", unit, texture,
+		    (unsigned)internal, way, ink, probe_write(name, pixels, (size_t)width * 4, (size_t)width * 4, height) ? name :
+		    "NOT WRITTEN");
+	} else {
+		probe_say("glprobe:     [%u] texture %u (internal format %#x): could not be read back\n", unit, texture,
+		    (unsigned)internal);
+	}
+	free(pixels);
+}
+
+static void
+probe_image_text(const struct image *image, char *out, size_t size)
+{
+	IOSurfaceRef s = image->surface;
+
+	snprintf(out, size, "surface %u '%.4s' %zu x %zu, %zu bytes a row, shown %d x %d format %#x type %#x%s%s%s%s%s%s; seed %u "
+	    "(filled at %u), changed at frame %u", IOSurfaceGetID(s),
+	    (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(s)) }, IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
+	    IOSurfaceGetBytesPerRow(s), image->width, image->height, image->format, image->type,
+	    image->target ? ", drawn into" : "", image->shared ? ", its memory" : image->mirror != 0 ? ", mirrored" : ", a copy",
+	    image->wrapped ? ", wrapped memory" : "", image->alpha_first ? ", opacity first" : "",
+	    image->invert ? ", turned over" : "", image->painted ? ", painted" : "", IOSurfaceGetSeed(s), image->seed,
+	    image->changed);
+}
+
+/* A request in PROBE_DIR/go: "box X0 Y0 X1 Y1 [FRAMES [ID]]" or "refill". */
+static void
+probe_poll(struct eagl *e)
+{
+	char text[256], path[200];
+	unsigned frames = 2, id = 0;
+	float box[4];
+	ssize_t n;
+	int fd = open(PROBE_DIR "/go", O_RDONLY);
+
+	if (fd < 0) {
+		return;
+	}
+	n = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	unlink(PROBE_DIR "/go");
+	if (n <= 0) {
+		return;
+	}
+	text[n] = 0;
+	if (strncmp(text, "refill", 6) == 0) {
+		unsigned marked = 0;
+
+		for (unsigned c = 0; c < sizeof(contexts) / sizeof(contexts[0]); c++) {
+			struct eagl *x = contexts[c];
+
+			for (unsigned i = 0; x != NULL && i < x->image_count; i++) {
+				if (!x->images[i].target && !x->images[i].shared) {
+					x->images[i].seed = IOSurfaceGetSeed(x->images[i].surface) + 1;     /* (frame_begin() fills it) */
+					marked++;
+				}
+			}
+		}
+		say("hakios-gl: glprobe: refill: %u textures copied from IOSurfaces are filled again at their next frame\n", marked);
+		return;
+	}
+	if (sscanf(text, "box %f %f %f %f %u %u", &box[0], &box[1], &box[2], &box[3], &frames, &id) < 4) {
+		say("hakios-gl: glprobe: %s/go not understood: %.80s\n", PROBE_DIR, text);
+		return;
+	}
+	memcpy(probe_box, box, sizeof(box));
+	probe_left = frames == 0 ? 1 : frames > 8 ? 8 : frames;
+	probe_id = id;
+	probe_dumps = 0;
+	probe_bytes = 0;
+	probe_frame_number = 0;
+	if (probe_fd >= 0) {
+		close(probe_fd);
+	}
+	snprintf(path, sizeof(path), PROBE_DIR "/p%u.txt", id);
+	probe_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	say("hakios-gl: glprobe %u: box %g,%g - %g,%g, the next %u frames into %s%s\n", id, (double)box[0], (double)box[1],
+	    (double)box[2], (double)box[3], probe_left, path, probe_fd < 0 ? " (WHICH CANNOT BE WRITTEN: the console then)" : "");
+	(void)e;
+}
+
+/* At a written-down frame's start: the frame before's summary, and this one's IOSurfaces (the first one's). */
+static void
+probe_frame(struct eagl *e)
+{
+	char text[400];
+
+	probe_frame_number = e->frames + 1;
+	probe_frame_draws = 0;
+	probe_seen_textures = probe_seen_surfaces = 0;
+	probe_say("glprobe %u: ---- frame %u (framebuffer %u, texture %u; %u textures with IOSurfaces)\n", probe_id,
+	    probe_frame_number, e->framebuffer, e->colour, e->image_count);
+	if (probe_dumps == 0) {
+		for (unsigned i = 0; i < e->image_count; i++) {
+			probe_image_text(&e->images[i], text, sizeof(text));
+			probe_say("glprobe: texture %u: %s\n", e->images[i].texture, text);
+		}
+	}
+}
+
+/* (frame_begin()) the frame before was written down: how it went, and the end of the request after its last */
+static void
+probe_frame_done(struct eagl *e)
+{
+	say("hakios-gl: glprobe %u: frame %u: %u draws written down; %u files, %llu KB so far\n", probe_id, probe_frame_number,
+	    probe_frame_draws, probe_dumps, (unsigned long long)(probe_bytes >> 10));
+	if (probe_left == 0) {
+		probe_say("glprobe %u: done\n", probe_id);
+		if (probe_fd >= 0) {
+			close(probe_fd);
+			probe_fd = -1;
+		}
+	}
+	(void)e;
+}
+
+/* One draw: what it draws into and with, where; the textures of those touching the box (or not into the display) dumped. */
+static void
+probe_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices, GLint first, GLsizei count)
+{
+	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	const GLfloat *m = e->matrix != NULL ? e->matrix : identity;
+	unsigned function = ca_context != NULL ? *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) : 90;
+	float low[2] = { 1e9f, 1e9f }, high[2] = { -1e9f, -1e9f }, tlow[2] = { 1e9f, 1e9f }, thigh[2] = { -1e9f, -1e9f };
+	float win[4] = { 1e9f, 1e9f, -1e9f, -1e9f }, colour[4] = { 0, 0, 0, 0 };
+	GLint view[4] = { 0, 0, 0, 0 }, scissor[4] = { 0, 0, 0, 0 }, blend[2] = { 0, 0 }, vbo = 0, ebo = 0;
+	struct image *into = e->colour != 0 ? image_of(e, e->colour) : NULL;
+	bool display = into != NULL && into->target && into->width >= 1000 && into->height >= 2000, touches = false;
+	bool placed = false;
+	char textures[900] = "";
+	size_t used = 0;
+	struct {
+		unsigned unit;
+		GLuint texture;
+		GLint width, height, internal;
+		struct image *image;
+	} units[4];
+	unsigned unit_count = 0;
+
+	probe_frame_draws++;
+	glGetIntegerv(GL_VIEWPORT, view);
+	glGetIntegerv(GL_SCISSOR_BOX, scissor);
+	glGetIntegerv(GL_BLEND_SRC_RGB, &blend[0]);
+	glGetIntegerv(GL_BLEND_DST_RGB, &blend[1]);
+	glGetIntegerv(GL_ARRAY_BUFFER_BINDING_P, &vbo);
+	glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING_P, &ebo);
+	/* (the arrays are CoreAnimation's own memory: not when a buffer is bound, where the pointers are places in it) */
+	if (vbo == 0 && (indices == NULL || ebo == 0) && e->arrays[0].pointer != NULL && e->arrays[0].type == GL_FLOAT &&
+	    (uintptr_t)e->arrays[0].pointer > 0x100000) {
+		GLsizei stride0 = e->arrays[0].stride != 0 ? e->arrays[0].stride : e->arrays[0].size * 4;
+		bool coords = e->arrays[2].pointer != NULL && e->arrays[2].type == GL_FLOAT && (uintptr_t)e->arrays[2].pointer > 0x100000;
+		GLsizei stride2 = e->arrays[2].stride != 0 ? e->arrays[2].stride : e->arrays[2].size * 4;
+
+		for (GLsizei i = 0; i < count && i < 4096; i++) {
+			unsigned vertex = indices == NULL ? (unsigned)(first + i) : type == GL_UNSIGNED_SHORT ?
+			    ((const uint16_t *)indices)[i] : type == GL_UNSIGNED_BYTE ? ((const uint8_t *)indices)[i] :
+			    ((const uint32_t *)indices)[i];
+			float place[2];
+
+			memcpy(place, (const uint8_t *)e->arrays[0].pointer + (size_t)vertex * (size_t)stride0, sizeof(place));
+			for (unsigned axis = 0; axis < 2; axis++) {
+				low[axis] = place[axis] < low[axis] ? place[axis] : low[axis];
+				high[axis] = place[axis] > high[axis] ? place[axis] : high[axis];
+			}
+			if (coords) {
+				memcpy(place, (const uint8_t *)e->arrays[2].pointer + (size_t)vertex * (size_t)stride2, sizeof(place));
+				for (unsigned axis = 0; axis < 2; axis++) {
+					tlow[axis] = place[axis] < tlow[axis] ? place[axis] : tlow[axis];
+					thigh[axis] = place[axis] > thigh[axis] ? place[axis] : thigh[axis];
+				}
+			}
+			if (i == 0 && e->arrays[1].pointer != NULL && e->arrays[1].type == GL_HALF_FLOAT &&
+			    (uintptr_t)e->arrays[1].pointer > 0x100000) {
+				uint16_t halves[4];
+				GLsizei stride1 = e->arrays[1].stride != 0 ? e->arrays[1].stride : 8;
+
+				memcpy(halves, (const uint8_t *)e->arrays[1].pointer + (size_t)vertex * (size_t)stride1, 8);
+				for (unsigned part = 0; part < 4; part++) {
+					colour[part] = half_float(halves[part]);
+				}
+			}
+		}
+		placed = count > 0;
+	}
+	if (placed) {
+		/* its corners as the viewport has them (y up, as OpenGL counts), by CoreAnimation's last matrix */
+		for (unsigned corner = 0; corner < 4; corner++) {
+			float x = corner & 1 ? high[0] : low[0], y = corner & 2 ? high[1] : low[1];
+			float cx = m[0] * x + m[4] * y + m[12], cy = m[1] * x + m[5] * y + m[13], w = m[3] * x + m[7] * y + m[15];
+			float wx, wy;
+
+			if (w == 0) {
+				w = 1;
+			}
+			wx = (float)view[0] + (cx / w + 1) / 2 * (float)view[2];
+			wy = (float)view[1] + (cy / w + 1) / 2 * (float)view[3];
+			win[0] = wx < win[0] ? wx : win[0];
+			win[1] = wy < win[1] ? wy : win[1];
+			win[2] = wx > win[2] ? wx : win[2];
+			win[3] = wy > win[3] ? wy : win[3];
+		}
+		if (display) {
+			/* the box is a screenshot's (y down); the display's picture may be either way up: both are taken */
+			float h = (float)(view[1] + view[3]);
+			bool up = win[0] <= probe_box[2] && win[2] >= probe_box[0] && win[1] <= probe_box[3] && win[3] >= probe_box[1];
+			bool down = win[0] <= probe_box[2] && win[2] >= probe_box[0] && h - win[3] <= probe_box[3] &&
+			    h - win[1] >= probe_box[1];
+
+			touches = up || down;
+		}
+	}
+	for (unsigned unit = 0; unit < 4; unit++) {
+		GLint width = 0, height = 0, internal = 0;
+		struct image *image;
+		char text[400] = "";
+
+		if (e->bound[unit] == 0) {
+			continue;
+		}
+		glActiveTexture(GL_TEXTURE0 + unit);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &internal);
+		image = image_of(e, e->bound[unit]);
+		if (image != NULL) {
+			probe_image_text(image, text, sizeof(text));
+		}
+		used += (size_t)snprintf(textures + used, sizeof(textures) - used, " [%u] %u (%d x %d, %#x%s%s)", unit, e->bound[unit],
+		    width, height, (unsigned)internal, image != NULL ? ": " : ": no IOSurface", text);
+		if (used >= sizeof(textures)) {
+			used = sizeof(textures) - 1;
+		}
+		units[unit_count].unit = unit;
+		units[unit_count].texture = e->bound[unit];
+		units[unit_count].width = width;
+		units[unit_count].height = height;
+		units[unit_count].internal = internal;
+		units[unit_count].image = image;
+		unit_count++;
+	}
+	glActiveTexture(GL_TEXTURE0 + e->unit);
+	probe_say("glprobe: frame %u draw %u: %s of %d into framebuffer %u (texture %u, %s); viewport %d,%d %dx%d; scissor %s %d,%d "
+	    "%dx%d; program %u, function %u (\"%s\"); blend %s %#x %#x; corners %g,%g - %g,%g -> %g,%g - %g,%g of the viewport%s; "
+	    "texture coordinates %g,%g - %g,%g; colour %g %g %g %g%s; textures%s\n", probe_frame_number, e->draws,
+	    mode == GL_TRIANGLES ? "triangles" : mode == GL_LINES ? "lines" : mode == GL_TRIANGLE_STRIP ? "a strip" :
+	    mode == GL_TRIANGLE_FAN ? "a fan" : "other", count, e->framebuffer, e->colour, display ? "the display's" :
+	    into != NULL ? "an IOSurface's" : "off the screen", view[0], view[1], view[2], view[3],
+	    glIsEnabled(GL_SCISSOR_TEST) ? "on" : "off", scissor[0], scissor[1], scissor[2], scissor[3], e->program, function,
+	    census_name(function), glIsEnabled(GL_BLEND) ? "on" : "off", blend[0], blend[1], (double)low[0], (double)low[1],
+	    (double)high[0], (double)high[1], (double)win[0], (double)win[1], (double)win[2], (double)win[3],
+	    !placed ? " (corners not read)" : touches ? " [IN THE BOX]" : "", (double)tlow[0], (double)tlow[1], (double)thigh[0],
+	    (double)thigh[1], (double)colour[0], (double)colour[1], (double)colour[2], (double)colour[3],
+	    e->unclear != 0 ? "; a clear put off before it" : "", unit_count != 0 ? textures : " none");
+	if (!touches && display) {
+		return;
+	}
+	if (!display && probe_dumps >= PROBE_MAX_DUMPS / 2) {
+		return;                 /* (what is drawn off the screen comes first in a frame: half the files are kept for the box) */
+	}
+	for (unsigned i = 0; i < unit_count; i++) {
+		if (units[i].image != NULL && !units[i].image->target) {
+			probe_dump_memory(e, units[i].image, units[i].unit);
+		}
+		probe_dump_texture(e, units[i].unit, units[i].texture, units[i].width, units[i].height, units[i].internal);
+	}
 }
 
 /* ---- an application's OpenGL ES: its current context, its CAEAGLLayer ---------------------------- */
@@ -6340,6 +7011,10 @@ install(void)
 	/* the kernel's boot-args are where a run is told things */
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 		drawn_seed = strstr(arguments, "gl_drawn_seed=1") != NULL;      /* (11-19: seed_drawn()) */
+		probe_on = !app_role && strstr(arguments, "glprobe=1") != NULL; /* (11-20: probe_poll()) */
+		if (probe_on) {
+			say("hakios-gl: glprobe=1: %s/go is looked for every 30 frames\n", PROBE_DIR);
+		}
 		if ((argument = strstr(arguments, "gl_driver_prio=")) != NULL) {        /* (11-19: raise_driver_threads()) */
 			driver_prio = (int)strtol(argument + 15, NULL, 10);
 		}
