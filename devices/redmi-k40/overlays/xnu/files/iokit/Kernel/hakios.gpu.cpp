@@ -228,6 +228,8 @@ static struct {
 	uint32_t gpuonly_skips;                 /* (11-19) interval pushes left out for surfaces said GPU-only (gpu_push_gpuonly) */
 	uint64_t gpuonly_bytes;
 	uint32_t wrapped;                       /* (11-19) surfaces around a program's memory made GPU buffers (gpu_wrap=1) */
+	uint32_t freed;                         /* (11-19) buffers given back (freeBuffer), and the time in it, the lock held */
+	uint64_t freeing;
 	uint32_t scan_held, scan_gave_up;       /* (11-19, fb_swap_async) submissions held for the surface on the panel */
 	uint64_t scan_holding;                  /* ... and for how long together (processor's clock) */
 } gGPUStat;
@@ -270,6 +272,55 @@ static TUNABLE(uint32_t, gWrapAgainMs, "gpu_wrap_ms", 0);
 #define SCAN_GUARD_MS           50
 static uint32_t gScanGuard;
 static IOLock * gScanGuardLock;
+
+/*
+ * (11-19) A buffer's memory let go of AFTER gGPULock: freeBuffer(), reap() and dropKept() released it under the lock,
+ * and letting go of tens of MB frees as many pages -- milliseconds, while every GPU wait of the system waited for the
+ * lock (census c25-c27: 0.4-3.6 ms on average in the windows where an application closed and the next one started).
+ * The GPU's pages of it are taken away under the lock as before; the memory itself goes on a thread call of its own.
+ */
+static IOLock * gReleaseLock;
+static OSArray * gReleaseList;
+static thread_call_t gReleaseCall;
+
+static void
+releaseWork(thread_call_param_t, thread_call_param_t)
+{
+	for (;;) {
+		IOLockLock(gReleaseLock);
+		OSArray * list = gReleaseList;
+
+		gReleaseList = NULL;
+		IOLockUnlock(gReleaseLock);
+		if (list == NULL) {
+			return;
+		}
+		list->release();                        /* (and with it what it holds) */
+	}
+}
+
+/* Takes over one reference of `o` (with gGPULock held, or not). */
+static void
+releaseLater(OSObject * o)
+{
+	bool queued = false;
+
+	if (o == NULL) {
+		return;
+	}
+	if (gReleaseLock != NULL && gReleaseCall != NULL) {
+		IOLockLock(gReleaseLock);
+		if (gReleaseList == NULL) {
+			gReleaseList = OSArray::withCapacity(16);
+		}
+		queued = gReleaseList != NULL && gReleaseList->setObject(o);
+		IOLockUnlock(gReleaseLock);
+	}
+	o->release();                                   /* (the list's own reference holds it, if it was queued) */
+	if (queued) {
+		thread_call_enter(gReleaseCall);
+	}
+}
 
 extern "C" void
 hakios_gpu_scan_guard(uint32_t sid)
@@ -570,6 +621,8 @@ HakiosGPUStart(void)
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	gGPULock = IOLockAlloc();
 	gScanGuardLock = IOLockAlloc();
+	gReleaseLock = IOLockAlloc();
+	gReleaseCall = thread_call_allocate_with_options(releaseWork, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
 	uint32_t sleepWanted = 0;
 	if (gGPULock != NULL && PE_parse_boot_argn("gpu_sleep", &sleepWanted, sizeof(sleepWanted)) && sleepWanted != 0) {
 		gGPUSleepCall = thread_call_allocate_with_options(gpuSleepWork, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
@@ -795,6 +848,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 	 */
 	struct gpu_buffer saved = *slot;
 	struct gpu_buffer * b = &saved;
+	uint64_t freeBegan = mach_absolute_time();      /* (11-19: the 5-s line's "given back") */
 
 	slot->memory = NULL;
 	slot->surface = NULL;
@@ -838,12 +892,14 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 			hakios_gpu_address_free(b->address, b->size);
 		}
 		if (b->memory != NULL) {
-			b->memory->release();
+			releaseLater(b->memory);                /* (11-19: let go of after gGPULock) */
 		}
 		if (b->surface != NULL) {
 			MiniIOSurfaceDrop(b->surface);
 		}
 	}
+	gGPUStat.freed++;
+	gGPUStat.freeing += mach_absolute_time() - freeBegan;
 }
 
 /* The buffers that were given back early and that the GPU is done with now: freed. With the lock held. */
@@ -865,7 +921,7 @@ HakiosGPUUserClient::reap(void)
 			hakios_gpu_address_free(left->address, left->size);
 		}
 		if (left->memory != NULL) {
-			left->memory->release();
+			releaseLater(left->memory);             /* (11-19: let go of after gGPULock) */
 		}
 		if (left->surface != NULL) {
 			MiniIOSurfaceDrop(left->surface);
@@ -999,7 +1055,7 @@ HakiosGPUUserClient::dropKept(struct gpu_kept * k)
 		hakios_gpu_unmap_in(fSpace, k->address, k->size);
 		hakios_gpu_address_free(k->address, k->size);
 	}
-	k->memory->release();
+	releaseLater(k->memory);                        /* (11-19: let go of after gGPULock) */
 	k->memory = NULL;
 	fKeptBytes -= k->size;
 }
@@ -1570,6 +1626,13 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.push_n[0], gGPUStat.push_bytes[0] >> 20, gGPUStat.push_n[1], gGPUStat.push_bytes[1] >> 20, gPushAgainMs,
 		    gGPUStat.push_n[3], gGPUStat.push_bytes[3] >> 20, gGPUStat.push_n[2], gGPUStat.push_bytes[2] >> 20,
 		    gGPUStat.gpuonly_skips, gGPUStat.gpuonly_bytes >> 20, gGPUStat.wrapped);
+		if (gGPUStat.freed != 0) {
+			uint64_t freeing;
+
+			absolutetime_to_nanoseconds(gGPUStat.freeing, &freeing);
+			IOLog("HakiosGPU: %u buffers given back, %llu us each with the lock held (their memory let go of after it)\n",
+			    gGPUStat.freed, freeing / NSEC_PER_USEC / gGPUStat.freed);
+		}
 		if (gGPUStat.scan_held != 0) {
 			uint64_t holding;
 
