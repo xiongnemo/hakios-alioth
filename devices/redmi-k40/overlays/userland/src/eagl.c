@@ -439,6 +439,43 @@ seed_drawn(IOSurfaceRef surface)
 	}
 }
 
+/*
+ * (11-19) boot-arg gl_driver_prio=N (0, the default: as before): Mesa's driver threads ("...:gdrv0", the threaded
+ * context's queue) at priority N, fixed (SCHED_RR), in the render server. Its frame's end waits for them (tc_sync),
+ * and psample of backboardd (census c19) has CoreAnimation's display thread real-time (-1) but gdrv0 at 31, the
+ * default -- under any application's interface threads (47): app launches 17-19% of the swaps late whatever the GPU's
+ * clock (census c31 / c32, gpugov=0 the same). Looked for once after each context is made (the queue starts with it).
+ */
+static int driver_prio;
+
+static void
+raise_driver_threads(void)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+	static int said;
+
+	if (driver_prio <= 0 || task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return;
+	}
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		pthread_t thread = pthread_from_mach_thread_np(threads[i]);
+		char name[64] = "";
+
+		if (thread != NULL && pthread_getname_np(thread, name, sizeof(name)) == 0 && strstr(name, "gdrv") != NULL) {
+			struct sched_param param = { .sched_priority = driver_prio };
+			int error = pthread_setschedparam(thread, SCHED_RR, &param);
+
+			if (said++ < 4) {
+				say("hakios-gl: %s: %s at priority %d (gl_driver_prio): %s\n", getprogname(), name, driver_prio,
+				    error == 0 ? "done" : strerror(error));
+			}
+		}
+		mach_port_deallocate(mach_task_self(), threads[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(threads[0]));
+}
+
 static void
 app_held_end(void *context)
 {
@@ -4702,6 +4739,9 @@ eagl_init(id self, unsigned long api, struct eagl *share)
 		return nil;
 	}
 	current = e;
+	if (!app_role) {
+		raise_driver_threads();         /* (gl_driver_prio: the render server's own) */
+	}
 	e->object = self;
 	e->api = api;
 	e->table[0] = e;
@@ -6241,6 +6281,9 @@ install(void)
 	/* the kernel's boot-args are where a run is told things */
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 		drawn_seed = strstr(arguments, "gl_drawn_seed=1") != NULL;      /* (11-19: seed_drawn()) */
+		if ((argument = strstr(arguments, "gl_driver_prio=")) != NULL) {        /* (11-19: raise_driver_threads()) */
+			driver_prio = (int)strtol(argument + 15, NULL, 10);
+		}
 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
 			trace_last = trace_first = (unsigned)strtoul(argument + 8, (char **)&argument, 10);
 			if (*argument == '-') {
