@@ -107,15 +107,6 @@ SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_dim_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &hak
 uint32_t hakios_bl_panel_dim;
 SYSCTL_UINT(_kern_hakios, OID_AUTO, bl_panel_dim, CTLFLAG_RW | CTLFLAG_LOCKED, &hakios_bl_panel_dim, 0,
     "the panel's own smoothing of brightness changes (DCS 53 28): 1 on, 0 off; from the next backlight write");
-/*
- * (11-20, here with the display path's other knobs) kern.hakios.surf_comp, boot-arg surf_comp=1: an 'A008' surface
- * says it has one component -- opacity, 8 bits -- as a BGRA or RGBA one says its four (MiniIOSurface.cpp
- * describeComponents(), at each surface's making, so from the next surface on). Apple News's text drawn into A008
- * surfaces of its own never reached their memory (glprobe, 11-20), the same text in BGRA ones did. 0: none, as before.
- */
-uint32_t hakios_surf_comp;
-SYSCTL_UINT(_kern_hakios, OID_AUTO, surf_comp, CTLFLAG_RW | CTLFLAG_LOCKED, &hakios_surf_comp, 0,
-    "an A008 surface describes its one component (opacity, 8 bits): 1 on, 0 off; from the next surface made");
 /* what WRCTRLD last went to the panel as (0: not since the kernel's start), and when it last woke (the backlight's) */
 uint8_t alioth_panel_ctrl;
 uint64_t alioth_panel_woke_at;

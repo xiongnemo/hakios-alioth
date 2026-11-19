@@ -141,7 +141,6 @@ static char             gSurfaceTraceOf[32];
 
 extern "C" void loader_log_line(const char *line);
 extern "C" void hakios_data_range(uint32_t *size_mb, uint32_t *used_mb, uint32_t *hole_mb);
-extern "C" uint32_t hakios_surf_comp;            /* kern.hakios.surf_comp (bsd/dev/alioth_dsi.c): describeComponents() */
 
 /* A line about a traced surface: to the loader's log too, where it outlives the kernel's own, short log. */
 static void
@@ -569,15 +568,6 @@ describeComponents(struct minisurf_plane * plane, uint32_t format)
 		names = bgra;
 	} else if (format == FOURCC('R', 'G', 'B', 'A')) {
 		names = rgba;
-	} else if (format == FOURCC('A', '0', '0', '8') && hakios_surf_comp != 0) {
-		/* (11-20, kern.hakios.surf_comp: alioth_dsi.c) one component, opacity, as Apple's says of A008 */
-		plane->componentCount = 1;
-		plane->componentBitDepth[0] = 8;
-		plane->componentBitOffset[0] = 0;
-		plane->componentName[0] = 1;            /* alpha */
-		plane->componentType[0] = 1;            /* unsigned integer */
-		plane->componentRange[0] = 1;           /* full range */
-		return;
 	} else {
 		return;
 	}
@@ -1079,7 +1069,6 @@ MiniIOSurfaceStart(IOService * provider)
 	if (!PE_parse_boot_arg_str("surftrace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
 		gSurfaceTraceOf[0] = 0;
 	}
-	(void) PE_parse_boot_argn("surf_comp", &hakios_surf_comp, sizeof(hakios_surf_comp));
 	gSurfaceClearing = thread_call_allocate(surfaceMemoryClear, NULL);
 	root = OSTypeAlloc(IOCoreSurfaceRoot);
 	if (root == NULL || !root->init() || !root->attach(provider)) {
