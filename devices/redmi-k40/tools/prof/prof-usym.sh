@@ -2,11 +2,12 @@
 # User addresses of a prof=1 run -> functions: the GL library and eagl (our own dylibs, at the bases eagl said),
 # else the dyld shared cache (minus its slide). usage: prof-usym.sh TOPFILE SLIDE MESA_BASE EAGL_BASE [N]
 TOP=$1 SLIDE=$(($2)) MESA=$(($3)) EAGL=$(($4)) N=${5:-50}
-R=~/hk/out/redmi-k40/userland-build/userland/root/lib
-MESALIB=~/hk/xnu-deps/build/mesa/build-softpipe-freedreno/src/gallium/targets/osmesa/libOSMesa.8.dylib   # (unstripped: same layout)
+ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)   # (the repo; the workspace's other folders beside it)
+R=$ROOT/out/redmi-k40/userland-build/userland/root/lib
+MESALIB=$ROOT/xnu-deps/build/mesa/build-softpipe-freedreno/src/gallium/targets/osmesa/libOSMesa.8.dylib   # (unstripped: same layout)
 EAGLLIB=$R/libhakios.gl.dylib
-D=~/dyldcache/dyld_shared_cache_arm64
-I=~/tools/ipsw/ipsw
+D=${DYLDCACHE:-$ROOT/../dyldcache}/dyld_shared_cache_arm64
+I=${IPSW:-$ROOT/../tools/ipsw/ipsw}
 mesa_end=$((MESA + 0x4000000)); eagl_end=$((EAGL + 0x200000))
 grep '^prof: u ' "$TOP" | sed 's/\r$//' | head -"$N" | while read -r _ _ addr count; do
 	a=$((addr & 0x7fffffffffffffff)); k=""
