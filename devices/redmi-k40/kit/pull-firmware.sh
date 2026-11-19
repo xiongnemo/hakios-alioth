@@ -113,4 +113,17 @@ run 'for f in /sys/devices/soc0/*; do [ -f "$f" ] && echo "${f##*/} = $(cat "$f"
 	done
 [ -d "$S/vendor/etc/sensors" ] || need "/vendor/etc/sensors"
 
+# (2026-11-20, issue #1) The phone's device tree as its firmware left it: XBL sizes removed_region by itself, and the
+# regions the GPU's zap shader and the audio and sensor DSPs are loaded into move with it from one firmware to the next.
+# assemble.sh takes them from here (tools/dt-regions.py -> board_pil_* boot-args).
+mkdir -p "$OUT/fw-board"
+D="$OUT/fw-board/runtime-fdt.dtb"
+"${A[@]}" exec-out "su -c 'cat /sys/firmware/fdt'" > "$D" 2> /dev/null || true
+if [ "$(head -c 4 "$D" 2> /dev/null | od -An -tx1 | tr -d ' \n')" = "d00dfeed" ]; then
+	echo "  the device tree ($(($(stat -c %s "$D") >> 10)) KB) -> $D"
+else
+	rm -f "$D"
+	echo "pull-firmware: the phone's /sys/firmware/fdt could not be read: the built-in regions are used" >&2
+fi
+
 echo "pull-firmware: $OUT: $(find "$OUT" -type f | wc -l) files, $(du -sh "$OUT" | cut -f1)"

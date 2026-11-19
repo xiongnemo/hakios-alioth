@@ -15,6 +15,9 @@
 #   FW_FROM=DIR    take the fw-* directories from DIR instead of the phone (a second assembly)
 #   SYSIMAGE_FROM=DIR  use an IPSW extraction already made (another kit's source/sysimage)
 set -euo pipefail
+# (2026-11-20, issue #1) what is made here is read by the phone's iOS, whose daemons refuse group-writable files: the
+# same modes whatever the computer's umask (an umask of 002 made every job plist 0664 -- launchd then skipped them)
+umask 022
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # A kit on a Windows drive (WSL's /mnt/c ...): the work is done in the Linux file system instead -- iOS's file names
 # differ in case only, which a Windows drive cannot keep apart, and it is many times faster -- and only the finished
@@ -135,14 +138,25 @@ python3 "$ROOT/xnuloader/mkpayload.py" -o "$O/usb-payload.bin" loader.efi="$O/lo
 	python3 devices/redmi-k40/tools/mkimage.py -p "$O/usb-payload.bin" -o "$O/alioth-xnu.img" > /dev/null)
 mac=
 [ -f "$ROOT/fw-wifi/mac" ] && mac=$(head -1 "$ROOT/fw-wifi/mac" | tr -d '\r ')
+# (2026-11-20, issue #1) the regions the zap shader and the DSPs go into, where this phone's own device tree has them
+# (pull-firmware.sh saved it): boot-args for those that differ from the kernel's built-in ones, nothing otherwise
+regions=
+if [ -f "$ROOT/fw-board/runtime-fdt.dtb" ]; then
+	regions=$(python3 "$ROOT/devices/redmi-k40/tools/dt-regions.py" "$ROOT/fw-board/runtime-fdt.dtb") ||
+		{ echo "assemble: the phone's device tree could not be read: the built-in regions are used"; regions=; }
+fi
 mkdir -p "$OUT/boot" "$OUT/bin" "$OUT/apps"
 # the payload as the one-click script expects it (start.ps1 adds the clock, the camera and the apps' token at boot):
 # "XNUP", the kernel, the root disk, the kernel's arguments -- this phone's verified set, usb=3 (the PC sees an iPhone),
 # touch_exit=0 (five fingers held on the screen do not end iOS: that is the test runs' way out)
-python3 - "$KIT/prebuilt/kernel-k40.bin" "$U/root.apfs" "$ROOT/devices/redmi-k40/boot.args" "$mac" "$OUT/boot/run-payload.bin" <<'EOF'
+python3 - "$KIT/prebuilt/kernel-k40.bin" "$U/root.apfs" "$ROOT/devices/redmi-k40/boot.args" "$mac" "$OUT/boot/run-payload.bin" "$regions" <<'EOF'
 import struct, sys
-kernel, root, args, mac, out = sys.argv[1:]
+kernel, root, args, mac, out, regions = sys.argv[1:]
 words = open(args).read().split()
+# (issue #1) this phone's own reserved-memory regions, where they differ from the kernel's built-in ones
+for w in regions.split():
+    if not any(x.startswith(w.split('=')[0] + '=') for x in words):
+        words.append(w)
 if not any(w.startswith('usb=') for w in words):
     words.append('usb=3')
 if not any(w.startswith('touch_exit=') for w in words):

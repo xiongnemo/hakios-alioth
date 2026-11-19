@@ -13,6 +13,11 @@
  *   intf       display: the DSI panel's timing engine (mdp_intf_base)                   0x0ae36000
  *   ufshc      ufs: the UFS host controller ("ufs_mem")                                 0x01d84000
  *   spmi_core, spmi_cnfg, spmi_obsrvr   buttons: the PMIC arbiter                       0x0c440000 ...
+ * (2026-11-20, issue #1) reserved-memory regions that move with XBL's removed_region from one firmware to the next,
+ * each with a _size (board_pil_gpu_size=...); the kit takes them from the phone's own device tree (tools/dt-regions.py):
+ *   pil_gpu    adreno: the zap shader (pil_gpu_region)                                  0x8681a000, 0x2000
+ *   pil_slpi   slpi: the sensor DSP (pil_slpi_region)                                   0x88c00000, 0x2f00000
+ *   pil_adsp   adsp: the audio DSP (pil_adsp_region)                                    0x8bb00000, 0x2500000
  */
 #include <libkern/libkern.h>
 #include <kern/startup.h>
@@ -53,7 +58,7 @@ void
 hakios_board_report(void)
 {
 	static const char *const names[] = { "epss", "cmd_db", "rsc", "tsens0", "tsens1", "gcc", "dispcc", "intf", "ufshc",
-		                             "spmi_core", "spmi_cnfg", "spmi_obsrvr" };
+		                             "spmi_core", "spmi_cnfg", "spmi_obsrvr", "pil_gpu", "pil_slpi", "pil_adsp" };
 	int given = 0;
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {

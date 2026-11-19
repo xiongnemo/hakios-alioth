@@ -95,6 +95,7 @@
 #include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
 #include <sys/hakios.audio.h>
+#include <sys/hakios.board.h>
 #include <sys/hakios.input.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -3414,9 +3415,16 @@ hakios_adsp_init(void)
 	thread_t thread;
 
 	if (PE_parse_boot_argn("adsp_umi", &umi, sizeof(umi)) && umi != 0) {
-		adsp_memory = UMI_ADSP_MEMORY;
-		adsp_memory_size = UMI_ADSP_SIZE;
-		printf("adsp: Mi 10 profile: PAS memory %#x, %#x bytes (adsp_umi=1)\n", adsp_memory, adsp_memory_size);
+		/*
+		 * (2026-11-20, issue #1) pil_adsp_region on THIS phone: board_pil_adsp=0x... board_pil_adsp_size=0x...
+		 * (sys/hakios.board.h; the kit takes them from the phone's own device tree, tools/dt-regions.py), else the
+		 * phone the port was brought up on. It moves with XBL's removed_region (a HyperOS 1.0 K40: 0x91700000).
+		 */
+		adsp_memory = (uint32_t)hakios_board_addr("pil_adsp", UMI_ADSP_MEMORY);
+		adsp_memory_size = hakios_board_number("pil_adsp_size", UMI_ADSP_SIZE);
+		printf("adsp: Mi 10 profile: PAS memory %#x, %#x bytes (adsp_umi=1%s)\n", adsp_memory, adsp_memory_size,
+		    adsp_memory != UMI_ADSP_MEMORY || adsp_memory_size != UMI_ADSP_SIZE ? "; board_pil_adsp: this phone's own device tree" :
+		    "");
 	}
 	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {

@@ -2891,10 +2891,24 @@ step_core_space(void)
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
 
+/*
+ * (2026-11-20, issue #1) Where pil_gpu_region is on THIS phone: boot-args board_pil_gpu=0x... board_pil_gpu_size=0x...
+ * (sys/hakios.board.h), which the kit takes from the phone's own device tree (tools/dt-regions.py); else the phone the
+ * port was brought up on. The region moves with XBL's removed_region from one firmware to the next (a HyperOS 1.0
+ * K40: 0x8c41a000, not 0x8681a000), and an image put in the wrong place stalls the phone.
+ */
 static uint64_t
 zap_memory_phys(void)
 {
-	return umi_a650 ? ZAP_MEMORY_UMI : ZAP_MEMORY_REDWOOD;
+	return umi_a650 ? (uint64_t)hakios_board_addr("pil_gpu", ZAP_MEMORY_UMI) : ZAP_MEMORY_REDWOOD;
+}
+
+static uint32_t
+zap_memory_size(void)
+{
+	uint32_t size = umi_a650 ? hakios_board_number("pil_gpu_size", ZAP_MEMORY_SIZE) : ZAP_MEMORY_SIZE;
+
+	return size >= 0x1000 && size <= 0x100000 && (size & 0xfff) == 0 ? size : ZAP_MEMORY_SIZE;
 }
 
 /* TrustZone is to give the zap shader up, and its memory with it. */
@@ -2913,6 +2927,7 @@ step_zap_load(void)
 	const uint8_t *segment;
 	volatile uint8_t *memory;
 	uint64_t size = 0, header = 0, answer = ~0ull, zap_phys = zap_memory_phys();
+	uint32_t zap_size = zap_memory_size();
 
 	if (!cx_ready() || !core_is_on) {
 		return false;
@@ -2920,8 +2935,11 @@ step_zap_load(void)
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
+	printf("adreno: %u: the zap shader's region %#llx, %#x bytes%s\n", step, zap_phys, zap_size,
+	    zap_phys != (umi_a650 ? ZAP_MEMORY_UMI : ZAP_MEMORY_REDWOOD) || zap_size != ZAP_MEMORY_SIZE ?
+	    " (board_pil_gpu / board_pil_gpu_size: this phone's own device tree)" : "");
 	segment = image_file("fw", gpu_firmware_name(GPU_FW_ZAP_B02), &size);
-	if (segment == NULL || size == 0 || size > 0x1000) {
+	if (segment == NULL || size == 0 || size > zap_size) {
 		return false;
 	}
 	announce("hand the zap shader's header to TrustZone, tell it where the image goes, put the image there, and ask "
@@ -2936,7 +2954,11 @@ step_zap_load(void)
 		zap_is_loaded = true;
 		return true;
 	}
-	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, zap_phys, 0x1000,
+	/*
+	 * (2026-11-20, issue #1) The region's whole size, as Linux's qcom_mdt_pas_init gives it (the device tree's 0x2000),
+	 * not one page: a K40 on HyperOS 1.0 stalled at the first read past a 0x1000 setup, and has run since with 0x2000.
+	 */
+	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, zap_phys, zap_size,
 	    &answer) != 0 || answer != 0) {
 		printf("adreno: %u: TrustZone does not take the place (%#llx): TAKEN TO MEAN THAT IT KEEPS A ZAP SHADER FROM "
 		    "BEFORE, which is used as it is\n", step, answer);
@@ -2944,13 +2966,13 @@ step_zap_load(void)
 		return true;
 	}
 	/* (the memory is looked at only now: TrustZone has just said that it is not its own) */
-	memory = (volatile uint8_t *)ml_io_map_wcomb(zap_phys, ZAP_MEMORY_SIZE);
+	memory = (volatile uint8_t *)ml_io_map_wcomb(zap_phys, zap_size);
 	printf("adreno: %u: the reserved memory begins %02x %02x %02x %02x, the zap shader %02x %02x %02x %02x\n", step,
 	    memory[0], memory[1], memory[2], memory[3], segment[0], segment[1], segment[2], segment[3]);
 	printf("adreno: %u: about to write %llu bytes at %#llx\n", step, size, zap_phys);
 	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader into memory at %#llx", step, zap_phys);
 	hold(true);
-	for (uint64_t i = 0; i < 0x1000; i++) {
+	for (uint64_t i = 0; i < zap_size; i++) {
 		memory[i] = i < size ? segment[i] : 0;
 	}
 	settle();

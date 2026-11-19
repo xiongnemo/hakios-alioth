@@ -36,6 +36,7 @@
 #include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
 #include <sys/hakios.audio.h>
+#include <sys/hakios.board.h>
 #include <sys/hakios.input.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -5111,6 +5112,17 @@ hakios_slpi_init(void)
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
 		printf("slpi: slpi=1 and slpi_step=N are for the phone's sensor DSP, and this is not the phone\n");
 		return;
+	}
+	/*
+	 * (2026-11-20, issue #1) pil_slpi_region on THIS phone: board_pil_slpi=0x... board_pil_slpi_size=0x...
+	 * (sys/hakios.board.h; the kit takes them from the phone's own device tree, tools/dt-regions.py), else the phone
+	 * the port was brought up on. It moves with XBL's removed_region (a HyperOS 1.0 K40: 0x8e800000).
+	 */
+	slpi_memory = (uint32_t)hakios_board_addr("pil_slpi", HAKIOS_SLPI_MEMORY);
+	slpi_memory_size = hakios_board_number("pil_slpi_size", HAKIOS_SLPI_SIZE);
+	if (slpi_memory != HAKIOS_SLPI_MEMORY || slpi_memory_size != HAKIOS_SLPI_SIZE) {
+		printf("slpi: PAS memory %#x, %#x bytes (board_pil_slpi: this phone's own device tree)\n", slpi_memory,
+		    slpi_memory_size);
 	}
 	if (last_step == 0) {
 		/* all of it, on a thread of its own, and left up */

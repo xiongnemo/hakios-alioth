@@ -83,6 +83,10 @@
 #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
 #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
 set -e
+# (2026-11-20, issue #1) the images' files with the same modes whatever the computer's umask: under 002 every staged file
+# came out group-writable (the job plists 0664, which launchd skipped; mkjobs.py sets those 0644 since ec53f55), and
+# iOS's daemons refuse group-writable configuration
+umask 022
 cd "$(dirname "$(readlink -f "$0")")"
 source ../xnu-env.sh
 
