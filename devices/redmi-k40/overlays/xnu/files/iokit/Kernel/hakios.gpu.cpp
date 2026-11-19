@@ -409,6 +409,8 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 			}
 		}
 		if (done && ready && !stable) done = false;
+		bool invalidate = false;
+
 		if (done && ready && stable && surface->gpu_written) {
 			/*
 			 * Not for a surface in a scan-out slot: that memory is write-combined wherever it is mapped (here and
@@ -416,16 +418,22 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 			 * lines of a display-sized one were gone through on the way of every frame to the panel.
 			 * Boot-arg gpu_inval_scan=1: as before.
 			 */
-			if (surface->scanPhys == 0 || gInvalScan) {
-				uint64_t began = mach_absolute_time();
-
-				hakios_gpu_from_memory(surface->kpixels, surface->info.allocSize);
-				gGPUStat.invalidating += mach_absolute_time() - began;
-				gGPUStat.invalidated++;
-			}
+			invalidate = surface->scanPhys == 0 || gInvalScan;
 			surface->gpu_written = false;
 		}
 		IOLockUnlock(gGPULock);
+		if (invalidate) {
+			/*
+			 * (11-19) ... with gGPULock let go of: ~0.5 ms for a display-sized surface, 110-298 of them in 5 s while
+			 * Map started (census c26), and every GPU wait of the system took the lock again up to ~3 ms late
+			 * meanwhile. The caller (the display's presenter, the only one) holds the surface.
+			 */
+			uint64_t began = mach_absolute_time();
+
+			hakios_gpu_from_memory(surface->kpixels, surface->info.allocSize);
+			__atomic_add_fetch(&gGPUStat.invalidating, mach_absolute_time() - began, __ATOMIC_RELAXED);
+			__atomic_add_fetch(&gGPUStat.invalidated, 1, __ATOMIC_RELAXED);
+		}
 	}
 	return done;
 }
@@ -945,11 +953,21 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 		hakios_tl("HakiosGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
 		return NULL;
 	}
-	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
+	/*
+	 * (11-19) Each physically contiguous run once, its 4 KB pages entered from it -- the segment was asked for again at
+	 * every 4 KB, with gGPULock held: buffers made in 1.8-3.2 ms each while Map started (census c26), the GPU's waits
+	 * taking the lock again up to ~3 ms late meanwhile.
+	 */
+	for (uint64_t offset = 0; offset < size && mapped;) {
 		IOByteCount length = 0;
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
+		uint64_t run = length >= 4096 ? MIN((uint64_t) length & ~4095ULL, size - offset) : 4096;
 
-		mapped = phys != 0 && hakios_gpu_map_in(fSpace, b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
+		mapped = phys != 0;
+		for (uint64_t k = 0; k < run && mapped; k += 4096) {
+			mapped = hakios_gpu_map_in(fSpace, b->address + offset + k, phys + k, flags & MSM_BO_GPU_READONLY);
+		}
+		offset += run;
 	}
 	hakios_gpu_mapped_in(fSpace);
 	if (!mapped) {

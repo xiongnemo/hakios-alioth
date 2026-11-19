@@ -5324,6 +5324,15 @@ storage_now(id self, SEL selector, unsigned long target, id drawable)
 		glGenTextures(1, &d->texture[i]);
 		glBindTexture(GL_TEXTURE_2D, d->texture[i]);
 		d->shared[i] = d->surface[i] != NULL && hakios_gl_surface_texture(e->gl, IOSurfaceGetID(d->surface[i]));
+		if (d->shared[i] && drawn_seed) {
+			/*
+			 * (11-19, gl_drawn_seed=1) drawn into by the GPU alone, as a CAMetalLayer drawable is: no push out of the
+			 * cache on gpu_push_ms's interval for it (gpu_push_gpuonly=1). Census c26: Map's GL frames' surfaces,
+			 * ~10.5 MB, pushed on the interval 530-612 times in 5 s (5.6-6.4 GB). A read-back into one (not shared)
+			 * still moves its seed by a lock.
+			 */
+			IOSurfaceSetValue(d->surface[i], CFSTR("HakiosGPUOnly"), kCFBooleanTrue);
+		}
 		if (!d->shared[i]) {
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 		}
