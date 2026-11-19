@@ -409,6 +409,36 @@ static int app_discard;                 /* boot-arg appgl_discard=1: an applicat
 static id app_last;                     /* the context +setCurrentContext: was given last (hakios_gl_app_context()) */
 static pthread_key_t app_held;          /* a thread's current context, retained (app_setCurrentContext()) */
 
+/*
+ * (11-19) boot-arg gl_drawn_seed=1: a surface the GPU has drawn into is said so to the kernel ("HakiosGPUDrawn", a new
+ * number every time: the value itself is not kept), which moves its seed as a lock would -- whoever reads it sees that
+ * the pixels changed -- and tells HakiosGPU that no processor wrote them, so nothing of it is pushed out of the cache
+ * for that (MiniIOSurface.cpp methodSetValue, hakios.gpu.cpp submit()). Census c25, Map starting: 4.3 GB in 5 s pushed
+ * for seeds moved by a lock and unlock after the GPU's frames, with HakiosGPU's lock held -- and the GPU's waits took it
+ * again up to 3 ms late. Default 0: a lock and unlock, as before. (Not where the processor does write: a read-back.)
+ */
+static int drawn_seed;
+
+static void
+seed_drawn(IOSurfaceRef surface)
+{
+	static int32_t said;
+
+	if (drawn_seed) {
+		int32_t n = __atomic_add_fetch(&said, 1, __ATOMIC_RELAXED);
+		CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt32Type, &n);
+
+		if (number != NULL) {
+			IOSurfaceSetValue(surface, CFSTR("HakiosGPUDrawn"), number);
+			CFRelease(number);
+			return;
+		}
+	}
+	if (IOSurfaceLock(surface, 0, NULL) == 0) {
+		IOSurfaceUnlock(surface, 0, NULL);
+	}
+}
+
 static void
 app_held_end(void *context)
 {
@@ -984,16 +1014,12 @@ target_to_surface(struct eagl *e, struct image *image)
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
-		}
+		seed_drawn(surface);            /* (by the GPU: gl_drawn_seed) */
 		return;
 	}
 	if (image->shared) {
-		/* whoever looks at the surface's seed is to see that it has changed */
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
-		}
+		/* whoever looks at the surface's seed is to see that it has changed (the GPU drew it: gl_drawn_seed) */
+		seed_drawn(surface);
 		return;
 	}
 	if (e->reader == 0) {
@@ -5706,8 +5732,7 @@ present_now(id self, SEL selector, unsigned long target)
 		began = now_us();
 		glFlush();
 		if (app_seed) {
-			IOSurfaceLock(d->surface[i], 0, NULL);
-			IOSurfaceUnlock(d->surface[i], 0, NULL);
+			seed_drawn(d->surface[i]);      /* (the GPU's copy: gl_drawn_seed) */
 		}
 		waited = now_us();
 		goto handed;
@@ -5834,11 +5859,10 @@ present_now(id self, SEL selector, unsigned long target)
 		if (app_seed) {
 			uint32_t seed = IOSurfaceGetSeed(d->surface[i]);
 
-			IOSurfaceLock(d->surface[i], 0, NULL);
-			IOSurfaceUnlock(d->surface[i], 0, NULL);
+			seed_drawn(d->surface[i]);      /* (the GPU's blit: gl_drawn_seed) */
 			if (d->presents == 1) {
-				say("hakios-gl: %s: a surface's seed %u -> %u over a lock and unlock\n", getprogname(), seed,
-				    IOSurfaceGetSeed(d->surface[i]));
+				say("hakios-gl: %s: a surface's seed %u -> %u over %s\n", getprogname(), seed,
+				    IOSurfaceGetSeed(d->surface[i]), drawn_seed ? "HakiosGPUDrawn" : "a lock and unlock");
 			}
 		}
 	}
@@ -6207,6 +6231,7 @@ install(void)
 	}
 	/* the kernel's boot-args are where a run is told things */
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		drawn_seed = strstr(arguments, "gl_drawn_seed=1") != NULL;      /* (11-19: seed_drawn()) */
 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
 			trace_last = trace_first = (unsigned)strtoul(argument + 8, (char **)&argument, 10);
 			if (*argument == '-') {

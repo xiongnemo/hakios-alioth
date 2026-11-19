@@ -1410,7 +1410,10 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			continue;
 		}
 		if (b->surface != NULL) {
-			uint32_t seed = b->surface->shared()->seed;
+			/* (11-19) less the moves that said a GPU drew the pixels (MiniIOSurface.h drawn_moves, eagl.c gl_drawn_seed):
+			 * no processor wrote those, nothing of them is in a cache. (Read apart, a move between the two reads only
+			 * pushes once too often.) */
+			uint32_t seed = b->surface->shared()->seed - b->surface->drawn_moves;
 			/* (11-19) a surface around a program's memory, a GPU buffer since gpu_wrap=1: gpu_wrap_ms's interval */
 			uint64_t again_here = b->surface->client != NULL && wrapAgain != 0 ? wrapAgain : again;
 

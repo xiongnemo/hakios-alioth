@@ -1696,8 +1696,20 @@ IOSurfaceRootUserClient::methodSetValue(IOExternalMethodArguments * args, const 
 	}
 	IOLockLock(gSurfaceLock);
 	ref = findRef(sid, false);
+	OSString * named = array->getCount() == 2 ? OSDynamicCast(OSString, array->getObject(1)) : NULL;
+
 	if (ref == NULL) {
 		ret = kIOReturnNotFound;
+	} else if (named != NULL && named->isEqualTo("HakiosGPUDrawn")) {
+		/*
+		 * (11-19, eagl.c gl_drawn_seed=1) "a GPU has drawn the pixels": the seed moves, as a lock would move it, and
+		 * the move is counted as a GPU's (drawn_moves), which hakios.gpu.cpp's cache pass leaves out -- no processor
+		 * wrote them. Not kept as a value (a new number every time; nobody reads it back).
+		 */
+		ref->surface->shared()->seed++;
+		ref->surface->drawn_moves++;
+		seed = ref->surface->shared()->valuesSeed;
+		ret = kIOReturnSuccess;
 	} else if (ref->surface->values != NULL) {
 		MiniIOSurface * s = ref->surface;
 		OSString * key = OSDynamicCast(OSString, array->getObject(1));
