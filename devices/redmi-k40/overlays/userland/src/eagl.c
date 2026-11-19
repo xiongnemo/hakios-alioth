@@ -278,6 +278,10 @@ struct app_drawable {
 	uint64_t window_us, wait_us, present_us;
 	_Atomic unsigned shown;         /* frames the main thread has put on the layer (of `presents`) */
 	_Atomic uint64_t shown_late_us; /* ... and how long after their present, summed */
+	/* (11-19, for a present that waits on its layer instead of appgl_fps's fixed pace) of the 2 s: the presents whose
+	 * surface, about to be drawn into again, read as in use (IOSurfaceIsInUse: the render server still holds it?) */
+	unsigned window_in_use;
+	unsigned window_last_in_use;    /* ... and those whose previous frame's surface (likeliest on the screen) did */
 };
 
 struct eagl {
@@ -5771,6 +5775,7 @@ present_now(id self, SEL selector, unsigned long target)
 
 		i = d->next;
 		way = 0;
+		d->window_in_use += d->surface[i] != NULL && IOSurfaceIsInUse(d->surface[i]);
 		if (d->presents == 0) {
 			say("hakios-gl: %s: OpenGL ES 1 frames copied by the library (hakios_gl_copy)\n", getprogname());
 		}
@@ -5794,6 +5799,12 @@ present_now(id self, SEL selector, unsigned long target)
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
 	scissor = glIsEnabled(GL_SCISSOR_TEST);
 	i = d->next;
+	d->window_in_use += d->surface[i] != NULL && IOSurfaceIsInUse(d->surface[i]);
+	{
+		IOSurfaceRef last = d->surface[(i + APP_SURFACES - 1) % APP_SURFACES];
+
+		d->window_last_in_use += last != NULL && IOSurfaceIsInUse(last);
+	}
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->app_read);
 	glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, (GLuint)renderbuffer);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->app_draw);
@@ -6078,11 +6089,15 @@ handed:
 		unsigned shown = d->shown;
 
 		say("hakios-gl: %s: %.1f frames a second (%u so far); a present %.2f ms, of it the GPU's copy + %s %.2f ms; "
-		    "%u put on the layer by the main thread, %.1f ms after\n", getprogname(), (double)d->window_frames * 1e6 / (double)span,
+		    "%u put on the layer by the main thread, %.1f ms after; %u drawn into a surface still in use, %u with the "
+		    "frame before's in use\n", getprogname(),
+		    (double)d->window_frames * 1e6 / (double)span,
 		    d->presents, (double)d->present_us / 1000.0 / d->window_frames, app_finish ? "glFinish" : "glFlush",
-		    (double)d->wait_us / 1000.0 / d->window_frames, shown, shown ? (double)d->shown_late_us / 1000.0 / shown : 0.0);
+		    (double)d->wait_us / 1000.0 / d->window_frames, shown, shown ? (double)d->shown_late_us / 1000.0 / shown : 0.0,
+		    d->window_in_use, d->window_last_in_use);
 		d->window_us = now_us();
 		d->window_frames = 0;
+		d->window_in_use = d->window_last_in_use = 0;
 		d->wait_us = d->present_us = 0;
 	}
 	/* held to a display's pace (app_period_us): back no sooner than that after the last present came back */
