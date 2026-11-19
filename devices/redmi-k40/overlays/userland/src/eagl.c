@@ -260,7 +260,7 @@ struct image {
 };
 
 /* an application's CAEAGLLayer, drawn into a renderbuffer of ours and handed over as IOSurfaces (app_present()) */
-#define APP_SURFACES    3
+#define APP_SURFACES    4               /* (the arrays: at most; appgl_surfaces says how many, 3 by default) */
 struct app_drawable {
 	GLuint renderbuffer;            /* the application's, its storage made by -renderbufferStorage:fromDrawable: (0: unused) */
 	id layer;                       /* retained */
@@ -505,6 +505,12 @@ static uint64_t app_period_us = 1000000 / 62;
  * keeps it from drawing into the picture being sent; with it appgl_fps may go up to the display's rate.
  */
 static uint64_t app_wait_us;
+/*
+ * (11-19) boot-arg appgl_surfaces=N (2-4, 3 the default): the surfaces an application's frames go round in. Census
+ * c38 (appgl_wait_ms=17, appgl_fps=122): Map at ~85 on the screen, each present waiting ~9.3 ms for its next surface --
+ * one on the panel, one waiting for its flip, one drawn into: a fourth lets it be a frame further ahead.
+ */
+static unsigned app_surfaces = 3;
 
 static void
 app_wait_surface(struct app_drawable *d, IOSurfaceRef surface)
@@ -5389,7 +5395,7 @@ storage_now(id self, SEL selector, unsigned long target, id drawable)
 	d->width = width;
 	d->height = height;
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
-	for (unsigned i = 0; i < APP_SURFACES; i++) {
+	for (unsigned i = 0; i < app_surfaces; i++) {
 		d->surface[i] = app_surface(width, height);
 		glGenTextures(1, &d->texture[i]);
 		glBindTexture(GL_TEXTURE_2D, d->texture[i]);
@@ -5409,7 +5415,7 @@ storage_now(id self, SEL selector, unsigned long target, id drawable)
 	}
 	glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
 	say("hakios-gl: %s: a layer of %dx%d pixels (%.0fx%.0f points at %.1f), its frames in %d IOSurfaces %s\n",
-	    getprogname(), width, height, bounds.width, bounds.height, scale, APP_SURFACES,
+	    getprogname(), width, height, bounds.width, bounds.height, scale, (int)app_surfaces,
 	    d->shared[0] ? "the GPU draws into" : "read back into (the GPU cannot address them)");
 	if (app_sum) {
 		id layer = ((id (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("retain"));
@@ -5828,7 +5834,7 @@ present_now(id self, SEL selector, unsigned long target)
 	i = d->next;
 	d->window_in_use += d->surface[i] != NULL && IOSurfaceIsInUse(d->surface[i]);
 	{
-		IOSurfaceRef last = d->surface[(i + APP_SURFACES - 1) % APP_SURFACES];
+		IOSurfaceRef last = d->surface[(i + app_surfaces - 1) % app_surfaces];
 
 		d->window_last_in_use += last != NULL && IOSurfaceIsInUse(last);
 	}
@@ -6101,7 +6107,7 @@ handed:
 	if (d->presents == 0) {
 		say("hakios-gl: %s: frames presented on %s\n", getprogname(), pthread_main_np() ? "the main thread" : "a thread of its own");
 	}
-	d->next = (i + 1) % APP_SURFACES;
+	d->next = (i + 1) % app_surfaces;
 	e->app_presented = e->calls;
 	/* every 2 s: frames a second, and where a present's time goes (the copy and its wait, the rest) */
 	d->window_frames++;
@@ -6317,6 +6323,11 @@ install(void)
 			}
 			if ((argument = strstr(arguments, "appgl_wait_ms=")) != NULL) {    /* (11-19: app_wait_surface()) */
 				app_wait_us = strtoull(argument + 14, NULL, 10) * 1000;
+			}
+			if ((argument = strstr(arguments, "appgl_surfaces=")) != NULL) {   /* (11-19: app_surfaces) */
+				unsigned long n = strtoul(argument + 15, NULL, 10);
+
+				app_surfaces = n >= 2 && n <= APP_SURFACES ? (unsigned)n : app_surfaces;
 			}
 			/* appgl_errors=1: the first 60 errors logged, with the call (the application no longer gets them) */
 			check_errors = strstr(arguments, "appgl_errors=1") != NULL;
