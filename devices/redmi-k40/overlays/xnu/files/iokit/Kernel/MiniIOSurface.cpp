@@ -747,9 +747,23 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	needed += offset;
 	alloc = dictNumber(props, "IOSurfaceAllocSize", 0);
 	if (alloc < needed) {
-		if (alloc != 0) {
-			IOLog("MiniIOSurface: alloc size %u too small for %ux%u '%.4s', using %llu\n", alloc, width, height,
-			    (const char *) &format, needed);
+		/*
+		 * (11-20) the first 8, then one every 30 s with how many since: CoreAnimation asks for the last row without its
+		 * padding (rows x (height - 1) + the pixels), ~20 a second while text and icons are drawn -- it pushed every
+		 * other line out of the kernel's log within ~100 s (the owner's walk, its frame numbers lost).
+		 */
+		static uint32_t short_n, short_since;
+		static uint64_t short_at;
+		uint64_t short_now = mach_absolute_time(), short_gap;
+
+		nanoseconds_to_absolutetime(30 * NSEC_PER_SEC, &short_gap);
+		if (alloc != 0 && (OSIncrementAtomic((SInt32 *) &short_n) < 8 || short_now - short_at >= short_gap)) {
+			IOLog("MiniIOSurface: alloc size %u too small for %ux%u '%.4s', using %llu (%u more since the last such line)\n",
+			    alloc, width, height, (const char *) &format, needed, short_since);
+			short_at = short_now;
+			short_since = 0;
+		} else if (alloc != 0) {
+			short_since++;
 		}
 		if (needed > MINISURF_MAX_ALLOC) {
 			s->release();
