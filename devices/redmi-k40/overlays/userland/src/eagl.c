@@ -304,7 +304,12 @@ struct eagl {
 	char *extensions;               /* ... its extensions' string, with Apple's names added (app_glGetString()) */
 	struct hakios_gl *gl;
 	unsigned long api;
-	struct image images[256];
+	/*
+	 * (1024, 11-21: 256 filled up in the render server during System Check's effects tests -- logs 035551 (11-15,
+	 * 42 refused) and 052650 (11-19, photo-grid) -- and a texture refused here shows nothing: the layer is blank.
+	 * The OnePlus 8T port found its "text bars" were the same table full, 11-19. About 90 KB a context.)
+	 */
+	struct image images[1024];
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
