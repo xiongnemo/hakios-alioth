@@ -123,6 +123,12 @@ int      hakios_sta_ask_scan(const struct hakios_sta_scan *what);
 int      hakios_sta_ask_join(const struct hakios_sta_join *what);
 /* ... and joined again whenever the radio is turned on, until some other network is asked for */
 int      hakios_sta_ask_join_standing(const struct hakios_sta_join *what);
+/*
+ * (11-20, Redmi K40) the same for the file's networks, in order: the first is the standing one; when it does not join
+ * (another place: it is not there), the next a moment later; all of them tried, the first again after the wait
+ */
+#define HAKIOS_STA_STANDING_MOST        4
+int      hakios_sta_ask_join_standing_list(const struct hakios_sta_join *list, unsigned count);
 int      hakios_sta_ask_leave(void);
 bool     hakios_sta_busy(void);                                        /* something asked for is not over yet */
 bool     hakios_sta_powered(void);

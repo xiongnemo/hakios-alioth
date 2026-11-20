@@ -50,6 +50,9 @@ static struct hakios_sta_scan asked_scan_what;
 static struct hakios_sta_join asked_join_what;
 static struct hakios_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
 static struct hakios_sta_join fallback;        /* ... as it was before a join that has not come through yet */
+/* (11-20) the file's networks in order (hakios_sta_ask_join_standing_list()); `standing` is number standing_index */
+static struct hakios_sta_join standings[HAKIOS_STA_STANDING_MOST];
+static unsigned standing_count, standing_index;
 
 static struct hakios_sta_bss *heard;           /* by the last scan that came to an end */
 static unsigned heard_count;
@@ -232,15 +235,29 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 					hakios_wifi_tell("wifi: the standing network is joined, at try %u\n", retry_count + 1);
 				}
 				retry_count = 0;
+			} else if (was_standing && !asked_join && !asked_leave && !asked_power && standing_index + 1 < standing_count) {
+				/* (11-20) the file's next network, a moment later: one that is not here is not waited for */
+				standing_index++;
+				standing = standings[standing_index];
+				retry_later(2000);
+				if (retry_at != 0) {
+					hakios_wifi_tell("wifi: the standing network did not join (%d): the file's network %u of %u in 2 s\n",
+					    error, standing_index + 1, standing_count);
+				}
 			} else if (was_standing && !asked_join && !asked_leave && !asked_power) {
 				static const uint32_t backoff_s[] = { 5, 10, 20, 40, 60 };
 				uint32_t s = backoff_s[retry_count < 5 ? retry_count : 4];
 
+				if (standing_count > 1) {
+					/* (all of the file's networks tried: from the first again, after the wait) */
+					standing_index = 0;
+					standing = standings[0];
+				}
 				retry_later((uint64_t)s * 1000);
 				if (retry_at != 0) {
 					retry_count++;
-					hakios_wifi_tell("wifi: the standing network did not join (%d): again in %u s (try %u)\n", error, s,
-					    retry_count + 1);
+					hakios_wifi_tell("wifi: the standing network did not join (%d): again in %u s (try %u)%s\n", error, s,
+					    retry_count + 1, standing_count > 1 ? ", the file's first network" : "");
 				}
 			}
 			lck_mtx_unlock(&sta_lock);
@@ -437,6 +454,23 @@ hakios_sta_ask_join_standing(const struct hakios_sta_join *what)
 	}
 	lck_mtx_unlock(&sta_lock);
 	return error;
+}
+
+int
+hakios_sta_ask_join_standing_list(const struct hakios_sta_join *list, unsigned count)
+{
+	if (count == 0) {
+		return EINVAL;
+	}
+	if (count > HAKIOS_STA_STANDING_MOST) {
+		count = HAKIOS_STA_STANDING_MOST;
+	}
+	lck_mtx_lock(&sta_lock);
+	memcpy(standings, list, count * sizeof(standings[0]));
+	standing_count = count;
+	standing_index = 0;
+	lck_mtx_unlock(&sta_lock);
+	return hakios_sta_ask_join_standing(&standings[0]);
 }
 
 int

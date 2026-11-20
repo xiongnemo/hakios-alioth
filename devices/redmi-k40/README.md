@@ -22,7 +22,9 @@ You need theos with `sdks/iPhoneOS16.5.sdk` (`THEOS`), XNU's dependencies (`xnu-
 Python 3; your own iOS 16.5 files in `sysimage/` (`sysimage/fetch.sh` downloads the IPSW from Apple's servers); and
 this phone's firmware, pulled from its own Android, in the ignored `fw-*/` directories (GPU, audio, Wi-Fi, Bluetooth,
 cameras, sensors). `fw-wifi/network` names the network iOS joins (its name on the first line, the passphrase on the
-second); `fw-usb/serial` may give your phone's serial, which the loader then shows over USB.
+second) -- or up to four, a name and a passphrase line for each, in the order they are tried: when one does not join
+(it is not where you are), the next one a moment later; `fw-usb/serial` may give your phone's serial, which the
+loader then shows over USB.
 
 ```sh
 devices/redmi-k40/build-wifi.sh

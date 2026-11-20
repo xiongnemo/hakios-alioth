@@ -4264,9 +4264,12 @@ hakios_wifi_radio_address(uint8_t *address)
  * the name on its first line, the passphrase on its second (userland/build.sh takes it from
  * fw-wifi/network, which is in no repository). Not a boot argument: those are echoed by the
  * loader and printed with a panic. The log says how long the two are, and nothing else of them.
+ * (11-20, the owner: "加俩 WiFi") Several networks: name and passphrase lines again for each, in the order they are to
+ * be tried (blank lines between them are passed over) -- the first that joins is the one; see join_given().
  */
-bool
-hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length)
+static bool
+wifi_network_at(unsigned index, uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length,
+    bool speak)
 {
 	uint64_t size = 0;
 	const uint8_t *file = image_file("network", &size), *end = file + size, *line = file;
@@ -4274,32 +4277,55 @@ hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, u
 	uint8_t *where[2] = { name, passphrase };
 
 	if (file == NULL) {
-		printf("wifi: %u: which network to join: none was given (fw/network of the small image)\n", step);
+		if (speak) {
+			printf("wifi: %u: which network to join: none was given (fw/network of the small image)\n", step);
+		}
 		return false;
 	}
-	for (unsigned n = 0; n < 2 && line < end; n++) {
-		const uint8_t *stop = line;
+	for (unsigned pair = 0; pair <= index; pair++) {
+		for (unsigned n = 0; n < 2; n++) {
+			const uint8_t *stop;
 
-		while (stop < end && *stop != '\n') {
-			stop++;
+			/* (blank lines between two networks are passed over) */
+			while (line < end && (*line == '\n' || *line == '\r')) {
+				line++;
+			}
+			if (line >= end) {
+				return false;           /* (fewer networks than that) */
+			}
+			stop = line;
+			while (stop < end && *stop != '\n') {
+				stop++;
+			}
+			lengths[n] = (unsigned)(stop - line) - (stop > line && stop[-1] == '\r' ? 1 : 0);
+			if (pair == index) {
+				if (lengths[n] > sizes[n]) {
+					lengths[n] = 0;
+				} else {
+					memcpy(where[n], line, lengths[n]);
+				}
+			}
+			line = stop + 1;
 		}
-		lengths[n] = (unsigned)(stop - line) - (stop > line && stop[-1] == '\r' ? 1 : 0);
-		if (lengths[n] > sizes[n]) {
-			lengths[n] = 0;
-		} else {
-			memcpy(where[n], line, lengths[n]);
-		}
-		line = stop + 1;
 	}
-	printf("wifi: %u: which network to join: a name of %u bytes and a passphrase of %u bytes were given%s\n", step,
-	    lengths[0], lengths[1], lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63 ? ": NOT A NAME OF 1 TO 32 BYTES AND A "
-	    "PASSPHRASE OF 8 TO 63" : "");
+	if (speak) {
+		printf("wifi: %u: which network to join (number %u of the file): a name of %u bytes and a passphrase of %u bytes "
+		    "were given%s\n", step, index + 1, lengths[0], lengths[1], lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63 ?
+		    ": NOT A NAME OF 1 TO 32 BYTES AND A PASSPHRASE OF 8 TO 63" : "");
+	}
 	if (lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63) {
 		return false;
 	}
 	*name_length = lengths[0];
 	*passphrase_length = lengths[1];
 	return true;
+}
+
+/* (the file's first network: what the lx side asks for) */
+bool
+hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length)
+{
+	return wifi_network_at(0, name, name_length, passphrase, passphrase_length, true);
 }
 
 /* ---- all of it together ---------------------------------------------------------------------------- */
@@ -4406,11 +4432,11 @@ steps_over(uint32_t done)
 static void
 join_given(uint64_t began)
 {
-	static struct hakios_sta_join what;
+	static struct hakios_sta_join list[HAKIOS_STA_STANDING_MOST];
 	struct hakios_sta_state *state;
-	unsigned name_length = sizeof(what.ssid), passphrase_length = sizeof(what.passphrase);
 	uint64_t size = 0;
 	uint32_t given = 1;
+	unsigned count = 0;
 	int error;
 
 	if (image_file("network", &size) == NULL) {
@@ -4421,16 +4447,29 @@ join_given(uint64_t began)
 		tell("wifi: the network of the file is not joined at the start (wifi_file=0): the radio waits to be asked\n");
 		return;
 	}
-	bzero(&what, sizeof(what));
-	if (!hakios_wifi_network(what.ssid, &name_length, what.passphrase, &passphrase_length)) {
+	bzero(list, sizeof(list));
+	/* (11-20) every network of the file, in its order; the first that joins is the one (hakios.sta.c) */
+	for (unsigned i = 0; i < HAKIOS_STA_STANDING_MOST; i++) {
+		unsigned name_length = sizeof(list[0].ssid), passphrase_length = sizeof(list[0].passphrase);
+
+		if (!wifi_network_at(i, list[count].ssid, &name_length, list[count].passphrase, &passphrase_length, true)) {
+			bzero(&list[count], sizeof(list[count]));      /* (not there, or not a network: the log said which) */
+			continue;
+		}
+		list[count].ssid_length = (uint8_t)name_length;
+		list[count].passphrase_length = (uint8_t)passphrase_length;
+		list[count].security = HAKIOS_STA_WPA2_PSK;
+		count++;
+	}
+	if (count == 0) {
 		tell("wifi: the network given in fw/network is not a name and a passphrase: nothing is joined\n");
 		return;
 	}
-	what.ssid_length = (uint8_t)name_length;
-	what.passphrase_length = (uint8_t)passphrase_length;
-	what.security = HAKIOS_STA_WPA2_PSK;
-	error = hakios_sta_ask_join_standing(&what);
-	bzero(&what, sizeof(what));
+	if (count > 1) {
+		tell("wifi: fw/network names %u networks: the first that joins is the one\n", count);
+	}
+	error = hakios_sta_ask_join_standing_list(list, count);
+	bzero(list, sizeof(list));
 	for (unsigned waited = 0; error == 0 && hakios_sta_busy() && waited < 300; waited++) {
 		sleep_ms(100);
 	}
