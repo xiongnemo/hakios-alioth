@@ -8,6 +8,9 @@ export XNU_HOST_OS=$(uname)
 # cctools of Xcode and to the iPhoneOS 16.5 SDK of github.com/theos/sdks).
 if [ "$XNU_HOST_OS" = Darwin ]; then
 	export THEOS=${THEOS:-$DARWIN_REDWOOD/xnu-deps/theos-mac}
+elif [ -z "${THEOS:-}" ] && [ -d "$DARWIN_REDWOOD/../theos/sdks" ]; then
+	# (a theos beside this tree -- one folder holding both -- comes before ~/theos)
+	export THEOS=$(cd "$DARWIN_REDWOOD/../theos" && pwd)
 else
 	export THEOS=${THEOS:-$HOME/theos}
 fi

@@ -64,7 +64,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | Scrolling with a finger down | about 75 % of frames at the 120 Hz pace, the rest about 16 ms |
 | Compositor CPU time per frame | about 3.1 ms |
 | Minecraft PE 1.2.10 / Terraria 1.2 / The Sims 3 Ambitions | 60.6 / 60.6 / 62 frames a second (62 is the cap) |
-| GPU Check | 81 of 83 (the two left need Metal) |
+| System Check | GPU tab 83 of 83; Metal tab 95 of 98 (the one failure: no Metal plug-in published on the accelerator service, by design; 2 skipped) |
 | GPU address spaces | 6 clients, 33 012 switches in 25 minutes, none refused, no SMMU fault; a present costs the same 0.2–0.5 ms as without |
 | System image | 2.4 GB, in RAM for the whole session |
 | Memory for iOS | 11 GB of a 12 GB phone (the whole free block from 0xc0000000; the rest is firmware's and the loader's); with the bundled apps installed iOS still has about 5.5 GB available, and the data volume (sized by memory) can grow to about 8 GB. 6 and 8 GB phones get their own largest block (not tried on one). |
@@ -75,27 +75,23 @@ The one-click release does all of this from a PC script; development runs do it 
 
 | Problem | Cause, as far as known |
 |---|---|
-| No Metal | No Metal device is published. Plan below. |
 | Nothing persists | The data volume is a RAM disk: settings, photos and apps are gone after a reboot. |
-| A GPU hang stops the screen | There is no hang detection or GPU reset yet. |
+| A GPU hang | Detected and recovered (`gpu_recover=1`, the daily default): the GPU is reset and the screen carries on. |
 | Power with the screen off | The panel sleeps and the cores and the GPU drop to their lowest speed, but the GPU is not put to sleep and the display engine keeps its clocks. |
 | USB after re-plugging | Fixed: a race in select() panicked the kernel at the unplug; the controller's EP0 stayed dead or answered wrongly after a replug (the controller is now restarted when the computer resets it in vain); the old session's data and a waiting write leaked into the new one; and about half the time the first packet one way or the other was dropped as a repeat, because the data endpoints kept the DATA0/DATA1 sequence of the session before (they are initialized again at every configuration now). Verified with the cable pulled by hand, quick and slow, in test runs and the release: the computer lists the iPhone again about 10 s after it is back, still trusted. |
-| Wi-Fi at times does not join | Once in a day of boots the access point deauthenticated the phone over and over (reason 6, "class 2 frame from a nonauthenticated station") and the session stayed offline; being looked into. |
+| Wi-Fi at times does not join | Once in a day of boots the access point deauthenticated the phone over and over (reason 6, "class 2 frame from a nonauthenticated station") and the session stayed offline. Since then the network is tried again by itself (after 5, 10, 20, 40, 60 s, then every minute), and after a loss in 2 s. |
 | A game asks for notifications at every boot | The answer is kept in the data volume, which is in RAM. |
 | AssistiveTouch's Home does nothing | Its button, menu and Control Center work; the Home action is not wired to anything here yet. |
 
 ## Next
 
-- **Power**: the GPU asleep and the display engine's clocks down with the screen off, 60 Hz when nothing moves, the
-  cores' idle states, interrupts instead of polling.
-- **Smoothness**: a third scan-out slot and swaps that do not wait for the flip.
-- **GPU robustness**: per-buffer fences, a fence interrupt, hang recovery.
-- **Metal** (estimated 2.5–3.5 months): a Metal plug-in published on the accelerator service, Metal translated to
-  Vulkan (metal2vulkan) and Mesa's Turnip driver on the same kernel interface. First goal: a Metal device and a
-  triangle; then apps.
-- **Persistent install** (estimated 3–5 weeks, plus a boot menu): the kernel already has UFS code; the hard parts are
-  a writable file system for the data volume and space on the phone's storage, which means repartitioning — only
-  with the owner's explicit agreement and a full backup.
-- **iOS 26** (researched; estimated 4–6 months to reach today's state): the kernel source is out, but all of iOS 26
-  is arm64e and this CPU has no pointer authentication, so the user space must be converted offline; the new
-  interface wants Metal to be smooth.
+- **GPU address spaces switched in the ring**: today each switch to another app's page tables drains the GPU first,
+  under the GPU lock; switching them in the command stream (CP_SMMU_TABLE_UPDATE) would take that wait away.
+- **Power**: the cores' deep idle states (PSCI CPU_SUSPEND); the screen-off draw is still about 375 mA.
+- **Wi-Fi**: WPA2-Enterprise (802.1X, eduroam) is written, through iOS's own eapolclient, and is being tried on a
+  real network; the image's network file can now name up to four networks, tried in order.
+- **Persistent install**: on hold. The kernel has UFS code; the hard parts are a writable file system for the data
+  volume and space on the phone's storage, which means repartitioning -- only with the owner's explicit agreement
+  and a full backup.
+- **Newer iOS**: staying on 16.5 for now. iOS 17 and 18 run on CPUs without pointer authentication in other
+  projects, but none has Wi-Fi, Bluetooth and a stable Settings yet on this kind of phone.
