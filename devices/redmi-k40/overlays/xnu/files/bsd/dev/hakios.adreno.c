@@ -1306,6 +1306,7 @@ struct gpu_space {
 	} tables[SPACE_TABLES];
 	uint64_t *last_entry, *last_table;      /* the level 2 entry looked up last, and its table */
 	uint32_t last_changed;                  /* the table an entry was written in last */
+	uint32_t last_fence;                    /* its last submission (gpu_ring_switch=1: the core may be at it still) */
 };
 
 /* tables of spaces that are gone (hakios_gpu_space_free()), cleared, for the next ones made */
@@ -1590,26 +1591,31 @@ space_off(struct gpu_space *space, uint32_t match)
 #define SCM_INTERRUPTED         1                       /* a call that was preempted says so, and is made again so */
 #define PAS_GPU                 13
 
-/* One call. What TrustZone returns: 0 or an error of its own, and a word of answer. */
+/*
+ * One call, of up to four values. What TrustZone returns: 0 or an error of its own, and a word of answer. `speak`
+ * false: nothing printed unless it fails (a call made at every wake of the GPU, gpu_ring_switch's).
+ */
 static int32_t
-scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
-    uint64_t *answer)
+scm_call(const char *what, uint64_t function, uint64_t arguments, const uint64_t value[4], bool speak, uint64_t *answer)
 {
 	uint64_t session = 0;
 
-	printf("adreno: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
-	    second, third);
-	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
+	if (speak) {
+		printf("adreno: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx, %#llx\n", step, what,
+		    function, value[0], value[1], value[2], value[3]);
+	}
+	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, value[0],
+	    value[1]);
 	hold(true);
 	/* (resumed until done, as Linux does: given up halfway, a call left TrustZone with it open and the next one
 	 * never came back -- see work/wsl/fix-scm-retry.py) */
 	for (int i = 0; i < 1000000; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
-		register uint64_t x2 __asm__("x2") = first;
-		register uint64_t x3 __asm__("x3") = second;
-		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = 0;
+		register uint64_t x2 __asm__("x2") = value[0];
+		register uint64_t x3 __asm__("x3") = value[1];
+		register uint64_t x4 __asm__("x4") = value[2];
+		register uint64_t x5 __asm__("x5") = value[3];
 		register uint64_t x6 __asm__("x6") = session;
 		register uint64_t x7 __asm__("x7") = 0;
 
@@ -1617,13 +1623,26 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 		session = x6;
 		if (x0 != SCM_INTERRUPTED) {
-			printf("adreno: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
+			if (speak) {
+				printf("adreno: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
+			} else if (x0 != 0) {
+				printf("adreno: %u: TrustZone returns %d to %s, answer %#llx\n", step, (int32_t)x0, what, x1);
+			}
 			*answer = x1;
 			return (int32_t)x0;
 		}
 	}
-	printf("adreno: %u: TrustZone keeps saying the call was interrupted\n", step);
+	printf("adreno: %u: TrustZone keeps saying the call was interrupted (%s)\n", step, what);
 	return -1;
+}
+
+static int32_t
+scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+    uint64_t *answer)
+{
+	const uint64_t value[4] = { first, second, third, 0 };
+
+	return scm_call(what, function, arguments, value, true, answer);
 }
 
 static bool
@@ -2986,6 +3005,73 @@ step_zap_load(void)
 	return true;
 }
 
+/*
+ * Boot-arg gpu_ring_switch=1 (2026-11-20; OFF by default, not yet run on the phone; work/research/gpu-ring-switch.md):
+ * the 3D core is put in a client's tables by a command in the ring, ahead of that client's commands --
+ * CP_SMMU_TABLE_UPDATE, which the command processor's microcode carries out on the SMMU context the core translates
+ * through, making it forget its translations as well (Linux's a6xx_set_pagetable does the same) -- instead of by this
+ * processor once the core has drained (space_switch()): a submission then no longer waits, under gGPULock, for every
+ * other client's work to be done (Map: 5-6 ms a submission behind the render server's). The command processor
+ * reaches the context's registers only after TrustZone has opened its window onto them (Linux:
+ * qcom_scm_set_gpu_smmu_aperture(0) -- the MP service's call 0x1b, four values: 0xffff0000 | the context, and three
+ * all ones -- at every start of a GPU of the A6xx family on, when TrustZone has the call): asked here at every start of
+ * the command processor (the first, each wake, each recovery). Not had: the switches stay this processor's. Every
+ * space has the context's ASID (0, as Linux's).
+ */
+#define SCM_MP_CP_SMMU_APERTURE SCM_CALL(0x0c, 0x1b)
+#define SCM_FOUR_VALUES         4
+static int gpu_ring_switch = -1;                /* -1: the boot-arg not read yet */
+static int ring_window_callable = -1;           /* does TrustZone have the call (-1: not asked yet) */
+static bool ring_window_open;                   /* opened at this start of the command processor */
+static uint32_t ring_window_asked, ring_window_refused;
+
+static bool
+ring_switch_wanted(void)
+{
+	if (gpu_ring_switch < 0) {
+		uint32_t value = 0;
+
+		PE_parse_boot_argn("gpu_ring_switch", &value, sizeof(value));
+		gpu_ring_switch = value != 0;
+	}
+	return gpu_ring_switch != 0;
+}
+
+static bool
+ring_window(void)
+{
+	const uint64_t call[4] = { SCM_SIP | SCM_MP_CP_SMMU_APERTURE, 0, 0, 0 };
+	const uint64_t window[4] = { 0xffff0000ull | (core_space.context & 0xff), 0xffffffffull, 0xffffffffull, 0xffffffffull };
+	bool speak = ring_window_asked++ < 2;
+	uint64_t answer = 0;
+	int32_t result;
+
+	if (ring_window_callable < 0) {
+		ring_window_callable = scm_call("whether it can open the SMMU's registers to the command processor",
+		    SCM_FAST | SCM_64 | SCM_SIP | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, call, true, &answer) == 0 && answer == 1;
+		if (!ring_window_callable) {
+			printf("adreno: gpu_ring_switch=1: TrustZone has no call to open the SMMU's registers to the command "
+			    "processor: the address space switches stay this processor's\n");
+		}
+	}
+	if (!ring_window_callable) {
+		return false;
+	}
+	result = scm_call("to open the SMMU's registers (its context 0) to the command processor", SCM_64 | SCM_SIP |
+	    SCM_MP_CP_SMMU_APERTURE, SCM_FOUR_VALUES, window, speak, &answer);
+	if (result != 0) {
+		if (ring_window_refused++ < 4) {
+			printf("adreno: gpu_ring_switch=1: TrustZone refused to open the SMMU's registers (%d): the address space "
+			    "switches stay this processor's\n", result);
+		}
+		return false;
+	}
+	if (speak) {
+		printf("adreno: gpu_ring_switch=1: the command processor switches the 3D core's address spaces itself\n");
+	}
+	return true;
+}
+
 /* ---- step 20: the 3D core's registers, its command processor started, its first command ------------------- */
 
 static bool
@@ -3061,6 +3147,8 @@ step_core_start(void)
 	get(&gpu, "cp_rb_cntl", CP_RB_CNTL);
 	get(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL);
 	get(&gpu, "rbbm_status", RBBM_STATUS);
+	/* (gpu_ring_switch=1: the window opened at every start, as Linux's adreno_hw_init does) */
+	ring_window_open = ring_switch_wanted() && !blind && ring_window();
 
 	announce(blind ? "start the 3D core's command processor with its microcode nowhere" :
 	    "start the 3D core's command processor");
@@ -4135,12 +4223,33 @@ hakios_gpu_space_new(void)
 	return space;
 }
 
+/* (with the core idle) Its context translates through `to`, by this processor's writes to the SMMU. */
+static void
+space_load(struct gpu_space *to)
+{
+	uint32_t context = smmu_context(&core_space);
+	uint64_t root;
+
+	space_commit(to);
+	root = kvtophys((vm_offset_t)to->root) | (uint64_t)to->context << 48;
+	wr(smmu.base + context + SMMU_CB_TTBR0, (uint32_t)root);
+	wr(smmu.base + context + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
+	settle();
+	wr(smmu.base + context + SMMU_CB_TLBIASID, to->context);
+	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
+	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
+	}
+	gpu_space_now = to == &core_space ? NULL : to;
+	if (gpu_space_switches++ == 0) {
+		printf("adreno: gpu: clients' own address spaces (gpu_spaces=1): the first switch, to %#llx\n", root);
+	}
+}
+
 /* The 3D core's context translates through `to` from now on; false: the core did not become idle (nothing changed). */
 static bool
 space_switch(struct gpu_space *to)
 {
-	uint32_t context = smmu_context(&core_space), waited = 0;
-	uint64_t root;
+	uint32_t waited = 0;
 
 	if (to == (gpu_space_now != NULL ? gpu_space_now : &core_space)) {
 		return true;
@@ -4156,20 +4265,46 @@ space_switch(struct gpu_space *to)
 		}
 		return false;
 	}
-	space_commit(to);
-	root = kvtophys((vm_offset_t)to->root) | (uint64_t)to->context << 48;
-	wr(smmu.base + context + SMMU_CB_TTBR0, (uint32_t)root);
-	wr(smmu.base + context + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
-	settle();
-	wr(smmu.base + context + SMMU_CB_TLBIASID, to->context);
-	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
-	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
-	}
-	gpu_space_now = to == &core_space ? NULL : to;
-	if (gpu_space_switches++ == 0) {
-		printf("adreno: gpu: clients' own address spaces (gpu_spaces=1): the first switch, to %#llx\n", root);
-	}
+	space_load(to);
 	return true;
+}
+
+/*
+ * gpu_ring_switch=1 (step 20 above says why): the switch to `to` as commands, written ahead of a submission's. The
+ * core first finishes what it has (whether the microcode waits for the pipeline itself is not known here; with
+ * gpu_exact=1, the default, every submission ends idle anyway), then takes the new tables and forgets the old
+ * translations, writes down which tables those are (the scratch page, for hakios_gpu_report()), and empties the cache
+ * its shaders read memory through. gpu_space_now is from here on the space of the ring's end, which the core reaches
+ * when it gets there.
+ */
+#define CP_SMMU_TABLE_UPDATE    0x53
+#define EVENT_CACHE_INVALIDATE  49              /* (the UCHE's) */
+#define GPU_RING_ROOT_AT        0xa0            /* in the scratch page: the tables of the last switch the core took */
+#define RING_SWITCH_WORDS       (1 + 5 + 5 + 2)
+static uint32_t ring_switches;
+
+static void
+ring_switch(struct gpu_space *to)
+{
+	uint64_t root = kvtophys((vm_offset_t)to->root);
+
+	ring_command(CP_WAIT_FOR_IDLE, 0);
+	ring_command(CP_SMMU_TABLE_UPDATE, 4);
+	ring((uint32_t)root);
+	ring((uint32_t)(root >> 32 & 0xffff) | (to->context & 0xffff) << 16);   /* ... and the ASID */
+	ring(0);                                /* (CONTEXTIDR: not used with these tables) */
+	ring(core_space.context);               /* the SMMU's context */
+	ring_command(CP_MEM_WRITE, 4);
+	ring(CORE_SCRATCH_ADDRESS + GPU_RING_ROOT_AT);
+	ring(0);
+	ring((uint32_t)root);
+	ring((uint32_t)(root >> 32));
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_CACHE_INVALIDATE);
+	gpu_space_now = to == &core_space ? NULL : to;
+	if (ring_switches++ == 0) {
+		printf("adreno: gpu: gpu_ring_switch=1: the first address space switch in the ring, to %#llx\n", root);
+	}
 }
 
 void
@@ -4183,6 +4318,15 @@ hakios_gpu_space_free(void *opaque)
 	if (gpu_space_now == space && !space_switch(&core_space)) {
 		/* (the core is still in it: its tables stay, for good) */
 		printf("adreno: gpu: a client is gone while the core is still at its commands: its space stays\n");
+		return;
+	}
+	/* (gpu_ring_switch=1: a space the ring has left may still have work in it ahead of the core) */
+	for (uint32_t waited = 0; space->last_fence != 0 && !hakios_gpu_done(space->last_fence) && waited < 5000; waited++) {
+		sleep_us(100);
+	}
+	if (space->last_fence != 0 && !hakios_gpu_done(space->last_fence)) {
+		printf("adreno: gpu: a client is gone while the core has its submission %u still to do: its space stays\n",
+		    space->last_fence);
 		return;
 	}
 	for (uint32_t i = 0; i < space->table_count; i++) {
@@ -4231,11 +4375,24 @@ hakios_gpu_unmap_in(void *space, uint64_t address, uint64_t size)
 	}
 }
 
+static uint32_t gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_t *words, uint32_t count);
+
 /* hakios_gpu_submit() in a client's space (NULL: the shared one): 0, as there, when it cannot be given to the core */
 uint32_t
 hakios_gpu_submit_in(void *space, const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
-	if (gpu_spaces_on() && !space_switch(space != NULL ? space : &core_space)) {
+	struct gpu_space *to = space != NULL ? space : &core_space;
+
+	if (!gpu_spaces_on()) {
+		return hakios_gpu_submit(addresses, words, count);
+	}
+	if (ring_window_open) {
+		/* (gpu_ring_switch=1: no wait for the core; the switch, if one is needed, goes into the ring) */
+		space_commit(to);
+		return gpu_submit(to == (gpu_space_now != NULL ? gpu_space_now : &core_space) ? NULL : to, addresses, words,
+		           count);
+	}
+	if (!space_switch(to)) {
 		return 0;
 	}
 	return hakios_gpu_submit(addresses, words, count);
@@ -4497,7 +4654,19 @@ gpu_gov_start(void)
 uint32_t
 hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
-	uint32_t wanted = 26 + 4 * count, room = 0;
+	return gpu_submit(NULL, addresses, words, count);
+}
+
+/* whose each of the last submissions was (NULL: the shared space's): which client a hang is put down to */
+#define FENCE_SPACES            512
+static struct gpu_space *fence_space[FENCE_SPACES];
+
+/* switch_to: gpu_ring_switch=1's switch of the core to that space first, in the ring (NULL: none) */
+static uint32_t
+gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	uint32_t wanted, room = 0;
+	struct gpu_space *in;
 
 	if (gpu_asleep) {
 		if (!hakios_gpu_wake()) {
@@ -4507,6 +4676,14 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 			hakios_gpu_screen(false);       /* (woken for this while dark: asleep again two seconds after it is done) */
 		}
 	}
+	if (switch_to != NULL && !ring_window_open) {
+		/* (the wake's start of the command processor did not get the window: this processor's switch, the core idle) */
+		if (!space_switch(switch_to)) {
+			return 0;
+		}
+		switch_to = NULL;
+	}
+	wanted = 26 + 4 * count + (switch_to != NULL ? RING_SWITCH_WORDS : 0);
 	for (int i = 0; i < 20000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
 		if (room >= wanted) {
@@ -4521,6 +4698,12 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	if (++gpu_fence == 0) {
 		gpu_fence = 1;
 	}
+	if (switch_to != NULL) {
+		ring_switch(switch_to);         /* (ahead of the time noted: the wait for the last one's work is not this one's) */
+	}
+	in = gpu_space_now != NULL ? gpu_space_now : &core_space;
+	in->last_fence = gpu_fence;
+	fence_space[gpu_fence % FENCE_SPACES] = gpu_space_now;
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
@@ -4611,6 +4794,7 @@ hakios_gpu_recover(void)
 	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
 	uint64_t began = mach_absolute_time(), minute, ns;
 	uint32_t done;
+	struct gpu_space *blamed;
 	bool ok;
 
 	nanoseconds_to_absolutetime(60 * NSEC_PER_SEC, &minute);
@@ -4623,8 +4807,10 @@ hakios_gpu_recover(void)
 	}
 	to_memory((vm_offset_t)word, 4);
 	done = *word;
+	/* (whose the submission it is stuck at is: with gpu_ring_switch=1 the ring can hold several clients' work) */
+	blamed = gpu_fence - done <= FENCE_SPACES ? fence_space[(done + 1) % FENCE_SPACES] : gpu_space_now;
 	printf("adreno: THE GPU HAS HUNG: submission %u is the last, the core has done %u, nothing has moved for 2 s; the work "
-	    "is %s's; bringing it back (%u)\n", gpu_fence, done, gpu_space_now != NULL ? "a client" : "the shared space's",
+	    "is %s's; bringing it back (%u)\n", gpu_fence, done, blamed != NULL ? "a client" : "the shared space's",
 	    gpu_recoveries + 1);
 	hakios_gpu_report("hung");
 	lck_mtx_lock(&gpu_gov_mtx);
@@ -4662,9 +4848,16 @@ hakios_gpu_recover(void)
 	gpu_asleep = true;                      /* (what gpu_wake_core() brings back from) */
 	ok = gpu_wake_core();
 	if (ok) {
+		/*
+		 * gpu_ring_switch=1: the core was stopped wherever it was in the ring, perhaps short of a switch it was to
+		 * take: its tables set again by this processor, to those of the ring's end (what gpu_space_now says)
+		 */
+		if (ring_switches != 0) {
+			space_load(gpu_space_now != NULL ? gpu_space_now : &core_space);
+		}
 		gpu_failed_after = done;
 		gpu_failed_upto = gpu_fence;
-		gpu_failed_space = gpu_space_now;
+		gpu_failed_space = blamed;
 		gpu_failed_any = true;
 		*word = gpu_fence;              /* (every waiter let go: what it waited for will not come) */
 		to_memory((vm_offset_t)word, 4);
@@ -4712,6 +4905,8 @@ hakios_gpu_test_hang(void)
 	if (++gpu_fence == 0) {
 		gpu_fence = 1;
 	}
+	fence_space[gpu_fence % FENCE_SPACES] = NULL;
+	core_space.last_fence = gpu_fence;
 	ring_command(CP_WAIT_REG_MEM, 6);       /* until a word of the scratch page that stays 0 is 0xdeadbeef */
 	ring(3u | 1u << 4);                     /* "equal", in memory */
 	ring(CORE_SCRATCH_ADDRESS + 0x80);
@@ -4749,6 +4944,14 @@ hakios_gpu_report(const char *why)
 	printf("adreno: gpu:   in the first command buffer at %#llx, %u words to go; in the second at %#llx, %u to go\n",
 	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_REM_SIZE),
 	    (uint64_t)rd(gpu.base + CP_IB2_BASE + 4) << 32 | rd(gpu.base + CP_IB2_BASE), rd(gpu.base + CP_IB2_REM_SIZE));
+	if (ring_switches != 0) {
+		volatile uint32_t *taken = (volatile uint32_t *)(core_scratch.memory + GPU_RING_ROOT_AT);
+
+		to_memory((vm_offset_t)taken, 8);
+		printf("adreno: gpu:   gpu_ring_switch=1: %u switches in the ring; the last the core took was to %#llx, the "
+		    "ring's end is in %#llx\n", ring_switches, (uint64_t)taken[1] << 32 | taken[0],
+		    (uint64_t)kvtophys((vm_offset_t)(gpu_space_now != NULL ? gpu_space_now : &core_space)->root));
+	}
 	step = 0;
 	if (space_faulted(&core_space)) {
 		wr(smmu.base + context + SMMU_CB_FSR, SMMU_FSR_ALL);    /* so that the next one shows */
@@ -4811,6 +5014,11 @@ hakios_adreno_minute(void)
 		printf("adreno: gpu: clients' own spaces: %u made, %u switches, %u refused; the core in %s; %u submissions\n",
 		    gpu_spaces_made, gpu_space_switches, gpu_space_refused, gpu_space_now != NULL ? "a client's" : "the shared one",
 		    gpu_fence);
+		if (ring_switch_wanted()) {
+			printf("adreno: gpu: gpu_ring_switch=1: %u switches in the ring; TrustZone's window %s (asked %u times, "
+			    "refused %u)\n", ring_switches, ring_window_open ? "open" : "SHUT: this processor switches",
+			    ring_window_asked, ring_window_refused);
+		}
 	}
 	if (gov_running || gov_votes != 0) {
 		uint64_t all = 0;
