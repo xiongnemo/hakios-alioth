@@ -1010,6 +1010,14 @@ frame_metadata(const struct isp *isp, const struct hakios_camera_frame *f, const
  */
 static qos_class_t render_qos = QOS_CLASS_USER_INITIATED;
 
+/*
+ * Boot-arg cam_pieces=N (11-21, WEEK-1121 E4): a picture made in N pieces of rows (8, the old way, by default). With four
+ * big cores and three small ones, eight equal pieces wait for the slowest -- a small core still at its bottom clock
+ * (cpugov: the small group 99 % of an idle minute at 300 MHz) -- so a frame's wall time is set by it; more, smaller
+ * pieces let the fast cores take the most. The work is the same; the frame is ready sooner.
+ */
+static uint32_t render_pieces = 8;
+
 static void
 deliver(struct stream *s, struct output *out, const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw,
     CFDictionaryRef metadata)
@@ -1035,7 +1043,8 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	struct render_job job = { isp, f, raw, pb, pf, width, height, render_pieces,
+		strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
 	uint64_t began = mach_absolute_time();
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(render_qos, 0), &job, render_piece);
@@ -1411,6 +1420,13 @@ worker(void *context)
 	}
 	if (isp.stats_step != 4) {
 		say("statistics from every %u%s cell each way (cam_stats)", isp.stats_step, isp.stats_step == 1 ? "" : "th");
+	}
+	render_pieces = boot_arg_number("cam_pieces", 8);
+	if (render_pieces < 1 || render_pieces > 64) {
+		render_pieces = 8;
+	}
+	if (render_pieces != 8) {
+		say("pictures made in %u pieces (cam_pieces)", render_pieces);
 	}
 	while (s->running && failures < 5) {
 		ssize_t n;
