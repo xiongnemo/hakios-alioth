@@ -81,6 +81,7 @@ struct isp {
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
 	struct isp_tuning *tuning;              /* isp_load_tuning()'s, or none */
 	bool            plain_preview;          /* the preview's pixels the way before 2026-11-15 (one at a time), to compare */
+	uint32_t        stats_step;             /* isp_measure's cells: every Nth each way (0: 4, the old way; boot-arg cam_stats) */
 };
 
 void isp_init(struct isp *isp);
@@ -90,7 +91,10 @@ void isp_init(struct isp *isp);
  * the same scene at any exposure the same; and green's mean level there (level, may be NULL).
  */
 float isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0, float y0, float x1, float y1, float *level);
-/* the levels, from every 4th cell of every 4th pair of lines (with the processor's lens shading and white balance, if isp) */
+/*
+ * the levels, from every 4th cell of every 4th pair of lines -- every isp->stats_step-th, if isp says (with the
+ * processor's lens shading and white balance, if isp)
+ */
 void isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, struct isp_stats *s);
 /* the exposure for the frames to come: true, and the command filled in, when it should change */
 bool isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c);

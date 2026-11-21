@@ -126,17 +126,24 @@ void
 isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, struct isp_stats *s)
 {
 	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
+	/*
+	 * (11-21, WEEK-1121 E1: every 4th cell each way took 4.3-5.9 ms a frame of 4000x3000 -- 187,500 cells, each with
+	 * the lens shading looked up -- in the camera thread, before the frame goes on. Everything taken from it is a
+	 * share of the cells -- the means, the near-grey ones, the brightest 1 % -- so fewer cells give the same answer
+	 * to within the noise: boot-arg cam_stats=8 reads a quarter as many.)
+	 */
+	uint32_t step = isp != NULL && isp->stats_step > 0 ? isp->stats_step : 4;
 	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 };
 	float gains[3] = { 1, 1, 1 };
 	int r, b;
 
 	memset(s, 0, sizeof(*s));
 	cell_places(f->bayer, &r, &b);
-	for (uint32_t cy = 0; cy < cells_h; cy += 4) {
+	for (uint32_t cy = 0; cy < cells_h; cy += step) {
 		const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
 		float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
 
-		for (uint32_t cx = 0; cx < cells_w; cx += 4) {
+		for (uint32_t cx = 0; cx < cells_w; cx += step) {
 			int v[4], g = 0, top_v = 0;
 
 			cell(top, f->stride, cx, v);

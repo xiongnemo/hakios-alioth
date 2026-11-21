@@ -45,9 +45,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 #include "camera_isp.h"
+
+/* boot-arg NAME=N (N at the start of the words or after a space), or otherwise */
+static unsigned
+boot_arg_number(const char *name, unsigned otherwise)
+{
+	char args[1100] = "";
+	size_t n = sizeof(args) - 1, len = strlen(name);
+
+	if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) != 0) {
+		return otherwise;
+	}
+	for (char *p = strstr(args, name); p != NULL; p = strstr(p + 1, name)) {
+		if ((p == args || p[-1] == ' ') && p[len] == '=') {
+			return (unsigned)strtoul(p + len + 1, NULL, 10);
+		}
+	}
+	return otherwise;
+}
 
 void hakios_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
@@ -1384,6 +1403,15 @@ worker(void *context)
 		return NULL;
 	}
 	isp_init(&isp);
+	/* boot-arg cam_stats=N: the exposure's and white balance's statistics from every Nth cell each way (4, the old
+	   way, by default; 8 reads a quarter as many: WEEK-1121 E1) */
+	isp.stats_step = boot_arg_number("cam_stats", 4);
+	if (isp.stats_step < 1 || isp.stats_step > 32) {
+		isp.stats_step = 4;
+	}
+	if (isp.stats_step != 4) {
+		say("statistics from every %u%s cell each way (cam_stats)", isp.stats_step, isp.stats_step == 1 ? "" : "th");
+	}
 	while (s->running && failures < 5) {
 		ssize_t n;
 
