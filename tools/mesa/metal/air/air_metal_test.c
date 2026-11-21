@@ -4296,6 +4296,119 @@ run_attrib_sweep(const char *vpath, const char *fpath, const char *ffunc)
  * that does not depend on there being a surface. An ID of 0 is its own refusal and is
  * checked too, which is why the sweep is run twice when no ID is given.
  */
+/*
+ * --upload (the K40's, 11-21, WEEK-1121 E3): rwa_texture_write against rwa_texture_write_begin /
+ * _copy / _end -- the same bytes into two textures of the same shape, one each way, both read back
+ * with rwa_texture_read and compared with what was written, byte for byte. Shapes that take the
+ * different roads of a map: a render target (tiled: a staging map, blitted at the unmap), an odd
+ * size, a region inside a texture with the caller's rows padded, rows of a few bytes, and a 3D
+ * texture (the layer stride). No .metallib: this is about memory.
+ */
+static int
+run_upload(void)
+{
+   char why[WHY] = "";
+   struct rwa_device *device = rwa_device_open(why, sizeof(why));
+   if (!device) {
+      printf("air_metal_test: rwa_device_open: %s\n", why);
+      return 1;
+   }
+   struct {
+      const char *what;
+      unsigned format, type, bpp, usage;
+      unsigned w, h, d;
+      unsigned origin[3], size[3];
+      unsigned pad;           /* bytes added to each of the caller's rows */
+   } cases[] = {
+      { "BGRA8Unorm 64x64, a render target", 80, MTL_TEXTURE_TYPE_2D, 4,
+        MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET, 64, 64, 1, { 0, 0, 0 }, { 64, 64, 1 }, 0 },
+      { "RGBA8Unorm 37x29, odd", 70, MTL_TEXTURE_TYPE_2D, 4, MTL_USAGE_SHADER_READ, 37, 29, 1,
+        { 0, 0, 0 }, { 37, 29, 1 }, 0 },
+      { "RGBA32Float 16x16, a 9x7 region at (3,5), rows padded by 32", MTL_RGBA32_FLOAT,
+        MTL_TEXTURE_TYPE_2D, 16, MTL_USAGE_SHADER_READ, 16, 16, 1, { 3, 5, 0 }, { 9, 7, 1 }, 32 },
+      { "R8Unorm 129x3, narrow rows", 10, MTL_TEXTURE_TYPE_2D, 1, MTL_USAGE_SHADER_READ, 129, 3, 1,
+        { 0, 0, 0 }, { 129, 3, 1 }, 0 },
+      { "RGBA32Uint 8x8x4, 3D", MTL_RGBA32_UINT, MTL_TEXTURE_TYPE_3D, 16, MTL_USAGE_SHADER_READ, 8, 8,
+        4, { 0, 0, 0 }, { 8, 8, 4 }, 0 },
+   };
+   unsigned failed = 0;
+
+   printf("air_metal_test: upload on %s: rwa_texture_write vs begin/copy/end\n",
+          rwa_device_name(device));
+   for (unsigned k = 0; k < COUNT_OF(cases); k++) {
+      const struct rwa_texture_shape ts = {
+         .pixel_format = cases[k].format, .type = cases[k].type, .width = cases[k].w,
+         .height = cases[k].h, .depth = cases[k].d, .array_length = 1, .mip_levels = 1,
+         .sample_count = 1, .usage = cases[k].usage,
+      };
+      size_t tight = (size_t)cases[k].size[0] * cases[k].bpp;
+      size_t row = tight + cases[k].pad;
+      size_t rows = (size_t)cases[k].size[1] * cases[k].size[2];
+      uint8_t *src = calloc(rows, row), *back[2] = { calloc(rows, tight), calloc(rows, tight) };
+      struct rwa_texture *t[2] = { rwa_texture_create(device, &ts, why, sizeof(why)), NULL };
+      bool ok = true;
+
+      if (t[0])
+         t[1] = rwa_texture_create(device, &ts, why, sizeof(why));
+      if (!src || !back[0] || !back[1] || !t[0] || !t[1]) {
+         printf("  %-62s NOT MADE: %s\n", cases[k].what, why);
+         failed++;
+         goto next;
+      }
+      for (size_t r = 0; r < rows; r++)
+         for (size_t b = 0; b < tight; b++) {
+            if (cases[k].format == MTL_RGBA32_FLOAT && b % 4 == 0) {
+               float v = (float)(r * 3 + b / 4) * 0.25f + 1.0f;   /* an exact, ordinary float */
+               memcpy(src + r * row + b, &v, 4);
+               b += 3;
+            } else {
+               src[r * row + b] = (uint8_t)(r * 13 + b * 7 + k * 31 + 1);
+            }
+         }
+      if (rwa_texture_write(t[0], 0, 0, cases[k].origin, cases[k].size, src, row, why,
+                            sizeof(why)) != 0) {
+         printf("  %-62s rwa_texture_write: %s\n", cases[k].what, why);
+         ok = false;
+      }
+      struct rwa_texture_upload up;
+      if (rwa_texture_write_begin(t[1], 0, 0, cases[k].origin, cases[k].size, row, &up, why,
+                                  sizeof(why)) != 0) {
+         printf("  %-62s rwa_texture_write_begin: %s\n", cases[k].what, why);
+         ok = false;
+      } else {
+         rwa_texture_write_copy(&up, src);
+         rwa_texture_write_end(t[1], &up);
+      }
+      for (unsigned i = 0; i < 2 && ok; i++) {
+         if (rwa_texture_read(t[i], 0, 0, cases[k].origin, cases[k].size, back[i], 0, why,
+                              sizeof(why)) != 0) {
+            printf("  %-62s rwa_texture_read (%s): %s\n", cases[k].what, i ? "three" : "one", why);
+            ok = false;
+         }
+      }
+      if (ok) {
+         size_t diff[2] = { 0, 0 };
+         for (size_t r = 0; r < rows; r++)
+            for (unsigned i = 0; i < 2; i++)
+               diff[i] += memcmp(back[i] + r * tight, src + r * row, tight) != 0;
+         ok = diff[0] == 0 && diff[1] == 0;
+         printf("  %-62s %s (rows differing: write %zu, begin/copy/end %zu of %zu)\n",
+                cases[k].what, ok ? "same" : "DIFFERENT", diff[0], diff[1], rows);
+      }
+      failed += !ok;
+   next:
+      for (unsigned i = 0; i < 2; i++)
+         if (t[i])
+            rwa_texture_destroy(t[i]);
+      free(src);
+      free(back[0]);
+      free(back[1]);
+   }
+   printf("air_metal_test: upload: %u of %zu failed\n", failed, COUNT_OF(cases));
+   rwa_device_close(device);
+   return failed ? 1 : 0;
+}
+
 static int
 run_surface(int surface_id, unsigned width, unsigned height, unsigned row_bytes)
 {
@@ -6259,6 +6372,10 @@ main(int argc, char **argv)
       }
       return run_draw_argbuf(argv[2], argv[3]);
    }
+
+   /* --upload neither (11-21): rwa_texture_write against its three halves */
+   if (argc >= 2 && !strcmp(argv[1], "--upload"))
+      return run_upload();
 
    /* --surface takes no .metallib at all: it is about memory, not about a shader. */
    if (argc >= 2 && !strcmp(argv[1], "--surface")) {
