@@ -3078,7 +3078,7 @@ static volatile bool link_wanted, link_runs;
  * words, no packet, no message of ours -- the next looks are N ms apart (a message of ours, link_wake(), ends the wait
  * at once) until something comes again. 0, the default: a look every millisecond, the old way.
  */
-#define LINK_QUIET 50
+#define LINK_QUIET 10      /* (~10 ms: a burst's packets come well within it; backboardd's orientation asks every 100 ms) */
 
 static void
 link_thread(__unused void *parameter, __unused wait_result_t result)
