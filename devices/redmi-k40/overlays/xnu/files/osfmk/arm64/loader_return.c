@@ -781,6 +781,63 @@ tcp_log_quiet_init(void)
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, tcp_log_quiet_init);
 
 /*
+ * Boot-arg psci_probe=1 (11-22, WEEK-1121 P5): what the firmware's PSCI says it offers for idle, asked and said once
+ * at boot -- PSCI_VERSION, PSCI_FEATURES of CPU_SUSPEND (bit 1: the extended StateID format; bit 0: OS-initiated
+ * mode), of PSCI_SET_SUSPEND_MODE, SYSTEM_SUSPEND, CPU_DEFAULT_SUSPEND and PSCI_STAT_*. Queries only: no state of the
+ * firmware or of a core changes. The groundwork for CPU idle states (the phone's device tree, qcom,lpm-levels: per
+ * core "rail-pc" = PSCI mode 4, power down; per cluster "llcc-off" = (0xc24 << 4); see work/research/psci-idle.md).
+ */
+extern uint32_t psci_smp_hvc;
+
+static int64_t
+psci_probe_call(uint64_t function, uint64_t arg1)
+{
+	register uint64_t x0 __asm__("x0") = function;
+	register uint64_t x1 __asm__("x1") = arg1;
+	register uint64_t x2 __asm__("x2") = 0;
+	register uint64_t x3 __asm__("x3") = 0;
+
+	if (psci_smp_hvc) {
+		__asm__ volatile ("hvc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
+		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
+	} else {
+		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
+		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
+	}
+	return (int64_t)x0;
+}
+
+static void
+psci_probe(void)
+{
+	uint32_t want = 0;
+	static const struct {
+		const char *name;
+		uint32_t id;
+	} asked[] = {
+		{ "CPU_SUSPEND (64)", 0xC4000001u }, { "PSCI_SET_SUSPEND_MODE", 0x8400000Fu },
+		{ "SYSTEM_SUSPEND (64)", 0xC400000Eu }, { "CPU_DEFAULT_SUSPEND (64)", 0xC400000Cu },
+		{ "PSCI_STAT_RESIDENCY (64)", 0xC4000010u }, { "PSCI_STAT_COUNT (64)", 0xC4000011u },
+		{ "CPU_OFF", 0x84000002u }, { "AFFINITY_INFO (64)", 0xC4000004u },
+	};
+	int64_t version;
+
+	if (!PE_parse_boot_argn("psci_probe", &want, sizeof(want)) || want == 0) {
+		return;
+	}
+	version = psci_probe_call(0x84000000u, 0);      /* PSCI_VERSION */
+	printf("psci_probe: PSCI %lld.%lld (%#llx), by %s\n", (version >> 16) & 0xffff, version & 0xffff,
+	    (unsigned long long)version, psci_smp_hvc ? "HVC" : "SMC");
+	for (unsigned i = 0; i < sizeof(asked) / sizeof(asked[0]); i++) {
+		int64_t r = psci_probe_call(0x8400000Au, asked[i].id);     /* PSCI_FEATURES */
+
+		printf("psci_probe: FEATURES %s (%#x): %lld (%#llx)%s\n", asked[i].name, asked[i].id, r,
+		    (unsigned long long)r, r < 0 ? " = not supported" : "");
+	}
+}
+STARTUP(LOCKDOWN, STARTUP_RANK_LAST, psci_probe);
+
+/*
  * kern.hakios.kthreads (the sysctl itself is in bsd/dev/hakios.cpufreq.c): one line per kernel thread -- its id, its
  * context switches (c_switch: every wake of a polling thread is one), its CPU time in microseconds, its priority and
  * its name ("-" if it has none) -- for the census of what wakes the cores (11-21, WEEK-1121 P1). Two reads a minute
