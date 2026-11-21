@@ -976,16 +976,26 @@ zip_add(int fd, uint64_t *at, NSMutableData *cd, unsigned *count, NSString *name
 	return YES;
 }
 
+static NSString *boot_arg(const char *name);
+
 /*
  * The application's state into the zip file OUT: data/... (its data container) and group/<GROUP-ID>/... (each of its
  * app group containers), regular files only, none whose name in the zip has one of SKIP in it (caches: they come
  * back by themselves) -- and never data/Library/Caches/, data/Library/SplashBoard/ (the screenshots of its last
  * screen), data/tmp/. The application is stopped first: a database copied while it is written is torn.
+ *
+ * (11-22, WEEK-1121 E5) Boot-arg state_shaders=1: data/Library/Caches/hakios-mesa/ goes into the zip after all -- the
+ * GPU's compiled shaders and the Metal translations (alioth_metal.m / gl_osmesa.c set MESA_SHADER_CACHE_DIR there),
+ * which the RAM-booted data volume loses at every boot: Flutter's first launch made its pipelines in 150 ms against
+ * 47-55 warm, first draws up to 42 ms. Put back with the rest of the state, they are found at the next launch; a new
+ * build of the driver keys them differently (and the translations' directory carries the library's time), so stale
+ * ones are only unused. Without it, the old way.
  */
 static BOOL
 save_state(NSString *bundle_id, NSString *out, NSArray<NSString *> *skip)
 {
 	NSFileManager *fm = NSFileManager.defaultManager;
+	BOOL shaders = [boot_arg("state_shaders") isEqualToString:@"1"];
 
 	if ([LSApplicationProxy applicationProxyForIdentifier:bundle_id].bundleURL == nil) {
 		say("ipainstall: %s is not installed\n", bundle_id.UTF8String);
@@ -1025,7 +1035,8 @@ save_state(NSString *bundle_id, NSString *out, NSArray<NSString *> *skip)
 				continue;
 			}
 			for (NSString *s in never) {
-				skipped = skipped || [name containsString:s];
+				skipped = skipped || ([name containsString:s] &&
+				    !(shaders && [name hasPrefix:@"data/Library/Caches/hakios-mesa/"]));
 			}
 			if (skipped) {
 				left_out++;
