@@ -545,6 +545,16 @@ sign_bundle(NSString *app)
 		say("ipainstall: not signed (ipa_sign=0)\n");
 		return;
 	}
+	/*
+	 * ipa_sign=keep: a bundle signed on the computer already -- by this same signer, the same walk (work's
+	 * wsl/presign-ipa.py, which mkrelease runs on the release's apps\) and marked .hakios-adhoc -- is left as it is:
+	 * ~4 s of hashing in the boot's busiest minute (5 IPAs, 11-21). Without the boot-arg it is signed again here, as
+	 * before (with the same entitlements: they are its own then).
+	 */
+	if ([sign isEqualToString:@"keep"] && [fm fileExistsAtPath:[app stringByAppendingPathComponent:@".hakios-adhoc"]]) {
+		say("ipainstall: signed on the computer already (.hakios-adhoc; ipa_sign=keep)\n");
+		return;
+	}
 	NSString *main_id = [NSDictionary dictionaryWithContentsOfFile:
 	    [app stringByAppendingPathComponent:@"Info.plist"]][@"CFBundleIdentifier"];
 	NSMutableArray<NSString *> *bundles = [NSMutableArray arrayWithObject:app];
