@@ -62,6 +62,7 @@ struct ir3_shader *ir3_get_shader(struct ir3_shader_state *hwcso);
 #include "util/format/u_format.h"
 #include "util/half_float.h"
 #include "util/u_inlines.h"
+#include "util/u_surface.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/os_time.h"
@@ -2003,18 +2004,12 @@ caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, siz
    return true;
 }
 
-int
-rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
-                  const unsigned origin[3], const unsigned size[3], const void *bytes,
-                  size_t stride, char *why, size_t why_size)
+/* What rwa_texture_write refuses, and the box and the caller's row bytes of what it takes. */
+static bool
+write_region(struct rwa_texture *texture, unsigned level, unsigned layer, const unsigned origin[3],
+             const unsigned size[3], size_t stride, struct pipe_box *box, size_t *row, char *why,
+             size_t why_size)
 {
-   struct pipe_box box;
-   size_t row;
-
-   if (!bytes) {
-      say(why, why_size, "no bytes to write into a texture");
-      return -1;
-   }
    /* A depth or stencil texture is refused here and read through rwa_depth_read, and
     * the two go together on purpose: a texel of Depth32Float_Stencil8 holds two values
     * of two kinds, so a call whose only argument is "bytes" cannot say which of them
@@ -2027,7 +2022,7 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                          "an aspect and this call has nowhere to name it. A depth "
                          "attachment is filled by the render pass's clearDepth and by what "
                          "the draw writes", texture->format_name);
-      return -1;
+      return false;
    }
    /*
     * And a multisample texture is refused for a harder reason than an argument the call
@@ -2057,10 +2052,25 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                          "a texel out in an order of its own, so these bytes would land in "
                          "no defined sample. A multisample texture is filled by rendering "
                          "into it", texture->format_name, texture->res->nr_samples);
+      return false;
+   }
+   return texture_box(texture, level, layer, origin, size, box, why, why_size) &&
+          caller_stride(texture, box, stride, row, why, why_size);
+}
+
+int
+rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
+                  const unsigned origin[3], const unsigned size[3], const void *bytes,
+                  size_t stride, char *why, size_t why_size)
+{
+   struct pipe_box box;
+   size_t row;
+
+   if (!bytes) {
+      say(why, why_size, "no bytes to write into a texture");
       return -1;
    }
-   if (!texture_box(texture, level, layer, origin, size, &box, why, why_size) ||
-       !caller_stride(texture, &box, stride, &row, why, why_size))
+   if (!write_region(texture, level, layer, origin, size, stride, &box, &row, why, why_size))
       return -1;
 
    /* The slice stride is the region's own rows, because the contract has one stride: a
@@ -2074,6 +2084,64 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                                           row * util_format_get_nblocksy(texture->res->format,
                                                                          box.height));
    return 0;
+}
+
+/*
+ * (the K40's, 11-21, WEEK-1121 E3) The same in three, for alioth_metal.m to let its library lock go
+ * while the bytes are copied: at Flutter's launches texture_write held the lock 6-17 ms (metal_stats
+ * "held longest", rounds b108/b112), every other thread's GPU work waiting behind a memcpy. Mesa's
+ * u_default_texture_subdata is texture_map(PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE), util_copy_box,
+ * texture_unmap -- these are those three steps with those flags.
+ */
+int
+rwa_texture_write_begin(struct rwa_texture *texture, unsigned level, unsigned layer,
+                        const unsigned origin[3], const unsigned size[3], size_t stride,
+                        struct rwa_texture_upload *upload, char *why, size_t why_size)
+{
+   struct pipe_context *pipe = texture->device->pipe;
+   struct pipe_transfer *transfer = NULL;
+   struct pipe_box box;
+   size_t row;
+   void *map;
+
+   memset(upload, 0, sizeof(*upload));
+   if (!write_region(texture, level, layer, origin, size, stride, &box, &row, why, why_size))
+      return -1;
+   map = pipe->texture_map(pipe, texture->res, res_level(texture, level),
+                           PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE, &box, &transfer);
+   if (!map || !transfer) {
+      say(why, why_size, "the %s texture could not be mapped for writing", texture->format_name);
+      return -1;
+   }
+   upload->transfer = transfer;
+   upload->map = map;
+   upload->map_stride = transfer->stride;
+   upload->map_layer_stride = transfer->layer_stride;
+   upload->row = row;
+   upload->format = texture->res->format;
+   upload->width = box.width;
+   upload->height = box.height;
+   upload->depth = box.depth;
+   return 0;
+}
+
+void
+rwa_texture_write_copy(const struct rwa_texture_upload *upload, const void *bytes)
+{
+   enum pipe_format format = (enum pipe_format)upload->format;
+
+   util_copy_box(upload->map, format, upload->map_stride, upload->map_layer_stride, 0, 0, 0,
+                 upload->width, upload->height, upload->depth, bytes, upload->row,
+                 upload->row * util_format_get_nblocksy(format, upload->height), 0, 0, 0);
+}
+
+void
+rwa_texture_write_end(struct rwa_texture *texture, struct rwa_texture_upload *upload)
+{
+   if (upload->transfer)
+      texture->device->pipe->texture_unmap(texture->device->pipe, upload->transfer);
+   upload->transfer = NULL;
+   upload->map = NULL;
 }
 
 /*

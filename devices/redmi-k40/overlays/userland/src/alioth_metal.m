@@ -122,6 +122,15 @@ struct rwa_texture;
 struct rwa_sampler;
 struct rwa_query;
 struct rwa_compute;
+/* (11-21) rwa_texture_write in three (air_metal.h): the map, the copy (no lock needed), the unmap */
+struct rwa_texture_upload {
+	void *transfer;
+	void *map;
+	size_t map_stride, map_layer_stride;
+	size_t row;
+	unsigned format;
+	unsigned width, height, depth;
+};
 struct rwa_compute_info {
 	unsigned max_threads_per_group, thread_execution_width, static_shared_bytes;
 	unsigned buffers, textures, samplers;
@@ -564,6 +573,11 @@ static struct {
 							size_t);
 	int (*texture_write)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
 			     const unsigned[3], const void *, size_t, char *, size_t);
+	/* (11-21) the same in three, for the copy outside the lock (boot-arg metal_upload=1); NULL in an older library */
+	int (*texture_write_begin)(struct rwa_texture *, unsigned, unsigned, const unsigned[3], const unsigned[3], size_t,
+				   struct rwa_texture_upload *, char *, size_t);
+	void (*texture_write_copy)(const struct rwa_texture_upload *, const void *);
+	void (*texture_write_end)(struct rwa_texture *, struct rwa_texture_upload *);
 	int (*texture_read)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
 			    const unsigned[3], void *, size_t, char *, size_t);
 	int (*depth_read)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
@@ -1199,8 +1213,51 @@ GPU_LOCKED_VOID(buffer_destroy, (struct rwa_buffer *b), (b))
 GPU_LOCKED(struct rwa_compute *, compute_create, (struct rwa_device *d, const void *bc, size_t n, const char *e,
     struct rwa_compute_info *i, char *w, size_t ws), (d, bc, n, e, i, w, ws))
 GPU_LOCKED_VOID(compute_destroy, (struct rwa_compute *c), (c))
-GPU_LOCKED(int, texture_write, (struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3],
-    const unsigned z[3], const void *b, size_t st, char *w, size_t ws), (t, l, s, o, z, b, st, w, ws))
+/*
+ * (11-21, WEEK-1121 E3) texture_write -- -replaceRegion: -- held the lock 6-17 ms at Flutter's launches (metal_stats
+ * "held longest", rounds b108/b112): the bytes copied into the texture with every other thread's GPU work waiting.
+ * Boot-arg metal_upload=1: the library's three steps instead (texture_write_begin maps, under the lock; the copy with
+ * the lock let go; texture_write_end unmaps, under the lock -- Mesa's texture_subdata is these three with the same
+ * flags). Only at the lock's outermost level (a nested call keeps the old way: the lock is recursive and would not be
+ * let go anyway), and only with a library that has the three. Without the boot-arg: the old way, all under the lock.
+ */
+static bool metal_upload_split;         /* boot-arg metal_upload=1, read where the library is loaded */
+static int (*unlocked_texture_write)(struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3],
+    const unsigned z[3], const void *b, size_t st, char *w, size_t ws);
+
+static int
+locked_texture_write(struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3], const unsigned z[3],
+    const void *b, size_t st, char *w, size_t ws)
+{
+	int result;
+
+	if (metal_upload_split && alioth_lock_depth == 0 && b != NULL && mesa.texture_write_begin != NULL &&
+	    mesa.texture_write_copy != NULL && mesa.texture_write_end != NULL) {
+		struct rwa_texture_upload upload;
+
+		alioth_gpu_lock();
+		alioth_lock_held("texture_write_begin");
+		result = mesa.texture_write_begin(t, l, s, o, z, st, &upload, w, ws);
+		alioth_lock_letting_go();
+		pthread_mutex_unlock(&alioth_gpu);
+		if (result != 0) {
+			return result;
+		}
+		mesa.texture_write_copy(&upload, b);
+		alioth_gpu_lock();
+		alioth_lock_held("texture_write_end");
+		mesa.texture_write_end(t, &upload);
+		alioth_lock_letting_go();
+		pthread_mutex_unlock(&alioth_gpu);
+		return 0;
+	}
+	alioth_gpu_lock();
+	alioth_lock_held("texture_write");
+	result = unlocked_texture_write(t, l, s, o, z, b, st, w, ws);
+	alioth_lock_letting_go();
+	pthread_mutex_unlock(&alioth_gpu);
+	return result;
+}
 GPU_LOCKED(int, texture_read, (struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3],
     const unsigned z[3], void *b, size_t st, char *w, size_t ws), (t, l, s, o, z, b, st, w, ws))
 GPU_LOCKED(int, depth_read, (struct rwa_texture *t, unsigned l, unsigned s, const unsigned o[3], const unsigned z[3],
@@ -1423,6 +1480,11 @@ mesa_available(void)
 				    sizes);
 			}
 		}
+		/* (11-21) metal_upload=1: -replaceRegion:'s copy outside the library's lock (locked_texture_write) */
+		if ((at = strstr(args, "metal_upload=1")) != NULL && (at == args || at[-1] == ' ')) {
+			metal_upload_split = true;
+			rw_print("metal_upload=1: texture writes copy their bytes outside the library's lock\n");
+		}
 		if ((at = strstr(args, "metal_fd_debug=")) != NULL) {
 			char flags[64];
 			size_t n = 0;
@@ -1464,6 +1526,9 @@ mesa_available(void)
 	*(void **)&alioth_translation_times = dlsym(mesa.handle, "rwa_translation_times");
 	*(void **)&alioth_translation_disk = dlsym(mesa.handle, "rwa_translation_disk");
 	*(void **)&mesa.texture_write = dlsym(mesa.handle, "rwa_texture_write");
+	*(void **)&mesa.texture_write_begin = dlsym(mesa.handle, "rwa_texture_write_begin");
+	*(void **)&mesa.texture_write_copy = dlsym(mesa.handle, "rwa_texture_write_copy");
+	*(void **)&mesa.texture_write_end = dlsym(mesa.handle, "rwa_texture_write_end");
 	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");
 	*(void **)&mesa.depth_read = dlsym(mesa.handle, "rwa_depth_read");
 	*(void **)&mesa.texture_destroy = dlsym(mesa.handle, "rwa_texture_destroy");

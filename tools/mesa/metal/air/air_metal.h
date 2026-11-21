@@ -190,6 +190,30 @@ int rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer
 		     size_t stride, char *why, size_t why_size);
 
 /*
+ * (the K40's, 11-21) rwa_texture_write in three, for a caller that keeps a lock around this
+ * library: _begin maps the region (needs the lock), _copy copies the caller's bytes into the map
+ * (touches no context: may run with the lock let go), _end lets the map go (needs the lock; a
+ * staging map's blit into a tiled texture happens there). Mesa's own texture_subdata is these
+ * three steps with the same flags, so the result is the same; what changes is only that other
+ * threads may use the library while the bytes are copied. The refusals are rwa_texture_write's.
+ * _begin: 0, or -1 and a sentence (and nothing to _end).
+ */
+struct rwa_texture_upload {
+	void *transfer;                 /* the pipe_transfer */
+	void *map;
+	size_t map_stride, map_layer_stride;
+	size_t row;                     /* bytes per row of the caller's */
+	unsigned format;                /* enum pipe_format */
+	unsigned width, height, depth;  /* the region, in texels */
+};
+
+int rwa_texture_write_begin(struct rwa_texture *texture, unsigned level, unsigned layer,
+			    const unsigned origin[3], const unsigned size[3], size_t stride,
+			    struct rwa_texture_upload *upload, char *why, size_t why_size);
+void rwa_texture_write_copy(const struct rwa_texture_upload *upload, const void *bytes);
+void rwa_texture_write_end(struct rwa_texture *texture, struct rwa_texture_upload *upload);
+
+/*
  * What a depth/stencil texture holds, by aspect, which is the reading rwa_texture_read
  * cannot give.
  *
