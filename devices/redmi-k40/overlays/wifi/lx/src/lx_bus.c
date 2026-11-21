@@ -343,11 +343,39 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
  */
 #define BUS_QUIET	10
 
+/*
+ * (11-22) With wifi_idle=10 the thread still woke ~862 times a second (census 014346): every look was "busy". What
+ * made it so, counted and said once a minute for the first ten (with wifi_idle only): looks, those with a data
+ * group's work (and which groups), those with a kick, the long waits.
+ */
+static struct {
+	unsigned long long looks, data, kicked, waits;
+	unsigned long long group[ATH11K_EXT_IRQ_GRP_NUM_MAX];
+	unsigned said;
+} ring_count;
+
+static void
+ring_count_say(void)
+{
+	char groups[160] = "";
+	size_t n = 0;
+
+	for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX && n + 24 < sizeof(groups); i++) {
+		if (ring_count.group[i] != 0) {
+			n += (size_t)snprintf(groups + n, sizeof(groups) - n, " %u:%llu", i, ring_count.group[i]);
+		}
+	}
+	lx_tell("lx: rings, the last minute: %llu looks, %llu with a data group's work (by group:%s), %llu with a kick, "
+	    "%llu long waits\n", ring_count.looks, ring_count.data, groups[0] ? groups : " none", ring_count.kicked,
+	    ring_count.waits);
+	memset(&ring_count, 0, offsetof(typeof(ring_count), said));
+}
+
 static void
 bus_looks(void *argument)
 {
 	struct ath11k_base *ab = argument;
-	unsigned long long said = lx_os_nanoseconds();
+	unsigned long long said = lx_os_nanoseconds(), counted = said;
 	unsigned idle_ms = lx_os_option("wifi_idle"), quiet = 0, kicks = bus.kicks;
 
 	idle_ms = idle_ms > 500 ? 500 : idle_ms;
@@ -378,16 +406,26 @@ bus_looks(void *argument)
 
 			more |= done >= DATA_BUDGET;
 			busy |= done > 0;
+			ring_count.group[i] += done > 0;
 			bus.late += bus.irq && done > 0;
 		}
 		if (bus.irq) {
 			mutex_unlock(&bus.service);
 		}
+		ring_count.looks++;
+		ring_count.data += busy;
 		if (bus.kicks != kicks) {
 			kicks = bus.kicks;
 			busy = true;
+			ring_count.kicked++;
 		}
 		quiet = busy ? 0 : quiet + 1;
+		if (idle_ms != 0 && lx_os_nanoseconds() - counted > 60000000000ull) {
+			counted = lx_os_nanoseconds();
+			if (ring_count.said++ < 10) {
+				ring_count_say();
+			}
+		}
 		if (more) {
 			continue;
 		}
@@ -395,6 +433,7 @@ bus_looks(void *argument)
 			/* (a kick between the look above and this sleep is caught by the count, under the lock) */
 			lx_os_lock();
 			if (bus.kicks == kicks && bus.looking) {
+				ring_count.waits++;
 				lx_os_sleep(&bus.kicks, idle_ms * 1000000ull);
 			}
 			lx_os_unlock();
