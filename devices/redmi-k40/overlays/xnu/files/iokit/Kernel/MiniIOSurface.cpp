@@ -1528,6 +1528,16 @@ IOSurfaceRootUserClient::methodWrapClientImage(IOExternalMethodArguments * args)
 		return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
 	}
 	IOLockLock(gSurfaceLock);
+	/*
+	 * (11-22, WEEK-1121 E6) marked as a client's picture: the pixels are a CGImage's, which does not change once made,
+	 * so the render server (eagl.c, gl_wrap_once=1) may copy it once and stop adding it up every frame
+	 * (surface_changed: ~7 % of CoreAnimation's display thread in home flicks, census c6). Read with
+	 * IOSurfaceCopyValue(surface, "HakiosWrapped").
+	 */
+	if (s->values != NULL) {
+		s->values->setObject("HakiosWrapped", kOSBooleanTrue);
+		s->updateValuesState();
+	}
 	ref = addRef(s);
 	ret = ref ? returnSurface(ref, false, args) : kIOReturnNoMemory;
 	if (ref != NULL && ret != kIOReturnSuccess) {

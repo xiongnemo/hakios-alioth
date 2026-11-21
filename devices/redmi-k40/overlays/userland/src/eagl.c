@@ -250,6 +250,7 @@ struct image {
 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
+	bool still;                     /* a CGImage's (the kernel's "HakiosWrapped"): copied once, never added up (gl_wrap_once) */
 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
@@ -564,6 +565,13 @@ static const char *const app_way_names[] = {
 static uint32_t slot_calls[SLOTS];
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
+/*
+ * Boot-arg gl_wrap_once=1 (11-22, WEEK-1121 E6): a copied surface the kernel marks as a client's picture
+ * (MiniIOSurface methodWrapClientImage: "HakiosWrapped" -- a CGImage's pixels, which do not change once made) is
+ * added up once when its texture is made and then never again (surface_changed): only its seed can bring a new copy.
+ * The adding-up was ~7 % of CoreAnimation's display thread in home flicks after gpu_wrap (census c6). 0: the old way.
+ */
+static bool wrap_once;
 /*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
  * GPU copies it into the surface at the frame's end (one blit; the display's driver waits for that
@@ -971,6 +979,9 @@ surface_changed(struct eagl *e, struct image *image)
 
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
+	}
+	if (image->still && image->looked != 0) {
+		return false;                   /* (gl_wrap_once: a client's picture, added up once already) */
 	}
 	if (e->frames - image->changed > STILL_AFTER && (e->frames + (uintptr_t)image / 64) % STILL_EVERY != 0) {
 		return false;
@@ -5031,6 +5042,15 @@ tex_image_now(id self, SEL selector, IOSurfaceRef surface, unsigned long target,
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
 	began = now_us();
 	if (!surface_shared(e, image)) {
+		image->still = false;
+		if (wrap_once) {
+			CFTypeRef mark = IOSurfaceCopyValue(surface, CFSTR("HakiosWrapped"));
+
+			image->still = mark == kCFBooleanTrue;
+			if (mark != NULL) {
+				CFRelease(mark);
+			}
+		}
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	} else {
@@ -7220,6 +7240,7 @@ install(void)
 			}
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+		wrap_once = strstr(arguments, "gl_wrap_once=1") != NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		early_flush = strstr(arguments, "glearly=1") != NULL;
 		copy_targets = strstr(arguments, "gltargetcopy=1") != NULL;
