@@ -377,6 +377,12 @@ bus_looks(void *argument)
 	struct ath11k_base *ab = argument;
 	unsigned long long said = lx_os_nanoseconds(), counted = said;
 	unsigned idle_ms = lx_os_option("wifi_idle"), quiet = 0, kicks = bus.kicks;
+	/*
+	 * (11-22, run 021510) Groups 0 and 1 had work at 50,731 of 50,756 looks a minute on an idle phone; the data came
+	 * in groups 4, 5, 7 and 8, now and then. A group with work at 99 % of a window's 1000 looks is "steady" for the
+	 * next window: its work does not count as activity (it is still taken care of at every look).
+	 */
+	unsigned window = 0, wgroup[ATH11K_EXT_IRQ_GRP_NUM_MAX] = { 0 }, steady = 0, steady_said = 0;
 
 	idle_ms = idle_ms > 500 ? 500 : idle_ms;
 	if (idle_ms != 0 && !bus.irq) {
@@ -405,7 +411,10 @@ bus_looks(void *argument)
 			int done = ath11k_dp_service_srng(ab, &ab->ext_irq_grp[i], DATA_BUDGET);
 
 			more |= done >= DATA_BUDGET;
-			busy |= done > 0;
+			if (done > 0) {
+				wgroup[i]++;
+				busy |= !(steady & (1u << i));
+			}
 			ring_count.group[i] += done > 0;
 			bus.late += bus.irq && done > 0;
 		}
@@ -414,6 +423,20 @@ bus_looks(void *argument)
 		}
 		ring_count.looks++;
 		ring_count.data += busy;
+		if (idle_ms != 0 && ++window >= 1000) {
+			unsigned was = steady;
+
+			steady = 0;
+			for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+				steady |= wgroup[i] * 100 >= window * 99 ? 1u << i : 0;
+				wgroup[i] = 0;
+			}
+			window = 0;
+			if (steady != was && steady_said++ < 10) {
+				lx_tell("lx: rings: data groups %#x had work at every look: not counted as activity (wifi_idle)\n",
+				    steady);
+			}
+		}
 		if (bus.kicks != kicks) {
 			kicks = bus.kicks;
 			busy = true;
