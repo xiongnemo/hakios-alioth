@@ -60,6 +60,29 @@ kthreads_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern_hakios, OID_AUTO, kthreads, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, kthreads_sysctl,
     "A", "every kernel thread: id, context switches, CPU time in us, priority, name");
 
+/* kern.hakios.psci (11-22, WEEK-1121 P5): the firmware's PSCI version and idle features, asked when read (psci_probe=1) */
+extern size_t hakios_psci_probe_text(char *buf, size_t size);   /* osfmk/arm64/loader_return.c */
+
+static int
+psci_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const size_t size = 4096;
+	char *buf = kalloc_data(size, Z_WAITOK | Z_ZERO);
+	size_t n;
+	int error;
+
+	if (buf == NULL) {
+		return ENOMEM;
+	}
+	n = hakios_psci_probe_text(buf, size);
+	error = SYSCTL_OUT(req, buf, n + 1);
+	kfree_data(buf, size);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, psci, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, psci_sysctl,
+    "A", "the firmware's PSCI version and idle features (boot-arg psci_probe=1)");
+
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
  * interrupts off -- on the way back to the loader (hakios_ddr_quiesce()) -- the loader's log only: the

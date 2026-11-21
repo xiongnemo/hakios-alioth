@@ -807,8 +807,14 @@ psci_probe_call(uint64_t function, uint64_t arg1)
 	return (int64_t)x0;
 }
 
-static void
-psci_probe(void)
+/*
+ * (11-22: said at boot, the lines were lost with the early log -- so it is kern.hakios.psci now, the sysctl in
+ * bsd/dev/hakios.cpufreq.c: read it, and these are asked then. Without psci_probe=1 it answers "off".)
+ */
+size_t hakios_psci_probe_text(char *buf, size_t size);
+
+size_t
+hakios_psci_probe_text(char *buf, size_t size)
 {
 	uint32_t want = 0;
 	static const struct {
@@ -820,22 +826,26 @@ psci_probe(void)
 		{ "PSCI_STAT_RESIDENCY (64)", 0xC4000010u }, { "PSCI_STAT_COUNT (64)", 0xC4000011u },
 		{ "CPU_OFF", 0x84000002u }, { "AFFINITY_INFO (64)", 0xC4000004u },
 	};
+	size_t n = 0;
 	int64_t version;
 
+	if (size < 1024) {
+		return 0;
+	}
 	if (!PE_parse_boot_argn("psci_probe", &want, sizeof(want)) || want == 0) {
-		return;
+		return (size_t)scnprintf(buf, size, "off (boot-arg psci_probe=1 asks the firmware when this is read)\n");
 	}
 	version = psci_probe_call(0x84000000u, 0);      /* PSCI_VERSION */
-	printf("psci_probe: PSCI %lld.%lld (%#llx), by %s\n", (version >> 16) & 0xffff, version & 0xffff,
-	    (unsigned long long)version, psci_smp_hvc ? "HVC" : "SMC");
+	n += (size_t)scnprintf(buf + n, size - n, "PSCI %lld.%lld (%#llx), by %s\n", (version >> 16) & 0xffff,
+	    version & 0xffff, (unsigned long long)version, psci_smp_hvc ? "HVC" : "SMC");
 	for (unsigned i = 0; i < sizeof(asked) / sizeof(asked[0]); i++) {
 		int64_t r = psci_probe_call(0x8400000Au, asked[i].id);     /* PSCI_FEATURES */
 
-		printf("psci_probe: FEATURES %s (%#x): %lld (%#llx)%s\n", asked[i].name, asked[i].id, r,
-		    (unsigned long long)r, r < 0 ? " = not supported" : "");
+		n += (size_t)scnprintf(buf + n, size - n, "FEATURES %s (%#x): %lld (%#llx)%s\n", asked[i].name, asked[i].id,
+		    r, (unsigned long long)r, r < 0 ? " = not supported" : "");
 	}
+	return n;
 }
-STARTUP(LOCKDOWN, STARTUP_RANK_LAST, psci_probe);
 
 /*
  * kern.hakios.kthreads (the sysctl itself is in bsd/dev/hakios.cpufreq.c): one line per kernel thread -- its id, its
