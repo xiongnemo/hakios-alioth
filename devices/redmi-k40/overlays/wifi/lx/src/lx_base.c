@@ -247,18 +247,55 @@ static struct {
 	unsigned long when;
 } later[16];
 
+/*
+ * (11-22, WEEK-1121 P2) Boot-arg wifi_idle=N (3..500): the ticker ("wifi-ticks", ~445 wakes a second on an idle phone)
+ * sleeps until the earliest timer or delayed work is due, at most N ms and at least 2 (the old pace) -- and a timer
+ * armed or work queued meanwhile wakes it at once (mod_timer, linux_queue_delayed_work_on), so nothing fires late.
+ * What changes: jiffies, which the driver reads directly, moves in steps of up to N ms while nothing is due. 0 /
+ * absent (or 1, 2), the default: every 2 ms, the old way.
+ */
+static unsigned
+ticker_wait_ms(unsigned idle_ms)
+{
+	unsigned long soonest = idle_ms;
+
+	if (idle_ms <= 2) {
+		return (2);
+	}
+	for (unsigned i = 0; i < nitems(armed); i++) {
+		if (armed[i] != NULL) {
+			long left = (long)(armed[i]->expires - jiffies);
+
+			soonest = left < 2 ? 2 : (unsigned long)left < soonest ? (unsigned long)left : soonest;
+		}
+	}
+	for (unsigned i = 0; i < nitems(later); i++) {
+		if (later[i].work != NULL) {
+			long left = (long)(later[i].when - jiffies);
+
+			soonest = left < 2 ? 2 : (unsigned long)left < soonest ? (unsigned long)left : soonest;
+		}
+	}
+	return ((unsigned)soonest);
+}
+
 static void
 ticker(void *argument)
 {
 	unsigned long long began = lx_os_nanoseconds();
+	unsigned idle_ms = lx_os_option("wifi_idle");
 
+	idle_ms = idle_ms > 500 ? 500 : idle_ms;
+	if (idle_ms > 2) {
+		lx_tell("lx: the ticker sleeps until what is due, at most %u ms (wifi_idle)\n", idle_ms);
+	}
 	for (;;) {
 		struct timer_list *due = NULL;
 		struct delayed_work *work = NULL;
 		struct workqueue_struct *queue = NULL;
 
 		lx_os_lock();
-		lx_os_sleep(&jiffies, 2 * 1000000ull);
+		lx_os_sleep(&jiffies, ticker_wait_ms(idle_ms) * 1000000ull);
 		jiffies = (unsigned long)((lx_os_nanoseconds() - began) / 1000000ull);
 		for (unsigned i = 0; i < nitems(armed) && due == NULL; i++) {
 			if (armed[i] != NULL && (long)(jiffies - armed[i]->expires) >= 0) {
@@ -314,6 +351,7 @@ linux_queue_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed
 		later[slot].work = dwork;
 		later[slot].queue = wq;
 		later[slot].when = jiffies + delay;
+		lx_os_wakeup(&jiffies);		/* (wifi_idle: the ticker's wait is reckoned again) */
 	}
 	lx_os_unlock();
 	if (slot < 0) {
@@ -389,6 +427,7 @@ mod_timer(struct timer_list *timer, unsigned long expires)
 	timer->expires = expires;
 	if (slot >= 0) {
 		armed[slot] = timer;
+		lx_os_wakeup(&jiffies);		/* (wifi_idle: the ticker's wait is reckoned again) */
 	}
 	lx_os_unlock();
 	if (slot < 0) {
