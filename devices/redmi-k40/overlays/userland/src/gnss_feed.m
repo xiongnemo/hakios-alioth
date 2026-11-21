@@ -474,11 +474,20 @@ main(int argc, char **argv)
 		const char *xtra_name = "xtra3grcej.bin";
 		bool active = false;
 		uint32_t last_reports;
-		unsigned fed = 0, sessions = 0, waited = 0;
-		time_t last_fix = 0, said = 0;
+		unsigned fed = 0, sessions = 0, waited = 0, held = 0;
+		time_t last_fix = 0, said = 0, last_fed = 0;
 		float last_acc = 0, best_acc = 1e9f;
 		Class cls;
 		id<HKLocationSimulation> sim;
+		/*
+		 * (11-22, WEEK-1121 P4) Boot-arg gnss_still=N: while the phone stands still -- within max(5 m, half the fix's
+		 * accuracy) of the location given last, slower than 0.5 m/s, the accuracy not a third better -- a fix goes to
+		 * locationd at most every N seconds (locationd keeps the last one for its clients); a move, or a better fix,
+		 * goes at once. Feeding every fix (one a second) kept locationd at ~5 % of a core (logs/184653-top.txt, run
+		 * 184300 of 11-15). 0 / absent, the default: every fix, the old way.
+		 */
+		uint32_t still_s = boot_arg_number("gnss_still", 0);
+		CLLocation *given = nil;
 
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		while ((opt = getopt(argc, argv, "d:r:x:")) != -1) {
@@ -558,20 +567,32 @@ main(int argc, char **argv)
 						}
 						location = [[CLLocation alloc] initWithCoordinate:c altitude:altitude horizontalAccuracy:acc
 						    verticalAccuracy:vertical course:course speed:speed timestamp:[NSDate date]];
-						[sim clearSimulatedLocations];
-						[sim appendSimulatedLocation:location];
-						if ([(id)sim respondsToSelector:@selector(flush)]) {
-							[sim flush];
+						/* (gnss_still: a fix of a phone standing still waits, up to N s; see above) */
+						bool hold = still_s != 0 && active && given != nil && now - last_fed < (time_t)still_s &&
+						    speed < 0.5 && acc > given.horizontalAccuracy * 2 / 3 &&
+						    [location distanceFromLocation:given] < (acc / 2 > 5 ? acc / 2 : 5);
+
+						if (hold) {
+							held++;
+						} else {
+							[sim clearSimulatedLocations];
+							[sim appendSimulatedLocation:location];
+							if ([(id)sim respondsToSelector:@selector(flush)]) {
+								[sim flush];
+							}
+							given = location;
+							last_fed = now;
+							fed++;
 						}
 						seed_stop();
 						if (!active) {
 							[sim startLocationSimulation];
 							active = true;
 							sessions++;
-							say("gnss_feed: A FIX: locationd gets the modem's position from now on (+-%.0f m)\n", acc);
+							say("gnss_feed: A FIX: locationd gets the modem's position from now on (+-%.0f m)%s\n", acc,
+							    still_s != 0 ? " (gnss_still: while still, at most one every N s)" : "");
 						}
-						fed++;
-						last_fix = now;
+						last_fix = now;         /* (a fix held back is a fix all the same: locationd is not let go) */
 						last_acc = (float)acc;
 						best_acc = (float)acc < best_acc ? (float)acc : best_acc;
 					}
@@ -585,8 +606,8 @@ main(int argc, char **argv)
 			}
 			if (active && now - said >= 60) {
 				said = now;
-				say("gnss_feed: %u fixes given to locationd, the last +-%.0f m, the best +-%.0f m\n", fed, last_acc,
-				    best_acc);
+				say("gnss_feed: %u fixes given to locationd (%u held back: still), the last +-%.0f m, the best +-%.0f m\n",
+				    fed, held, last_acc, best_acc);
 			}
 		}
 		if (active) {
