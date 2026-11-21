@@ -73,6 +73,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
@@ -1208,6 +1209,9 @@ static volatile uint64_t last_sound_us;         /* when the latest write that wa
 static volatile bool feeder_runs, watcher_runs;
 static uint64_t fed_frames, silent_frames, ios_frames;
 static volatile uint32_t ios_peak;              /* the largest sample since the amplifiers last started */
+/* boot-arg sound_idle=N (E8, 11-22): the watcher, amplifiers off, naps up to N ms; the sink's sound wakes it */
+static volatile uint32_t watcher_kick, watcher_kicks;
+static volatile bool watcher_napping;
 
 /* From the writer's thread, under hakios.audio.c's lock: never waits. */
 static uint32_t
@@ -1232,6 +1236,12 @@ ios_sink(const int16_t *frames, uint32_t count)
 	ios_frames += taken;
 	if (sound) {
 		last_sound_us = now_us();
+		OSMemoryBarrier();              /* (the time before the look at watcher_napping: see watch()) */
+		if (watcher_napping) {
+			watcher_napping = false;
+			watcher_kicks++;
+			thread_wakeup((event_t)&watcher_kick);
+		}
 	}
 	return taken;
 }
@@ -1395,7 +1405,9 @@ guard_off(bool unheard)
 /*
  * The amplifiers on while there is sound, at the volume iOS has set (hakios_audio_volume(): how
  * far under the loudest, sound_below under Android's level), and off while iOS's volume is 0;
- * their status looked at every 200 ms while they are on. On the sound's thread.
+ * their status looked at every 200 ms while they are on (boot-arg amp_look_ms=N: every N ms, 20..5000). On the sound's
+ * thread, every 5 ms -- or, with boot-arg sound_idle=N (1..1000; E8, 11-22: 183 wakes a second while nothing plays),
+ * while the amplifiers are off up to N ms apart, the sink's first sound after a nap waking it at once (ios_sink()).
  */
 static void
 watch(void)
@@ -1403,10 +1415,18 @@ watch(void)
 	bool on = false, given_up = false, muted = false;
 	uint64_t last_look = 0, last_monitor = 0, setup_next = 0, set_up_at = 0, last_test = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0, set_ups = 0;
-	uint32_t i2c_test = 0;
+	uint32_t i2c_test = 0, idle_ms = 0, look_ms = 200, naps = 0;
 	/* (after a set-up that failed, the next one no sooner than this, in seconds: the last one for ever after) */
 	static const uint32_t setup_gap_s[] = { 2, 10, 60, 300 };
 
+	PE_parse_boot_argn("sound_idle", &idle_ms, sizeof(idle_ms));
+	PE_parse_boot_argn("amp_look_ms", &look_ms, sizeof(look_ms));
+	idle_ms = idle_ms > 1000 ? 1000 : idle_ms;
+	look_ms = look_ms < 20 ? 20 : look_ms > 5000 ? 5000 : look_ms;
+	if (idle_ms != 0 || look_ms != 200) {
+		say("sound: the watcher looks every %u ms while the amplifiers are off (sound_idle; a sound wakes it), their "
+		    "status every %u ms while on (amp_look_ms)\n", idle_ms ? idle_ms : 5, look_ms);
+	}
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
 	if (umi_profile && PE_parse_boot_argn("sound_i2c_test", &i2c_test, sizeof(i2c_test)) && i2c_test != 0) {
 		say("sound: sound_i2c_test=%u: the amplifiers' chip IDs read so many times now and every 2 minutes while "
@@ -1498,7 +1518,7 @@ watch(void)
 			guard_off(false);
 			speaker_stop();
 			on = false;
-		} else if (on && now - last_look >= 200000) {
+		} else if (on && now - last_look >= (uint64_t)look_ms * 1000) {
 			last_look = now;
 			if (!(umi_profile ? umi_speaker_healthy() : hakios_speaker_healthy())) {
 				guard_off(true);
@@ -1518,11 +1538,33 @@ watch(void)
 				}
 			}
 		}
-		sleep_ms(5);
+		if (idle_ms != 0 && !on && !stopping) {
+			/*
+			 * sound_idle: amplifiers off, nothing to follow but a sound to come (and a volume, which matters at their
+			 * next start, read then), a retried set-up (on a sound too) and sound_i2c_test's 2 minutes. The sink sets
+			 * last_sound_us, then looks at watcher_napping; this sets watcher_napping, then looks at last_sound_us
+			 * (both behind a barrier): a sound is never slept through.
+			 */
+			watcher_napping = true;
+			OSMemoryBarrier();
+			assert_wait_timeout((event_t)&watcher_kick, THREAD_UNINT, idle_ms, NSEC_PER_MSEC);
+			if (last_sound_us != sounded || stopping) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+			watcher_napping = false;
+			naps++;
+		} else {
+			sleep_ms(5);
+		}
 	}
 	guard_off(true);
 	say("sound: the watcher stops; the amplifiers were started %u times, iOS set the volume %u times%s\n", starts, changes,
 	    given_up ? ", and the amplifiers were then given up on" : "");
+	if (idle_ms != 0) {
+		say("sound: the watcher napped %u times (sound_idle=%u), woken by a sound %u times\n", naps, idle_ms, watcher_kicks);
+	}
 	watcher_runs = false;
 }
 
@@ -1534,6 +1576,7 @@ static void
 take_down(void)
 {
 	stopping = true;
+	thread_wakeup((event_t)&watcher_kick);  /* (sound_idle: it may be napping) */
 	if (umi_profile) {
 		umi_speaker_abort();            /* (a set-up of 12-25 s on the way gives up: not two of us on the bus) */
 	}
