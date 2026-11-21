@@ -5,7 +5,7 @@
  * same turned, smaller, zoomed (the magnified road) and as BGRA. Prints the time per picture (one thread) and writes
  * the pictures to DIR, to compare byte by byte with another build's or the other road's (the frame is the same
  * everywhere: a fixed generator). "plain": the preview's pixels the way before 2026-11-15 (isp.plain_preview).
- * usage: isp_bench DIR [ITERATIONS] [plain]
+ * usage: isp_bench DIR [ITERATIONS] [plain | gather | gather2]
  */
 #include <math.h>
 #include <stdio.h>
@@ -77,6 +77,8 @@ main(int argc, char **argv)
 	}
 	isp_init(&isp);
 	isp.plain_preview = argc > 3 && strcmp(argv[3], "plain") == 0;
+	/* (11-21) "gather" / "gather2": isp.gather 1 / 2 (boot-arg cam_gather): 1 must give the same pictures */
+	isp.gather = argc > 3 && strcmp(argv[3], "gather") == 0 ? 1 : argc > 3 && strcmp(argv[3], "gather2") == 0 ? 2 : 0;
 	isp.wb[0] = 1.85f, isp.wb[2] = 1.52f, isp.digital = 1.15f;
 	isp_set_ccm(&isp, (const float[9]){ 1.62f, -0.43f, -0.19f, -0.27f, 1.49f, -0.22f, -0.06f, -0.55f, 1.61f });
 	isp.lsc.on = true;

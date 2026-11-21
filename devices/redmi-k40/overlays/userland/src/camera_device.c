@@ -1421,6 +1421,16 @@ worker(void *context)
 	if (isp.stats_step != 4) {
 		say("statistics from every %u%s cell each way (cam_stats)", isp.stats_step, isp.stats_step == 1 ? "" : "th");
 	}
+	/* boot-arg cam_gather=1: the preview's cells only where the picture takes them (the same picture); 2: and the
+	   cells' road for narrower pictures (WEEK-1121 E4); 0 / absent: the old way */
+	isp.gather = boot_arg_number("cam_gather", 0);
+	if (isp.gather > 2) {
+		isp.gather = 0;
+	}
+	if (isp.gather != 0) {
+		say("the preview's cells: only those the picture takes%s (cam_gather=%u)", isp.gather == 2 ?
+		    ", and for pictures to a quarter of the crop" : "", isp.gather);
+	}
 	render_pieces = boot_arg_number("cam_pieces", 8);
 	if (render_pieces < 1 || render_pieces > 64) {
 		render_pieces = 8;

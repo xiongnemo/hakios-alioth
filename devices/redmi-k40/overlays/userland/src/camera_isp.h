@@ -82,6 +82,12 @@ struct isp {
 	struct isp_tuning *tuning;              /* isp_load_tuning()'s, or none */
 	bool            plain_preview;          /* the preview's pixels the way before 2026-11-15 (one at a time), to compare */
 	uint32_t        stats_step;             /* isp_measure's cells: every Nth each way (0: 4, the old way; boot-arg cam_stats) */
+	/*
+	 * the preview's cells (boot-arg cam_gather): 0 every cell of the crop's line, the old way; 1 only the cells the
+	 * picture's pixels take -- the same picture, byte for byte; 2 that, and the cells' road for pictures up to a
+	 * quarter of the crop's width too (the per-pixel road below two thirds before: a different picture there)
+	 */
+	uint32_t        gather;
 };
 
 void isp_init(struct isp *isp);

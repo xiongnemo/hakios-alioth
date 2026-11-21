@@ -688,6 +688,8 @@ struct preview {
 	int             r, b, g0, g1;
 	struct pipe     p;
 	float           to_grid;        /* a cell's index to the lens shading grid's column */
+	bool            gather;         /* (isp->gather) the line's cells gathered by map first: cell x is pixel x's */
+	float           gxs[PV_CELLS];  /* ... and then each one's lens shading column, (x0 + map[x]) * to_grid */
 	uint16_t        map[8192];      /* the picture's pixel -> its cell, from x0 */
 	uint16_t        l0[2 * PV_CELLS + 32], l1[2 * PV_CELLS + 32];  /* the two lines' values above black */
 	float           base[3][16], slope[3][16];                      /* the line's lens shading: column i and to i + 1 */
@@ -703,8 +705,13 @@ preview_setup(const struct isp *isp, const struct hakios_camera_frame *f, uint32
 		return false;
 	}
 	crop(isp, f, width, height, &pv->x0, &pv->y0, &pv->cw, &pv->ch);
-	/* (magnified, or the picture well under its cells: render_line()) */
-	if (pv->cw < width || pv->ch < height || pv->cw > PV_CELLS || (uint64_t)pv->cw * 2 > (uint64_t)width * 3) {
+	/*
+	 * (magnified, or the picture well under its cells: render_line(). With cam_gather=2 the cells' road goes on to a
+	 * quarter of the crop's width: the cells it computes are only the picture's own, so a narrow picture costs its
+	 * own width, not the crop's.)
+	 */
+	if (pv->cw < width || pv->ch < height || pv->cw > PV_CELLS ||
+	    (uint64_t)pv->cw * 2 > (uint64_t)width * (isp->gather >= 2 ? 8 : 3)) {
 		return false;
 	}
 	cell_places(f->bayer, &pv->r, &pv->b);
@@ -724,6 +731,18 @@ preview_setup(const struct isp *isp, const struct hakios_camera_frame *f, uint32
 
 	for (uint32_t x = 0; x < width; x++, at += step) {
 		pv->map[x] = (uint16_t)((at >> 16) - pv->x0);
+	}
+	/*
+	 * (11-21, WEEK-1121 E4) A picture narrower than its crop takes only some of the cells -- Camera.app's 1504 of 2000 --
+	 * and preview_row made all of them. With isp->gather the line's cells are gathered by map first (in place: map is
+	 * rising and map[x] >= x, so no cell is overwritten before it is read) and only `width` are made, each with the
+	 * lens shading column of its own cell -- the same float multiply as before, so the same picture.
+	 */
+	pv->gather = isp->gather > 0 && pv->cw > width;
+	if (pv->gather) {
+		for (uint32_t x = 0; x < width; x++) {
+			pv->gxs[x] = (float)(pv->x0 + pv->map[x]) * pv->to_grid;
+		}
 	}
 	return true;
 }
@@ -840,6 +859,16 @@ preview_row(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 
 	unpack_raw10(top, f->stride, 2 * pv->x0, 2 * n, l0);
 	unpack_raw10(top + f->stride, f->stride, 2 * pv->x0, 2 * n, l1);
+	if (pv->gather) {
+		/* (in place: map[x] >= x and rising -- see preview_setup) */
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t k = pv->map[x];
+
+			l0[2 * x] = l0[2 * k], l0[2 * x + 1] = l0[2 * k + 1];
+			l1[2 * x] = l1[2 * k], l1[2 * x + 1] = l1[2 * k + 1];
+		}
+		n = width;
+	}
 	if (shade) {
 		preview_shading(isp, cells_h > 1 ? (float)cy / (cells_h - 1) : 0, pv);
 	}
@@ -861,7 +890,8 @@ preview_row(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 			float32x4_t B = vcvtq_f32_u32(vmovl_u16(b16));
 
 			if (shade) {
-				float32x4_t gx = vmulq_n_f32(vaddq_f32(vdupq_n_f32((float)(pv->x0 + c + 4 * h)), lanes), pv->to_grid);
+				float32x4_t gx = pv->gather ? vld1q_f32(pv->gxs + c + 4 * h) :
+				    vmulq_n_f32(vaddq_f32(vdupq_n_f32((float)(pv->x0 + c + 4 * h)), lanes), pv->to_grid);
 				uint32x4_t lx = vminq_u32(vcvtq_u32_f32(gx), vdupq_n_u32(LSC_W - 2));
 				float32x4_t fx = vsubq_f32(gx, vcvtq_f32_u32(lx));
 
@@ -885,7 +915,7 @@ preview_row(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		float R = v[pv->r], G = (float)(v[pv->g0] + v[pv->g1]) * 0.5f, B = v[pv->b];
 
 		if (shade) {
-			float gx = (pv->x0 + c) * pv->to_grid;
+			float gx = pv->gather ? pv->gxs[c] : (pv->x0 + c) * pv->to_grid;
 			uint32_t lx = (uint32_t)gx;
 
 			lx = lx > LSC_W - 2 ? LSC_W - 2 : lx;
@@ -904,8 +934,20 @@ preview_row(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		pv->cg[c] = isp->gamma[(int)(vg < 0 ? 0 : vg > 4095 ? 4095 : vg)];
 		pv->cb[c] = isp->gamma[(int)(vb < 0 ? 0 : vb > 4095 ? 4095 : vb)];
 	}
-	/* each pixel its nearest cell (the line from its end when the picture is turned) */
-	if (isp->turned) {
+	/* each pixel its nearest cell (the line from its end when the picture is turned); gathered: cell x is pixel x's */
+	if (pv->gather) {
+		if (isp->turned) {
+			for (uint32_t x = 0; x < width; x++) {
+				uint32_t o = width - 1 - x;
+
+				R8[o] = pv->cr[x], G8[o] = pv->cg[x], B8[o] = pv->cb[x];
+			}
+		} else {
+			memcpy(R8, pv->cr, width);
+			memcpy(G8, pv->cg, width);
+			memcpy(B8, pv->cb, width);
+		}
+	} else if (isp->turned) {
 		for (uint32_t x = 0; x < width; x++) {
 			uint32_t k = pv->map[x], o = width - 1 - x;
 
