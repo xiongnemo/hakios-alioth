@@ -80,6 +80,7 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <os/atomic_private.h>
@@ -2417,6 +2418,20 @@ glink_pump(void)
 	}
 }
 
+/*
+ * (11-22, WEEK-1121 P2) The link's thread looks every millisecond -- ~880 wakes a second on an idle phone (the census of
+ * 11-21) -- and with boot-arg glink_idle=N it looks every N ms once nothing has come for a while (link_thread). A message
+ * of ours wakes it at once, so that what the DSP answers is heard at the old pace.
+ */
+static volatile uint32_t link_kick;
+
+static void
+link_wake(void)
+{
+	link_kick++;
+	thread_wakeup((event_t)&link_kick);
+}
+
 /* One whole message to the DSP on a channel; waits up to five seconds for an intent of the DSP's that it fits. */
 static int
 glink_send(struct glink_channel *channel, const void *data, uint32_t length)
@@ -2471,6 +2486,7 @@ glink_send(struct glink_channel *channel, const void *data, uint32_t length)
 	header.message.param2 = channel->their_intents[found].id;
 	glink_put(&header, sizeof(header), data, length);
 	lck_mtx_unlock(&glink_lock);
+	link_wake();
 	return 0;
 }
 
@@ -3057,19 +3073,47 @@ battmgr_stop(void)
 
 static volatile bool link_wanted, link_runs;
 
+/*
+ * Boot-arg glink_idle=N: after LINK_QUIET looks in a row that found nothing -- no ring of the DSP's, no change in its
+ * words, no packet, no message of ours -- the next looks are N ms apart (a message of ours, link_wake(), ends the wait
+ * at once) until something comes again. 0, the default: a look every millisecond, the old way.
+ */
+#define LINK_QUIET 50
+
 static void
 link_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	struct smp2p words, last;
 	struct glink_packet *packet;
 	bool gave_up = false;
+	uint32_t idle_ms = 0, quiet = 0, kicks = link_kick, rings = doorbell.glink + doorbell.smp2p;
 
+	PE_parse_boot_argn("glink_idle", &idle_ms, sizeof(idle_ms));
+	if (idle_ms != 0) {
+		printf("adsp: link: looks %u ms apart after %u quiet ones (glink_idle)\n", idle_ms, LINK_QUIET);
+	}
 	bzero(&last, sizeof(last));
 	dsp_words(&last);
 	while (link_wanted) {
-		sleep_us(1000);
+		bool busy = false;
+
+		if (idle_ms != 0 && quiet >= LINK_QUIET) {
+			assert_wait_timeout((event_t)&link_kick, THREAD_UNINT, idle_ms, NSEC_PER_MSEC);
+			thread_block(THREAD_CONTINUE_NULL);
+		} else {
+			sleep_us(1000);
+		}
+		if (link_kick != kicks) {
+			kicks = link_kick;
+			busy = true;
+		}
 		doorbells();
+		if (doorbell.glink + doorbell.smp2p != rings) {
+			rings = doorbell.glink + doorbell.smp2p;
+			busy = true;
+		}
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
+			busy = true;
 			last = words;
 			dsp_listen(&words);
 			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
@@ -3097,6 +3141,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			if (packet == NULL) {
 				break;
 			}
+			busy = true;
 			if (from == CHANNEL_QRTR) {
 				qrtr_input(packet->data, packet->length);
 			} else if (from == CHANNEL_PMIC) {
@@ -3106,6 +3151,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			kfree_data(packet, sizeof(*packet) + packet->length);
 		}
+		quiet = busy ? 0 : quiet + 1;
 	}
 	link_runs = false;
 	thread_terminate(current_thread());
@@ -3118,6 +3164,7 @@ link_stop(void)
 
 	if (link_runs) {
 		link_wanted = false;
+		link_wake();                    /* (glink_idle: it may be in a long wait) */
 		for (unsigned ms = 0; ms < 2000 && link_runs; ms++) {
 			sleep_ms(1);
 		}
