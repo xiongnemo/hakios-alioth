@@ -71,6 +71,12 @@ static uint8_t umi_qrtr_tx_packet[UMI_QRTR_PACKET_MAX];
 static LCK_GRP_DECLARE(umi_wifi_lck_grp, "umi-wifi");
 static LCK_MTX_DECLARE(umi_mhi_lock, &umi_wifi_lck_grp);
 static bool umi_poll_wanted, umi_poll_finished;
+/*
+ * (11-22, WEEK-1121 P2) what the IPC router's poll has received, and the messages of ours sent: the poll thread
+ * ("umi-ipcr", ~885 wakes a second on an idle phone in the census of 11-21) looks every wifi_idle=N ms instead of
+ * every millisecond once ten looks in a row found nothing and nothing was sent; a send wakes it at once.
+ */
+static volatile uint32_t umi_poll_received, umi_poll_kicks;
 static struct umi_pcie *umi_active_pcie;
 static bool umi_normal_session, umi_service_wanted, umi_service_finished = true;
 static struct {
@@ -326,6 +332,8 @@ umi_qrtr_send(struct hakios_qrtr_port *port, uint32_t node, uint32_t dst_port,
 	lck_mtx_lock(&umi_mhi_lock);
 	int error = umi_qrtr_send_locked(port, node, dst_port, data, length);
 	lck_mtx_unlock(&umi_mhi_lock);
+	umi_poll_kicks++;               /* (the answer is looked for at once: wifi_idle's long wait ends) */
+	wakeup(&umi_poll_wanted);
 	return error;
 }
 
@@ -367,6 +375,7 @@ umi_qrtr_poll_locked(struct hakios_qrtr_port *port, uint32_t timeout_ms)
 	if (port != &umi_qrtr.port || !port->active || umi_qrtr.mhi == NULL)
 		return EINVAL;
 	int error = umi_mhi_poll_ipcr(umi_qrtr.mhi, timeout_ms, &received);
+	umi_poll_received += received;
 	return error ? error : umi_qrtr_flush_resume();
 }
 
@@ -382,13 +391,27 @@ umi_qrtr_poll(struct hakios_qrtr_port *port, uint32_t timeout_ms)
 static void
 umi_wifi_poll_thread(__unused void *argument)
 {
+	/* boot-arg wifi_idle=N (1..500): N ms between looks after ten quiet ones; 0 / absent: every 1 ms, the old way */
+	uint32_t idle_ms = 0, quiet = 0, seen = umi_poll_received, kicks = umi_poll_kicks;
+
+	PE_parse_boot_argn("wifi_idle", &idle_ms, sizeof(idle_ms));
+	idle_ms = idle_ms > 500 ? 500 : idle_ms;
+	if (idle_ms != 0) {
+		hakios_tl("UMI Wi-Fi: the IPC router is looked at %u ms apart after ten quiet looks (wifi_idle)\n", idle_ms);
+	}
 	while (os_atomic_load(&umi_poll_wanted, acquire)) {
 		int error = umi_qrtr_poll(&umi_qrtr.port, 1);
 		if (error && error != EINVAL && error != EBUSY) {
 			hakios_tl("UMI Wi-Fi: background MHI polling failed: %d\n", error);
 			break;
 		}
-		struct timespec pause = { .tv_sec = 0, .tv_nsec = NSEC_PER_MSEC };
+		bool busy = umi_poll_received != seen || umi_poll_kicks != kicks;
+
+		seen = umi_poll_received;
+		kicks = umi_poll_kicks;
+		quiet = busy ? 0 : quiet + 1;
+		struct timespec pause = { .tv_sec = 0,
+			.tv_nsec = (long)(idle_ms != 0 && quiet >= 10 ? idle_ms : 1) * NSEC_PER_MSEC };
 		msleep(&umi_poll_wanted, NULL, PZERO, "umi-ipcr", &pause);
 	}
 	os_atomic_store(&umi_poll_finished, true, release);
@@ -759,6 +782,7 @@ umi_wifi_firmware_diagnostic(void *context)
 					hakios_lx_stop();
 				}
 				os_atomic_store(&umi_poll_wanted, false, release);
+				wakeup(&umi_poll_wanted);       /* (wifi_idle: it may be in a long wait) */
 				while (!os_atomic_load(&umi_poll_finished, acquire)) {
 					struct timespec pause = { .tv_sec = 0, .tv_nsec = NSEC_PER_MSEC };
 					msleep(&umi_poll_finished, NULL, PZERO, "umi-ipcr-end", &pause);

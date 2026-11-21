@@ -2389,7 +2389,14 @@ lx_station_send(const unsigned char *frame, unsigned long length)
 		radio->eap_out++;
 		eap_note("out", frame, (unsigned)length);
 	}
-	return (ethernet_send(radio, frame, (unsigned)length, false) ? 0 : ENOBUFS);
+	bool sent = ethernet_send(radio, frame, (unsigned)length, false);
+
+	if (sent) {
+		extern void lx_bus_kick(void);
+
+		lx_bus_kick();			/* (the rings looked at at once: wifi_idle's wait ends, lx_bus.c) */
+	}
+	return (sent ? 0 : ENOBUFS);
 }
 
 /* ---- the station boundary: what the kernel asks through sys/hakios.sta.h --------------------------------- */

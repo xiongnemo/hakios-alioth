@@ -68,7 +68,23 @@ static struct {
 	int ce_vector[CE_COUNT_MAX];		/* a copy engine's vector, -1: it has none (ce.c: CE_ATTR_DIS_INTR) */
 	int group_vector[ATH11K_EXT_IRQ_GRP_NUM_MAX];
 	unsigned long long late;		/* work the thread found that no interrupt had brought */
+
+	/* (11-22, WEEK-1121 P2) wifi_idle=N: the frames the kernel has sent (lx_bus_kick), to end a long wait at once */
+	volatile unsigned kicks;
 } bus;
+
+/*
+ * A frame of the kernel's is on its way out (lx_station_send): whatever answers it is looked for at once, not
+ * after wifi_idle's wait (bus_looks).
+ */
+void lx_bus_kick(void);
+
+void
+lx_bus_kick(void)
+{
+	bus.kicks++;
+	lx_os_wakeup(&bus.kicks);
+}
 
 /*
  * The radio's interrupt vectors, as pcic.c has them for this chip: 28 of the node's 32, ten for the
@@ -317,15 +333,30 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
  */
 #define DATA_BUDGET	64
 
+/*
+ * (11-22, WEEK-1121 P2) Boot-arg wifi_idle=N (1..500): without the radio's interrupts (the K40's PCIe radio has none
+ * yet: bus.irq stays false), a look every millisecond is ~866 wakes a second and 2.8 % of a core on an idle phone (the
+ * census of 11-21). After ten looks in a row in which no group of the data path had anything, the looks are N ms apart
+ * until one has again; a frame of the kernel's going out ends the wait at once (lx_bus_kick), so an answer is looked
+ * for at the old pace. What the radio sends unasked (a frame from the network, an event of the firmware's) waits up to
+ * N ms more. 0 / absent, the default: every millisecond, the old way.
+ */
+#define BUS_QUIET	10
+
 static void
 bus_looks(void *argument)
 {
 	struct ath11k_base *ab = argument;
 	unsigned long long said = lx_os_nanoseconds();
+	unsigned idle_ms = lx_os_option("wifi_idle"), quiet = 0, kicks = bus.kicks;
 
+	idle_ms = idle_ms > 500 ? 500 : idle_ms;
+	if (idle_ms != 0 && !bus.irq) {
+		lx_tell("lx: the rings are looked at %u ms apart after %u quiet looks (wifi_idle)\n", idle_ms, BUS_QUIET);
+	}
 	bus.looks = true;
 	while (bus.looking) {
-		bool more = false;
+		bool more = false, busy = false;
 
 		if (lx_os_nanoseconds() - said > 300000000000ull) {	/* every five minutes: how the station and memory stand */
 			said = lx_os_nanoseconds();
@@ -346,12 +377,28 @@ bus_looks(void *argument)
 			int done = ath11k_dp_service_srng(ab, &ab->ext_irq_grp[i], DATA_BUDGET);
 
 			more |= done >= DATA_BUDGET;
+			busy |= done > 0;
 			bus.late += bus.irq && done > 0;
 		}
 		if (bus.irq) {
 			mutex_unlock(&bus.service);
 		}
-		if (!more) {
+		if (bus.kicks != kicks) {
+			kicks = bus.kicks;
+			busy = true;
+		}
+		quiet = busy ? 0 : quiet + 1;
+		if (more) {
+			continue;
+		}
+		if (!bus.irq && idle_ms != 0 && quiet >= BUS_QUIET) {
+			/* (a kick between the look above and this sleep is caught by the count, under the lock) */
+			lx_os_lock();
+			if (bus.kicks == kicks && bus.looking) {
+				lx_os_sleep(&bus.kicks, idle_ms * 1000000ull);
+			}
+			lx_os_unlock();
+		} else {
 			lx_pause_ms(bus.irq ? 100 : 1);
 		}
 	}
@@ -375,6 +422,7 @@ bus_quiet(void)
 	}
 	bus.data = false;
 	bus.looking = false;
+	lx_os_wakeup(&bus.kicks);		/* (wifi_idle: it may be in a long wait) */
 	while (bus.looks) {
 		lx_pause_ms(1);
 	}
