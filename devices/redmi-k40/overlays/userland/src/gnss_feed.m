@@ -219,6 +219,35 @@ struct hk_gnss_time {
 	uint32_t uncertainty_ms, reserved;
 };
 
+/*
+ * Boot-arg gnss_seed_for=S (11-21, WEEK-1121 E2): the seed asks iOS for its Wi-Fi location at most S seconds, and
+ * stops SEED_MORE seconds after the first one the kernel took (one better may still come). 0, the default, is the old
+ * way: it asks until the modem has its own fix -- which indoors may be never, and every answer is a Wi-Fi scan by
+ * locationd (every 6-7 s for minutes in logs 201117/205942; locationd 4-5.6 % of a core idle).
+ */
+#define SEED_MORE 20
+static unsigned seed_for;
+static dispatch_queue_t seed_queue;
+
+static unsigned
+boot_arg_number(const char *name, unsigned otherwise)
+{
+	char args[1100] = "";
+	size_t n = sizeof(args) - 1, len = strlen(name);
+
+	if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) != 0) {
+		return otherwise;
+	}
+	for (char *p = strstr(args, name); p != NULL; p = strstr(p + 1, name)) {
+		if ((p == args || p[-1] == ' ') && p[len] == '=') {
+			return (unsigned)strtoul(p + len + 1, NULL, 10);
+		}
+	}
+	return otherwise;
+}
+
+static void seed_stop_because(const char *why);
+
 @interface HKSeed : NSObject <CLLocationManagerDelegate>
 @property (nonatomic) CLLocationManager *manager;
 @property (nonatomic) double given;          /* the accuracy of the last seed given (0: none) */
@@ -250,8 +279,15 @@ struct hk_gnss_time {
 		seed.source = 3;                        /* (QMI LOC: Wi-Fi) */
 		seed.utc_ms = (uint64_t)(l.timestamp.timeIntervalSince1970 * 1000);
 		if (sysctlbyname("kern.hakios.gnss_seed", NULL, NULL, &seed, sizeof(seed)) == 0) {
+			bool first = self.given == 0;
+
 			self.given = acc;
 			say("gnss_feed: seed: iOS's Wi-Fi location, +-%.0f m, given to the modem (the position is not written)\n", acc);
+			if (first && seed_for > 0) {
+				dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)SEED_MORE * NSEC_PER_SEC), seed_queue, ^{
+					seed_stop_because("a seed given SEED_MORE (20) s ago (gnss_seed_for)");
+				});
+			}
 		} else {
 			say("gnss_feed: seed: the kernel did not take it (%s)\n", strerror(errno));
 		}
@@ -286,6 +322,8 @@ seed_start(void)
 	SEL init = sel_registerName("initWithEffectiveBundlePath:delegate:onQueue:");
 	dispatch_queue_t queue = dispatch_queue_create("gnss_feed.seed", DISPATCH_QUEUE_SERIAL);
 
+	seed_queue = queue;
+	seed_for = boot_arg_number("gnss_seed_for", 0);
 	if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
 		say("gnss_feed: seed: no %s: no seed position\n", SEED_BUNDLE);
 		return;
@@ -320,19 +358,38 @@ seed_start(void)
 		}
 		m.desiredAccuracy = kCLLocationAccuracyHundredMeters;
 		[m startUpdatingLocation];
-		say("gnss_feed: seed: asking iOS for its Wi-Fi location (as %s)\n", SEED_BUNDLE);
+		if (seed_for > 0) {
+			say("gnss_feed: seed: asking iOS for its Wi-Fi location (as %s), %u s at most (gnss_seed_for)\n",
+			    SEED_BUNDLE, seed_for);
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)seed_for * NSEC_PER_SEC), queue, ^{
+				seed_stop_because("asked for gnss_seed_for's time");
+			});
+		} else {
+			say("gnss_feed: seed: asking iOS for its Wi-Fi location (as %s)\n", SEED_BUNDLE);
+		}
 	});
 }
 
+/* (on the seed's queue, where its manager lives: the main loop's call and the timers' come one at a time) */
 static void
-seed_stop(void)
+seed_stop_because(const char *why)
 {
 	if (seed_source.manager != nil) {
 		CLLocationManager *m = seed_source.manager;
 
 		seed_source.manager = nil;
 		[m stopUpdatingLocation];
-		say("gnss_feed: seed: the modem has its own fix: no more Wi-Fi locations asked\n");
+		say("gnss_feed: seed: %s: no more Wi-Fi locations asked\n", why);
+	}
+}
+
+static void
+seed_stop(void)
+{
+	if (seed_queue != NULL) {
+		dispatch_async(seed_queue, ^{
+			seed_stop_because("the modem has its own fix");
+		});
 	}
 }
 
