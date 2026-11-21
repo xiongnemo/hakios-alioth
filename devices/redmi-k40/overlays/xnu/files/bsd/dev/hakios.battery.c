@@ -71,6 +71,7 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_from_dsp, CTLFLAG_RD | CTLFLAG_LOCKED
     &battery_source_dsp, 0, "1 when the values come from the audio DSP's battery manager");
 
 extern void HakiosBatteryReport(const void *state, unsigned size);     /* iokit/Kernel/hakios.battery.cpp */
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 void
 hakios_battery_report(const struct hakios_battery_state *b)
@@ -332,6 +333,6 @@ hakios_battery_init(void)
 
 	/* This phone's gauge is read here, over SPMI: on unless battery=0 says otherwise. */
 	if (PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) && !enabled) return;
-	if (kernel_thread_start(battery_gauge_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+	if (kernel_thread_start(battery_gauge_thread, NULL, &thread) == KERN_SUCCESS) { thread_set_thread_name(thread, "battery:battery_gauge_thread"); thread_deallocate(thread); }
 	return;
 }

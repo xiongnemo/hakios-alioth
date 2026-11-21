@@ -129,6 +129,7 @@ static bool leaving;                    /* on the way back to the loader after a
  * with adsp=1 only the few that say how it went (tell()), the rest to the kernel's own log.
  */
 extern void loader_log_putc(char c);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static LCK_MTX_DECLARE(say_lock, &adsp_lock_group);
 static bool quiet;
@@ -3038,6 +3039,7 @@ battmgr_start(void)
 	}
 	battmgr.wanted = true;
 	if (kernel_thread_start(battmgr_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "adsp:battmgr_thread");
 		thread_deallocate(thread);
 	}
 }
@@ -3218,6 +3220,7 @@ step_link(void)
 		printf("adsp: %u: no thread\n", step);
 		return false;
 	}
+	thread_set_thread_name(thread, "adsp:link_thread");
 	thread_deallocate(thread);
 	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
 		sleep_ms(1);
@@ -3446,6 +3449,7 @@ hakios_adsp_init(void)
 			printf("adsp: no thread: the audio DSP is not brought up\n");
 			return;
 		}
+		thread_set_thread_name(thread, "adsp:whole_thread");
 		thread_deallocate(thread);
 		tell("adsp: the audio DSP is being brought up beside the system's start (adsp=1)\n");
 		return;

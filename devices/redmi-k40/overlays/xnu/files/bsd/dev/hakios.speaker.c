@@ -74,6 +74,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static vm_offset_t tlmm, gcc, cmd_db;
 static uint32_t probe_level;
@@ -2312,6 +2313,7 @@ hakios_speaker_init(void)
 		}
 		if (umi_amp_probe_level != 0) {
 			if (kernel_thread_start(umi_amp_probe_thread, NULL, &thread) == KERN_SUCCESS) {
+				thread_set_thread_name(thread, "speaker:umi_amp_probe_thread");
 				thread_deallocate(thread);
 			}
 		}
@@ -2322,6 +2324,7 @@ hakios_speaker_init(void)
 		return;
 	}
 	if (kernel_thread_start(probe_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "speaker:probe_thread");
 		thread_deallocate(thread);
 	}
 }

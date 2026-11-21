@@ -21,7 +21,9 @@
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.board.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <kern/kalloc.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -29,6 +31,34 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+extern size_t hakios_kthreads_text(char *buf, size_t size);    /* osfmk/arm64/loader_return.c */
+
+/*
+ * kern.hakios.kthreads: every kernel thread's id, context switches, CPU time (us), priority and name, one per line
+ * (11-21, WEEK-1121 P1: which pollers wake the cores, and how often). Read only. usbsh "sysctl kern.hakios.kthreads"
+ * prints it; work/tools/kthreads-diff.py turns two reads into wakes/s and CPU per thread.
+ */
+SYSCTL_DECL(_kern_hakios);
+
+static int
+kthreads_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const size_t size = 64 * 1024;
+	char *buf = kalloc_data(size, Z_WAITOK | Z_ZERO);
+	size_t n;
+	int error;
+
+	if (buf == NULL) {
+		return ENOMEM;
+	}
+	n = hakios_kthreads_text(buf, size);
+	error = SYSCTL_OUT(req, buf, n + 1);
+	kfree_data(buf, size);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, kthreads, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, kthreads_sysctl,
+    "A", "every kernel thread: id, context switches, CPU time in us, priority, name");
 
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
@@ -225,6 +255,7 @@ hakios_cpufreq_cap(uint32_t domain, int row)
 #define GOV_REPORT_S    60
 
 extern volatile uint64_t hakios_input_at;      /* hakios.input.c */
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static uint32_t
 row_for_khz(uint32_t domain, uint64_t khz)
@@ -473,6 +504,7 @@ bench_all(void *arg __unused, wait_result_t wr __unused)
 		thread_t thread;
 
 		if (kernel_thread_start(bench_thread, (void *)i, &thread) == KERN_SUCCESS) {
+			thread_set_thread_name(thread, "cpufreq:bench_thread");
 			thread_deallocate(thread);
 		} else {
 			os_atomic_inc(&bench.ready, relaxed);
@@ -548,6 +580,7 @@ load_start(void)
 		return;
 	}
 	if (kernel_thread_start(load_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "cpufreq:load_thread");
 		thread_deallocate(thread);
 	}
 }
@@ -905,6 +938,7 @@ hakios_cpufreq_init(void)
 		thread_t thread;
 
 		if (kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_set_thread_name(thread, "cpufreq:gov_thread");
 			thread_deallocate(thread);
 		}
 	}
@@ -915,6 +949,7 @@ hakios_cpufreq_init(void)
 		thread_t thread;
 
 		if (kernel_thread_start(bench_all, NULL, &thread) == KERN_SUCCESS) {
+			thread_set_thread_name(thread, "cpufreq:bench_all");
 			thread_deallocate(thread);
 		}
 	}

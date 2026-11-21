@@ -304,6 +304,7 @@ struct hakios_usb_note {
 #define HAKIOS_USB_NOTE         _IOW('u', 5, struct hakios_usb_note)
 extern int hakios_usbmux_publish(void);
 extern void hakios_usbmux_host(bool connected);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 static volatile bool usb_taken;         /* /dev/hakios-usb is there, the thread runs */
 static volatile bool mux_asked;         /* usb=3: a program gave the serial: the device side may start */
 static char mux_serial[48];
@@ -1051,6 +1052,7 @@ take_controller(void)
 		say("usb: no thread: not taken\n");
 		return;
 	}
+	thread_set_thread_name(thread, "usb:usb_thread");
 	thread_deallocate(thread);
 	usb_taken = true;
 }

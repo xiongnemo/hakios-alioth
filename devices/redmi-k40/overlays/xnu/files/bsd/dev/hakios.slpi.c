@@ -70,6 +70,7 @@ static bool leaving;                    /* on the way back to the loader after a
  * with slpi=1 only the few that say how it went (tell()), the rest to the kernel's own log.
  */
 extern void loader_log_putc(char c);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static LCK_MTX_DECLARE(say_lock, &slpi_lock_group);
 static bool quiet;
@@ -4000,6 +4001,7 @@ step_link(void)
 		printf("slpi: %u: no thread\n", step);
 		return false;
 	}
+	thread_set_thread_name(thread, "slpi:link_thread");
 	thread_deallocate(thread);
 	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
 		sleep_ms(1);
@@ -4173,6 +4175,7 @@ step_listen(void)
 		printf("slpi: %u: no thread\n", step);
 		return false;
 	}
+	thread_set_thread_name(thread, "slpi:rpc_listener");
 	thread_deallocate(thread);
 	/* boot-arg slpi_rpc_wait=N: how long the step looks on (8 s), counting the DSP's calls and services */
 	PE_parse_boot_argn("slpi_rpc_wait", &seconds, sizeof(seconds));
@@ -5136,6 +5139,7 @@ hakios_slpi_init(void)
 			printf("slpi: no thread: the sensor DSP is not brought up\n");
 			return;
 		}
+		thread_set_thread_name(thread, "slpi:whole_thread");
 		thread_deallocate(thread);
 		tell("slpi: the sensor DSP is being brought up beside the system's start (slpi=1)\n");
 		return;

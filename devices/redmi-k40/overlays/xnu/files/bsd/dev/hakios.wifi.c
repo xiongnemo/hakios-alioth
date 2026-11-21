@@ -201,6 +201,7 @@ static char last_write[96] = "nothing written";
 /* As in hakios.adreno.c: every line goes to the log the loader reads from another core as well. */
 extern void loader_log_putc(char c);
 extern bool hakios_sta_retrying(void);          /* (hakios.sta.c, this device's overlay) */
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -3251,6 +3252,7 @@ step_link(void)
 		printf("wifi: %u: no thread\n", step);
 		return false;
 	}
+	thread_set_thread_name(thread, "wifi:link_thread");
 	link_thread_is = thread;
 	thread_deallocate(thread);
 	for (unsigned ms = 0; ms < 5000 && !glink.open && !glink.broken; ms++) {
@@ -4599,6 +4601,7 @@ hakios_wifi_init(void)
 			tell("wifi: no thread: the radio is not brought up\n");
 			return;
 		}
+		thread_set_thread_name(thread, "wifi:whole_thread");
 		thread_deallocate(thread);
 		tell("wifi: the radio is being brought up beside the system's start (wifi=1)\n");
 		return;

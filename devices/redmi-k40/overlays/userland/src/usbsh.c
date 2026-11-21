@@ -570,9 +570,25 @@ execute(char *line)
 			}
 		}
 	} else if (!strcmp(argv[0], "sysctl") && argc > 1) {
-		/* sysctl NAME [COUNT [MS]]: an integer sysctl, COUNT times MS apart (default once) */
+		/* sysctl NAME [COUNT [MS]]: an integer sysctl, COUNT times MS apart (default once); one longer than an
+		   integer (a string: kern.hakios.kthreads, 11-21) is printed once, as text */
 		int times = argc > 2 ? atoi(argv[2]) : 1, gap = argc > 3 ? atoi(argv[3]) : 500;
+		size_t want = 0;
 
+		if (sysctlbyname(argv[1], NULL, &want, NULL, 0) == 0 && want > sizeof(int)) {
+			size_t size = want + 16384, got = size;
+			char *text = malloc(size);
+
+			if (text == NULL || sysctlbyname(argv[1], text, &got, NULL, 0) != 0) {
+				out("%s: %s\n", argv[1], strerror(errno));
+			} else {
+				got = got < size ? got : size - 1;
+				text[got] = '\0';
+				out_bytes(text, strlen(text));
+			}
+			free(text);
+			times = 0;
+		}
 		for (int i = 0; i < times && i < 1000; i++) {
 			int value = 0;
 			size_t size = sizeof(value);

@@ -51,6 +51,7 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 #define TSENS0_TM               hakios_board_addr("tsens0", 0x0c263000UL)    /* dt: tsens@c222000, "tsens_tm_physical" */
 #define TSENS1_TM               hakios_board_addr("tsens1", 0x0c265000UL)    /* dt: tsens@c223000 */
@@ -276,6 +277,7 @@ hakios_thermal_init(void)
 		tell("thermal: no thread: the cores are NOT watched\n");
 		return;
 	}
+	thread_set_thread_name(thread, "thermal:thermal_thread");
 	thread_deallocate(thread);
 	thermal_running = 1;
 }

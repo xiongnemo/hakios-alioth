@@ -84,6 +84,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static uint32_t level;
 static bool broken, leaving;
@@ -4253,6 +4254,7 @@ hakios_camera_init(void)
 		}
 	}
 	if (kernel_thread_start(camera_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "camera:camera_thread");
 		thread_deallocate(thread);
 	}
 }

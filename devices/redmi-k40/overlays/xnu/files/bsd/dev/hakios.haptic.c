@@ -68,6 +68,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static vm_offset_t tlmm;
 static uint32_t level;
@@ -1426,6 +1427,7 @@ hakios_haptic_init(void)
 		say("haptic: haptic_i2c_fix=0: the bus's timing as it was before 2026-11-03\n");
 	}
 	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "haptic:haptic_thread");
 		thread_deallocate(thread);
 	}
 }

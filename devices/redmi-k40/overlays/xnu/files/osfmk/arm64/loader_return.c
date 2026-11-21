@@ -17,6 +17,8 @@
 #include <kern/debug.h>
 #include <kern/startup.h>
 #include <kern/thread_call.h>
+#include <kern/task.h>
+#include <kern/recount.h>
 #include <kern/clock.h>
 #include <arm/cpu_internal.h>
 #include <arm/machine_routines.h>
@@ -777,3 +779,41 @@ tcp_log_quiet_init(void)
 	tcp_log_enable_flags = flags;
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, tcp_log_quiet_init);
+
+/*
+ * kern.hakios.kthreads (the sysctl itself is in bsd/dev/hakios.cpufreq.c): one line per kernel thread -- its id, its
+ * context switches (c_switch: every wake of a polling thread is one), its CPU time in microseconds, its priority and
+ * its name ("-" if it has none) -- for the census of what wakes the cores (11-21, WEEK-1121 P1). Two reads a minute
+ * apart give wakes/s and CPU per thread (work/tools/kthreads-diff.py). Read only; changes nothing.
+ */
+size_t hakios_kthreads_text(char *buf, size_t size);
+
+size_t
+hakios_kthreads_text(char *buf, size_t size)
+{
+	size_t n = 0;
+	unsigned count = 0;
+	thread_t th;
+
+	if (size < 256) {
+		return 0;
+	}
+	task_lock(kernel_task);
+	queue_iterate(&kernel_task->threads, th, thread_t, task_threads) {
+		char name[MAXTHREADNAMESIZE] = "";
+		uint64_t ns = 0;
+
+		if (n + 160 >= size) {
+			break;
+		}
+		absolutetime_to_nanoseconds(recount_thread_time_mach(th), &ns);
+		thread_get_thread_name(th, name);
+		name[sizeof(name) - 1] = '\0';
+		n += (size_t)scnprintf(buf + n, size - n, "%llu %u %llu %d %s\n", thread_tid(th), th->c_switch, ns / 1000,
+		    th->sched_pri, name[0] ? name : "-");
+		count++;
+	}
+	task_unlock(kernel_task);
+	n += (size_t)scnprintf(buf + n, size - n, "# %u kernel threads\n", count);
+	return n;
+}

@@ -90,6 +90,7 @@ extern void loader_log_putc(char c);
 
 /* The SMMU's match registers and contexts are found free and taken by the Wi-Fi's start as well (hakios.wifi.c). */
 extern lck_mtx_t hakios_smmu_lock;
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static LCK_GRP_DECLARE(sound_lock_group, "hakios-sound");
 static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
@@ -1650,6 +1651,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 			say("sound: no thread for the feeder\n");
 			goto out;
 		}
+		thread_set_thread_name(feeder, "sound:feeder_thread");
 		thread_deallocate(feeder);
 		watcher_runs = true;
 		hakios_audio_set_sink("the speakers (the audio DSP, hakios.sound.c)", ios_sink);
@@ -1738,6 +1740,7 @@ hakios_sound_dsp_up(void)
 		say("sound: no thread\n");
 		return;
 	}
+	thread_set_thread_name(thread, "sound:sound_thread");
 	thread_deallocate(thread);
 }
 

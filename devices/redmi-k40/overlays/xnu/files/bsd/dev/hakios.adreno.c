@@ -129,6 +129,7 @@ static bool gpu_profile_known;
  * as well, before the next register is touched.
  */
 extern void loader_log_putc(char c);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -4640,6 +4641,7 @@ gpu_gov_start(void)
 	PE_parse_boot_argn("gpugov_jump", &gov_jump, sizeof(gov_jump));
 	gov_running = true;
 	if (kernel_thread_start(gpu_gov_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "adreno:gpu_gov_thread");
 		thread_deallocate(thread);
 	} else {
 		gov_running = false;

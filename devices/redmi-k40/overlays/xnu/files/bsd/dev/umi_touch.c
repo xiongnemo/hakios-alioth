@@ -10,6 +10,7 @@
 
 #include <sys/hakios.input.h>
 #include <pexpert/device_tree.h>
+extern void thread_set_thread_name(thread_t thread, const char *name);
 /* Preserve hardware diagnostics in the USB log even in quiet UI boots. */
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
 #define printf hakios_tl
@@ -460,6 +461,6 @@ void umi_touch_init(void)
     st.started = true;
     thread_t thread;
     kern_return_t kr = kernel_thread_start(umi_touch_thread, NULL, &thread);
-    if (kr == KERN_SUCCESS) thread_deallocate(thread);
+    if (kr == KERN_SUCCESS) { thread_set_thread_name(thread, "umi_touch:umi_touch_thread"); thread_deallocate(thread); }
     else printf("UMI FTS: kernel_thread_start failed %d\n", kr);
 }

@@ -68,6 +68,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern volatile bool hakios_screen_off;         /* hakios.cpufreq.c: the display is off */
+extern void thread_set_thread_name(thread_t thread, const char *name);
 #define TOUCH_DARK_US           50000           /* the line looked at this often with the display off */
 
 static vm_offset_t tlmm, gcc, se, rsc, cmd_db;
@@ -1758,6 +1759,7 @@ hakios_goodix_init(void)
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "goodix:goodix_thread");
 		thread_deallocate(thread);
 	}
 }

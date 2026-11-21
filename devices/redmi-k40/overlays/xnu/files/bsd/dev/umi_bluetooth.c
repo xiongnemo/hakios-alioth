@@ -15,6 +15,7 @@
 #include <sys/errno.h>
 #include <sys/hakios.bluetooth.h>
 #include "umi_bt_firmware.inc"
+extern void thread_set_thread_name(thread_t thread, const char *name);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
 /*
@@ -600,6 +601,7 @@ static int bt_control_start(vm_offset_t uart)
     umi_bluetooth_set_ready(true);
     kern_return_t started=kernel_thread_start(bt_control_worker,NULL,&thread);
     if(started!=KERN_SUCCESS) { umi_bluetooth_set_ready(false); ctl_deregister(bt_control); return EIO; }
+    thread_set_thread_name(thread, "umi_bluetooth:bt_control_worker");
     thread_deallocate(thread);
     hakios_tl("UMI BT: persistent H4 endpoint ready: com.hakios.bluetooth\n");
     return 0;

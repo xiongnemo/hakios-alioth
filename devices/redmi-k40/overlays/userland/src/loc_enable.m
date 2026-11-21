@@ -22,7 +22,9 @@
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -202,12 +204,36 @@ photos_version_two(void)
 	fflush(stdout);
 }
 
+/*
+ * Boot-arg loc_poll=N: --all looks for new applications every N seconds (10, the old way, is the default);
+ * LaunchServices' install notes still cut a wait short. Each look lists every application through lsd, so a census
+ * of an idle phone wants it rare (11-21, WEEK-1121 P1: loc_poll=600).
+ */
+static unsigned
+loc_poll_seconds(void)
+{
+	char args[1100] = "";
+	size_t n = sizeof(args) - 1;
+	unsigned v = 10;
+
+	if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) == 0) {
+		for (char *p = strstr(args, "loc_poll="); p != NULL; p = strstr(p + 1, "loc_poll=")) {
+			if (p == args || p[-1] == ' ') {
+				v = (unsigned)strtoul(p + 9, NULL, 10);
+				break;
+			}
+		}
+	}
+	return v ? v : 10;
+}
+
 /* --all: every application there is, then every new one, for as long as the system runs */
 static int
 allow_all(void)
 {
 	Class workspace = NSClassFromString(@"LSApplicationWorkspace");
 	NSMutableSet<NSString *> *done = [NSMutableSet set];
+	unsigned poll = loc_poll_seconds();
 
 	if (workspace == Nil || ![CLLocationManager respondsToSelector:@selector(setAuthorizationStatusByType:forBundleIdentifier:)]) {
 		printf("loc_enable: no LSApplicationWorkspace or no setAuthorizationStatusByType:forBundleIdentifier: here\n");
@@ -215,6 +241,11 @@ allow_all(void)
 	}
 	tcc_everything = YES;
 	HKInstallWatch *watch = [HKInstallWatch new];
+
+	if (poll != 10) {
+		printf("loc_enable: --all: a look every %u s (loc_poll)\n", poll);
+		fflush(stdout);
+	}
 
 	if ([[workspace defaultWorkspace] respondsToSelector:@selector(addObserver:)]) {
 		[[workspace defaultWorkspace] addObserver:watch];
@@ -242,13 +273,13 @@ allow_all(void)
 				photos_version_two();
 			}
 		}
-		/* (10 s, or until LaunchServices says something was installed: HKInstallWatch stops the run loop) */
+		/* (loc_poll s, or until LaunchServices says something was installed: HKInstallWatch stops the run loop) */
 		watch.installed = NO;
 		uint64_t before = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 
-		if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 10.0, false) == kCFRunLoopRunFinished ||
+		if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, (double)poll, false) == kCFRunLoopRunFinished ||
 		    (!watch.installed && clock_gettime_nsec_np(CLOCK_MONOTONIC) - before < 1000000000ull)) {
-			sleep(10);      /* (a run loop with nothing in it returns at once: no busy looking) */
+			sleep(poll);    /* (a run loop with nothing in it returns at once: no busy looking) */
 		}
 	}
 	return 0;

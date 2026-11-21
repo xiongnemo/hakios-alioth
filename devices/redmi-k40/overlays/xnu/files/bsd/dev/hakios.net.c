@@ -35,6 +35,7 @@
 #include <sys/systm.h>
 
 extern void HakiosWLANStart(const char *interface, const uint8_t *address);  /* iokit/Kernel/hakios.wlan.cpp */
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static LCK_GRP_DECLARE(net_lck_grp, "hakios-net");
 
@@ -423,6 +424,7 @@ hakios_net_attach(const struct hakios_net_link *link)
 		    address[1], address[2], address[3], address[4], address[5], n->up ? "up" : "down");
 	}
 	if (kernel_thread_start(net_thread, n, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "net:net_thread");
 		thread_deallocate(thread);
 	}
 	return true;

@@ -67,6 +67,7 @@ extern lck_mtx_t hakios_smmu_lock;      /* (bsd/dev/hakios.wifi.c: the SMMU's gl
  * the middle that is not kept, and the modem only looked silent.
  */
 extern void loader_log_putc(char c);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 #define MDM_KEPT                (128 * 1024)    /* (48 KB filled up with step 6's repeated service lists, 11-14) */
 static char mdm_kept[MDM_KEPT];
 static uint32_t mdm_kept_len;
@@ -3192,6 +3193,7 @@ alioth_mdm_init(void)
 	}
 	PE_parse_boot_argn("mdm_keep", &mdm_keep, sizeof(mdm_keep));
 	if (kernel_thread_start(mdm_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "alioth_mdm:mdm_thread");
 		thread_deallocate(thread);
 	}
 }

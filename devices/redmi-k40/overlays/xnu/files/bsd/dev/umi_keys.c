@@ -17,6 +17,7 @@
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 #include <sys/hakios.board.h>
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
@@ -223,6 +224,7 @@ umi_keys_init(void)
 	    version, channels, pon_apid, gpio_apid);
 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
 	if (kr == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "umi_keys:keys_thread");
 		thread_deallocate(thread);
 	} else {
 		hakios_tl("UMI keys: kernel_thread_start failed %d\n", kr);
