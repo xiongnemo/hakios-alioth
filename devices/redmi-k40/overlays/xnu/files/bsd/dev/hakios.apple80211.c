@@ -87,6 +87,7 @@ type_name(int32_t type)
 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 83, "PMK_CACHE (eapolclient)" }, { 85, "IE" },
 		{ 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" }, { 89, "PMK_CACHE_CLEAR (eapolclient)" }, { 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
 		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
+	{ 383, "SET_PROPERTY" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -237,6 +238,28 @@ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
 static bool assoc_told;                         /* event 9 has been posted for the 802.1X join under way (on association) */
+static uint8_t country[3];                      /* wifi_answers=1: the country code wifid set last (not told to the radio) */
+static bool country_set;
+
+/*
+ * (2026-11-22) Boot-arg wifi_answers: 0 (the default) refuses what is not built, as before; 1 also takes wifid's
+ * SET_PROPERTY (383: its heartbeat, external power state and app-aware parameters, every 5 s -- taken, nothing done)
+ * and its COUNTRY_CODE (51: kept and given back, the radio's own regulatory setting left as it is), which it
+ * otherwise retries every second, then every 30 s, for the whole run.
+ */
+static bool
+answers(void)
+{
+	static int value = -1;
+
+	if (value < 0) {
+		uint32_t on = 0;
+
+		PE_parse_boot_argn("wifi_answers", &on, sizeof(on));
+		value = on != 0;
+	}
+	return value != 0;
+}
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -405,6 +428,19 @@ get(struct apple80211req *request)
 		request->req_val = (int32_t)join_result;
 		lck_mtx_unlock(&apple80211_lock);
 		return 0;
+	case 51: {                              /* wifi_answers=1: the country code as set (the 3 bytes alone); none yet: */
+		uint8_t code[3];                /* refused as before */
+		bool have;
+
+		if (!answers()) {
+			return EOPNOTSUPP;
+		}
+		lck_mtx_lock(&apple80211_lock);
+		have = country_set;
+		memcpy(code, country, sizeof(code));
+		lck_mtx_unlock(&apple80211_lock);
+		return have ? give(request, code, sizeof(code)) : EOPNOTSUPP;
+	}
 	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
 		struct hakios_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
 		unsigned index;
@@ -676,6 +712,31 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 383:                               /* wifi_answers=1: SET_PROPERTY, taken (nothing to do with it here) */
+		return answers() ? 0 : EOPNOTSUPP;
+	case 51: {                              /* wifi_answers=1: COUNTRY_CODE, 8 bytes: a version word, then the code's */
+		uint8_t asked[8];               /* 3 bytes (2 letters and an 802.11d qualifier) -- kept, never logged */
+		int error;
+
+		if (!answers()) {
+			return EOPNOTSUPP;
+		}
+		if (request->req_len < sizeof(asked) || (error = copyin(request->req_data, asked, sizeof(asked))) != 0) {
+			return request->req_len < sizeof(asked) ? EINVAL : error;
+		}
+		for (unsigned i = 4; i < 6; i++) {
+			if (!((asked[i] >= 'A' && asked[i] <= 'Z') || (asked[i] >= '0' && asked[i] <= '9'))) {
+				snprintf(said, said_size, " (not a country code at byte 4)");
+				return EINVAL;
+			}
+		}
+		lck_mtx_lock(&apple80211_lock);
+		memcpy(country, &asked[4], sizeof(country));
+		country_set = true;
+		lck_mtx_unlock(&apple80211_lock);
+		snprintf(said, said_size, " (a country code, kept)");
+		return 0;
+	}
 	default:
 		return EOPNOTSUPP;
 	}
