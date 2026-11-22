@@ -225,6 +225,30 @@ raise_domain(uint32_t domain, uint32_t cores)
 	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz (the hardware says %u MHz; "
 	    "per-core votes %s)\n", domain, cores, was, top, top_khz / 1000, epss_now_khz(domain) / 1000,
 	    epss_per_core[domain] ? "on: every core's word written" : "off");
+	/*
+	 * (2026-11-22) The biggest core's table tops at 3187 MHz, but asked for it the hardware runs it at 2841 -- in every
+	 * one of 212 runs, cold or warm: a limit outside the table. The governor's averages counted the row asked for
+	 * (3013 "MHz avg" at 88 % top) and scaled its next row from it. Boot-arg cpufreq_hwtop=1: the group's top is the
+	 * highest row at or under what the hardware gives, so the rows above it are never asked for. Default 0: as before.
+	 */
+	{
+		uint32_t hwtop = 0, hw = epss_now_khz(domain);
+
+		PE_parse_boot_argn("cpufreq_hwtop", &hwtop, sizeof(hwtop));
+		if (hwtop != 0 && hw != 0 && hw < top_khz) {
+			uint32_t row = top;
+
+			while (row > 0 && epss_khz[domain][row] > hw) {
+				row--;
+			}
+			epss_top[domain] = (int)row;
+			epss_write(domain, row);
+			delay_for_interval(20, NSEC_PER_MSEC);
+			tell("cpufreq: group %u: the hardware gives %u MHz of row %u's %u: its top is row %u, %u MHz (cpufreq_hwtop=1; "
+			    "the hardware says %u MHz now)\n", domain, hw / 1000, top, top_khz / 1000, row, epss_khz[domain][row] / 1000,
+			    epss_now_khz(domain) / 1000);
+		}
+	}
 }
 
 /*
