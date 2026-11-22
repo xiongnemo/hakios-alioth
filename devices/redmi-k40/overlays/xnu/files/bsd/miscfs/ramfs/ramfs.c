@@ -1007,14 +1007,15 @@ ramfs_link(struct vnop_link_args *ap)
 	return error;
 }
 
+/* rename(2), and renamex_np(2)'s RENAME_EXCL (EXCL: an existing target is EEXIST, decided under the lock) */
 static int
-ramfs_rename(struct vnop_rename_args *ap)
+ramfs_rename_names(vnode_t fdvp, vnode_t fvp, struct componentname *fcnp, vnode_t tdvp, struct componentname *tcnp,
+    bool excl)
 {
-	struct ramfs_node *fdir = RAMFS_NODE(ap->a_fdvp);
-	struct ramfs_node *tdir = RAMFS_NODE(ap->a_tdvp);
-	struct ramfs_node *node = RAMFS_NODE(ap->a_fvp);
+	struct ramfs_node *fdir = RAMFS_NODE(fdvp);
+	struct ramfs_node *tdir = RAMFS_NODE(tdvp);
+	struct ramfs_node *node = RAMFS_NODE(fvp);
 	struct ramfs_mount *rm = node->rn_mount;
-	struct componentname *fcnp = ap->a_fcnp, *tcnp = ap->a_tcnp;
 	struct ramfs_dirent *fde, *tde, *spare;
 	int error = 0;
 
@@ -1029,6 +1030,10 @@ ramfs_rename(struct vnop_rename_args *ap)
 
 	if (fde == NULL || fde->rd_node != node || tdir->rn_nlink == 0) {
 		error = ENOENT;
+		goto out;
+	}
+	if (excl && tde != NULL) {
+		error = EEXIST;
 		goto out;
 	}
 	if (node->rn_type == VDIR) {
@@ -1087,8 +1092,121 @@ out:
 		ramfs_dirent_free(spare);
 	}
 	if (!error) {
-		vnode_update_identity(ap->a_fvp, ap->a_tdvp, tcnp->cn_nameptr, tcnp->cn_namelen, tcnp->cn_hash,
+		vnode_update_identity(fvp, tdvp, tcnp->cn_nameptr, tcnp->cn_namelen, tcnp->cn_hash,
 		    VNODE_UPDATE_PARENT | VNODE_UPDATE_NAME);
+	}
+	return error;
+}
+
+static int
+ramfs_rename(struct vnop_rename_args *ap)
+{
+	return ramfs_rename_names(ap->a_fdvp, ap->a_fvp, ap->a_fcnp, ap->a_tdvp, ap->a_tcnp, false);
+}
+
+/*
+ * renamex_np(2) (11-22, WEEK-1121 N1b): RENAME_SWAP -- two existing names exchange their files, as usermanagerd
+ * saves /private/var/keybags/{usersession,persona}.kb (an atomic swap with a temporary file; ENOTSUP here kept the
+ * user personas from the usermanagerd daemon and so from lsd, which asked for them ~1,860 times a boot) -- and
+ * RENAME_EXCL. Boot-arg ramfs_swap=1; without it renamex answers ENOTSUP for every flag, as before (the VFS then has no
+ * fallback for either). VFS has already refused a swap without a target and an EXCL with one at lookup.
+ */
+static int ramfs_swap_wanted = -1;
+
+static bool
+ramfs_swap_enabled(void)
+{
+	if (ramfs_swap_wanted < 0) {
+		int on = 0;
+
+		PE_parse_boot_argn("ramfs_swap", &on, sizeof(on));
+		ramfs_swap_wanted = on != 0;
+	}
+	return ramfs_swap_wanted != 0;
+}
+
+/* DIR is NODE or lies below it. rm_lock held. */
+static bool
+ramfs_is_below(struct ramfs_mount *rm, struct ramfs_node *dir, struct ramfs_node *node)
+{
+	for (struct ramfs_node *up = dir; up != NULL; up = (up == rm->rm_root) ? NULL : up->rn_parent) {
+		if (up == node) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static int
+ramfs_renamex(struct vnop_renamex_args *ap)
+{
+	struct componentname *fcnp = ap->a_fcnp, *tcnp = ap->a_tcnp;
+	struct ramfs_node *fdir, *tdir, *fnode, *tnode;
+	struct ramfs_mount *rm;
+	struct ramfs_dirent *fde, *tde;
+	int error = 0;
+
+	if (!ramfs_swap_enabled() || (ap->a_flags & ~(VFS_RENAME_SWAP | VFS_RENAME_EXCL)) != 0 ||
+	    ap->a_flags == (VFS_RENAME_SWAP | VFS_RENAME_EXCL)) {
+		return ENOTSUP;
+	}
+	if (ap->a_flags == VFS_RENAME_EXCL) {
+		return ramfs_rename_names(ap->a_fdvp, ap->a_fvp, fcnp, ap->a_tdvp, tcnp, true);
+	}
+	if (ap->a_tvp == NULLVP) {
+		return ENOENT;
+	}
+	fdir = RAMFS_NODE(ap->a_fdvp);
+	tdir = RAMFS_NODE(ap->a_tdvp);
+	fnode = RAMFS_NODE(ap->a_fvp);
+	tnode = RAMFS_NODE(ap->a_tvp);
+	rm = fnode->rn_mount;
+
+	lck_mtx_lock(&rm->rm_lock);
+	fde = ramfs_dir_find(fdir, fcnp->cn_nameptr, (size_t)fcnp->cn_namelen);
+	tde = ramfs_dir_find(tdir, tcnp->cn_nameptr, (size_t)tcnp->cn_namelen);
+	if (fde == NULL || tde == NULL || fde->rd_node != fnode || tde->rd_node != tnode ||
+	    fdir->rn_nlink == 0 || tdir->rn_nlink == 0) {
+		error = ENOENT;
+		goto out;
+	}
+	if (fnode == tnode) {
+		goto out;                       /* two names of one file: nothing to exchange */
+	}
+	/* a directory may not end up inside itself */
+	if ((fnode->rn_type == VDIR && ramfs_is_below(rm, tdir, fnode)) ||
+	    (tnode->rn_type == VDIR && ramfs_is_below(rm, fdir, tnode))) {
+		error = EINVAL;
+		goto out;
+	}
+	fde->rd_node = tnode;
+	tde->rd_node = fnode;
+	if (fdir != tdir) {
+		if (fnode->rn_type == VDIR) {
+			fnode->rn_parent = tdir;
+			fdir->rn_nlink--;
+			tdir->rn_nlink++;
+		}
+		if (tnode->rn_type == VDIR) {
+			tnode->rn_parent = fdir;
+			tdir->rn_nlink--;
+			fdir->rn_nlink++;
+		}
+	}
+	ramfs_touch(fnode, false);
+	ramfs_touch(tnode, false);
+	ramfs_touch(fdir, true);
+	if (tdir != fdir) {
+		ramfs_touch(tdir, true);
+	}
+out:
+	lck_mtx_unlock(&rm->rm_lock);
+	if (!error && fnode != tnode) {
+		/* both vnodes: new name and parent, and nothing of the old ones left in the name cache */
+		vnode_update_identity(ap->a_fvp, ap->a_tdvp, tcnp->cn_nameptr, tcnp->cn_namelen, tcnp->cn_hash,
+		    VNODE_UPDATE_PARENT | VNODE_UPDATE_NAME | VNODE_UPDATE_PURGE);
+		vnode_update_identity(ap->a_tvp, ap->a_fdvp, fcnp->cn_nameptr, fcnp->cn_namelen, fcnp->cn_hash,
+		    VNODE_UPDATE_PARENT | VNODE_UPDATE_NAME | VNODE_UPDATE_PURGE);
 	}
 	return error;
 }
@@ -1859,6 +1977,7 @@ const struct vnodeopv_entry_desc ramfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_remove_desc, .opve_impl = (VOPFUNC)ramfs_remove },
 	{ .opve_op = &vnop_link_desc, .opve_impl = (VOPFUNC)ramfs_link },
 	{ .opve_op = &vnop_rename_desc, .opve_impl = (VOPFUNC)ramfs_rename },
+	{ .opve_op = &vnop_renamex_desc, .opve_impl = (VOPFUNC)ramfs_renamex },
 	{ .opve_op = &vnop_mkdir_desc, .opve_impl = (VOPFUNC)ramfs_mkdir },
 	{ .opve_op = &vnop_rmdir_desc, .opve_impl = (VOPFUNC)ramfs_rmdir },
 	{ .opve_op = &vnop_symlink_desc, .opve_impl = (VOPFUNC)ramfs_symlink },
