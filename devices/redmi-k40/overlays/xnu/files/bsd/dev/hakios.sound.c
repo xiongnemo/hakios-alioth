@@ -1212,6 +1212,17 @@ static volatile uint32_t ios_peak;              /* the largest sample since the 
 /* boot-arg sound_idle=N (E8, 11-22): the watcher, amplifiers off, naps up to N ms; the sink's sound wakes it */
 static volatile uint32_t watcher_kick, watcher_kicks;
 static volatile bool watcher_napping;
+/*
+ * (2026-11-22, N11) The amplifiers come up 170-182 ms after iOS's first sound (32 starts in 3 days), its first sample
+ * reaches them 160 ms after it was written (PERIODS x 20 ms at the DSP): the first ~15 ms and their fade-in are lost,
+ * most of a key click after 3 s of silence. Boot-arg amp_lead_ms=N (1..200; 0, the default: as before): when the
+ * amplifiers are off and sound comes, the feeder holds it back N ms (silence goes out, the ring is not taken from), so
+ * it reaches them after they are up; the N ms it then lags are won back by dropping silence (never sound) from the ring.
+ */
+static uint32_t lead_ms;
+static volatile bool guard_on;                  /* (declared again, with its words, below) */
+static volatile uint64_t hold_until_us;         /* the feeder holds the ring back until then (0: not holding) */
+static uint32_t lag_frames, held_periods, dropped_silence;
 
 /* From the writer's thread, under hakios.audio.c's lock: never waits. */
 static uint32_t
@@ -1236,6 +1247,9 @@ ios_sink(const int16_t *frames, uint32_t count)
 	ios_frames += taken;
 	if (sound) {
 		last_sound_us = now_us();
+		if (lead_ms != 0 && !guard_on && hold_until_us == 0 && lag_frames == 0) {
+			hold_until_us = last_sound_us + (uint64_t)lead_ms * 1000;       /* amp_lead_ms: the feeder holds it back */
+		}
 		OSMemoryBarrier();              /* (the time before the look at watcher_napping: see watch()) */
 		if (watcher_napping) {
 			watcher_napping = false;
@@ -1284,7 +1298,32 @@ period_fill_ios(unsigned period)
 {
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
 	uint32_t tail = ring_tail, available = ring_head - tail, n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+	uint64_t hold = hold_until_us;
 
+	if (hold != 0 && now_us() < hold) {
+		/* amp_lead_ms: silence out, the ring kept -- the sound waits for the amplifiers */
+		n = 0;
+		held_periods++;
+		lag_frames += PERIOD_FRAMES;
+	} else if (hold != 0) {
+		hold_until_us = 0;
+	}
+	if (lag_frames != 0 && n == PERIOD_FRAMES) {
+		/* won back: silence at the ring's tail, as much as it lags, is dropped (never a sample that is sound) */
+		uint32_t drop = 0;
+
+		while (drop < lag_frames && drop < available - n) {
+			int16_t l = ring[2 * ((tail + drop) % RING_FRAMES)], r = ring[2 * ((tail + drop) % RING_FRAMES) + 1];
+
+			if (l > SILENCE || l < -SILENCE || r > SILENCE || r < -SILENCE) {
+				break;
+			}
+			drop++;
+		}
+		tail += drop;
+		lag_frames -= drop;
+		dropped_silence += drop;
+	}
 	OSMemoryBarrier();
 	for (uint32_t i = 0; i < n; i++) {
 		samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
@@ -1415,7 +1454,7 @@ watch(void)
 	bool on = false, given_up = false, muted = false;
 	uint64_t last_look = 0, last_monitor = 0, setup_next = 0, set_up_at = 0, last_test = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0, set_ups = 0;
-	uint32_t i2c_test = 0, idle_ms = 0, look_ms = 200, naps = 0;
+	uint32_t i2c_test = 0, idle_ms = 0, look_ms = 200, naps = 0, hold_ms = (uint32_t)(QUIET_BEFORE_OFF_US / 1000), lead = 0;
 	/* (after a set-up that failed, the next one no sooner than this, in seconds: the last one for ever after) */
 	static const uint32_t setup_gap_s[] = { 2, 10, 60, 300 };
 
@@ -1426,6 +1465,18 @@ watch(void)
 	if (idle_ms != 0 || look_ms != 200) {
 		say("sound: the watcher looks every %u ms while the amplifiers are off (sound_idle; a sound wakes it), their "
 		    "status every %u ms while on (amp_look_ms)\n", idle_ms ? idle_ms : 5, look_ms);
+	}
+	/*
+	 * (2026-11-22, N11) Boot-arg amp_hold_ms=N (1000..600000; 3000, the default: as before): N ms of silence before the
+	 * amplifiers stop -- fewer starts (each loses the first ~15 ms, see amp_lead_ms) for their idle power meanwhile.
+	 */
+	PE_parse_boot_argn("amp_hold_ms", &hold_ms, sizeof(hold_ms));
+	hold_ms = hold_ms < 1000 ? 1000 : hold_ms > 600000 ? 600000 : hold_ms;
+	PE_parse_boot_argn("amp_lead_ms", &lead, sizeof(lead));
+	lead_ms = lead > 200 ? 200 : lead;
+	if (hold_ms != QUIET_BEFORE_OFF_US / 1000 || lead_ms != 0) {
+		say("sound: the amplifiers stop after %u ms of silence (amp_hold_ms); a first sound waits %u ms for them (amp_lead_ms)\n",
+		    hold_ms, lead_ms);
 	}
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
 	if (umi_profile && PE_parse_boot_argn("sound_i2c_test", &i2c_test, sizeof(i2c_test)) && i2c_test != 0) {
@@ -1508,11 +1559,13 @@ watch(void)
 				monitor_looks = 0;
 				/* (what is written now is heard after the periods already queued at the DSP: PERIODS x 20 ms) */
 				say("sound: the amplifiers are up %llu ms after the first write that was not silence; that write reaches "
-				    "them %u ms after it was made, behind the periods queued at the DSP\n", (last_look - sounded) / 1000,
-				    PERIODS * PERIOD_FRAMES / 48);
+				    "them %u ms after it was made, behind the periods queued at the DSP%s; margin %lld ms (under 0: its start "
+				    "is lost)\n", (last_look - sounded) / 1000, PERIODS * PERIOD_FRAMES / 48 + lead_ms, lead_ms ? " and amp_lead_ms" : "",
+				    (long long)(PERIODS * PERIOD_FRAMES / 48 + lead_ms) - (long long)((last_look - sounded) / 1000));
 			}
-		} else if (on && now - sounded > QUIET_BEFORE_OFF_US) {
-			say_when("three seconds of silence: the amplifiers are stopped");
+		} else if (on && now - sounded > (uint64_t)hold_ms * 1000) {
+			say_when(hold_ms == QUIET_BEFORE_OFF_US / 1000 ? "three seconds of silence: the amplifiers are stopped" :
+			    "amp_hold_ms of silence: the amplifiers are stopped");
 			say("sound: what iOS wrote while they were on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768,
 			    ios_peak);
 			guard_off(false);
@@ -1564,6 +1617,10 @@ watch(void)
 	    given_up ? ", and the amplifiers were then given up on" : "");
 	if (idle_ms != 0) {
 		say("sound: the watcher napped %u times (sound_idle=%u), woken by a sound %u times\n", naps, idle_ms, watcher_kicks);
+	}
+	if (lead_ms != 0) {
+		say("sound: amp_lead_ms=%u: %u periods held back for the amplifiers, %u frames of silence dropped to catch up, %u "
+		    "frames still behind\n", lead_ms, held_periods, dropped_silence, lag_frames);
 	}
 	watcher_runs = false;
 }
