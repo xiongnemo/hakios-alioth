@@ -30,6 +30,7 @@ extern kern_return_t thread_terminate(thread_t);
 extern int vsnprintf(char *, size_t, const char *, va_list) __printflike(3, 0);
 extern void *get_bsdtask_info(task_t);
 extern char *proc_name_address(void *p);
+extern void proc_name(int pid, char *buf, int size);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern vm_offset_t vm_kernel_slide;
 
@@ -41,7 +42,15 @@ struct prof_sample {
 	uint64_t kpc;           /* kernel PC when in the kernel, unslid; else the user LR */
 	uint64_t kcall[3];      /* in the kernel: the callers, by the frame pointers, unslid */
 	uint32_t thread;        /* the thread's id, low bits */
+	int32_t pid;            /* (prof_name=*: whose it was) */
 };
+
+/*
+ * (2026-11-23, N10b) prof_name=* samples every process but the kernel's (kernel_task), and the report begins with
+ * the processes by samples -- for "which process is busy" when thread accounting cannot say (time in system calls and
+ * interrupts is not charged to threads here).
+ */
+static bool prof_all;
 
 static struct prof_sample *prof_samples;
 static volatile uint32_t prof_count, prof_seen_other;
@@ -74,7 +83,10 @@ prof_xcall(__unused void *parameter)
 	uint32_t at;
 	uint64_t pc, kpc;
 
-	if (proc == NULL || state == NULL || (name = proc_name_address(proc)) == NULL || strncmp(name, prof_name, sizeof(prof_name)) != 0) {
+	if (proc == NULL || state == NULL || (name = proc_name_address(proc)) == NULL) {
+		return;
+	}
+	if (prof_all ? task == kernel_task : strncmp(name, prof_name, sizeof(prof_name)) != 0) {
 		return;
 	}
 	if (PSR64_IS_USER(get_saved_state_cpsr(state))) {
@@ -91,6 +103,7 @@ prof_xcall(__unused void *parameter)
 		prof_samples[at].pc = pc;
 		prof_samples[at].kpc = kpc;
 		prof_samples[at].thread = (uint32_t)thread_tid(thread);
+		prof_samples[at].pid = proc_pid((struct proc *)proc);   /* (declared in vm/vm_protos.h) */
 		prof_samples[at].kcall[0] = prof_samples[at].kcall[1] = prof_samples[at].kcall[2] = 0;
 		if (pc & PROF_KERNEL) {
 			/* the callers: frame records { previous fp, lr } on this thread's kernel stack, and nowhere else */
@@ -228,6 +241,45 @@ prof_thread(__unused void *parameter, __unused wait_result_t result)
 		prof_say(" %#x %u", threads[t], thread_counts[t]);
 	}
 	prof_say("\n");
+	if (prof_all) {
+		/* the processes by samples, the most first (64 kept: the rest counted together) */
+		int32_t pids[64];
+		uint32_t counts[64], other = 0, used = 0;
+
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t p;
+
+			for (p = 0; p < used && pids[p] != prof_samples[i].pid; p++) {
+			}
+			if (p == used && used < 64) {
+				pids[used] = prof_samples[i].pid;
+				counts[used++] = 0;
+			}
+			if (p < used) {
+				counts[p]++;
+			} else {
+				other++;
+			}
+		}
+		prof_say("prof: by process (%u samples; %u in processes past the 64 counted):\n", n, other);
+		for (uint32_t k = 0; k < 16; k++) {
+			uint32_t best = 0, at = 0;
+			char name[32] = "?";
+
+			for (uint32_t p = 0; p < used; p++) {
+				if (counts[p] > best) {
+					best = counts[p];
+					at = p;
+				}
+			}
+			if (best == 0) {
+				break;
+			}
+			proc_name(pids[at], name, sizeof(name));
+			prof_say("prof: p %d %s %u\n", pids[at], name, best);
+			counts[at] = 0;
+		}
+	}
 	prof_top("user addresses (| 1<<63: in a system call made from there)", false, n, 120);
 	prof_top("kernel addresses, unslid", true, n, 40);
 	prof_stacks(n, 40);
@@ -247,6 +299,7 @@ hakios_prof_init(void)
 		return;
 	}
 	PE_parse_boot_arg_str("prof_name", prof_name, sizeof(prof_name));
+	prof_all = prof_name[0] == '*';
 	PE_parse_boot_argn("prof_after", &prof_after, sizeof(prof_after));
 	PE_parse_boot_argn("prof_secs", &prof_secs, sizeof(prof_secs));
 	PE_parse_boot_argn("prof_us", &prof_us, sizeof(prof_us));
