@@ -1554,20 +1554,28 @@ request_elements(struct lx_radio *radio, uint8_t *out)
 		 * is: it writes the station's own SM power save there, "disabled" (3) with both chains on. Boot-arg
 		 * wifi_mimo=1 does the same; default 0: the driver's value, as before.
 		 */
+		/*
+		 * (2026-11-22, N10b) And the A-MPDU factor: ath11k_create_ht_cap() sets IEEE80211_HT_MAX_AMPDU_64K, which is 3 in
+		 * Linux but 0 in FreeBSD's linuxkpi (an enum with that one member) -- so we said "8 KB aggregates" (2^(13+0)-1
+		 * bytes, ~5 frames). Boot-arg wifi_ht_ampdu=N (1..3: 16, 32, 64 KB) says N; default 0: the driver's value.
+		 */
+		uint32_t ampdu = (uint32_t)lx_os_option("wifi_ht_ampdu");
+		uint8_t factor = ampdu >= 1 && ampdu <= 3 ? (uint8_t)ampdu : band->ht_cap.ampdu_factor;
+
 		if (lx_os_option("wifi_mimo")) {
 			cap = (uint16_t)((cap & ~IEEE80211_HT_CAP_SM_PS) | WLAN_HT_CAP_SM_PS_DISABLED << IEEE80211_HT_CAP_SM_PS_SHIFT);
 		}
-		lx_tell("lx: our HT capabilities %#06x (SM power save %u: 0 static, 1 dynamic, 3 off), A-MPDU factor %u, receive MCS "
-		    "%02x %02x; VHT %#010x, receive MCS map %#06x\n", cap, (cap & IEEE80211_HT_CAP_SM_PS) >> IEEE80211_HT_CAP_SM_PS_SHIFT,
-		    band->ht_cap.ampdu_factor, band->ht_cap.mcs.rx_mask[0], band->ht_cap.mcs.rx_mask[1],
-		    band->vht_cap.vht_supported ? band->vht_cap.cap : 0,
+		lx_tell("lx: our HT capabilities %#06x (SM power save %u: 0 static, 1 dynamic, 3 off), A-MPDU factor %u (the driver's "
+		    "%u), receive MCS %02x %02x; VHT %#010x, receive MCS map %#06x\n", cap, (cap & IEEE80211_HT_CAP_SM_PS) >>
+		    IEEE80211_HT_CAP_SM_PS_SHIFT, factor, band->ht_cap.ampdu_factor, band->ht_cap.mcs.rx_mask[0],
+		    band->ht_cap.mcs.rx_mask[1], band->vht_cap.vht_supported ? band->vht_cap.cap : 0,
 		    band->vht_cap.vht_supported ? (unsigned)le16_to_cpu(band->vht_cap.vht_mcs.rx_mcs_map) : 0);
 		*at++ = 45;
 		*at++ = 26;
 		bzero(at, 26);
 		at[0] = (uint8_t)cap;
 		at[1] = (uint8_t)(cap >> 8);
-		at[2] = (uint8_t)(band->ht_cap.ampdu_factor | band->ht_cap.ampdu_density << 2);
+		at[2] = (uint8_t)(factor | band->ht_cap.ampdu_density << 2);
 		memcpy(at + 3, &band->ht_cap.mcs, sizeof(band->ht_cap.mcs));
 		at += 26;
 	}
