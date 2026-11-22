@@ -267,12 +267,19 @@ hakios_thermal_init(void)
 	tsens[0] = ml_io_map(TSENS0_TM, TSENS_TM_SIZE);
 	tsens[1] = ml_io_map(TSENS1_TM, TSENS_TM_SIZE);
 	thermal_gov_init(&gov, top);
+	{
+		uint32_t hold = 0;              /* thermal_hold=N s: back down to nominal only when calm for N s (hakios.thermal.h) */
+
+		PE_parse_boot_argn("thermal_hold", &hold, sizeof(hold));
+		gov.hold_ticks = (int)((hold > 60 ? 60 : hold) * 1000 / THERMAL_TICK_MS);
+	}
 	for (int z = 0; z < THERMAL_ZONES; z++) {
 		readings[z] = read_sensor(hakios_thermal_zones[z].block, hakios_thermal_zones[z].sensor);
 	}
 	/* one reading of the prime core's sensor to the log: whether TSENS answers at all is the first thing to know */
-	tell("thermal: %d sensors; the prime core reads %s C; caps %s; every %d ms\n", THERMAL_ZONES,
-	    tenths_text(readings[13], a, sizeof(a)), thermal_caps_on ? "on" : "off (thermal=2: watching only)", THERMAL_TICK_MS);
+	tell("thermal: %d sensors; the prime core reads %s C; caps %s; every %d ms; back to nominal after %d ms calm\n",
+	    THERMAL_ZONES, tenths_text(readings[13], a, sizeof(a)), thermal_caps_on ? "on" : "off (thermal=2: watching only)",
+	    THERMAL_TICK_MS, gov.hold_ticks * THERMAL_TICK_MS);
 	if (kernel_thread_start(thermal_thread, NULL, &thread) != KERN_SUCCESS) {
 		tell("thermal: no thread: the cores are NOT watched\n");
 		return;

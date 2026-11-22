@@ -104,7 +104,17 @@ struct thermal_gov {
 	int hot_ticks;                          /* ticks in a row past a critical limit */
 	int blind_ticks;                        /* ticks in a row with no reading of any CPU zone */
 	uint32_t throttles;                     /* times a group was slowed, over the run */
+	int hold_ticks;                         /* boot-arg thermal_hold, in ticks (0: none, as before): see below */
+	int calm_ticks;                         /* ticks in a row it has been calm enough to go back to nominal */
 };
+
+/*
+ * (2026-11-22) A phone that idles near MODERATE's line (10 C under the limit) went nominal <-> moderate up to 33 times
+ * a run, most flips under a second apart -- each one posted to every listener of iOS's thermal notification. With
+ * thermal_hold=N seconds a level above nominal comes back down to nominal only after N seconds in a row with every
+ * zone a further THERMAL_HOLD_MARGIN under the line (and the battery as far under its warm mark); up at once as before.
+ */
+#define THERMAL_HOLD_MARGIN     30              /* 3 C */
 
 /* What one tick decided, besides the caps. */
 #define THERMAL_CAPS_CHANGED    (1u << 0)       /* write the caps to the hardware */
@@ -233,6 +243,18 @@ thermal_gov_step(struct thermal_gov *g, const int16_t *tenths, int battery)
 		level = THERMAL_HEAVY;
 	} else if (battery >= THERMAL_BATTERY_WARM && level < THERMAL_MODERATE) {
 		level = THERMAL_MODERATE;
+	}
+	if (g->hold_ticks > 0 && level == THERMAL_NOMINAL && old_level > THERMAL_NOMINAL) {
+		bool calm = worst < -100 - THERMAL_HOLD_MARGIN && battery < THERMAL_BATTERY_WARM - THERMAL_HOLD_MARGIN;
+
+		g->calm_ticks = calm ? g->calm_ticks + 1 : 0;
+		if (g->calm_ticks < g->hold_ticks) {
+			level = THERMAL_MODERATE;       /* not yet: held one level up */
+		} else {
+			g->calm_ticks = 0;
+		}
+	} else {
+		g->calm_ticks = 0;
 	}
 	g->level = level;
 	if (level != old_level) {
