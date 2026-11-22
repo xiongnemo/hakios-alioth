@@ -384,42 +384,4 @@ psci_smp_stop_here(void)
 	}
 }
 
-/* ---- CPU idle states (11-22; psci_smp.h) ---------------------------------------------------------------- */
-
-#define PSCI_CPU_SUSPEND_64     0xC4000001u
-
-psci_idle_hook_t psci_idle_hook;                /* set by a platform driver; NULL: the notifier does nothing */
-
-/* boot-arg cpu_suspend=MASK given and not 0: GenericARMPE registers psci_processor_idle() for every core */
-bool
-psci_idle_wanted(void)
-{
-	uint32_t mask = 0;
-
-	return PE_parse_boot_argn("cpu_suspend", &mask, sizeof(mask)) && mask != 0;
-}
-
-/* The idle notifier (processor_idle_t): interrupts are off; the driver's hook decides everything. */
-void
-psci_processor_idle(void *cpu_id __unused, boolean_t enter, uint64_t *new_timeout_ticks __unused)
-{
-	psci_idle_hook_t hook = psci_idle_hook;
-
-	if (hook != NULL) {
-		hook(enter);
-	}
-}
-
-/*
- * CPU_SUSPEND: a power-down state comes back at the reset vector -- LowResetVectorBase, which finds this core's
- * cpu_data and jumps to its cpu_reset_handler, resume_idle_cpu since cpu_machine_idle_init() -- and from there
- * through arm_init_idle_cpu() to cpu_idle_exit(TRUE): nothing of this call's frame is needed again. A return means
- * the core did not go down (an interrupt was pending, or the state was refused): its status.
- */
-int64_t
-psci_cpu_suspend(uint32_t power_state)
-{
-	return psci_call(PSCI_CPU_SUSPEND_64, power_state, ml_static_vtop((vm_offset_t)&LowResetVectorBase), 0);
-}
-
 #endif /* defined(GENERIC_PSCI_SMP) */

@@ -392,36 +392,6 @@ gic_v3_irq_cpu_shutdown(void)
 	__builtin_arm_isb(ISB_SY);
 }
 
-/*
- * Back from a power-down (CPU idle states, 11-22): the CPU interface is in the core's power domain and comes back
- * reset; the redistributor (in the GIC's) keeps its state. So the system-register part of gic_v3_irq_cpu_init()
- * again -- which that function skips for a core it has seen -- as Linux does on every CPU_PM exit. Interrupts off.
- */
-void
-gic_v3_irq_cpu_resume(void)
-{
-	vm_offset_t gicr;
-	uint32_t waker;
-
-	if (gicd_base == 0 || (gicr = gicr_cpu_base[cpu_number()]) == 0) {
-		return;
-	}
-	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
-	__builtin_arm_isb(ISB_SY);
-	waker = gic_read32(gicr + GICR_WAKER);
-	if (waker & (GICR_WAKER_PROCSLEEP | GICR_WAKER_CHILDASLEEP)) {
-		gic_write32(gicr + GICR_WAKER, waker & ~GICR_WAKER_PROCSLEEP);
-		while (gic_read32(gicr + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
-			/* spin until the redistributor is awake */
-		}
-	}
-	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
-	__builtin_arm_wsr64("ICC_PMR_EL1", 0xff);
-	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
-	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
-	__builtin_arm_isb(ISB_SY);
-}
-
 static vm_offset_t
 gic_find_redistributor(void)
 {

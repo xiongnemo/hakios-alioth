@@ -21,11 +21,6 @@ extern "C" {
 #include <kern/thread_call.h>
 
 #include "MiniDrivers.h"
-#if defined(GENERIC_PSCI_SMP)
-/* osfmk/arm64/psci_smp.c (its header is not one IOKit sees) */
-extern "C" bool psci_idle_wanted(void);
-extern "C" void psci_processor_idle(void *cpu_id, boolean_t enter, uint64_t *new_timeout_ticks);
-#endif
 
 extern "C" {
 kern_return_t processor_start(processor_t processor);
@@ -107,12 +102,6 @@ GenericARMCPU::start(IOService * provider)
 	info.phys_id = physID;
 	info.cluster_id = topology->cluster_id;
 	info.cluster_type = topology->cluster_type;
-#if defined(GENERIC_PSCI_SMP)
-	/* (boot-arg cpu_suspend=MASK: the idle notifier, through which a platform driver may power a core down) */
-	if (psci_idle_wanted()) {
-		info.processor_idle = psci_processor_idle;
-	}
-#endif
 	if (ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler) != KERN_SUCCESS) {
 		IOLog("GenericARMCPU: ml_processor_register failed\n");
 		return false;
