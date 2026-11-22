@@ -1547,6 +1547,21 @@ request_elements(struct lx_radio *radio, uint8_t *out)
 		uint16_t cap = (uint16_t)(band->ht_cap.cap & (radio->width > 20 ? 0xffff : ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
 		    IEEE80211_HT_CAP_SGI_40)));
 
+		/*
+		 * (2026-11-22, N10b) The driver's capabilities say SM power save STATIC (ath11k_create_ht_cap(): 0, or dynamic
+		 * if the firmware says so) -- "one receive chain": the access point then sent to us with one spatial stream
+		 * only (96 % VHT MCS 9, 1 stream: TCP in ~150 Mbit/s against ~340 out). mac80211 never sends that value as it
+		 * is: it writes the station's own SM power save there, "disabled" (3) with both chains on. Boot-arg
+		 * wifi_mimo=1 does the same; default 0: the driver's value, as before.
+		 */
+		if (lx_os_option("wifi_mimo")) {
+			cap = (uint16_t)((cap & ~IEEE80211_HT_CAP_SM_PS) | WLAN_HT_CAP_SM_PS_DISABLED << IEEE80211_HT_CAP_SM_PS_SHIFT);
+		}
+		lx_tell("lx: our HT capabilities %#06x (SM power save %u: 0 static, 1 dynamic, 3 off), A-MPDU factor %u, receive MCS "
+		    "%02x %02x; VHT %#010x, receive MCS map %#06x\n", cap, (cap & IEEE80211_HT_CAP_SM_PS) >> IEEE80211_HT_CAP_SM_PS_SHIFT,
+		    band->ht_cap.ampdu_factor, band->ht_cap.mcs.rx_mask[0], band->ht_cap.mcs.rx_mask[1],
+		    band->vht_cap.vht_supported ? band->vht_cap.cap : 0,
+		    band->vht_cap.vht_supported ? (unsigned)le16_to_cpu(band->vht_cap.vht_mcs.rx_mcs_map) : 0);
 		*at++ = 45;
 		*at++ = 26;
 		bzero(at, 26);
