@@ -127,6 +127,12 @@ AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio
          'System/Library/Audio/UISounds/', 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
+# ... of LinguisticData (1 GB, every language's), since 2026-11-23, what the Chinese keyboard runs on: without zh-Hans'
+# language model and dictionaries kbd died on the first pinyin candidates, in TextInputCore's
+# FavoniusStrokeBuildManager::extended_latham_conversions (its model, this+0x10, never loaded: a NULL read). 113 MB:
+# zh-Hans (Chinese.lm, sys.dic, the stroke and wubi tables), zh (readings shared with traditional, emoji), root
+# (language identification).
+LINGUISTIC_WANTED = tuple(f'System/Library/LinguisticData/RequiredAssets_{name}.bundle/' for name in ('zh-Hans', 'zh', 'root'))
 
 
 def entries(listing):
@@ -166,6 +172,8 @@ def mode_bits(text):
 
 
 def wanted_file(path, size):
+    if path.startswith(LINGUISTIC_WANTED):
+        return True
     lproj = re.search(r'/([^/]+)\.lproj/', path)
     if lproj and lproj.group(1) not in KEEP_LANG:
         return False
@@ -225,7 +233,7 @@ def main():
         elif stat.S_ISLNK(mode):
             # a symlink costs nothing: keep every one that lives where we take anything at all
             keep = '/' not in path or path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX) and \
-                not accessibility_unwanted(path)
+                not accessibility_unwanted(path) or path.startswith(LINGUISTIC_WANTED)
         else:
             # (the sound plug-ins' too: Library/Audio is skipped but for AUDIO, and without its en.lproj the
             # virtual audio device's port names came out NULL -- mediaserverd died naming the microphone)
