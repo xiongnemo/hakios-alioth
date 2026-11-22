@@ -41,10 +41,14 @@ WHOLE = ('usr/libexec/', 'usr/sbin/', 'usr/bin/', 'usr/lib/', 'usr/share/', 'sbi
 # News refuses to start without its own -- "a legal requirement"; nor Health, the plug-ins the Health
 # application and its daemon are made of: both stop with a fatal error when the directory is not there.
 # Of Health only the pictures and films of the activity awards are left out, see SKIP_PREFIX and HEALTH)
+# (Not ProductDocuments, 11 MB, since 2026-11-23: Settings > General > Legal & Regulatory stopped with a trap without
+# it -- LegalAndRegulatorySettingsPrivate force-unwraps SFAcknowledgementsDocumentFilePath(), which is
+# ProductDocuments/Notices/Acknowledgements.bundle when it is there and nil when not; the licence, warranty, RF
+# exposure and regulatory pages read the rest.)
 SKIP_SYSTEM_LIBRARY = ('LinguisticData', 'PreinstalledAssetsV2', 'NanoTimeKit', 'Audio',
                        'Assistant',
                        'VideoProcessors', 'ScreenReader', 'Photos', 'Carrier Bundles', 'NanoPreferenceBundles',
-                       'ImagingNetworks', 'ProductDocuments', 'AppPlaceholders', 'UserNotifications',
+                       'ImagingNetworks', 'AppPlaceholders', 'UserNotifications',
                        'Caches')
 # the accessibility bundles (62 MB, 415 of them): what iOS loads into a process once an accessibility feature is on.
 # Their servers are in them -- backboardd's job names com.apple.accessibility.AXBackBoardServer, which only
