@@ -66,5 +66,9 @@ int umi_mhi_poll_ipcr(struct umi_mhi *, unsigned timeout_ms, unsigned *received)
 int umi_mhi_send_qrtr_hello(struct umi_mhi *);
 int umi_mhi_send_qrtr_packet(struct umi_mhi *, const void *, size_t,
 	unsigned timeout_ms, uint16_t expected_transaction);
+/* The same, but a request the peer may not answer (the firmware asked for mode "off"): ENETRESET when timeout_ms
+ * pass without it, saying whether the packet was taken -- the channel marked unusable as on any timeout. */
+int umi_mhi_send_qrtr_packet_unanswered(struct umi_mhi *, const void *, size_t,
+	unsigned timeout_ms, uint16_t expected_transaction);
 
 #endif

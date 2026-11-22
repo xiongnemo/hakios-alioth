@@ -719,9 +719,26 @@ umi_mhi_poll_ipcr(struct umi_mhi *host, unsigned timeout_ms, unsigned *received)
 	return 0;
 }
 
+static int send_qrtr_packet(struct umi_mhi *host, const void *packet, size_t length, unsigned timeout_ms,
+	uint16_t expected_transaction, bool may_go_unanswered);
+
 int
 umi_mhi_send_qrtr_packet(struct umi_mhi *host, const void *packet,
 	size_t length, unsigned timeout_ms, uint16_t expected_transaction)
+{
+	return send_qrtr_packet(host, packet, length, timeout_ms, expected_transaction, false);
+}
+
+int
+umi_mhi_send_qrtr_packet_unanswered(struct umi_mhi *host, const void *packet,
+	size_t length, unsigned timeout_ms, uint16_t expected_transaction)
+{
+	return send_qrtr_packet(host, packet, length, timeout_ms, expected_transaction, true);
+}
+
+static int
+send_qrtr_packet(struct umi_mhi *host, const void *packet,
+	size_t length, unsigned timeout_ms, uint16_t expected_transaction, bool may_go_unanswered)
 {
 	if (!host || !host->io) return EINVAL;
 	if (host->poisoned) return EIO;
@@ -772,6 +789,12 @@ umi_mhi_send_qrtr_packet(struct umi_mhi *host, const void *packet,
 	}
 	host->poisoned = true;
 	report(host, "QRTR packet timeout; status", read_reg(host, 0x48));
+	if (may_go_unanswered) {
+		/* (the caller asked for that: no answer is an answer -- taken by the device or not, said here) */
+		report(host, "QRTR packet unanswered, taken by the device", host->ipcr_tx_done ? 1u : 0u);
+		host->ipcr_waiting_response = false;
+		return ENETRESET;
+	}
 	return ETIMEDOUT;
 }
 

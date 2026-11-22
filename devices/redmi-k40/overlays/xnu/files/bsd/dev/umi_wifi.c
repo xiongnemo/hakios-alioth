@@ -320,6 +320,27 @@ umi_qrtr_send_locked(struct hakios_qrtr_port *port, uint32_t node, uint32_t dst_
 	if (length >= 3 && ((const uint8_t *)data)[0] == 0)
 		transaction = (uint16_t)((const uint8_t *)data)[1] |
 		    (uint16_t)((const uint8_t *)data)[2] << 8;
+	/*
+	 * (2026-11-23) The firmware asked for mode "off" (QMI_WLANFW_WLAN_MODE_REQ 0x22, mode TLV 1 = 4) never answers here:
+	 * the run's end waited the whole 10 s for it, every time ("failed to send wlan mode request (mode 4): -60", Wi-Fi off
+	 * ~11 s). Linux's ath11k counts a mode "off" whose service went away as done. Boot-arg wifi_off_wait=N (1..10000):
+	 * wait N ms for that answer, then say ENETRESET (hakios.qmi.c ends the transaction with -ENETRESET, ath11k: "WLFW
+	 * service is dis-connected", done). 0, the default: the full 10 s, as before.
+	 */
+	const uint8_t *q = data;
+	if (length >= 14 && q[0] == 0 && ((uint16_t)q[3] | (uint16_t)q[4] << 8) == 0x22 && q[7] == 0x01 &&
+	    ((uint16_t)q[8] | (uint16_t)q[9] << 8) == 4 && ((uint32_t)q[10] | (uint32_t)q[11] << 8 |
+	    (uint32_t)q[12] << 16 | (uint32_t)q[13] << 24) == 4) {
+		uint32_t off_wait = 0;
+
+		PE_parse_boot_argn("wifi_off_wait", &off_wait, sizeof(off_wait));
+		if (off_wait != 0) {
+			off_wait = off_wait > 10000 ? 10000 : off_wait;
+			hakios_tl("UMI Wi-Fi: mode \"off\" asked: its answer waited for at most %u ms (wifi_off_wait)\n", off_wait);
+			return umi_mhi_send_qrtr_packet_unanswered(umi_qrtr.mhi, umi_qrtr_tx_packet, frame_length, off_wait,
+			    transaction);
+		}
+	}
 	error = umi_mhi_send_qrtr_packet(umi_qrtr.mhi, umi_qrtr_tx_packet,
 	    frame_length, 10000, transaction);
 	return error ? error : umi_qrtr_flush_resume();

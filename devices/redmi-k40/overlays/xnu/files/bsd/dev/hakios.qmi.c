@@ -931,6 +931,22 @@ qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_tx
 	}
 	error = s->transport->send(s->port, node, port, buffer, (size_t)length);
 	os_free(buffer, size);
+	if (error == ENETRESET || error == -ENETRESET) {
+		/*
+		 * (2026-11-23) The transport says the request went out and the service went away without an answer (umi_wifi.c:
+		 * the firmware asked for mode "off", wifi_off_wait). Linux's QMI completes such a transaction with -ENETRESET
+		 * when the server goes (DEL_SERVER / BYE), and its callers know that answer -- ath11k's mode "off" takes it as
+		 * done ("WLFW service is dis-connected"). The same here: sent, and the transaction over with -ENETRESET.
+		 */
+		os_lock(&s->lock);
+		if (!txn->done) {
+			txn->result = -ENETRESET;
+			txn->done = true;
+			os_wake(&s->lock, txn);
+		}
+		os_unlock(&s->lock);
+		return 0;
+	}
 	return error > 0 ? -error : error;
 }
 
