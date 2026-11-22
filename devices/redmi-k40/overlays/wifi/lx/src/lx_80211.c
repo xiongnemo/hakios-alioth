@@ -1045,6 +1045,60 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
 }
 
 /*
+ * (2026-11-22, N10b) The data frames received, by how the access point sent them -- encoding (legacy, HT, VHT, HE), MCS,
+ * streams, width, short guard interval -- as the driver describes each: the phone received ~3x slower than it sent
+ * (TCP, the same link), and the rate the access point picks for us is the first suspect. Counted only; said with the
+ * station's summary (lx_station_say).
+ */
+static uint32_t rx_rates[4][16][3][4][2];      /* [encoding][MCS][streams 0 (unknown) .. 2][20, 40, 80, wider][SGI] */
+
+static void
+rx_rate_count(const struct ieee80211_rx_status *status)
+{
+	unsigned enc = status->encoding < 4 ? status->encoding : 3, mcs = status->rate_idx & 15, nss = status->nss < 3 ? status->nss : 2;
+	unsigned bw = status->bw == RATE_INFO_BW_40 ? 1 : status->bw == RATE_INFO_BW_80 ? 2 : status->bw == RATE_INFO_BW_20 ? 0 : 3;
+
+	rx_rates[enc][mcs][nss][bw][(status->enc_flags & RX_ENC_FLAG_SHORT_GI) != 0]++;
+}
+
+static void
+rx_rates_say(void)
+{
+	static const char *const encodings[4] = { "legacy", "HT", "VHT", "HE+" }, *const widths[4] = { "20", "40", "80", ">80" };
+	const uint32_t *count = &rx_rates[0][0][0][0][0];
+	const int cells = (int)(sizeof(rx_rates) / sizeof(*count));
+	int top[6], shown = 0;
+	uint64_t all = 0;
+	char line[512] = "";
+	size_t at = 0;
+
+	/* the six commonest cells, kept in order in one pass */
+	for (int i = 0; i < cells; i++) {
+		int j;
+
+		all += count[i];
+		if (count[i] == 0 || (shown == 6 && count[i] <= count[top[5]])) {
+			continue;
+		}
+		for (j = shown < 6 ? shown++ : 5; j > 0 && count[top[j - 1]] < count[i]; j--) {
+			top[j] = top[j - 1];
+		}
+		top[j] = i;
+	}
+	if (all == 0) {
+		return;
+	}
+	for (int k = 0; k < shown && at < sizeof(line); k++) {
+		int which = top[k];
+
+		at += (size_t)snprintf(line + at, sizeof(line) - at, "%s %s MCS %d, %d stream(s), %s MHz%s: %llu %%", k ? ";" : "",
+		    encodings[which / (16 * 3 * 4 * 2)], which / (3 * 4 * 2) % 16, which / (4 * 2) % 3, widths[which / 2 % 4],
+		    which % 2 ? ", short GI" : "", (unsigned long long)count[which] * 100 / all);
+	}
+	lx_tell("lx: data frames received by rate (%llu):%s\n", (unsigned long long)all, line);
+}
+
+/*
  * A frame the radio has received, with the driver's description behind it (where, how strong,
  * and in which form: an Ethernet frame, or 802.11 as it was on the air).
  */
@@ -1074,6 +1128,7 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	}
 	if (status->flag & RX_FLAG_8023) {
 		radio->group_as_ethernet += skb->len >= 14 && (skb->data[0] & 1);
+		rx_rate_count(status);
 		ethernet_received(radio, skb);
 	} else if (skb->len >= 36 && (skb->data[0] == 0x80 || skb->data[0] == 0x50)) {	/* a beacon, an answer to a probe */
 		heard(radio, skb->data, skb->len, status->freq, status->signal);
@@ -1082,6 +1137,7 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 		management_received(radio, skb->data, skb->len);
 	} else if (to_ethernet(skb, (status->flag & RX_FLAG_IV_STRIPPED) != 0)) {
 		radio->group_as_80211 += skb->data[0] & 1;
+		rx_rate_count(status);
 		ethernet_received(radio, skb);
 	} else {
 		radio->others++;
@@ -2353,6 +2409,7 @@ lx_station_say(void)
 		    (lx_os_nanoseconds() - radio->joined_at) / 1000000000ull : 0, radio->sent, radio->sent_lost, radio->received,
 		    radio->received_group, radio->received_broadcast, radio->group_as_ethernet, radio->group_as_80211,
 		    radio->data_not_taken, radio->eapol, radio->rekeys, radio->ba_sessions, radio->ba_refused);
+		rx_rates_say();
 		lx_rx_errors();
 	}
 }

@@ -485,9 +485,16 @@ cmd_udp(int udp_port, int seconds)
  * (source: what goes out) until the other side closes or SECONDS have passed, and says how many bytes in how long.
  * tools/wifi-tput.py is the other side, on the computer.
  */
+/*
+ * (N10b) ... [KB]: the socket's buffer for the way it streams (SO_RCVBUF for the sink, SO_SNDBUF for the source) set
+ * to KB before the connection -- whether the window is what holds a direction back; the buffer as it was when the
+ * connection came and when it ended (TCP's autotuning grows it) is said either way.
+ */
 static void
-cmd_tcp_rate(const char *name, int tcp_port, int seconds, int sending)
+cmd_tcp_rate(const char *name, int tcp_port, int seconds, int sending, int buf_kb)
 {
+	int which = sending ? SO_SNDBUF : SO_RCVBUF, buf_start = 0, buf_end = 0;
+	socklen_t buf_len = sizeof(int);
 	struct sockaddr_in at = { .sin_len = sizeof(at), .sin_family = AF_INET, .sin_port = htons((uint16_t)tcp_port) };
 	int s = socket(AF_INET, SOCK_STREAM, 0), on = 1, c = -1;
 	struct timeval wait = { .tv_sec = seconds > 0 ? seconds : 1 };
@@ -502,6 +509,13 @@ cmd_tcp_rate(const char *name, int tcp_port, int seconds, int sending)
 		return;
 	}
 	(void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	if (buf_kb > 0) {
+		int bytes = buf_kb * 1024;
+
+		if (setsockopt(s, SOL_SOCKET, which, &bytes, sizeof(bytes)) != 0) {
+			out("%s: %s %d KB: %s\n", name, sending ? "SO_SNDBUF" : "SO_RCVBUF", buf_kb, strerror(errno));
+		}
+	}
 	if (bind(s, (struct sockaddr *)&at, sizeof(at)) != 0 || listen(s, 1) != 0) {
 		out("%s: port %d: %s\n", name, tcp_port, strerror(errno));
 		close(s);
@@ -523,6 +537,7 @@ cmd_tcp_rate(const char *name, int tcp_port, int seconds, int sending)
 		(void)setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 		(void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &stall, sizeof(stall));
 		(void)setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &stall, sizeof(stall));
+		(void)getsockopt(c, SOL_SOCKET, which, &buf_start, &buf_len);
 	}
 	memset(buf, 0, sizeof(buf));
 	clock_gettime(CLOCK_MONOTONIC, &began);
@@ -539,10 +554,13 @@ cmd_tcp_rate(const char *name, int tcp_port, int seconds, int sending)
 		}
 	}
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	buf_len = sizeof(int);
+	(void)getsockopt(c, SOL_SOCKET, which, &buf_end, &buf_len);
 	close(c);
 	ms = (long)((now.tv_sec - began.tv_sec) * 1000 + (now.tv_nsec - began.tv_nsec) / 1000000);
-	out("%s: %lld bytes %s in %ld ms = %.2f MB/s (%.1f Mbit/s)\n", name, bytes, sending ? "sent" : "received", ms,
-	    ms > 0 ? (double)bytes / 1048576.0 * 1000.0 / ms : 0.0, ms > 0 ? (double)bytes * 8.0 / 1000.0 / ms : 0.0);
+	out("%s: %lld bytes %s in %ld ms = %.2f MB/s (%.1f Mbit/s); %s %d KB at the start, %d KB at the end\n", name, bytes,
+	    sending ? "sent" : "received", ms, ms > 0 ? (double)bytes / 1048576.0 * 1000.0 / ms : 0.0,
+	    ms > 0 ? (double)bytes * 8.0 / 1000.0 / ms : 0.0, sending ? "SO_SNDBUF" : "SO_RCVBUF", buf_start / 1024, buf_end / 1024);
 }
 
 /*
@@ -573,7 +591,7 @@ help(void)
 	out("usbsh: commands over USB, run on iOS\n"
 	    "  ls [DIR]  cat FILE  b64 FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
 	    "  fill FILE MB (0: remove it)  udp PORT SECONDS  dmesg (the kernel's message buffer)\n"
-	    "  tcpsink PORT SECONDS / tcpsource PORT SECONDS (one connection: bytes in / out, MB/s)\n"
+	    "  tcpsink PORT SECONDS [KB] / tcpsource PORT SECONDS [KB] (one connection: bytes in / out, MB/s; KB: its buffer)\n"
 	    "  anything else: a program and its arguments; names are looked for in\n"
 	    "  /redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec -- e.g. battery_test, vol_ls /, net_test\n"
 	    "  Ctrl-C interrupts a program; 'log' gives the port back to the kernel's log\n");
@@ -694,7 +712,7 @@ execute(char *line)
 	} else if (!strcmp(argv[0], "udp") && argc > 2) {
 		cmd_udp(atoi(argv[1]), atoi(argv[2]));
 	} else if ((!strcmp(argv[0], "tcpsink") || !strcmp(argv[0], "tcpsource")) && argc > 2) {
-		cmd_tcp_rate(argv[0], atoi(argv[1]), atoi(argv[2]), argv[0][3] == 's' && argv[0][4] == 'o');
+		cmd_tcp_rate(argv[0], atoi(argv[1]), atoi(argv[2]), argv[0][3] == 's' && argv[0][4] == 'o', argc > 3 ? atoi(argv[3]) : 0);
 	} else if (!strcmp(argv[0], "dmesg")) {
 		cmd_dmesg();
 	} else if (!strcmp(argv[0], "uname")) {
