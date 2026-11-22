@@ -480,6 +480,72 @@ cmd_udp(int udp_port, int seconds)
 }
 
 /*
+ * (2026-11-22) tcpsink PORT SECONDS / tcpsource PORT SECONDS: Wi-Fi's throughput, end to end. The phone listens on a TCP
+ * port for one connection (for at most SECONDS), then reads and drops everything (sink: what comes in) or sends zeros
+ * (source: what goes out) until the other side closes or SECONDS have passed, and says how many bytes in how long.
+ * tools/wifi-tput.py is the other side, on the computer.
+ */
+static void
+cmd_tcp_rate(const char *name, int tcp_port, int seconds, int sending)
+{
+	struct sockaddr_in at = { .sin_len = sizeof(at), .sin_family = AF_INET, .sin_port = htons((uint16_t)tcp_port) };
+	int s = socket(AF_INET, SOCK_STREAM, 0), on = 1, c = -1;
+	struct timeval wait = { .tv_sec = seconds > 0 ? seconds : 1 };
+	struct timespec began, now;
+	static char buf[65536];
+	long long bytes = 0;
+	fd_set ready;
+	long ms;
+
+	if (s < 0) {
+		out("%s: socket: %s\n", name, strerror(errno));
+		return;
+	}
+	(void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	if (bind(s, (struct sockaddr *)&at, sizeof(at)) != 0 || listen(s, 1) != 0) {
+		out("%s: port %d: %s\n", name, tcp_port, strerror(errno));
+		close(s);
+		return;
+	}
+	out("%s: listening on port %d for %d s\n", name, tcp_port, seconds);
+	FD_ZERO(&ready);
+	FD_SET(s, &ready);
+	if (select(s + 1, &ready, NULL, NULL, &wait) <= 0 || (c = accept(s, NULL, NULL)) < 0) {
+		out("%s: nobody came\n", name);
+		close(s);
+		return;
+	}
+	close(s);
+	{
+		/* (a peer that goes away must not kill the shell with SIGPIPE, nor one that stalls hold it for ever) */
+		struct timeval stall = { .tv_sec = 3 };
+
+		(void)setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+		(void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &stall, sizeof(stall));
+		(void)setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &stall, sizeof(stall));
+	}
+	memset(buf, 0, sizeof(buf));
+	clock_gettime(CLOCK_MONOTONIC, &began);
+	for (;;) {
+		ssize_t n = sending ? write(c, buf, sizeof(buf)) : read(c, buf, sizeof(buf));
+
+		if (n <= 0) {
+			break;
+		}
+		bytes += n;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec - began.tv_sec >= seconds) {
+			break;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	close(c);
+	ms = (long)((now.tv_sec - began.tv_sec) * 1000 + (now.tv_nsec - began.tv_nsec) / 1000000);
+	out("%s: %lld bytes %s in %ld ms = %.2f MB/s (%.1f Mbit/s)\n", name, bytes, sending ? "sent" : "received", ms,
+	    ms > 0 ? (double)bytes / 1048576.0 * 1000.0 / ms : 0.0, ms > 0 ? (double)bytes * 8.0 / 1000.0 / ms : 0.0);
+}
+
+/*
  * The kernel's message buffer as it is now -- what printf() and IOLog() wrote, oldest first -- during the run: the loader
  * gets it only when the kernel is back, and it holds about 16 minutes of a game (2026-11-03: the minute that mattered
  * had gone round). tools/klog-pull.py takes it every 2 minutes over the network, so a long run keeps all of it and one
@@ -507,6 +573,7 @@ help(void)
 	out("usbsh: commands over USB, run on iOS\n"
 	    "  ls [DIR]  cat FILE  b64 FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
 	    "  fill FILE MB (0: remove it)  udp PORT SECONDS  dmesg (the kernel's message buffer)\n"
+	    "  tcpsink PORT SECONDS / tcpsource PORT SECONDS (one connection: bytes in / out, MB/s)\n"
 	    "  anything else: a program and its arguments; names are looked for in\n"
 	    "  /redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec -- e.g. battery_test, vol_ls /, net_test\n"
 	    "  Ctrl-C interrupts a program; 'log' gives the port back to the kernel's log\n");
@@ -626,6 +693,8 @@ execute(char *line)
 		cmd_fill(argv[1], atol(argv[2]));
 	} else if (!strcmp(argv[0], "udp") && argc > 2) {
 		cmd_udp(atoi(argv[1]), atoi(argv[2]));
+	} else if ((!strcmp(argv[0], "tcpsink") || !strcmp(argv[0], "tcpsource")) && argc > 2) {
+		cmd_tcp_rate(argv[0], atoi(argv[1]), atoi(argv[2]), argv[0][3] == 's' && argv[0][4] == 'o');
 	} else if (!strcmp(argv[0], "dmesg")) {
 		cmd_dmesg();
 	} else if (!strcmp(argv[0], "uname")) {
