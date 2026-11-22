@@ -598,6 +598,42 @@ vendor_element(const uint8_t *elements, unsigned length, const uint8_t *begins)
 	return (NULL);
 }
 
+/* An extension element (255) with that extension number (802.11-2020 9.4.2.1): HE capabilities 35, HE operation 36. */
+static const uint8_t *
+ext_element(const uint8_t *elements, unsigned length, unsigned extension)
+{
+	for (unsigned at = 0; at + 2 <= length && at + 2 + elements[at + 1] <= length; at += 2 + elements[at + 1]) {
+		if (elements[at] == 255 && elements[at + 1] >= 1 && elements[at + 2] == extension) {
+			return (elements + at);
+		}
+	}
+	return (NULL);
+}
+
+/*
+ * (2026-11-23, N10c) Boot-arg wifi_he=1: HE (802.11ax, Wi-Fi 6) where the access point has it -- the home one does,
+ * and the phone's own Android links to it at 1200 Mbit/s (HE, 2 streams, 80 MHz) where we joined as VHT (867). The
+ * driver's HE capabilities for a station, from its band's interface-type data; NULL without wifi_he or without them.
+ */
+static const struct ieee80211_sta_he_cap *
+station_he_cap(const struct ieee80211_supported_band *band)
+{
+	if (!lx_os_option("wifi_he") || band == NULL) {
+		return (NULL);
+	}
+	for (int i = 0; i < band->n_iftype_data; i++) {
+		const struct ieee80211_sband_iftype_data *data = &band->iftype_data[i];
+
+		if ((data->types_mask & BIT(NL80211_IFTYPE_STATION)) && data->he_cap.has_he) {
+			return (&data->he_cap);
+		}
+	}
+	return (NULL);
+}
+#define HE_PHY0_160_5G          0x08    /* HE PHY capabilities, byte 0: 160 MHz in 5 GHz */
+#define HE_PHY0_80P80_5G        0x10    /* ... 80+80 MHz in 5 GHz */
+#define HE_PHY6_PPE             0x80    /* byte 6: PPE thresholds follow the MCS maps */
+
 static const uint8_t wmm[4] = { 0x00, 0x50, 0xf2, 0x02 };	/* Microsoft's, which is how WMM is announced */
 
 /* ---- what the radio hears -------------------------------------------------------------------------- */
@@ -1481,6 +1517,46 @@ station_abilities(struct lx_radio *radio, const uint8_t *elements, unsigned leng
 		vht->cap = e[2] | e[3] << 8 | e[4] << 16 | (uint32_t)e[5] << 24;
 		memcpy(&vht->vht_mcs, e + 6, sizeof(vht->vht_mcs));
 	}
+	/*
+	 * wifi_he=1: the access point's HE capabilities (extension 35: MAC 6, PHY 11, then the MCS maps -- 80 MHz always,
+	 * 160 and 80+80 when its PHY byte 0 says so -- then PPE thresholds when byte 6 says so) for the driver's peer
+	 * (mac.c: ath11k_peer_assoc_h_he()), and its HE operation (extension 36: parameters 3 bytes + the BSS colour byte)
+	 * for the interface's HE state.
+	 */
+	sta->deflink.he_cap.has_he = false;
+	conf->he_support = false;
+	if (station_he_cap(band) != NULL && (e = ext_element(elements, length, 35)) != NULL && e[1] >= 1 + 6 + 11 + 4) {
+		struct ieee80211_sta_he_cap *he = &sta->deflink.he_cap;
+		const uint8_t *p = e + 3, *end = e + 2 + e[1];
+		const uint8_t *maps = p + 17;
+
+		memset(he, 0, sizeof(*he));
+		he->has_he = true;
+		memcpy(he->he_cap_elem.mac_cap_info, p, 6);
+		memcpy(he->he_cap_elem.phy_cap_info, p + 6, 11);
+		memcpy(&he->he_mcs_nss_supp.rx_mcs_80, maps, 2);
+		memcpy(&he->he_mcs_nss_supp.tx_mcs_80, maps + 2, 2);
+		maps += 4;
+		if ((p[6] & HE_PHY0_160_5G) && maps + 4 <= end) {
+			memcpy(&he->he_mcs_nss_supp.rx_mcs_160, maps, 2);
+			memcpy(&he->he_mcs_nss_supp.tx_mcs_160, maps + 2, 2);
+			maps += 4;
+		}
+		if ((p[6] & HE_PHY0_80P80_5G) && maps + 4 <= end) {
+			memcpy(&he->he_mcs_nss_supp.rx_mcs_80p80, maps, 2);
+			memcpy(&he->he_mcs_nss_supp.tx_mcs_80p80, maps + 2, 2);
+			maps += 4;
+		}
+		if ((p[6 + 6] & HE_PHY6_PPE) && maps < end) {
+			memcpy(he->ppe_thres, maps, MIN((size_t)(end - maps), sizeof(he->ppe_thres)));
+		}
+		if ((e = ext_element(elements, length, 36)) != NULL && e[1] >= 1 + 4) {
+			conf->he_support = true;
+			conf->he_oper.params = (uint32_t)e[3] | (uint32_t)e[4] << 8 | (uint32_t)e[5] << 16 | (uint32_t)e[6] << 24;
+			conf->he_bss_color.color = e[6] & 0x3f;
+			conf->he_bss_color.enabled = (e[6] & 0x80) == 0;
+		}
+	}
 	if ((e = element(elements, length, 61)) != NULL && e[1] >= 22) {	/* HT operation: the protection in use */
 		conf->ht_operation_mode = (uint16_t)(e[4] | e[5] << 8);
 	}
@@ -1588,6 +1664,32 @@ request_elements(struct lx_radio *radio, uint8_t *out)
 		at[3] = (uint8_t)(band->vht_cap.cap >> 24);
 		memcpy(at + 4, &band->vht_cap.vht_mcs, sizeof(band->vht_cap.vht_mcs));
 		at += 12;
+	}
+	{
+		/*
+		 * wifi_he=1 (see station_he_cap()): our HE capabilities where the access point offers HE -- the driver's own,
+		 * less 160 / 80+80 MHz (this radio does 80) and less the PPE thresholds (optional: the access point then pads
+		 * as nominal), so the 80 MHz MCS maps are all that follow.
+		 */
+		const struct ieee80211_sta_he_cap *he = station_he_cap(band);
+
+		if (he != NULL && ext_element(target->elements, target->elements_length, 35) != NULL) {
+			uint8_t phy[11];
+
+			memcpy(phy, he->he_cap_elem.phy_cap_info, sizeof(phy));
+			phy[0] &= (uint8_t)~(HE_PHY0_160_5G | HE_PHY0_80P80_5G);
+			phy[6] &= (uint8_t)~HE_PHY6_PPE;
+			*at++ = 255;
+			*at++ = 1 + 6 + 11 + 4;
+			*at++ = 35;
+			memcpy(at, he->he_cap_elem.mac_cap_info, 6);
+			memcpy(at + 6, phy, sizeof(phy));
+			memcpy(at + 17, &he->he_mcs_nss_supp.rx_mcs_80, 2);
+			memcpy(at + 19, &he->he_mcs_nss_supp.tx_mcs_80, 2);
+			at += 21;
+			lx_tell("lx: our HE capabilities go with it (wifi_he): receive MCS map (80 MHz) %#06x\n",
+			    (unsigned)le16_to_cpu(he->he_mcs_nss_supp.rx_mcs_80));
+		}
 	}
 	if (vendor_element(target->elements, target->elements_length, wmm) != NULL) {
 		memcpy(at, "\xdd\x07\x00\x50\xf2\x02\x00\x01\x00", 9);
