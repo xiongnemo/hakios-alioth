@@ -38,6 +38,10 @@ extern void             psci_processor_idle(void *cpu_id, boolean_t enter, uint6
 /* PSCI CPU_SUSPEND (64-bit) with POWER_STATE, entering the kernel again at phys(LowResetVectorBase) through the
    core's cpu_reset_handler (resume_idle_cpu) when it was powered down; the status when it was not */
 extern int64_t          psci_cpu_suspend(uint32_t power_state);
+/* the K40's rail power collapse in idle (psci_smp.c): set-up started by the platform (boot-arg cpu_suspend=MASK),
+   and its counters as text (kern.hakios.cpuidle) */
+extern void             psci_idle_start(void);
+extern size_t           psci_idle_text(char *buf, size_t size);
 
 /* osfmk/arm64/gic_v3_irq.c */
 extern void             gic_v3_irq_signal(uint32_t phys_id);

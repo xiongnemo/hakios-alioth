@@ -60,6 +60,30 @@ kthreads_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern_hakios, OID_AUTO, kthreads, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, kthreads_sysctl,
     "A", "every kernel thread: id, context switches, CPU time in us, priority, name");
 
+/* kern.hakios.cpuidle (11-22, WEEK-1121 P5b): rail power collapse in idle (cpu_suspend=MASK), per core */
+extern void psci_idle_start(void);                              /* osfmk/arm64/psci_smp.c */
+extern size_t psci_idle_text(char *buf, size_t size);
+
+static int
+cpuidle_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const size_t size = 4096;
+	char *buf = kalloc_data(size, Z_WAITOK | Z_ZERO);
+	size_t n;
+	int error;
+
+	if (buf == NULL) {
+		return ENOMEM;
+	}
+	n = psci_idle_text(buf, size);
+	error = SYSCTL_OUT(req, buf, n + 1);
+	kfree_data(buf, size);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, cpuidle, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, cpuidle_sysctl,
+    "A", "cores powered down in idle: entries, not entered, back from reset, broadcast wake-ups, lateness");
+
 /* kern.hakios.psci (11-22, WEEK-1121 P5): the firmware's PSCI version and idle features, asked when read (psci_probe=1) */
 extern size_t hakios_psci_probe_text(char *buf, size_t size);   /* osfmk/arm64/loader_return.c */
 
@@ -933,6 +957,7 @@ hakios_cpufreq_init(void)
 	uint32_t enabled = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 
 	load_start();
+	psci_idle_start();              /* (boot-arg cpu_suspend=MASK: cores powered down in idle; nothing without it) */
 	enabled = 2;
 	PE_parse_boot_argn("ddr", &enabled, sizeof(enabled));
 	if (enabled == 1) {

@@ -43,6 +43,11 @@
 #include <arm/machine_routines.h>
 #include <arm64/proc_reg.h>
 #include <arm64/psci_smp.h>
+#include <kern/processor.h>
+#include <kern/sched_prim.h>
+#include <kern/simple_lock.h>
+#include <kern/thread.h>
+#include <kern/timer_queue.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
@@ -420,6 +425,304 @@ int64_t
 psci_cpu_suspend(uint32_t power_state)
 {
 	return psci_call(PSCI_CPU_SUSPEND_64, power_state, ml_static_vtop((vm_offset_t)&LowResetVectorBase), 0);
+}
+
+/*
+ * ---- The K40's cores in rail power collapse (SM8250, 11-22; work/research/psci-idle.md) ---------------------
+ *
+ * boot-arg cpu_suspend=MASK: the cores whose bit is set (physical index = MPIDR Aff1; never the boot core) power
+ * down in idle -- PSCI power_state 0x40000004, "rail-pc" in the phone's qcom,lpm-levels (is-reset,
+ * use-broadcast-timer) -- when their next timer is at least cpu_suspend_min microseconds away (10000; rail-pc's
+ * own minimum residency is 3934 us silver, 4488 gold). The core's generic timer stops down there, so its deadline
+ * goes to the QTimer's frame 0 (0x17c21000, "arm,armv7-timer-mem" in the phone's tree; Linux's broadcast timer
+ * too), whose interrupt (SPI 8 physical / SPI 6 virtual) is routed to the boot core, which wakes the sleeper with
+ * an IPI. The deadline is taken early by the state's exit latency (531 us silver, 1061 gold). A core that comes
+ * back through reset gets its GIC CPU interface and its own timer again (psci_idle_hook(FALSE)).
+ * Counters: kern.hakios.cpuidle (psci_idle_text()). Without the boot-arg none of this runs.
+ */
+#define IDLE_CORES              8
+#define IDLE_STATE_RAIL_PC      0x40000004u
+#define QTIMER_CTL_PHYS         0x17c20000ull           /* CNTCTLBase */
+#define QTIMER_FRAME0_PHYS      0x17c21000ull           /* CNTBase of frame 0 */
+#define QT_CNTNSAR              0x004
+#define QT_CNTTIDR              0x008
+#define QT_CNTACR0              0x040
+#define QT_CNTPCT_LO            0x000
+#define QT_CNTPCT_HI            0x004
+#define QT_CNTVCT_LO            0x008
+#define QT_CNTVCT_HI            0x00c
+#define QT_CNTP_CVAL_LO         0x020
+#define QT_CNTP_CVAL_HI         0x024
+#define QT_CNTP_CTL             0x02c
+#define QT_CNTV_CVAL_LO         0x030
+#define QT_CNTV_CVAL_HI         0x034
+#define QT_CNTV_CTL             0x03c
+#define QT_CTL_ENABLE           1u
+#define QT_CTL_IMASK            2u
+#define QT_ACR_RPCT             (1u << 0)
+#define QT_ACR_RVCT             (1u << 1)
+#define QT_ACR_RWVT             (1u << 4)
+#define QT_ACR_RWPT             (1u << 5)
+#define QTIMER_INTID_PHYS       (32 + 8)
+#define QTIMER_INTID_VIRT       (32 + 6)
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+
+static struct {
+	uint32_t        mask, boot_core, intid;
+	bool            virt;                           /* frame 0's virtual timer (its physical one is not ours) */
+	vm_offset_t     frame;
+	uint64_t        offset;                         /* the frame's count - mach_absolute_time() */
+	uint64_t        min_ticks, exit_ticks[IDLE_CORES];
+	int             cpu_of[IDLE_CORES];             /* kernel cpu number of a physical core, -1 none */
+	uint64_t        want[IDLE_CORES];               /* a sleeper's wake-up (absolute time), 0 none */
+	uint64_t        pop[IDLE_CORES];                /* ... and the deadline it was for */
+	volatile uint32_t down[IDLE_CORES];             /* set before CPU_SUSPEND; still set in hook(FALSE) = reset */
+	uint64_t        entries[IDLE_CORES], not_entered[IDLE_CORES], resumed[IDLE_CORES], too_soon[IDLE_CORES];
+	uint64_t        ipis[IDLE_CORES], late_sum_us[IDLE_CORES], late_max_us[IDLE_CORES];
+	int64_t         last_status[IDLE_CORES];
+	uint64_t        fired;
+	const char      *why;                           /* why it is not running, if it is not */
+} idle;
+decl_simple_lock_data(static, idle_lock);
+
+static inline uint32_t
+qt_read(uint32_t reg)
+{
+	return *(volatile uint32_t *)(idle.frame + reg);
+}
+
+static inline void
+qt_write(uint32_t reg, uint32_t value)
+{
+	*(volatile uint32_t *)(idle.frame + reg) = value;
+}
+
+static uint64_t
+qt_count(void)
+{
+	uint32_t lo_reg = idle.virt ? QT_CNTVCT_LO : QT_CNTPCT_LO, hi, lo;
+
+	do {
+		hi = qt_read(lo_reg + 4);
+		lo = qt_read(lo_reg);
+	} while (hi != qt_read(lo_reg + 4));
+	return (uint64_t)hi << 32 | lo;
+}
+
+/* the QTimer at the earliest sleeper's wake-up, or off (masked: a level interrupt quieted). idle_lock held. */
+static void
+qt_arm_locked(void)
+{
+	uint32_t ctl = idle.virt ? QT_CNTV_CTL : QT_CNTP_CTL, cval = idle.virt ? QT_CNTV_CVAL_LO : QT_CNTP_CVAL_LO;
+	uint64_t next = UINT64_MAX;
+
+	for (int i = 0; i < IDLE_CORES; i++) {
+		if (idle.want[i] != 0 && idle.want[i] < next) {
+			next = idle.want[i];
+		}
+	}
+	qt_write(ctl, QT_CTL_IMASK);
+	if (next != UINT64_MAX) {
+		next += idle.offset;
+		qt_write(cval, (uint32_t)next);
+		qt_write(cval + 4, (uint32_t)(next >> 32));
+		qt_write(ctl, QT_CTL_ENABLE);
+	}
+	__builtin_arm_dsb(DSB_SY);
+}
+
+/* the QTimer's interrupt, on the boot core: every sleeper whose wake-up has come gets an IPI */
+static void
+qt_fired(__unused void *context, __unused uint32_t intid)
+{
+	uint32_t wake = 0;
+	uint64_t now;
+
+	simple_lock(&idle_lock, LCK_GRP_NULL);
+	now = mach_absolute_time();
+	idle.fired++;
+	for (int i = 0; i < IDLE_CORES; i++) {
+		if (idle.want[i] != 0 && idle.want[i] <= now + idle.exit_ticks[i] / 8) {
+			idle.want[i] = 0;
+			idle.ipis[i]++;
+			wake |= 1u << i;
+		}
+	}
+	qt_arm_locked();
+	simple_unlock(&idle_lock);
+	for (int i = 0; i < IDLE_CORES; i++) {
+		if ((wake & (1u << i)) && idle.cpu_of[i] >= 0) {
+			(void) cpu_signal(cpu_datap(idle.cpu_of[i]), SIGPnop, NULL, NULL);
+		}
+	}
+}
+
+/* cpu_idle()'s notifier (psci_processor_idle()): interrupts are off */
+static void
+idle_hook(boolean_t enter)
+{
+	cpu_data_t *cdp = getCpuDatap();
+	uint32_t core = (uint32_t)(cdp->cpu_phys_id >> 8) & 0xff;
+	uint64_t now, pop;
+
+	if (core >= IDLE_CORES) {
+		return;
+	}
+	if (!enter) {
+		if (idle.down[core] == 0) {
+			return;
+		}
+		/* back through reset: the CPU interface and this core's own timer were lost */
+		idle.down[core] = 0;
+		gic_v3_irq_cpu_resume();
+		now = mach_absolute_time();
+		simple_lock(&idle_lock, LCK_GRP_NULL);
+		idle.resumed[core]++;
+		if (idle.pop[core] != 0 && now > idle.pop[core]) {
+			uint64_t late_us;
+
+			absolutetime_to_nanoseconds(now - idle.pop[core], &late_us);
+			late_us /= NSEC_PER_USEC;
+			idle.late_sum_us[core] += late_us;
+			idle.late_max_us[core] = late_us > idle.late_max_us[core] ? late_us : idle.late_max_us[core];
+		}
+		idle.want[core] = idle.pop[core] = 0;
+		qt_arm_locked();
+		simple_unlock(&idle_lock);
+		cdp->rtcPop = 0;                /* (timer_resync_deadlines sets the timer only if this differs) */
+		timer_resync_deadlines();
+		return;
+	}
+	if (!(idle.mask & (1u << core)) || core == idle.boot_core) {
+		return;
+	}
+	now = mach_absolute_time();
+	pop = cdp->rtcPop;
+	if (pop != EndOfAllTime && pop < now + idle.min_ticks) {
+		idle.too_soon[core]++;
+		return;
+	}
+	simple_lock(&idle_lock, LCK_GRP_NULL);
+	idle.pop[core] = pop == EndOfAllTime ? 0 : pop;
+	idle.want[core] = pop == EndOfAllTime ? 0 : pop - idle.exit_ticks[core];
+	idle.entries[core]++;
+	qt_arm_locked();
+	simple_unlock(&idle_lock);
+	idle.down[core] = 1;
+	__builtin_arm_dsb(DSB_SY);
+	idle.last_status[core] = psci_cpu_suspend(IDLE_STATE_RAIL_PC);
+	/* returned: it did not go down (an interrupt pending, or refused) */
+	idle.down[core] = 0;
+	simple_lock(&idle_lock, LCK_GRP_NULL);
+	idle.not_entered[core]++;
+	idle.want[core] = idle.pop[core] = 0;
+	qt_arm_locked();
+	simple_unlock(&idle_lock);
+}
+
+/* set-up, on a thread bound to the boot processor (the QTimer's SPI is routed to the core that attaches it) */
+static void
+idle_setup(__unused void *arg, __unused wait_result_t wr)
+{
+	vm_offset_t ctl;
+	uint32_t acr, nsar, us = 10000;
+	uint64_t a, b, c;
+
+	thread_bind(master_processor);
+	thread_block(THREAD_CONTINUE_NULL);
+	ctl = ml_io_map(QTIMER_CTL_PHYS, PAGE_SIZE);
+	idle.frame = ml_io_map(QTIMER_FRAME0_PHYS, PAGE_SIZE);
+	if (ctl == 0 || idle.frame == 0) {
+		idle.why = "the QTimer could not be mapped";
+		goto out;
+	}
+	nsar = *(volatile uint32_t *)(ctl + QT_CNTNSAR);
+	acr = *(volatile uint32_t *)(ctl + QT_CNTACR0);
+	printf("psci idle: QTimer CNTNSAR 0x%x CNTTIDR 0x%x CNTACR0 0x%x\n", nsar,
+	    *(volatile uint32_t *)(ctl + QT_CNTTIDR), acr);
+	if ((acr & (QT_ACR_RPCT | QT_ACR_RWPT)) == (QT_ACR_RPCT | QT_ACR_RWPT)) {
+		idle.virt = false;
+		idle.intid = QTIMER_INTID_PHYS;
+	} else if ((acr & (QT_ACR_RVCT | QT_ACR_RWVT)) == (QT_ACR_RVCT | QT_ACR_RWVT)) {
+		idle.virt = true;
+		idle.intid = QTIMER_INTID_VIRT;
+	} else {
+		idle.why = "frame 0's timers are not ours (CNTACR0)";
+		goto out;
+	}
+	a = mach_absolute_time();
+	c = qt_count();
+	b = mach_absolute_time();
+	idle.offset = c - (a + (b - a) / 2);
+	PE_parse_boot_argn("cpu_suspend_min", &us, sizeof(us));
+	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &idle.min_ticks);
+	for (int i = 0; i < IDLE_CORES; i++) {
+		idle.cpu_of[i] = -1;
+		nanoseconds_to_absolutetime((i < 4 ? 531 : 1061) * NSEC_PER_USEC, &idle.exit_ticks[i]);
+	}
+	for (int n = 0; n <= ml_get_max_cpu_number(); n++) {
+		cpu_data_t *cdp = cpu_datap(n);
+
+		if (cdp != NULL && ((cdp->cpu_phys_id >> 8) & 0xff) < IDLE_CORES) {
+			idle.cpu_of[(cdp->cpu_phys_id >> 8) & 0xff] = n;
+		}
+	}
+	idle.boot_core = (uint32_t)(cpu_datap(master_cpu)->cpu_phys_id >> 8) & 0xff;
+	simple_lock_init(&idle_lock, 0);
+	simple_lock(&idle_lock, LCK_GRP_NULL);
+	qt_arm_locked();                        /* (off) */
+	simple_unlock(&idle_lock);
+	if (gic_v3_spi_attach(idle.intid, false, qt_fired, NULL) != KERN_SUCCESS) {
+		idle.why = "the QTimer's interrupt could not be attached";
+		goto out;
+	}
+	os_atomic_thread_fence(release);
+	psci_idle_hook = idle_hook;
+	printf("psci idle: cores 0x%x power down in idle (rail-pc 0x%x) when their next timer is %u us away; boot core %u "
+	    "never; QTimer frame 0 %s timer (interrupt %u), offset %lld\n", idle.mask & ~(1u << idle.boot_core),
+	    IDLE_STATE_RAIL_PC, us, idle.boot_core, idle.virt ? "virtual" : "physical", idle.intid, (long long)idle.offset);
+out:
+	if (idle.why != NULL) {
+		printf("psci idle: NOT started: %s\n", idle.why);
+	}
+	thread_bind(PROCESSOR_NULL);
+	/* (returning ends the thread: Call_continuation goes on to thread_terminate) */
+}
+
+/* From the platform's start-up (hakios.cpufreq.c), in thread context: starts the set-up if cpu_suspend=MASK. */
+void
+psci_idle_start(void)
+{
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("cpu_suspend", &idle.mask, sizeof(idle.mask)) || idle.mask == 0) {
+		return;
+	}
+	if (kernel_thread_start(idle_setup, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "psci:idle_setup");
+		thread_deallocate(thread);
+	}
+}
+
+/* kern.hakios.cpuidle */
+size_t
+psci_idle_text(char *buf, size_t size)
+{
+	size_t n = 0;
+
+	n += snprintf(buf + n, size - n, "mask 0x%x boot core %u %s, QTimer fired %llu\n", idle.mask, idle.boot_core,
+	    psci_idle_hook != NULL ? "running" : (idle.why ? idle.why : "off"), idle.fired);
+	for (int i = 0; i < IDLE_CORES && n + 1 < size; i++) {
+		if (idle.entries[i] == 0 && idle.too_soon[i] == 0) {
+			continue;
+		}
+		n += snprintf(buf + n, size - n, "core %d: entries %llu not-entered %llu (last status %lld) resumed %llu "
+		    "too-soon %llu ipis %llu late mean %llu max %llu us\n", i, idle.entries[i], idle.not_entered[i],
+		    idle.last_status[i], idle.resumed[i], idle.too_soon[i], idle.ipis[i],
+		    idle.resumed[i] ? idle.late_sum_us[i] / idle.resumed[i] : 0, idle.late_max_us[i]);
+	}
+	return n < size ? n : size - 1;
 }
 
 #endif /* defined(GENERIC_PSCI_SMP) */
