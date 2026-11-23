@@ -153,7 +153,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
 /redwood/lib/libhakios.tweaks.dylib Preferences
-/redwood/lib/libhakios.ui.dylib *.app *.appex"}
+/redwood/lib/libhakios.ui.dylib *.app *.appex
+/redwood/lib/libhakios.at.dylib assistivetouchd"}
 [ "${BLUETOOTH-0}" != 1 ] || INJECT="$INJECT
 /redwood/lib/libhakios.bluetooth.dylib bluetoothd"
 # STOREFRONT=1: and a library of ours inside appstored as well (src/inject_store.c). It is not in the
@@ -309,6 +310,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# not work there (src/inject_ui.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.ui.dylib -lobjc -weak_framework CoreVideo \
 			-o obj/libhakios.ui.dylib src/inject_ui.c
+		# ... and inside assistivetouchd, so that AssistiveTouch's Home presses the home button: iOS presses it
+		# through an IOHIDUserDevice this kernel cannot make (src/inject_at.c; boot-arg at_home=1, off by default)
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.at.dylib -lobjc -o obj/libhakios.at.dylib src/inject_at.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -436,6 +440,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.fairplay.dylib ] && cp obj/libhakios.fairplay.dylib root/lib/
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.ui.dylib ] && cp obj/libhakios.ui.dylib root/lib/
+	[ -f obj/libhakios.at.dylib ] && cp obj/libhakios.at.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
@@ -466,6 +471,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		*) echo "$library $names" ;;
 		esac
 	done > root/etc/inject.conf
+	# (the kernel keeps the list in 512 bytes, its 0 included: a longer one is refused WHOLE -- init says
+	# "kern.exec_inject: error 22", no program gets a library of ours, and backboardd without libhakios.dylib
+	# shows no picture at all: WEEK-1121 run 143130)
+	if [ "$(wc -c < root/etc/inject.conf)" -ge 512 ]; then
+		echo "build.sh: etc/inject.conf is $(wc -c < root/etc/inject.conf) bytes, kern.exec_inject takes 511 at most" >&2
+		exit 1
+	fi
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
 	# points back into /var); point them at the data that ships with the system, and use this machine's zone
