@@ -631,19 +631,33 @@ struct lx_workqueue {
 	char name[24];
 };
 
+/*
+ * (11-23, WEEK-1121 N18) Boot-arg wifi_wq_idle=N (10..5000 ms): an empty queue's thread looks again every N ms instead of
+ * every SLICE_NS -- four queues (ath11k_wq, ath11k_aux_wq, ath11k_qmi_driver_event, wifi-80211) at ~182 wakes a second
+ * each on an idle phone (census 212837), for nothing: work is only ever added by linux_queue_work_on, which wakes the
+ * thread under lx_os_lock, the lock its sleep gives up, so no queueing is missed and the look is a safety net only.
+ * 0 / absent, the default: every 5 ms, the old way.
+ */
 static void
 worker(void *argument)
 {
 	struct lx_workqueue *queue = argument;
 	struct work_struct *work;
+	unsigned idle_ms = lx_os_option("wifi_wq_idle");
+	unsigned long long slice = SLICE_NS;
 
+	if (idle_ms != 0) {
+		idle_ms = idle_ms < 10 ? 10 : idle_ms > 5000 ? 5000 : idle_ms;
+		slice = idle_ms * 1000000ull;
+		lx_tell("lx: queue %s: an empty queue looks again every %u ms (wifi_wq_idle)\n", queue->name, idle_ms);
+	}
 	queue->thread = lx_os_thread_self();
 	for (;;) {
 		lx_os_lock();
 		queue->running = NULL;
 		lx_os_wakeup(&queue->running);
 		while (queue->count == 0) {
-			lx_os_sleep(queue, SLICE_NS);
+			lx_os_sleep(queue, slice);
 		}
 		work = queue->waiting[queue->first];
 		queue->first = (queue->first + 1) % nitems(queue->waiting);
