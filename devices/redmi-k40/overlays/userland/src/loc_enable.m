@@ -209,21 +209,32 @@ photos_version_two(void)
  * LaunchServices' install notes still cut a wait short. Each look lists every application through lsd, so a census
  * of an idle phone wants it rare (11-21, WEEK-1121 P1: loc_poll=600).
  */
+/* the boot-arg NAME=N's N (NAME without the "="), or `otherwise' when it is not there */
 static unsigned
-loc_poll_seconds(void)
+boot_arg_uint(const char *name, unsigned otherwise)
 {
-	char args[1100] = "";
-	size_t n = sizeof(args) - 1;
-	unsigned v = 10;
+	char args[1100] = "", key[64];
+	size_t n = sizeof(args) - 1, k;
+	unsigned v = otherwise;
 
+	snprintf(key, sizeof(key), "%s=", name);
+	k = strlen(key);
 	if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) == 0) {
-		for (char *p = strstr(args, "loc_poll="); p != NULL; p = strstr(p + 1, "loc_poll=")) {
+		for (char *p = strstr(args, key); p != NULL; p = strstr(p + 1, key)) {
 			if (p == args || p[-1] == ' ') {
-				v = (unsigned)strtoul(p + 9, NULL, 10);
+				v = (unsigned)strtoul(p + k, NULL, 10);
 				break;
 			}
 		}
 	}
+	return v;
+}
+
+static unsigned
+loc_poll_seconds(void)
+{
+	unsigned v = boot_arg_uint("loc_poll", 10);
+
 	return v ? v : 10;
 }
 
@@ -241,9 +252,20 @@ allow_all(void)
 	}
 	tcc_everything = YES;
 	HKInstallWatch *watch = [HKInstallWatch new];
+	/*
+	 * (11-24, WEEK-1121 N22) boot-arg loc_photos_v2=0: the Photos rows left as TCCAccessSetForBundleId wrote them (no
+	 * edit, no tccd restart). The restart after the first look is followed by ~8 min of tccd at ~45 % of a core
+	 * (+ locationd ~14 %, launchd ~4 %) on every test boot (logs 051726 / 061348 / 063423: the look itself took ~2 s) --
+	 * is the restart the cost? 1 / absent, the default: edited and restarted, the old way (PhotoKit then sees v2).
+	 */
+	unsigned photos_v2 = boot_arg_uint("loc_photos_v2", 1);
 
 	if (poll != 10) {
 		printf("loc_enable: --all: a look every %u s (loc_poll)\n", poll);
+		fflush(stdout);
+	}
+	if (!photos_v2) {
+		printf("loc_enable: --all: the Photos rows left at version 1, tccd not restarted (loc_photos_v2=0)\n");
 		fflush(stdout);
 	}
 
@@ -269,8 +291,10 @@ allow_all(void)
 				printf("loc_enable: --all: %u more applications allowed everything (%lu in all, look %u)\n", added,
 				    (unsigned long)done.count, round);
 				fflush(stdout);
-				sleep(1);       /* (tccd's writes in first) */
-				photos_version_two();
+				if (photos_v2) {
+					sleep(1);       /* (tccd's writes in first) */
+					photos_version_two();
+				}
 			}
 		}
 		/* (loc_poll s, or until LaunchServices says something was installed: HKInstallWatch stops the run loop) */
