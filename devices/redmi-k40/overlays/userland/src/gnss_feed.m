@@ -229,6 +229,20 @@ struct hk_gnss_time {
 static unsigned seed_for;
 static dispatch_queue_t seed_queue;
 
+/*
+ * Boot-arg gnss_seed_auth=S (11-23, WEEK-1121 N14): from 11-21 on every run's seed was refused -- "authorization is
+ * 0", then "now 2", "now 0", kCLErrorDomain 1 -- where 11-14/15's got 3 at once. The good runs had loc_enable switch
+ * Location Services on long before the seed authorized its bundle; the bad ones within a moment of it, and 11-22's
+ * 123801 went 3 -> 2 -> 0: locationd takes a bundle's authorization back when Location Services were switched on just
+ * before (11-23 run 111658: on, authorized 3, then "now 2", "now 0"). With S: wait up to S seconds for Location
+ * Services to be on before authorizing, and authorize again (SEED_REAUTH times at most) when locationd says the bundle
+ * went back to 0 or 2 while they are on -- in 111658 once: 3 again, and the seed (+-35 m) was given. 0, the default,
+ * is the old way.
+ */
+#define SEED_REAUTH 5
+static unsigned seed_auth;
+static void seed_authorize(const char *why);
+
 static unsigned
 boot_arg_number(const char *name, unsigned otherwise)
 {
@@ -306,24 +320,56 @@ static void seed_stop_because(const char *why);
 
 - (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager
 {
-	say("gnss_feed: seed: the bundle's authorization is now %d\n", (int)manager.authorizationStatus);
+	static unsigned again;
+	int now = (int)manager.authorizationStatus;
+
+	say("gnss_feed: seed: the bundle's authorization is now %d\n", now);
+	if (seed_auth > 0 && (now == 0 || now == 2) && [CLLocationManager locationServicesEnabled] &&
+	    again < SEED_REAUTH) {
+		again++;
+		seed_authorize("it went back (gnss_seed_auth)");
+	}
 }
 
 @end
 
 static HKSeed *seed_source;
 
+/* (on the seed's queue) "always" by type (3) and by the BOOL call, then what locationd says it is */
+static void
+seed_authorize(const char *why)
+{
+	Class cl = [CLLocationManager class];
+	NSString *path = @SEED_BUNDLE;
+	SEL authorize = sel_registerName("setAuthorizationStatus:forBundlePath:");
+	SEL by_type = sel_registerName("setAuthorizationStatusByType:forBundlePath:");
+	SEL status_for = sel_registerName("authorizationStatusForBundlePath:");
+
+	if ([cl respondsToSelector:by_type]) {
+		((void (*)(id, SEL, int, id))objc_msgSend)(cl, by_type, 3, path);
+	}
+	if ([cl respondsToSelector:authorize]) {
+		((void (*)(id, SEL, BOOL, id))objc_msgSend)(cl, authorize, YES, path);
+	}
+	usleep(500000);
+	if ([cl respondsToSelector:status_for]) {
+		say("gnss_feed: seed: locationd says the bundle's authorization is %d (3 always, 4 when in use)%s%s\n",
+		    ((int (*)(id, SEL, id))objc_msgSend)(cl, status_for, path), why ? " -- authorized again: " : "",
+		    why ?: "");
+	}
+}
+
 static void
 seed_start(void)
 {
 	NSString *path = @SEED_BUNDLE;
 	Class cl = [CLLocationManager class];
-	SEL authorize = sel_registerName("setAuthorizationStatus:forBundlePath:");
 	SEL init = sel_registerName("initWithEffectiveBundlePath:delegate:onQueue:");
 	dispatch_queue_t queue = dispatch_queue_create("gnss_feed.seed", DISPATCH_QUEUE_SERIAL);
 
 	seed_queue = queue;
 	seed_for = boot_arg_number("gnss_seed_for", 0);
+	seed_auth = boot_arg_number("gnss_seed_auth", 0);
 	if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
 		say("gnss_feed: seed: no %s: no seed position\n", SEED_BUNDLE);
 		return;
@@ -341,21 +387,20 @@ seed_start(void)
 		 */
 		CLLocationManager *m = ((id (*)(id, SEL, id, id, id))objc_msgSend)([CLLocationManager alloc], init, path,
 		    seed_source, queue);
-		SEL by_type = sel_registerName("setAuthorizationStatusByType:forBundlePath:");
-		SEL status_for = sel_registerName("authorizationStatusForBundlePath:");
 
 		seed_source.manager = m;
-		if ([cl respondsToSelector:by_type]) {
-			((void (*)(id, SEL, int, id))objc_msgSend)(cl, by_type, 3, path);
+		if (seed_auth > 0) {
+			unsigned waited = 0;
+
+			while (![CLLocationManager locationServicesEnabled] && waited < seed_auth * 2) {
+				usleep(500000);
+				waited++;
+			}
+			say("gnss_feed: seed: Location Services %s after %u.%u s (gnss_seed_auth=%u)\n",
+			    [CLLocationManager locationServicesEnabled] ? "on" : "STILL OFF", waited / 2, (waited % 2) * 5,
+			    seed_auth);
 		}
-		if ([cl respondsToSelector:authorize]) {
-			((void (*)(id, SEL, BOOL, id))objc_msgSend)(cl, authorize, YES, path);
-		}
-		usleep(500000);
-		if ([cl respondsToSelector:status_for]) {
-			say("gnss_feed: seed: locationd says the bundle's authorization is %d (3 always, 4 when in use)\n",
-			    ((int (*)(id, SEL, id))objc_msgSend)(cl, status_for, path));
-		}
+		seed_authorize(NULL);
 		m.desiredAccuracy = kCLLocationAccuracyHundredMeters;
 		[m startUpdatingLocation];
 		if (seed_for > 0) {
