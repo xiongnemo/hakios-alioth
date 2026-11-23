@@ -4,6 +4,7 @@
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>                   /* (thread_wakeup: bt_idle, N17) */
 #include <kern/thread.h>
 #include <sys/kauth.h>
 #include <sys/kern_control.h>
@@ -130,6 +131,10 @@ static uint8_t bt_supported_commands[64];
 static uint8_t bt_rx_raw[BT_RX_RAW_SIZE];
 static unsigned bt_rx_head, bt_rx_tail;
 static bool bt_host_awake;
+/* (11-23, WEEK-1121 N17) the controller's own IBS state: true after its SLEEP_IND (0xfe), false at its WAKE_IND (0xfd)
+ * or any packet of its. While it sleeps it cannot send without our WAKE_ACK first (bt_service_ibs), so a worker that
+ * looks less often then loses nothing: see bt_idle in bt_control_worker. */
+static bool bt_peer_asleep;
 static int bt_rx_capture(vm_offset_t uart)
 {
     uint32_t irq=bt_read(uart,0x640);
@@ -156,10 +161,11 @@ static int bt_rx_frame(vm_offset_t uart,uint8_t *frame,unsigned capacity,unsigne
         int result=hakios_bt_h4_push(&bt_rx_packet,byte);
         if(result<0) { hakios_tl("UMI BT: H4 framing error=%d byte=%#x\n",result,byte); memset(&bt_rx_packet,0,sizeof(bt_rx_packet)); return -EILSEQ; }
         if(result==2) {
-            if(byte==0xfd) { bt_ibs_ack_pending=true; bt_ibs_wakes++; }
-            if(byte==0xfe) bt_ibs_sleeps++;
+            if(byte==0xfd) { bt_ibs_ack_pending=true; bt_ibs_wakes++; bt_peer_asleep=false; }
+            if(byte==0xfe) { bt_ibs_sleeps++; bt_peer_asleep=true; }
             if(byte==0xfc) bt_host_awake=true;
         }
+        if(result==1) bt_peer_asleep=false;
         if(result!=1 || (events_only && bt_rx_packet.bytes[0]!=4)) continue;
         if(bt_rx_packet.used>capacity) return -EMSGSIZE;
         *length=bt_rx_packet.used;
@@ -429,6 +435,7 @@ static uint8_t bt_tx_queue[BT_TX_QUEUE_SIZE];
 static unsigned bt_tx_head,bt_tx_tail;
 static bool bt_control_fault;
 static struct termios bt_control_termios;
+static uint32_t bt_kick;                /* (N17) what a waiting worker sleeps on: bytes of the host's queued, a client */
 
 static errno_t bt_control_connect(kern_ctl_ref ref,struct sockaddr_ctl *address,void **info)
 {
@@ -440,6 +447,7 @@ static errno_t bt_control_connect(kern_ctl_ref ref,struct sockaddr_ctl *address,
         bt_control_unit=address->sc_unit;
         bt_control_generation++;
         bt_tx_head=bt_tx_tail=0;
+        thread_wakeup((event_t)&bt_kick);
         *info=NULL;
         hakios_tl("UMI BT: H4 client connected uid=%u unit=%u\n",uid,bt_control_unit);
     }
@@ -451,6 +459,7 @@ static errno_t bt_control_disconnect(kern_ctl_ref ref,uint32_t unit,void *info)
     lck_mtx_lock(&bt_control_lock);
     if(bt_control_unit==unit) {
         bt_control_unit=0; bt_control_generation++; bt_tx_head=bt_tx_tail=0;
+        thread_wakeup((event_t)&bt_kick);
         hakios_tl("UMI BT: H4 client disconnected unit=%u\n",unit);
     }
     lck_mtx_unlock(&bt_control_lock);
@@ -472,6 +481,7 @@ static errno_t bt_control_send(kern_ctl_ref ref,uint32_t unit,void *info,mbuf_t 
         for(size_t i=0;i<count;i++) bt_tx_queue[bt_tx_head++&(BT_TX_QUEUE_SIZE-1)]=bytes[i];
         offset+=count;
     }
+    if(!error && length) thread_wakeup((event_t)&bt_kick);   /* (N17: a worker waiting under bt_idle goes at once) */
     lck_mtx_unlock(&bt_control_lock);
     mbuf_freem(message);
     return error;
@@ -516,6 +526,18 @@ static void bt_control_worker(void *unused,wait_result_t result)
     unsigned commands=0;
     bool waking=false;
     uint64_t wake_deadline=0;
+    /*
+     * (11-23, WEEK-1121 N17) Boot-arg bt_idle=N (1..100): the worker looks at the UART every millisecond -- ~880 wakes a
+     * second on an idle phone (census 192936/194009). While the controller is asleep by IBS (its SLEEP_IND, no WAKE_IND
+     * since: bt_peer_asleep), nothing of ours is queued and nothing is owed, it waits up to N ms instead; the host's
+     * bytes (bt_control_send) or a client coming or going end the wait at once, and the controller's WAKE_IND waits for
+     * our WAKE_ACK, so it is answered at most N ms later. 0 / absent, the default: every millisecond, the old way.
+     */
+    uint32_t idle_ms=0;
+    uint64_t naps=0,looks=0,say_at=0;
+    PE_parse_boot_argn("bt_idle",&idle_ms,sizeof(idle_ms));
+    if(idle_ms>100) idle_ms=100;
+    if(idle_ms) hakios_tl("UMI BT: the worker looks %u ms apart while the controller sleeps (bt_idle)\n",idle_ms);
     for(;;) {
         lck_mtx_lock(&bt_control_lock);
         uint32_t unit=bt_control_unit;
@@ -574,7 +596,27 @@ static void bt_control_worker(void *unused,wait_result_t result)
             int queued=unit?ctl_enqueuedata(bt_control,unit,receive,receive_length,0):ENOTCONN;
             if(queued!=ENOBUFS) receive_length=0;
         }
-        delay(worked ? 20 : 1000);
+        if(idle_ms && !worked && !waking && !tx.complete && !receive_length && !error && bt_peer_asleep &&
+            !bt_ibs_ack_pending) {
+            uint64_t deadline;
+            clock_interval_to_deadline(idle_ms,NSEC_PER_MSEC,&deadline);
+            lck_mtx_lock(&bt_control_lock);
+            /* (under the queue's lock: a send between the look and the sleep wakes it, it is not lost for N ms) */
+            if(bt_tx_head==bt_tx_tail && generation==bt_control_generation) {
+                lck_mtx_sleep_deadline(&bt_control_lock,LCK_SLEEP_DEFAULT,(event_t)&bt_kick,THREAD_UNINT,deadline);
+                naps++;
+            }
+            lck_mtx_unlock(&bt_control_lock);
+        } else {
+            delay(worked ? 20 : 1000);
+            looks++;
+        }
+        if(idle_ms && mach_absolute_time()>=say_at) {
+            if(say_at) hakios_tl("UMI BT: a minute: %llu naps of up to %u ms, %llu short looks; IBS wakes %u sleeps %u (bt_idle)\n",
+                naps,idle_ms,looks,bt_ibs_wakes,bt_ibs_sleeps);
+            naps=looks=0;
+            clock_interval_to_deadline(60,NSEC_PER_SEC,&say_at);
+        }
     }
 }
 static int bt_control_start(vm_offset_t uart)
@@ -686,7 +728,7 @@ static bool bt_hci_probe(vm_offset_t gcc,vm_offset_t gpio,vm_offset_t uart,bool 
     bt_write(uart,0x618,0xffffffff); bt_write(uart,0x648,0xffffffff);
     bt_write(uart,0x630,(1u<<27)|0x80); /* START_READ, RFR_OPEN */
     memset(&bt_rx_packet,0,sizeof(bt_rx_packet));
-    bt_rx_head=bt_rx_tail=0; bt_host_awake=false; bt_ibs_ack_pending=false; bt_ibs_wakes=bt_ibs_sleeps=0;
+    bt_rx_head=bt_rx_tail=0; bt_host_awake=false; bt_ibs_ack_pending=false; bt_ibs_wakes=bt_ibs_sleeps=0; bt_peer_asleep=false;
     uint8_t event[BT_EVENT_MAX]; unsigned length=0;
     error=bt_hci_command(uart,0x0c03,NULL,0,true,event,&length);
     if(!error) error=bt_hci_command(uart,0x1001,NULL,0,true,event,&length);
