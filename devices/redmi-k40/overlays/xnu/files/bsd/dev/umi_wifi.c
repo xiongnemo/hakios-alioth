@@ -10,6 +10,7 @@
 #include <machine/machine_routines.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <pexpert/device_tree.h>
 #include <sys/systm.h>
 #include <sys/hakios.board.h>
@@ -415,7 +416,7 @@ umi_wifi_poll_thread(__unused void *argument)
 	/* boot-arg wifi_idle=N (1..500): N ms between looks after ten quiet ones; 0 / absent: every 1 ms, the old way */
 	uint32_t idle_ms = 0, quiet = 0, seen = umi_poll_received, kicks = umi_poll_kicks;
 
-	PE_parse_boot_argn("wifi_idle", &idle_ms, sizeof(idle_ms));
+	(void)hakios_idle_arg("wifi_idle", &idle_ms, HAKIOS_IDLE_WIFI);
 	idle_ms = idle_ms > 500 ? 500 : idle_ms;
 	if (idle_ms != 0) {
 		hakios_tl("UMI Wi-Fi: the IPC router is looked at %u ms apart after ten quiet looks (wifi_idle)\n", idle_ms);

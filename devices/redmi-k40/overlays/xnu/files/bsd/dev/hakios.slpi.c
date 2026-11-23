@@ -23,6 +23,7 @@
 #include <mach/vm_param.h>
 #include <vm/memory_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <sys/dirent.h>
 #include <sys/errno.h>
 #include <sys/kauth.h>
@@ -3871,7 +3872,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	bool gave_up = false;
 	uint32_t idle_ms = 0, quiet = 0, kicks = link_kick, rings = doorbell.glink + doorbell.smp2p;
 
-	PE_parse_boot_argn("glink_idle", &idle_ms, sizeof(idle_ms));
+	(void)hakios_idle_arg("glink_idle", &idle_ms, HAKIOS_IDLE_GLINK);
 	if (idle_ms != 0) {
 		printf("slpi: link: looks %u ms apart after %u quiet ones (glink_idle)\n", idle_ms, LINK_QUIET);
 	}

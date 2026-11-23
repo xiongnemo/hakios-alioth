@@ -12,6 +12,7 @@
 #include <sys/termios.h>
 #include <sys/ttycom.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <sys/hakios.bluetooth.h>
@@ -535,7 +536,7 @@ static void bt_control_worker(void *unused,wait_result_t result)
      */
     uint32_t idle_ms=0;
     uint64_t naps=0,looks=0,say_at=0;
-    PE_parse_boot_argn("bt_idle",&idle_ms,sizeof(idle_ms));
+    (void)hakios_idle_arg("bt_idle",&idle_ms,HAKIOS_IDLE_BT);
     if(idle_ms>100) idle_ms=100;
     if(idle_ms) hakios_tl("UMI BT: the worker looks %u ms apart while the controller sleeps (bt_idle)\n",idle_ms);
     for(;;) {

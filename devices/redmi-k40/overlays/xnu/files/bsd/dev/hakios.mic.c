@@ -66,6 +66,7 @@
 #include <mach/mach_types.h>
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <sys/conf.h>
 #include <sys/hakios.audio.h>
 #include <sys/hakios.board.h>
@@ -1738,7 +1739,7 @@ for_ios(void)
 		return;
 	}
 	say("mic: THE MICROPHONE IS IOS'S (/dev/hakios-mic) from here on, until the run ends: it listens only while iOS records\n");
-	if (PE_parse_boot_argn("mic_idle", &mic_idle_ms, sizeof(mic_idle_ms)) && mic_idle_ms > 1000) {
+	if (hakios_idle_arg("mic_idle", &mic_idle_ms, HAKIOS_IDLE_MIC) && mic_idle_ms > 1000) {
 		mic_idle_ms = 1000;
 	}
 	if (mic_idle_ms != 0) {

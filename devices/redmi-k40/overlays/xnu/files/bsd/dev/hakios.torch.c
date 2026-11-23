@@ -17,6 +17,7 @@
 #include <machine/machine_routines.h>
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <sys/conf.h>
 #include <sys/hakios.audio.h>
 #include <sys/hakios.input.h>
@@ -578,7 +579,7 @@ serve(void)
 	}
 	say("torch: THE LIGHT IS IOS'S (/dev/hakios-torch) from here on, until the run ends: at most %u mA per channel, at most %u s "
 	    "at a time\n", ANDROID_TORCH_MA, max_secs);
-	if (PE_parse_boot_argn("torch_idle", &torch_idle_ms, sizeof(torch_idle_ms)) && torch_idle_ms > 1000) {
+	if (hakios_idle_arg("torch_idle", &torch_idle_ms, HAKIOS_IDLE_TORCH) && torch_idle_ms > 1000) {
 		torch_idle_ms = 1000;
 	}
 	if (torch_idle_ms != 0) {

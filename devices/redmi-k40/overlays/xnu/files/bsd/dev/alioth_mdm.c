@@ -38,6 +38,7 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <sys/alioth_mhi.h>
 #include <sys/alioth_qrtr.h>
 #include <sys/errno.h>
@@ -3047,7 +3048,7 @@ step_qrtr(void)
 		if (PE_parse_boot_argn("mdm_listen", &listen_s, sizeof(listen_s)) && listen_s != 0) {
 			listen_ms = (uint64_t)listen_s * 1000;
 		}
-		if (PE_parse_boot_argn("mdm_idle", &idle_ms, sizeof(idle_ms)) && idle_ms > 100) {
+		if (hakios_idle_arg("mdm_idle", &idle_ms, HAKIOS_IDLE_MDM) && idle_ms > 100) {
 			idle_ms = 100;
 		}
 		say("mdm: 6: listening for %llu s\n", listen_ms / 1000);

@@ -163,6 +163,7 @@
 #include <mach/vm_param.h>
 #include <vm/memory_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <sys/errno.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.qrtr.h>
@@ -392,6 +393,13 @@ hakios_wifi_option(const char *name)
 		return quiet;
 	}
 	if (PE_parse_boot_argn(name, &value, sizeof(value))) {
+		return value;
+	}
+	/* (idle_set=1, sys/hakios.idle.h: lx's wifi_idle and wifi_wq_idle at their measured values) */
+	if (strcmp(name, "wifi_idle") == 0 && hakios_idle_arg(name, &value, HAKIOS_IDLE_WIFI)) {
+		return value;
+	}
+	if (strcmp(name, "wifi_wq_idle") == 0 && hakios_idle_arg(name, &value, HAKIOS_IDLE_WIFI_WQ)) {
 		return value;
 	}
 	for (unsigned i = 0; whole && i < sizeof(stands_for) / sizeof(stands_for[0]); i++) {

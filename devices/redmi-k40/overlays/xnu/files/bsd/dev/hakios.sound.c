@@ -80,6 +80,7 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <sys/systm.h>
 #include <sys/hakios.audio.h>
 #include <vm/vm_kern.h>
@@ -1367,7 +1368,7 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t sent = 0, failed = 0, waits = 0;
 
-	if (PE_parse_boot_argn("sound_feed_wait", &feed_wait_ms, sizeof(feed_wait_ms)) && feed_wait_ms > 20) {
+	if (hakios_idle_arg("sound_feed_wait", &feed_wait_ms, HAKIOS_IDLE_FEED) && feed_wait_ms > 20) {
 		feed_wait_ms = 20;
 	}
 	if (feed_wait_ms != 0) {
@@ -1494,7 +1495,7 @@ watch(void)
 	/* (after a set-up that failed, the next one no sooner than this, in seconds: the last one for ever after) */
 	static const uint32_t setup_gap_s[] = { 2, 10, 60, 300 };
 
-	PE_parse_boot_argn("sound_idle", &idle_ms, sizeof(idle_ms));
+	(void)hakios_idle_arg("sound_idle", &idle_ms, HAKIOS_IDLE_SOUND);
 	PE_parse_boot_argn("amp_look_ms", &look_ms, sizeof(look_ms));
 	idle_ms = idle_ms > 1000 ? 1000 : idle_ms;
 	look_ms = look_ms < 20 ? 20 : look_ms > 5000 ? 5000 : look_ms;

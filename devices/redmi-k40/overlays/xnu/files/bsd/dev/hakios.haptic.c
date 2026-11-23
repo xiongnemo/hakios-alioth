@@ -59,6 +59,7 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
 #include <sys/systm.h>
@@ -1464,7 +1465,7 @@ hakios_haptic_init(void)
 	if (level > 5) {
 		level = 5;
 	}
-	if (PE_parse_boot_argn("haptic_idle", &haptic_idle_ms, sizeof(haptic_idle_ms)) && haptic_idle_ms > 1000) {
+	if (hakios_idle_arg("haptic_idle", &haptic_idle_ms, HAKIOS_IDLE_HAPTIC) && haptic_idle_ms > 1000) {
 		haptic_idle_ms = 1000;
 	}
 	uint32_t fix = 1;

@@ -27,6 +27,7 @@
 #include <net/kpi_interface.h>
 #include <netinet/in.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.idle.h>
 #include <sys/kern_event.h>
 #include <sys/kpi_mbuf.h>
 #include <sys/proc.h>
@@ -332,7 +333,7 @@ net_thread(void *parameter, __unused wait_result_t result)
 	 */
 	uint32_t idle_ms = 0;
 
-	if (n->link->poll == NULL && PE_parse_boot_argn("net_idle", &idle_ms, sizeof(idle_ms)) && idle_ms != 0) {
+	if (n->link->poll == NULL && hakios_idle_arg("net_idle", &idle_ms, HAKIOS_IDLE_NET) && idle_ms != 0) {
 		idle_ms = idle_ms < 20 ? 20 : idle_ms > 60000 ? 60000 : idle_ms;
 		printf("net: en%u's link is never asked: its thread looks every %u ms (net_idle)\n", n->unit, idle_ms);
 	} else {
