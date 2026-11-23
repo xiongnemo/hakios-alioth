@@ -59,6 +59,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
 #include <kern/kalloc.h>
@@ -1462,6 +1463,12 @@ static bool ring_primed;                        /* the reader is RING_KEEP behin
 static uint64_t ring_skipped, ring_dry;         /* frames skipped, reads that found too little: said when iOS stops */
 static volatile uint32_t ios_wants;             /* the device is open */
 static volatile bool stopping;                  /* the run ends (hakios_mic_dsp_down()) */
+/*
+ * (11-24, WEEK-1121 N19) boot-arg mic_idle=N (1..1000 ms): with the device closed the service looks at ios_wants every
+ * 20 ms (~48 wakes a second on an idle phone, census 001623). With N it waits on ios_wants for up to N ms instead; the
+ * open wakes it at once (and the run's end). 0 / absent, the default: every 20 ms, the old way.
+ */
+static uint32_t mic_idle_ms;
 
 static void
 ring_put(const int16_t *samples, uint32_t count)
@@ -1516,6 +1523,9 @@ static int
 mic_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
 {
 	ios_wants = 1;
+	if (mic_idle_ms != 0) {
+		thread_wakeup((event_t)&ios_wants);
+	}
 	return 0;
 }
 
@@ -1728,12 +1738,28 @@ for_ios(void)
 		return;
 	}
 	say("mic: THE MICROPHONE IS IOS'S (/dev/hakios-mic) from here on, until the run ends: it listens only while iOS records\n");
+	if (PE_parse_boot_argn("mic_idle", &mic_idle_ms, sizeof(mic_idle_ms)) && mic_idle_ms > 1000) {
+		mic_idle_ms = 1000;
+	}
+	if (mic_idle_ms != 0) {
+		say("mic: while the device is closed it waits for iOS to open it, %u ms at most (mic_idle)\n", mic_idle_ms);
+	}
 	while (!stopping) {
 		uint64_t began, ns;
 		bool failed;
 
 		if (!ios_wants) {
-			sleep_ms(20);
+			if (mic_idle_ms != 0) {
+				/* (an open after the look wakes it, or is seen before it blocks) */
+				assert_wait_timeout((event_t)&ios_wants, THREAD_UNINT, mic_idle_ms, NSEC_PER_MSEC);
+				if (ios_wants || stopping) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+				} else {
+					(void)thread_block(THREAD_CONTINUE_NULL);
+				}
+			} else {
+				sleep_ms(20);
+			}
 			continue;
 		}
 		lck_mtx_lock(&mic_lock);
@@ -1839,6 +1865,7 @@ void
 hakios_mic_dsp_down(void)
 {
 	stopping = true;
+	thread_wakeup((event_t)&ios_wants);     /* (mic_idle: the service may be waiting) */
 	if (running) {
 		lck_mtx_lock(&mic_lock);
 		undo();

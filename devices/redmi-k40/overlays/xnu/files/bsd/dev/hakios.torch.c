@@ -11,6 +11,7 @@
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -504,6 +505,13 @@ light(uint32_t permille)
 static volatile uint32_t wanted;                /* the level asked for last, 0 to 1000 */
 static volatile uint32_t asked;                 /* how many times one was */
 static uint32_t max_secs = 30;
+/*
+ * (11-24, WEEK-1121 N19) boot-arg torch_idle=N (1..1000 ms): serve() looks at `wanted' every 20 ms even while dark
+ * (~48 wakes a second on an idle phone, census 001623). With N, while nothing is lit (and nothing asked, or the limit's
+ * cut waits for iOS's 0), it waits on `wanted' for up to N ms; iOS's write wakes it at once. 0 / absent, the default:
+ * every 20 ms, the old way.
+ */
+static uint32_t torch_idle_ms;
 
 static int
 torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
@@ -517,6 +525,9 @@ torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		}
 		wanted = value > 1000 ? 1000 : value;
 		asked++;
+		if (torch_idle_ms != 0) {
+			thread_wakeup((event_t)&wanted);
+		}
 	}
 	return 0;
 }
@@ -567,6 +578,12 @@ serve(void)
 	}
 	say("torch: THE LIGHT IS IOS'S (/dev/hakios-torch) from here on, until the run ends: at most %u mA per channel, at most %u s "
 	    "at a time\n", ANDROID_TORCH_MA, max_secs);
+	if (PE_parse_boot_argn("torch_idle", &torch_idle_ms, sizeof(torch_idle_ms)) && torch_idle_ms > 1000) {
+		torch_idle_ms = 1000;
+	}
+	if (torch_idle_ms != 0) {
+		say("torch: while it is dark it waits for iOS's next ask, %u ms at most (torch_idle)\n", torch_idle_ms);
+	}
 	while (!broken) {
 		uint32_t want = wanted;
 		uint64_t now = now_ms();
@@ -614,6 +631,20 @@ serve(void)
 				(void)dark();
 				give_up("trouble while lit");
 				break;
+			}
+		}
+		if (torch_idle_ms != 0 && applied == 0 && !leaving) {
+			uint32_t seen = wanted, seen_asked = asked;
+
+			if (seen == 0 || waiting_for_off) {
+				/* (an ask after the look wakes it, or is seen before it blocks) */
+				assert_wait_timeout((event_t)&wanted, THREAD_UNINT, torch_idle_ms, NSEC_PER_MSEC);
+				if (wanted != seen || asked != seen_asked) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+				} else {
+					(void)thread_block(THREAD_CONTINUE_NULL);
+				}
+				continue;
 			}
 		}
 		wait_ms(20);

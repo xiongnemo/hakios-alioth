@@ -322,20 +322,39 @@ static void
 net_thread(void *parameter, __unused wait_result_t result)
 {
 	struct net_if *n = parameter;
-	uint64_t said = 0, total;
+	uint64_t said = 0, total, say_at = 0;
 	unsigned quiet = 0;
+	/*
+	 * (11-24, WEEK-1121 N19) boot-arg net_idle=N (20..60000 ms): a link that is never asked (no poll: the radio's, lx)
+	 * leaves this thread nothing but the minute's line, yet it looks every 10 ms (~93 wakes a second on an idle phone,
+	 * census 001623). With N such a link's thread looks every N ms, the line by the clock (60 s) instead of every 8192
+	 * looks. A link that wants to be asked is asked as before. 0 / absent, the default: every 2 / 10 ms, the old way.
+	 */
+	uint32_t idle_ms = 0;
 
+	if (n->link->poll == NULL && PE_parse_boot_argn("net_idle", &idle_ms, sizeof(idle_ms)) && idle_ms != 0) {
+		idle_ms = idle_ms < 20 ? 20 : idle_ms > 60000 ? 60000 : idle_ms;
+		printf("net: en%u's link is never asked: its thread looks every %u ms (net_idle)\n", n->unit, idle_ms);
+	} else {
+		idle_ms = 0;
+	}
 	for (unsigned tick = 1;; tick++) {
+		bool say_now;
+
 		quiet = n->link->poll != NULL && n->link->poll() ? 0 : quiet + 1;
 		/* about once a minute, if anything has moved since */
 		total = n->count.sent + n->count.received + n->count.dropped_out + n->count.dropped_in;
-		if (tick % 8192 == 0 && total != said) {
+		say_now = idle_ms != 0 ? mach_absolute_time() >= say_at : tick % 8192 == 0;
+		if (say_now && idle_ms != 0) {
+			clock_interval_to_deadline(60, NSEC_PER_SEC, &say_at);
+		}
+		if (say_now && total != said) {
 			said = total;
 			printf("net: en%u so far %llu frames sent (%llu bytes), %llu received (%llu bytes); dropped: %llu out, %llu in\n",
 			    n->unit, n->count.sent, n->count.sent_bytes, n->count.received, n->count.received_bytes,
 			    n->count.dropped_out, n->count.dropped_in);
 		}
-		delay_for_interval(quiet < 100 ? 2 : 10, NSEC_PER_MSEC);
+		delay_for_interval(idle_ms != 0 ? idle_ms : quiet < 100 ? 2 : 10, NSEC_PER_MSEC);
 	}
 }
 
