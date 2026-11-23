@@ -948,6 +948,22 @@ static bool mapped, copp_open, stream_open;
 static uint32_t map_handle, copp;
 static volatile uint32_t returned;      /* the periods the DSP has said it is done with (a bit each) */
 static volatile uint32_t written_done, underflows, write_errors;
+/*
+ * (11-23, WEEK-1121 N18) boot-arg sound_feed_wait=N (1..20 ms): sound=4's feeder looks at `returned' every 2 ms (~443
+ * wakes a second on an idle phone, census 212837) for a period back every 20 ms. With N it waits on `returned' for up
+ * to N ms instead, and the DSP's done (events(), on the link's thread) wakes it at once: a period is filled again as
+ * soon as it is back, not up to 2 ms later. 0 / absent, the default: every 2 ms, the old way.
+ */
+static uint32_t feed_wait_ms;
+
+static void
+period_back(uint32_t token)
+{
+	OSBitOrAtomic(1u << (token & 31), &returned);
+	if (feed_wait_ms != 0) {
+		thread_wakeup((event_t)&returned);
+	}
+}
 
 /* The DSP's events: the "done" of every write, and underflows. On the link's thread. */
 static bool
@@ -961,14 +977,14 @@ events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token,
 			OSIncrementAtomic((volatile SInt32 *)&write_errors);
 		}
 		OSIncrementAtomic((volatile SInt32 *)&written_done);
-		OSBitOrAtomic(1u << (token & 31), &returned);
+		period_back(token);
 		return true;
 	}
 	if (opcode == APR_BASIC_RSP_RESULT && (token & WRITE_TOKEN)) {
 		/* (a write the DSP refused outright: it answers it as a command) */
 		OSIncrementAtomic((volatile SInt32 *)&write_errors);
 		OSIncrementAtomic((volatile SInt32 *)&written_done);
-		OSBitOrAtomic(1u << (token & 31), &returned);
+		period_back(token);
 		return true;
 	}
 	if (opcode == ASM_SESSION_EVENT_RX_UNDERFLOW) {
@@ -1349,8 +1365,14 @@ period_fill_ios(unsigned period)
 static void
 feeder_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t sent = 0, failed = 0;
+	uint32_t sent = 0, failed = 0, waits = 0;
 
+	if (PE_parse_boot_argn("sound_feed_wait", &feed_wait_ms, sizeof(feed_wait_ms)) && feed_wait_ms > 20) {
+		feed_wait_ms = 20;
+	}
+	if (feed_wait_ms != 0) {
+		say("sound: the feeder waits for the DSP's done, %u ms at most (sound_feed_wait)\n", feed_wait_ms);
+	}
 	returned = 0;
 	for (unsigned p = 0; p < PERIODS; p++) {
 		period_fill_ios(p);
@@ -1383,11 +1405,25 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 				}
 			}
 		}
-		sleep_ms(2);
+		if (feed_wait_ms != 0) {
+			/* (a done after the look at `returned' wakes it, or is seen before it blocks: none is missed) */
+			assert_wait_timeout((event_t)&returned, THREAD_UNINT, feed_wait_ms, NSEC_PER_MSEC);
+			if (returned != 0 || stopping) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+				waits++;
+			}
+		} else {
+			sleep_ms(2);
+		}
 	}
 	say("sound: the feeder stops: %u periods written (%u could not be sent), %u given back (%u with an error), %u underflows; "
 	    "from iOS %llu frames came, %llu went to the DSP, %llu of silence filled in\n", sent, failed, written_done, write_errors,
 	    underflows, ios_frames, fed_frames, silent_frames);
+	if (feed_wait_ms != 0) {
+		say("sound: the feeder waited %u times (sound_feed_wait=%u)\n", waits, feed_wait_ms);
+	}
 	feeder_runs = false;
 	thread_terminate(current_thread());
 }
@@ -1634,6 +1670,7 @@ take_down(void)
 {
 	stopping = true;
 	thread_wakeup((event_t)&watcher_kick);  /* (sound_idle: it may be napping) */
+	thread_wakeup((event_t)&returned);      /* (sound_feed_wait: the feeder may be waiting) */
 	if (umi_profile) {
 		umi_speaker_abort();            /* (a set-up of 12-25 s on the way gives up: not two of us on the bus) */
 	}
