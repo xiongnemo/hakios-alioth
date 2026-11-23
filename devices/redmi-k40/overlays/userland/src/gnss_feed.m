@@ -230,14 +230,15 @@ static unsigned seed_for;
 static dispatch_queue_t seed_queue;
 
 /*
- * Boot-arg gnss_seed_auth=S (11-23, WEEK-1121 N14): from 11-21 on every run's seed was refused -- "authorization is
- * 0", then "now 2", "now 0", kCLErrorDomain 1 -- where 11-14/15's got 3 at once. The good runs had loc_enable switch
+ * Boot-arg gnss_seed_auth=S (11-23, WEEK-1121 N14): from 11-21 on the seed was refused in 7 of 8 runs -- "authorization
+ * is 0", then "now 2", "now 0", kCLErrorDomain 1 (once, run 124936, it came back to 3 by itself) -- where
+ * 11-14/15's got 3 at once. The good runs had loc_enable switch
  * Location Services on long before the seed authorized its bundle; the bad ones within a moment of it, and 11-22's
  * 123801 went 3 -> 2 -> 0: locationd takes a bundle's authorization back when Location Services were switched on just
  * before (11-23 run 111658: on, authorized 3, then "now 2", "now 0"). With S: wait up to S seconds for Location
  * Services to be on before authorizing, and authorize again (SEED_REAUTH times at most) when locationd says the bundle
- * went back to 0 or 2 while they are on -- in 111658 once: 3 again, and the seed (+-35 m) was given. 0, the default,
- * is the old way.
+ * went back to 0 or 2 while they are on -- in 111658 and 121531 once each: 3 again, and the seed (+-35 m) was
+ * given. 0, the default, is the old way.
  */
 #define SEED_REAUTH 5
 static unsigned seed_auth;
