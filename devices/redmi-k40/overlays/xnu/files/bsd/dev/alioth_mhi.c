@@ -613,7 +613,7 @@ service(struct alioth_mhi *host, unsigned r)
 		say(host, "MHI: AN EVENT RING POINTER OUTSIDE ITS RING: ring, pointer", r, producer, 0);
 		return EIO;
 	}
-	while (ring->rp != producer && handled < ring->elements) {
+	while (ring->rp != producer && handled < ring->elements && (host->event_budget == 0 || handled < host->event_budget)) {
 		volatile uint32_t *e = ring_element(ring, ring->rp);
 		uint64_t pointer;
 		uint32_t w0, w1;

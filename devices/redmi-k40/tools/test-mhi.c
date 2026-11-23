@@ -671,6 +671,7 @@ modem_reset(void)
 static uint8_t host_packets[16][256];
 static uint32_t host_lengths[16];
 static unsigned host_head, host_tail;
+static unsigned host_most_per_poll;     /* (the most packets one poll queued: alioth_mhi.event_budget's check) */
 
 static void
 host_received(void *context, unsigned channel, const uint8_t *bytes, uint32_t length, bool end)
@@ -689,12 +690,18 @@ host_qrtr(struct alioth_mhi *host)
 	int error;
 
 	host_head = host_tail = 0;
+	host_most_per_poll = 0;
 	CHECK(alioth_mhi_open(host, 20, ALIOTH_MHI_TO_DEVICE, 2, 32, 0x2000, NULL, NULL) == 0, "open 20");
 	CHECK(alioth_mhi_open(host, 21, ALIOTH_MHI_FROM_DEVICE, 2, 32, 0x2000, host_received, NULL) == 0, "open 21");
 	CHECK(alioth_mhi_send(host, 20, out, (uint32_t)qrtr_make_control(out, sizeof(out), QRTR_TYPE_HELLO, 1, QRTR_NODE_BCAST, NULL),
 	    true, 100) == 0, "send HELLO");
 	for (unsigned ms = 0; ms < 50; ms++) {
+		unsigned before = host_tail;
+
 		CHECK((error = alioth_mhi_poll(host)) == 0, "poll: %d", error);
+		if (host_tail - before > host_most_per_poll) {
+			host_most_per_poll = host_tail - before;
+		}
 		while (host_head != host_tail) {
 			unsigned slot = host_head++ % 16;
 			struct qrtr_packet p;
@@ -791,8 +798,23 @@ main(void)
 	/* mission mode: QRTR on IPCR, as alioth_mdm.c's step 6 */
 	host_qrtr(&host);
 	CHECK(!host.poisoned, "not poisoned");
-	printf("run 1: %u events, %zu KB of host memory, %llu ms pretend, %u QRTR packets to the modem\n", dev.events,
-	    arena_used >> 10, (unsigned long long)(dev.us / 1000), dev.qrtr_packets);
+	printf("run 1: %u events, %zu KB of host memory, %llu ms pretend, %u QRTR packets to the modem; at most %u packets "
+	    "a poll\n", dev.events, arena_used >> 10, (unsigned long long)(dev.us / 1000), dev.qrtr_packets, host_most_per_poll);
+
+	/* (2026-11-23, alioth_mdm.c's mdm_idle) the same boot with event_budget = 1 in mission mode: QRTR gets through
+	 * the same, one packet a poll, the rest on the next polls */
+	printf("run 1b: mission mode with event_budget = 1\n");
+	quiet_say = 1;
+	modem_reset();
+	memset(&host, 0, sizeof(host));
+	CHECK(alioth_mhi_probe(&host, &io) == 0, "probe");
+	CHECK(alioth_mhi_bhi(&host, sbl, sbl_size, 2000) == 0, "BHI");
+	CHECK(alioth_mhi_ready(&host, known, 5, 2000) == 0, "READY, M0");
+	CHECK(alioth_mhi_sahara(&host, image_of, NULL, 2000) == 0, "Sahara");
+	host.event_budget = 1;
+	host_qrtr(&host);
+	CHECK(!host.poisoned && host_most_per_poll == 1, "one packet a poll at most (%u)", host_most_per_poll);
+	quiet_say = 0;
 
 	/* a version 2 header, as Linux's router also sends: HELLO from node 3's control port, broadcast (size is 32 bits:
 	 * this test had it as 16, the same mistake as the parser, until 2026-11-14) */

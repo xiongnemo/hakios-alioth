@@ -1385,6 +1385,8 @@ step_sahara(void)
 #define IPCR_PACKET_MAX         0x4000
 #define QRTR_OUR_NODE           1               /* the application processor's, as Linux numbers it */
 #define IPCR_LISTEN_MS          60000           /* (11-13: the first 15 services came at once, then 30 s of nothing) */
+#define MDM_IDLE_AFTER_MS       60000           /* (mdm_idle: the services, tftp and the GNSS session's start first) */
+#define MDM_IDLE_QUIET_MS       20              /* (a request's answer, a burst's rest: within a few ms) */
 #define MDM_SERVERS             64
 
 static struct {
@@ -3029,12 +3031,30 @@ step_qrtr(void)
 		uint64_t listen_ms = loc.wanted ? 240000 : IPCR_LISTEN_MS;      /* (a GNSS cold start with no help: minutes) */
 		uint32_t listen_s = 0;
 		unsigned handled = 0;
+		/*
+		 * boot-arg mdm_idle=N (1..100; 11-23, WEEK-1121 N17): the loop looks every millisecond (~880 wakes a second on
+		 * an idle phone, the census 192936/194009) for ~12 packets a second. With N, from MDM_IDLE_AFTER_MS into the
+		 * listen, once nothing has come or gone (no MHI event) for MDM_IDLE_QUIET_MS, it looks N ms apart; any event
+		 * brings back the millisecond. Nothing is lost waiting: the modem's completions stay in its rings until read.
+		 * But a nap's packets come in one poll, and ipcr's queue holds IPCR_QUEUE: a poll then takes at most
+		 * IPCR_QUEUE / 2 events of a ring (mhi.event_budget), the rest on the next look (the beat line's "dropped"
+		 * says whether that holds). 0 / absent, the default: every millisecond, every event a poll, the old way.
+		 */
+		uint32_t idle_ms = 0, seen_events = mhi.events;
+		uint64_t quiet_from = start, idle_say = start + MDM_IDLE_AFTER_MS + 60000, naps = 0, looks = 0;
 
 		/* boot-arg mdm_listen=S: listened to for S seconds (run the kernel longer than that: loader_return_after) */
 		if (PE_parse_boot_argn("mdm_listen", &listen_s, sizeof(listen_s)) && listen_s != 0) {
 			listen_ms = (uint64_t)listen_s * 1000;
 		}
+		if (PE_parse_boot_argn("mdm_idle", &idle_ms, sizeof(idle_ms)) && idle_ms > 100) {
+			idle_ms = 100;
+		}
 		say("mdm: 6: listening for %llu s\n", listen_ms / 1000);
+		if (idle_ms != 0) {
+			say("mdm: 6: idle: after %u s, quiet %u ms: a look every %u ms, %u events a poll (mdm_idle)\n",
+			    MDM_IDLE_AFTER_MS / 1000, MDM_IDLE_QUIET_MS, idle_ms, IPCR_QUEUE / 2);
+		}
 
 		while (error == 0 && (now = since_reset_ms()) - start < listen_ms) {
 			/* (a line a second for the first 20 s, then every 10 s: the kept lines have room for the GNSS session) */
@@ -3066,8 +3086,30 @@ step_qrtr(void)
 
 				error = efs_packet(efsq.packet[slot], efsq.length[slot]);
 			}
-			delay(1000);
+			if (idle_ms != 0 && now - start >= MDM_IDLE_AFTER_MS) {
+				mhi.event_budget = IPCR_QUEUE / 2;
+				if (mhi.events != seen_events) {
+					seen_events = mhi.events;
+					quiet_from = now;
+				}
+				if (now - quiet_from >= MDM_IDLE_QUIET_MS) {
+					delay(idle_ms * 1000);
+					naps++;
+				} else {
+					delay(1000);
+					looks++;
+				}
+				if (now >= idle_say) {
+					say("mdm: 6: idle: a minute: %llu naps of %u ms, %llu short looks; %u events, %u dropped in all "
+					    "(mdm_idle)\n", naps, idle_ms, looks, mhi.events, ipcr.dropped + efsq.dropped);
+					naps = looks = 0;
+					idle_say = now + 60000;
+				}
+			} else {
+				delay(1000);
+			}
 		}
+		mhi.event_budget = 0;
 		if (error != 0) {
 			say("mdm: 6: the listen stopped on an error (%d) after %llu ms, %u packets handled\n", error,
 			    since_reset_ms() - start, handled);

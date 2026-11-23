@@ -89,6 +89,8 @@ struct alioth_mhi {
 	struct alioth_mhi_dma image, channel_contexts, event_contexts, command_context;
 	struct alioth_mhi_ring commands, event[ALIOTH_MHI_EVENT_RINGS];
 	struct alioth_mhi_channel open[ALIOTH_MHI_OPEN];
+	/* (11-23) at most this many events of a ring a poll, the rest left for the next one; 0 (a zeroed host): all */
+	uint32_t event_budget;
 };
 
 /* A zeroed host; reads registers only. */
