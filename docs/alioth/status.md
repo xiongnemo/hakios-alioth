@@ -76,7 +76,7 @@ The one-click release does all of this from a PC script; development runs do it 
 
 | Problem | Cause, as far as known |
 |---|---|
-| Nothing persists | The data volume is a RAM disk: settings, photos and apps are gone after a reboot. |
+| Nothing persists | The data volume is a RAM disk: settings, photos and apps are gone after a reboot. The release's start script installs its apps again at every boot, and an app's data (a login, say) can be kept on the computer: `保存应用状态.bat` saves it while iOS runs, and the next boot puts it back. |
 | A GPU hang | Detected and recovered (`gpu_recover=1`, the daily default): the GPU is reset and the screen carries on. |
 | Power with the screen off | The panel sleeps and the cores and the GPU drop to their lowest speed, but the GPU is not put to sleep and the display engine keeps its clocks. |
 | USB after re-plugging | Fixed: a race in select() panicked the kernel at the unplug; the controller's EP0 stayed dead or answered wrongly after a replug (the controller is now restarted when the computer resets it in vain); the old session's data and a waiting write leaked into the new one; and about half the time the first packet one way or the other was dropped as a repeat, because the data endpoints kept the DATA0/DATA1 sequence of the session before (they are initialized again at every configuration now). Verified with the cable pulled by hand, quick and slow, in test runs and the release: the computer lists the iPhone again about 10 s after it is back, still trusted. |
