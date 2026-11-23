@@ -85,7 +85,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | GPS without its Wi-Fi seed | From November 21 the seed position was refused in 7 of 8 boots (locationd takes the bundle's authorization back right after Location Services are switched on; once it came back by itself), so a first fix had no position to start from. `gnss_seed_auth=30` (off by default) waits for Location Services and authorizes again: the seed (±35 m) reaches the modem. |
 | Settings > General > Legal & Regulatory and the Chinese keyboard crashed | Fixed in the system image (November 23): the legal documents (`/System/Library/ProductDocuments`, 7 MB) and the Chinese keyboard's language data (LinguisticData for zh-Hans, 116 MB) had been left out of it. Pinyin now gives its candidates and next-word predictions. |
 | A game asks for notifications at every boot | The answer is kept in the data volume, which is in RAM. |
-| AssistiveTouch's Home does nothing | Its button, menu and Control Center work; the Home action is not wired to anything here yet. |
+| AssistiveTouch's Home did nothing | iOS presses it through a virtual HID device (IOHIDUserDevice) that this kernel cannot make. `at_home=1` (off by default) sends it as the home button instead: the menu's Home goes home. |
 
 ## Next
 
