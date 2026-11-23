@@ -54,6 +54,7 @@
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -1054,6 +1055,22 @@ static volatile uint64_t onset_us;              /* when iOS's last waveform bega
 static volatile uint32_t heard_peak;            /* the largest sample of that waveform, or since the service last looked */
 static uint64_t written_frames;
 static unsigned taps, loops, capped;            /* what has been played, for the run's end */
+/*
+ * (11-23, WEEK-1121 N18) boot-arg haptic_idle=N (1..1000 ms): serve() looks every 4 ms even with nothing playing (~225
+ * wakes a second on an idle phone, census 212837). With N, while it is IDLE and nothing has been heard for ACTIVE_US,
+ * it waits on onset_us for up to N ms instead: a write that begins a waveform wakes it at once (haptic_wake), and from
+ * there it looks every 4 ms as before -- a tap still starts SETTLE_US after its onset. 0 / absent, the default: every
+ * 4 ms, the old way.
+ */
+static uint32_t haptic_idle_ms;
+
+static void
+haptic_wake(void)
+{
+	if (haptic_idle_ms != 0) {
+		thread_wakeup((event_t)&onset_us);
+	}
+}
 
 static uint64_t
 now_us(void)
@@ -1090,14 +1107,18 @@ haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		written_frames += (uint64_t)bytes / 2;
 		if (peak > SILENT_BELOW) {
 			uint64_t now = now_us();
+			bool began = heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US;
 
-			if (heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US) {
+			if (began) {
 				onset_us = now;
 				heard_peak = 0;
 			}
 			heard_us = now;
 			if (peak > heard_peak) {
 				heard_peak = peak;
+			}
+			if (began) {
+				haptic_wake();
 			}
 		} else {
 			quiet_us = now_us();
@@ -1120,13 +1141,18 @@ hakios_haptic_pretend(uint32_t peak)
 		quiet_us = now;
 		return;
 	}
-	if (heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US) {
+	bool began = heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US;
+
+	if (began) {
 		onset_us = now;
 		heard_peak = 0;
 	}
 	heard_us = now;
 	if (peak > heard_peak) {
 		heard_peak = peak;
+	}
+	if (began) {
+		haptic_wake();
 	}
 }
 
@@ -1249,6 +1275,9 @@ serve(void)
 		return;
 	}
 	say("haptic: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR (/dev/hakios-haptic) from here on, until the run ends\n");
+	if (haptic_idle_ms != 0) {
+		say("haptic: with nothing playing it waits for iOS's next waveform, %u ms at most (haptic_idle)\n", haptic_idle_ms);
+	}
 	while (!broken) {
 		uint64_t now = now_us();
 		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
@@ -1347,6 +1376,20 @@ serve(void)
 				break;
 			}
 		}
+		if (haptic_idle_ms != 0 && state == IDLE && !leaving) {
+			/* (a waveform begun after `seen` is read wakes it, or is seen before it blocks: none is missed) */
+			uint64_t seen = onset_us, heard = heard_us;
+
+			if (heard == 0 || now_us() - heard >= ACTIVE_US) {
+				assert_wait_timeout((event_t)&onset_us, THREAD_UNINT, haptic_idle_ms, NSEC_PER_MSEC);
+				if (onset_us != seen || heard_us != heard) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+				} else {
+					(void)thread_block(THREAD_CONTINUE_NULL);
+				}
+				continue;
+			}
+		}
 		wait_ms(4);
 	}
 	say("haptic: the motor is given up on (%u taps and %u vibrations played, %u cut at %u ms)\n", taps, loops, capped,
@@ -1420,6 +1463,9 @@ hakios_haptic_init(void)
 	}
 	if (level > 5) {
 		level = 5;
+	}
+	if (PE_parse_boot_argn("haptic_idle", &haptic_idle_ms, sizeof(haptic_idle_ms)) && haptic_idle_ms > 1000) {
+		haptic_idle_ms = 1000;
 	}
 	uint32_t fix = 1;
 	if (PE_parse_boot_argn("haptic_i2c_fix", &fix, sizeof(fix)) && fix == 0) {
