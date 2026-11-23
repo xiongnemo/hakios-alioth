@@ -70,6 +70,7 @@ The one-click release does all of this from a PC script; development runs do it 
 | System image | 2.6 GB, in RAM for the whole session (with the legal documents and the Chinese keyboard's language data since November 23) |
 | Memory for iOS | 11 GB of a 12 GB phone (the whole free block from 0xc0000000; the rest is firmware's and the loader's); with the bundled apps installed iOS still has about 5.5 GB available, and the data volume (sized by memory) can grow to about 8 GB. 6 and 8 GB phones get their own largest block (not tried on one). |
 | Battery current with the frequency scaling and the panel sleep (on USB, so differences only) | home screen at rest 239 → 147 mA, Minecraft 443 → 296 mA, screen off about 180 mA less; frame rates and the scrolling pace unchanged |
+| Wakeups of our drivers' threads at rest (home screen, the modem's GNSS session on) | about 7,900 a second as shipped; about 2,300 with the polling boot-args of November 22–24 (all off by default: `glink_idle`, `wifi_idle`, `sound_idle`, `bt_idle`, `mdm_idle`, `wifi_wq_idle`, `haptic_idle`, `sound_feed_wait`, `net_idle`, `mic_idle`, `torch_idle`), each thread waiting for its own event instead of looking every few milliseconds; Wi-Fi throughput, sound, Bluetooth and the modem's traffic the same |
 | Boot from the PC | about 3 minutes, most of it the system image over USB |
 
 ## Known problems
