@@ -168,6 +168,7 @@ are on each repository's Releases page.
 - Power: with the screen off the panel sleeps and the GPU is powered off, but the display engine stays powered.
 
 How each part works, what was measured and what comes next: [docs/alioth/status.md](docs/alioth/status.md).
+The optional boot-args (all off by default): [docs/alioth/boot-args.md](docs/alioth/boot-args.md).
 
 ## The phone it is developed on
 

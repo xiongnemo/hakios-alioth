@@ -120,6 +120,9 @@ audio DSP with speakers and microphone, the GPU with 120 Hz pacing (`fb_vsync=2`
 flashlight. The eight-core mode (`bootcpu=0 cpus=8`) froze this phone twice, with and without USB, and is
 not used.
 
+Optional boot-args added since (all off by default, each with what it does and what was measured):
+[docs/alioth/boot-args.md](../../docs/alioth/boot-args.md). Append them to `boot.args` to try them.
+
 Wi-Fi: an access point of the network on 5 GHz is preferred by 15 dB (`lx_80211.c` `preference()`), and
 one that turns the station away is skipped for the next: a home network's 2.4 GHz access point refused
 authentication (status 1, band steering) while its 5 GHz one accepted. The address in `fw-wifi/mac` should
