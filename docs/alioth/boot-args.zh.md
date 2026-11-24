@@ -57,6 +57,7 @@
 | `state_shaders=1` | 1 | 保存 App 状态时，连同它的着色器缓存和 Metal 翻译结果（`Library/Caches/hakios-mesa`）一起存 | Flutter Check 重启后恢复状态：最长的一帧 33 → 5 ms；状态压缩包大 183 KB |
 | `appgl_wait_ms=N` | 毫秒（和 `appgl_fps` 一起） | GL App 提交画面时，等它下一块表面不在屏幕上了再交，让 App 按屏幕能接的速度跑，不用固定的上限 | 地图 App 原来卡在 60，开了约 85 帧/秒，但间隔不均匀 |
 | `metal_upload=1` | 1 | Metal 的 `replaceRegion` 在库锁外面拷贝数据 | 结果正确，量不出提升（时间花在暂存内存的分配上） |
+| `gpu_ring_switch=1` | 1 | GPU 的命令环自己在各个 App 的页表之间切换（CP_SMMU_TABLE_UPDATE），处理器不用再等 GPU 做完一个 App 的工作才送下一个 App 的 | 还没在手机上跑过，不要用（第一次开机要有人在手机旁边） |
 
 ## 相机
 
