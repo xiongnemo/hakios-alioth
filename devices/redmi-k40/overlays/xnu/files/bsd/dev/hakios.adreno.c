@@ -4308,6 +4308,9 @@ ring_switch(struct gpu_space *to)
 	}
 }
 
+/* (hakios_gpu_recover()) the space of the client whose work hung the GPU: refused (hakios_gpu_space_faulted()) */
+static struct gpu_space *gpu_failed_space;
+
 void
 hakios_gpu_space_free(void *opaque)
 {
@@ -4329,6 +4332,9 @@ hakios_gpu_space_free(void *opaque)
 		printf("adreno: gpu: a client is gone while the core has its submission %u still to do: its space stays\n",
 		    space->last_fence);
 		return;
+	}
+	if (gpu_failed_space == space) {
+		gpu_failed_space = NULL;        /* (its client is gone: one made later at this memory is not it) */
 	}
 	for (uint32_t i = 0; i < space->table_count; i++) {
 		bzero(space->tables[i].table, 4096);
@@ -4752,7 +4758,6 @@ bool hakios_gpu_fence_failed(uint32_t fence);
 bool hakios_gpu_space_faulted(void *space);
 void hakios_gpu_test_hang(void);
 static uint32_t gpu_recoveries, gpu_failed_after, gpu_failed_upto;
-static struct gpu_space *gpu_failed_space;
 static bool gpu_failed_any;
 static uint64_t gpu_recovered_at[3];
 static uint32_t hang_seen[4];
