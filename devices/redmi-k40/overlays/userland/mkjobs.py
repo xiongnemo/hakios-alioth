@@ -230,7 +230,12 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'soft
         # every boot -- the data volume is in RAM, so nothing is remembered, and the sign-in cannot succeed on a phone
         # the account layer calls unactivated. Without it GameKit's authenticate handler gets an error, which games
         # take as "Game Center is not available" and go on. ALLOW=gamed brings it back.
-        'com.apple.gamed')
+        'com.apple.gamed',
+        # (the K40's, owner 2026-11-25: "fairplayd + amseng ... 该杀") the App Store's engagement daemon: it looks up
+        # com.apple.fairplayd (FairPlay, which is not here) for ever -- 104 failed lookups of each name in a 10-minute
+        # run, with nsurlsessiond and aggregated busy for it. Without it the idle phone's processes take 4.74 % of a
+        # core instead of 9.92 %, and no one looks it up (WEEK-1121, 11-21 21:41). ALLOW=amsengagementd brings it back.
+        'com.apple.amsengagementd')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
