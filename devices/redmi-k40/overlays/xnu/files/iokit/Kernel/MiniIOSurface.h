@@ -117,7 +117,8 @@ public:
 	 */
 	IOMemoryDescriptor *            client;
 	IOMemoryMap *                   clientMap;
-	task_t                          clientTask;     /* whose memory it is (not held: only compared) */
+	task_t                          clientTask;     /* whose memory it is (not held: only compared, with the id) */
+	uint64_t                        clientTaskID;   /* its process's unique id: a task made later at its memory is not it */
 	mach_vm_address_t               clientAddress;  /* ... and where it is there */
 	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
 	uint32_t                        drawn;          /* the GPU's last submission that names the pixels (0: none; HakiosGPU.cpp) */

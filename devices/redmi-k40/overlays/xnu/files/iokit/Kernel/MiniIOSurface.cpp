@@ -141,6 +141,7 @@ static char             gSurfaceTraceOf[32];
 
 extern "C" void loader_log_line(const char *line);
 extern "C" void hakios_data_range(uint32_t *size_mb, uint32_t *used_mb, uint32_t *hole_mb);
+extern "C" uint64_t get_task_uniqueid(task_t task);
 
 /* A line about a traced surface: to the loader's log too, where it outlives the kernel's own, short log. */
 static void
@@ -830,6 +831,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	}
 	if (wrapped != NULL) {
 		s->clientTask = current_task();
+		s->clientTaskID = get_task_uniqueid(s->clientTask);
 		s->clientAddress = wrapped->unsigned64BitValue();
 		IOReturn held = kIOReturnNoMemory;
 
@@ -1242,7 +1244,7 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 	bzero(ref, sizeof(*ref));
 	ref->surface = surface;
 	ref->map = map;
-	if (surface->client != NULL && surface->clientTask != fTask) {
+	if (surface->client != NULL && (surface->clientTask != fTask || surface->clientTaskID != get_task_uniqueid(fTask))) {
 		/* (a scan-out slot is memory outside XNU's: write-combined, which takes any access a program makes) */
 		ref->pixelMap = surface->client->createMappingInTask(fTask, 0,
 		    kIOMapAnywhere | (surface->scanPhys != 0 ? kIOMapWriteCombineCache : 0));
