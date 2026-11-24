@@ -11,6 +11,7 @@
 #include <pexpert/pexpert.h>
 
 #define HAKIOS_IDLE_GLINK               10      /* glink_idle: the sensor / audio DSP links (hakios.slpi.c, hakios.adsp.c) */
+#define HAKIOS_IDLE_FOLLOW              2       /* glink_follow: quick looks after the audio DSP's traffic (hakios.adsp.c; 11-24 evening) */
 #define HAKIOS_IDLE_WIFI                4       /* wifi_idle: the IPC router, the ticker, the rings (umi_wifi.c, lx) */
 #define HAKIOS_IDLE_SOUND               100     /* sound_idle: the speaker watcher (hakios.sound.c) */
 #define HAKIOS_IDLE_FEED                20      /* sound_feed_wait: the sound feeder (hakios.sound.c) */

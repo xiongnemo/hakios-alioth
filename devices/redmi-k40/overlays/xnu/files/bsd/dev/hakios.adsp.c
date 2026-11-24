@@ -3103,7 +3103,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		 * looks for its answer; a send nobody waits on (the feeder's writes, 11-24 run 171523: 75 sends a second kept the
 		 * link at 570 wakes) counts as the DSP's traffic. 0 / absent, the default: LINK_QUIET after anything, the old way.
 		 */
-		if (PE_parse_boot_argn("glink_follow", &follow, sizeof(follow)) && follow != 0) {
+		if (hakios_idle_arg("glink_follow", &follow, HAKIOS_IDLE_FOLLOW) && follow != 0) {     /* (idle_set: 2) */
 			follow = follow > LINK_QUIET ? LINK_QUIET : follow;
 			printf("adsp: link: %u quick looks after the DSP's own traffic, %u after ours (glink_follow)\n", follow,
 			    LINK_QUIET);
