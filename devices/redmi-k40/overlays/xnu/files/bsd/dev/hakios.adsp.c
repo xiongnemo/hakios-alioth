@@ -2425,6 +2425,7 @@ glink_pump(void)
  * of ours wakes it at once, so that what the DSP answers is heard at the old pace.
  */
 static volatile uint32_t link_kick;
+static volatile uint32_t link_lazy;     /* (glink_follow) of those, sends nobody waits on: counted before the kick */
 
 static void
 link_wake(void)
@@ -2782,6 +2783,7 @@ hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 	if (ms == 0) {
 		/* (sent and not waited for: what comes back is the events' handler's) */
 		header->token = token;
+		link_lazy++;            /* (glink_follow: its kick needs no quick answer -- counted before glink_send's kick) */
 		error = glink_send(&glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
 		apr_out += error == 0;
 		return error == 0;
@@ -3088,7 +3090,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	struct glink_packet *packet;
 	bool gave_up = false;
 	uint32_t idle_ms = 0, quiet = 0, kicks = link_kick, rings = doorbell.glink + doorbell.smp2p;
-	uint32_t follow = 0;
+	uint32_t follow = 0, lazies = link_lazy;
 
 	(void)hakios_idle_arg("glink_idle", &idle_ms, HAKIOS_IDLE_GLINK);
 	if (idle_ms != 0) {
@@ -3098,7 +3100,8 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		 * rings or packets, no message of ours, no change of its state words -- N quick looks follow instead of
 		 * LINK_QUIET. At rest the feeder's silence brings a write-done ~49 times a second, and each kept the link at
 		 * 1 ms looks for 10 ms (~570 wakes a second, census 141823). A message of ours still brings LINK_QUIET quick
-		 * looks for its answer. 0 / absent, the default: LINK_QUIET after anything, the old way.
+		 * looks for its answer; a send nobody waits on (the feeder's writes, 11-24 run 171523: 75 sends a second kept the
+		 * link at 570 wakes) counts as the DSP's traffic. 0 / absent, the default: LINK_QUIET after anything, the old way.
 		 */
 		if (PE_parse_boot_argn("glink_follow", &follow, sizeof(follow)) && follow != 0) {
 			follow = follow > LINK_QUIET ? LINK_QUIET : follow;
@@ -3126,8 +3129,13 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			sleep_us(1000);
 		}
 		if (link_kick != kicks) {
-			kicks = link_kick;
-			busy = ours = true;
+			uint32_t kick = link_kick, lazy = link_lazy;
+
+			/* (glink_follow: ours only when more kicks than unwaited sends -- the feeder's writes -- came) */
+			ours = (int32_t)((kick - kicks) - (lazy - lazies)) > 0;
+			kicks = kick;
+			lazies = lazy;
+			busy = true;
 		}
 		doorbells();
 		if (doorbell.glink + doorbell.smp2p != rings) {
