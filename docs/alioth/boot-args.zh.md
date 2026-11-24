@@ -78,9 +78,9 @@
 
 | 参数 | 取值（默认关） | 作用 | 实测 |
 |---|---|---|---|
-| `gnss_seed_auth=S` | 秒 | gnss_feed 最多等 S 秒，等定位服务打开后再给 Wi-Fi 粗定位的 bundle 授权；locationd 把授权收回时再授权，最多 5 次 | 以前 8 次开机有 7 次粗定位被拒；S=30 时，查过的每一次粗定位（±35 米）都送到了调制解调器 |
+| `gnss_seed_auth=S` | 秒 | gnss_feed 最多等 S 秒，等定位服务打开后再给 Wi-Fi 粗定位的 bundle 授权；locationd 把授权收回时再授权，最多 5 次 | 以前 8 次开机有 7 次粗定位被拒；S=30 时，查过的每一次粗定位（±35 米）都送到了调制解调器。要和下面的 `gnss_seed_for` 一起用，不然调制解调器没定到位时定位服务会一直扫 Wi-Fi |
 | `gnss_still=N` | 秒 | 手机没动时，gnss_feed 最多每 N 秒送一次定位；一动或者定位更准了马上送 | 还没测（室内没有 GNSS 定位） |
-| `gnss_seed_for=S` | 秒 | gnss_feed 最多请求 S 秒 Wi-Fi 粗定位 | 量不出提升 |
+| `gnss_seed_for=S` | 秒 | gnss_feed 最多请求 S 秒 Wi-Fi 粗定位，第一次送出后 20 秒就停 | 不开的话，它会一直要到调制解调器自己定到位。在室内可能永远定不到，定位服务就整个开机期间每 6 秒左右扫一次 Wi-Fi（20 分钟 182 次）。S=120 时粗定位照样送到，20 秒后扫描就停了（开头 6 次，之后 8 分钟一次没有） |
 
 ## 系统
 
@@ -97,7 +97,7 @@
 
 下面这一行在手机上一起开过，装着正式包的 App，跑了 8 到 20 分钟：
 
-    gl_wrap_once=1 state_shaders=1 cam_pieces=32 cam_gather=1 cam_stats=8 wifi_off_wait=300 amp_lead_ms=40 wifi_he=1 wifi_mimo=1 wifi_ht_ampdu=3 cpufreq_hwtop=1 thermal_hold=5 wifi_answers=1 gnss_seed_auth=30 at_home=1 idle_set=1
+    gl_wrap_once=1 state_shaders=1 cam_pieces=32 cam_gather=1 cam_stats=8 wifi_off_wait=300 amp_lead_ms=40 wifi_he=1 wifi_mimo=1 wifi_ht_ampdu=3 cpufreq_hwtop=1 thermal_hold=5 wifi_answers=1 gnss_seed_auth=30 at_home=1 idle_set=1 gnss_seed_for=120
 
 App 全装好了，每个参数都打印了自己的一行，没有故障。20 分钟里调制解调器 0 丢包、声音 0 断流、蓝牙正常地睡、
-温度一直在 36–38 °C、没有进程因内存被杀。正式包开机时，这一行加进去一共 956 个字符（上限 1022）。
+温度一直在 36–38 °C、没有进程因内存被杀。`gnss_seed_for=120` 是 20 分钟那次之后补的，和其他的一起又跑了 9 分钟，也没有故障。正式包开机时，这一行加进去一共 974 个字符（上限 1022）。

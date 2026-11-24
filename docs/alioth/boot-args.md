@@ -79,9 +79,9 @@ own event, or for N ms at most, and wakes at once when work arrives.
 
 | boot-arg | values (default: off) | what it does | measured |
 |---|---|---|---|
-| `gnss_seed_auth=S` | s | gnss_feed waits up to S s for Location Services to come on before it authorizes the Wi-Fi seed's bundle. When locationd takes the authorization back, gnss_feed grants it again, up to 5 times | before: the seed was refused in 7 of 8 boots. With S=30, the seed (±35 m) reached the modem in every run checked |
+| `gnss_seed_auth=S` | s | gnss_feed waits up to S s for Location Services to come on before it authorizes the Wi-Fi seed's bundle. When locationd takes the authorization back, gnss_feed grants it again, up to 5 times | before: the seed was refused in 7 of 8 boots. With S=30, the seed (±35 m) reached the modem in every run checked. Use it with `gnss_seed_for` (below), or locationd keeps scanning Wi-Fi while the modem has no fix |
 | `gnss_still=N` | s | gnss_feed sends a fix from a phone that is not moving at most every N s; a move or a better fix goes at once | not tested yet (no GNSS fix indoors) |
-| `gnss_seed_for=S` | s | gnss_feed stops requesting the Wi-Fi seed after S s | no measured gain |
+| `gnss_seed_for=S` | s | gnss_feed asks for the Wi-Fi seed at most S s, and stops 20 s after the first seed is given | without it, the seed keeps asking until the modem has its own fix. Indoors that may be never, and locationd then scans Wi-Fi about every 6 s for the whole session (182 scans in 20 minutes). With S=120 the seed was still given, and the scans stopped 20 s later (6 scans, then none for 8 minutes) |
 
 ## System
 
@@ -98,8 +98,8 @@ Test roots only (their `loc_enable --all`): `loc_poll=N` (seconds between its ap
 
 This line ran on the phone in one boot, with a release's apps installed, for 8 to 20 minutes:
 
-    gl_wrap_once=1 state_shaders=1 cam_pieces=32 cam_gather=1 cam_stats=8 wifi_off_wait=300 amp_lead_ms=40 wifi_he=1 wifi_mimo=1 wifi_ht_ampdu=3 cpufreq_hwtop=1 thermal_hold=5 wifi_answers=1 gnss_seed_auth=30 at_home=1 idle_set=1
+    gl_wrap_once=1 state_shaders=1 cam_pieces=32 cam_gather=1 cam_stats=8 wifi_off_wait=300 amp_lead_ms=40 wifi_he=1 wifi_mimo=1 wifi_ht_ampdu=3 cpufreq_hwtop=1 thermal_hold=5 wifi_answers=1 gnss_seed_auth=30 at_home=1 idle_set=1 gnss_seed_for=120
 
 All apps installed, each boot-arg printed its own line, and nothing faulted. Over 20 minutes the modem dropped 0
 packets, sound had 0 underflows, Bluetooth slept normally, the temperature stayed at 36–38 °C, and no process was
-killed for memory. In a release boot the line comes to 956 of the 1022 characters.
+killed for memory. `gnss_seed_for=120` was added after the 20-minute run and ran with the rest for 9 minutes, again with no fault. In a release boot the line comes to 974 of the 1022 characters.
