@@ -89,6 +89,7 @@
 | 参数 | 取值（默认关） | 作用 | 实测 |
 |---|---|---|---|
 | `at_home=1` | 1 | 辅助触控的「主屏幕」当主屏幕键用：assistivetouchd 里的 `libhakios.at.dylib` 通过 `/dev/hakios-touch` 发按键。iOS 自己用的虚拟 HID 设备这个内核做不出来 | 设置 → 辅助触控 → 主屏幕能回到主屏幕了（以前没反应） |
+| `pb_store=1` | 1 | 让 PosterBoard 的壁纸存储用自己的目录：内存启动时 PosterBoard 没有容器，它的存储位置是共享的 `Application Support`，重置存储时会把别的服务放在那里的东西一起删掉，其中就有 ScreenTimeAgent 用的远程管理数据库（PosterBoard 里的 `libhakios.pb.dylib`，来自上游的 `umi_posterboard.m`） | 同一个 root 上 ScreenTimeAgent 的 "Can't create coordinator" 从 14 次变成 0 次；它的数据库和 PosterBoard 自己的目录都还在；屏幕使用时间能打开；壁纸照旧 |
 | `ipa_sign=keep` | `keep`，`0` 是从不签名（默认：安装时每个 IPA 都签名） | 已经在电脑上签过名的 IPA（标着 `.hakios-adhoc`）直接装，不再签一次 | 开机最忙的第一分钟少了 4.1 秒签名（5 个 IPA） |
 | `ramfs_swap=1` | 1 | 内存文件系统支持 renamex 的 `RENAME_SWAP` / `RENAME_EXCL`，usermanagerd 能保存它的钥匙包 | 能用，但只开它的话 SpringBoard 晚约 10 秒出来：lsd 查人格的请求变成能成功了，成功比马上失败花得多 |
 

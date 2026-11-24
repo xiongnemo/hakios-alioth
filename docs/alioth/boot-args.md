@@ -90,6 +90,7 @@ own event, or for N ms at most, and wakes at once when work arrives.
 | boot-arg | values (default: off) | what it does | measured |
 |---|---|---|---|
 | `at_home=1` | 1 | AssistiveTouch's Home acts as the home button: `libhakios.at.dylib` in assistivetouchd sends the button through `/dev/hakios-touch`, because iOS's virtual HID device cannot be made with this kernel | Settings → AssistiveTouch → Home goes to the home screen (before: nothing) |
+| `pb_store=1` | 1 | PosterBoard's wallpaper store gets a directory of its own: in a RAM boot PosterBoard has no container, so its store's base is the shared `Application Support`, and its store reset wiped what other services keep there -- ScreenTimeAgent's Remote Management store among them (`libhakios.pb.dylib` in PosterBoard, from upstream's `umi_posterboard.m`) | ScreenTimeAgent's "Can't create coordinator" 14 -> 0 on the same root; its store and PosterBoard's own directory stay; Screen Time opens; the wallpaper as before |
 | `ipa_sign=keep` | `keep`, or `0` for never (default: sign every IPA when installing it) | an IPA that was already signed on the computer (marked `.hakios-adhoc`) is installed as is, without being signed again | 4.1 s less signing in the busiest first minute (5 IPAs) |
 | `ramfs_swap=1` | 1 | the RAM file system supports renamex `RENAME_SWAP` / `RENAME_EXCL`, so usermanagerd can save its keybags | works, but on its own SpringBoard comes up about 10 s later: lsd's persona queries then succeed and cost more than the quick failure did |
 

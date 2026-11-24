@@ -154,7 +154,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.app.dylib Sileo
 /redwood/lib/libhakios.tweaks.dylib Preferences
 /redwood/lib/libhakios.ui.dylib *.app *.appex
-/redwood/lib/libhakios.at.dylib assistivetouchd"}
+/redwood/lib/libhakios.at.dylib assistivetouchd
+/redwood/lib/libhakios.pb.dylib PosterBoard"}
 [ "${BLUETOOTH-0}" != 1 ] || INJECT="$INJECT
 /redwood/lib/libhakios.bluetooth.dylib bluetoothd"
 # STOREFRONT=1: and a library of ours inside appstored as well (src/inject_store.c). It is not in the
@@ -313,6 +314,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# ... and inside assistivetouchd, so that AssistiveTouch's Home presses the home button: iOS presses it
 		# through an IOHIDUserDevice this kernel cannot make (src/inject_at.c; boot-arg at_home=1, off by default)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.at.dylib -lobjc -o obj/libhakios.at.dylib src/inject_at.c
+		# ... and inside PosterBoard: in a RAM boot it has no container, its wallpaper store's base is the shared
+		# Application Support and its store reset wipes ScreenTimeAgent's database there (src/inject_pb.m, from
+		# upstream's umi_posterboard.m; boot-arg pb_store=1, off by default)
+		$DYN -dynamiclib -fobjc-arc -framework Foundation -install_name /redwood/lib/libhakios.pb.dylib \
+			-o obj/libhakios.pb.dylib src/inject_pb.m
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -441,6 +447,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.ui.dylib ] && cp obj/libhakios.ui.dylib root/lib/
 	[ -f obj/libhakios.at.dylib ] && cp obj/libhakios.at.dylib root/lib/
+	[ -f obj/libhakios.pb.dylib ] && cp obj/libhakios.pb.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
