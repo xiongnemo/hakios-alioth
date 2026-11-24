@@ -2,8 +2,9 @@
 
 [English](boot-args.md) · 中文
 
-下面这些开机参数是 2026 年 11 月加的。每一个默认都是关的：不写它，内核和我们的程序跟以前完全一样，
-`devices/redmi-k40/boot.args` 里一个都没有。要试哪个，就在生成 payload 之前把它加到这个文件末尾。
+下面这些开机参数是 2026 年 11 月加的。不写哪个，哪个就是关的，内核和我们的程序跟以前完全一样。
+2026-11-25 起，「一起试过的」那一行已经写进 `devices/redmi-k40/boot.args`（用这个文件生成的包都开着它们），
+其余的还没有。要试哪个，就在生成 payload 之前把它加到这个文件末尾；不想要那一行里的某个，就在文件里删掉它，或者写成 `=0`。
 整条命令行不能超过 1022 个字符，这里面也算加载器自己的那一段，正式包里还要算 Wi-Fi 地址和装 App 的口令。
 每个参数开机时都会打印自己的一行，看日志就知道哪些生效了。
 
@@ -98,7 +99,7 @@
 
 ## 一起试过的
 
-下面这一行在手机上一起开过，装着正式包的 App，跑了 8 到 20 分钟：
+2026-11-25 起写在 `devices/redmi-k40/boot.args` 里。下面这一行在手机上一起开过，装着正式包的 App，跑了 8 到 20 分钟：
 
     gl_wrap_once=1 state_shaders=1 cam_pieces=32 cam_gather=1 cam_stats=8 wifi_off_wait=300 amp_lead_ms=40 wifi_he=1 wifi_mimo=1 wifi_ht_ampdu=3 cpufreq_hwtop=1 thermal_hold=5 wifi_answers=1 gnss_seed_auth=30 at_home=1 idle_set=1 gnss_seed_for=120
 

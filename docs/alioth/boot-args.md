@@ -2,9 +2,10 @@
 
 English · [中文](boot-args.zh.md)
 
-These boot-args were added in November 2026. Each one is off by default: without it the kernel and our programs
-behave as before, and none of them is in `devices/redmi-k40/boot.args`. To try one, append it to that file before
-the payload is built. The whole command line has to fit in 1022 characters, and that count includes the loader's own
+These boot-args were added in November 2026. Each one is off when it is not given: without it the kernel and our
+programs behave as before. Since 2026-11-25 the line under "Tried together" is in `devices/redmi-k40/boot.args`
+(so every build from that file has those on); the others are not. To try one, append it to that file before
+the payload is built; to leave one of the line out, delete it there or give it `=0`. The whole command line has to fit in 1022 characters, and that count includes the loader's own
 part and, in a release, the Wi-Fi address and the app token. Each boot-arg prints a line of its own at boot, so a log
 shows which ones were in effect.
 
@@ -99,7 +100,7 @@ Test roots only (their `loc_enable --all`): `loc_poll=N` (seconds between its ap
 
 ## Tried together
 
-This line ran on the phone in one boot, with a release's apps installed, for 8 to 20 minutes:
+In `devices/redmi-k40/boot.args` since 2026-11-25. This line ran on the phone in one boot, with a release's apps installed, for 8 to 20 minutes:
 
     gl_wrap_once=1 state_shaders=1 cam_pieces=32 cam_gather=1 cam_stats=8 wifi_off_wait=300 amp_lead_ms=40 wifi_he=1 wifi_mimo=1 wifi_ht_ampdu=3 cpufreq_hwtop=1 thermal_hold=5 wifi_answers=1 gnss_seed_auth=30 at_home=1 idle_set=1 gnss_seed_for=120
 
