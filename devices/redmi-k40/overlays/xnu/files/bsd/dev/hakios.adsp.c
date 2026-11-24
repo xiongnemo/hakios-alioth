@@ -3088,15 +3088,28 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	struct glink_packet *packet;
 	bool gave_up = false;
 	uint32_t idle_ms = 0, quiet = 0, kicks = link_kick, rings = doorbell.glink + doorbell.smp2p;
+	uint32_t follow = 0;
 
 	(void)hakios_idle_arg("glink_idle", &idle_ms, HAKIOS_IDLE_GLINK);
 	if (idle_ms != 0) {
 		printf("adsp: link: looks %u ms apart after %u quiet ones (glink_idle)\n", idle_ms, LINK_QUIET);
+		/*
+		 * (11-24) Boot-arg glink_follow=N (1..LINK_QUIET): after a look that found only the DSP's own traffic -- its
+		 * rings or packets, no message of ours, no change of its state words -- N quick looks follow instead of
+		 * LINK_QUIET. At rest the feeder's silence brings a write-done ~49 times a second, and each kept the link at
+		 * 1 ms looks for 10 ms (~570 wakes a second, census 141823). A message of ours still brings LINK_QUIET quick
+		 * looks for its answer. 0 / absent, the default: LINK_QUIET after anything, the old way.
+		 */
+		if (PE_parse_boot_argn("glink_follow", &follow, sizeof(follow)) && follow != 0) {
+			follow = follow > LINK_QUIET ? LINK_QUIET : follow;
+			printf("adsp: link: %u quick looks after the DSP's own traffic, %u after ours (glink_follow)\n", follow,
+			    LINK_QUIET);
+		}
 	}
 	bzero(&last, sizeof(last));
 	dsp_words(&last);
 	while (link_wanted) {
-		bool busy = false;
+		bool busy = false, ours = false;
 
 		if (idle_ms != 0 && quiet >= LINK_QUIET) {
 			/*
@@ -3114,7 +3127,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		if (link_kick != kicks) {
 			kicks = link_kick;
-			busy = true;
+			busy = ours = true;
 		}
 		doorbells();
 		if (doorbell.glink + doorbell.smp2p != rings) {
@@ -3122,7 +3135,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			busy = true;
 		}
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
-			busy = true;
+			busy = ours = true;     /* (glink_follow: a change of its state words counts as ours: the full look) */
 			last = words;
 			dsp_listen(&words);
 			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
@@ -3160,7 +3173,8 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			kfree_data(packet, sizeof(*packet) + packet->length);
 		}
-		quiet = busy ? 0 : quiet + 1;
+		/* (glink_follow: the DSP's own traffic leaves at least `follow' quick looks, and never shortens a window of ours) */
+		quiet = !busy ? quiet + 1 : (follow != 0 && !ours) ? MIN(quiet, LINK_QUIET - follow) : 0;
 	}
 	link_runs = false;
 	thread_terminate(current_thread());
