@@ -5,6 +5,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>             /* (wifi_idle's wait: assert_wait_timeout, clear_wait) */
 #include <os/atomic_private.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -432,6 +433,20 @@ umi_wifi_poll_thread(__unused void *argument)
 		seen = umi_poll_received;
 		kicks = umi_poll_kicks;
 		quiet = busy ? 0 : quiet + 1;
+		if (idle_ms != 0 && quiet >= 10) {
+			/*
+			 * (11-24) wifi_idle's long wait, armed first and then looked at: a send of ours (umi_qrtr_send) between
+			 * the look above and the sleep ends it before it begins, where msleep without a mutex slept through it.
+			 */
+			assert_wait_timeout((event_t)&umi_poll_wanted, THREAD_UNINT, idle_ms, NSEC_PER_MSEC);
+			if (umi_poll_kicks != kicks || umi_poll_received != seen ||
+			    !os_atomic_load(&umi_poll_wanted, acquire)) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
+			continue;
+		}
 		struct timespec pause = { .tv_sec = 0,
 			.tv_nsec = (long)(idle_ms != 0 && quiet >= 10 ? idle_ms : 1) * NSEC_PER_MSEC };
 		msleep(&umi_poll_wanted, NULL, PZERO, "umi-ipcr", &pause);

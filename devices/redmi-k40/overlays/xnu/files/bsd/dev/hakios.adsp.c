@@ -3099,8 +3099,16 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		bool busy = false;
 
 		if (idle_ms != 0 && quiet >= LINK_QUIET) {
+			/*
+			 * (11-24) armed first, then looked at: a message of ours since the last look -- during it included, which
+			 * the look after the sleep alone would have slept through for idle_ms -- ends the wait before it begins.
+			 */
 			assert_wait_timeout((event_t)&link_kick, THREAD_UNINT, idle_ms, NSEC_PER_MSEC);
-			thread_block(THREAD_CONTINUE_NULL);
+			if (link_kick != kicks || !link_wanted) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
 		} else {
 			sleep_us(1000);
 		}
