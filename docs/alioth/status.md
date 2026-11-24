@@ -4,6 +4,7 @@ English · [中文](status.zh.md)
 
 State of the Redmi K40 / POCO F3 (`alioth`, Snapdragon 870 / SM8250) port as of November 2026. Every "works" here
 was checked on the phone; numbers are measurements from it.
+The boot-args added in November, all off by default, are listed in [boot-args.md](boot-args.md).
 
 ## How it boots
 
