@@ -572,16 +572,68 @@ lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi
 
 /* ---- the radio's interrupts ---------------------------------------------------------------------- */
 
+/*
+ * (the K40's, 2026-11-25, WEEK-1121 N27) Per copy engine: interrupts, those whose service called none of the pipe's
+ * callbacks (empty), and a guard -- CE_EMPTY_STORM empty ones within a second (a storm; one that did work starts the
+ * count again) and the CE's vector is left masked, its ring served by the 100 ms look as without interrupts. (A CE
+ * whose interrupts are empty by nature and few -- CE3's send completions, ~80 a run -- never reaches it: session
+ * 201602 with a plain 64-in-a-row rule left CE3 too.) The callbacks are wrapped (one wrapper a pipe, so whoever serves
+ * the ring, the look too, still reaches the driver's own) and only counted.
+ */
+#define CE_EMPTY_STORM	32			/* empty interrupts within one second: a storm */
+static void (*ce_recv_orig[CE_COUNT_MAX])(struct ath11k_base *, struct sk_buff *);
+static void (*ce_send_orig[CE_COUNT_MAX])(struct ath11k_base *, struct sk_buff *);
+static unsigned long long ce_calls[CE_COUNT_MAX], ce_irqs[CE_COUNT_MAX], ce_empty[CE_COUNT_MAX];
+static unsigned ce_empty_run[CE_COUNT_MAX];	/* empty ones in the current second */
+static unsigned long long ce_window[CE_COUNT_MAX];	/* when that second began (ns) */
+static bool ce_left[CE_COUNT_MAX];
+#define CE_WRAP(n) \
+	static void ce_recv_##n(struct ath11k_base *ab, struct sk_buff *skb) { ce_calls[n]++; ce_recv_orig[n](ab, skb); } \
+	static void ce_send_##n(struct ath11k_base *ab, struct sk_buff *skb) { ce_calls[n]++; ce_send_orig[n](ab, skb); }
+CE_WRAP(0) CE_WRAP(1) CE_WRAP(2) CE_WRAP(3) CE_WRAP(4) CE_WRAP(5) CE_WRAP(6) CE_WRAP(7) CE_WRAP(8) CE_WRAP(9)
+CE_WRAP(10) CE_WRAP(11)
+static void (*const ce_recv_wrap[])(struct ath11k_base *, struct sk_buff *) = { ce_recv_0, ce_recv_1, ce_recv_2,
+	ce_recv_3, ce_recv_4, ce_recv_5, ce_recv_6, ce_recv_7, ce_recv_8, ce_recv_9, ce_recv_10, ce_recv_11 };
+static void (*const ce_send_wrap[])(struct ath11k_base *, struct sk_buff *) = { ce_send_0, ce_send_1, ce_send_2,
+	ce_send_3, ce_send_4, ce_send_5, ce_send_6, ce_send_7, ce_send_8, ce_send_9, ce_send_10, ce_send_11 };
+_Static_assert(CE_COUNT_MAX <= 12, "one wrapper a pipe");
+
 /* A copy engine's interrupt (pcic.c: ath11k_pcic_ce_interrupt_handler() and its tasklet). */
 static void
 irq_ce(void *argument)
 {
 	struct ath11k_ce_pipe *pipe = argument;
 
+	unsigned n = pipe->pipe_num;
+	unsigned long long before;
+	bool has_cb = ce_recv_orig[n] != NULL;	/* (receive rings only: a send ring left masked starves the WMI commands, 211414) */
+
 	mutex_lock(&bus.service);
-	ath11k_ce_per_engine_service(pipe->ab, pipe->pipe_num);
+	before = ce_calls[n];
+	ath11k_ce_per_engine_service(pipe->ab, n);
+	ce_irqs[n]++;
+	if (ce_calls[n] == before) {
+		unsigned long long now = lx_os_nanoseconds();
+
+		ce_empty[n]++;
+		if (now - ce_window[n] > 1000000000ull) {
+			ce_window[n] = now;
+			ce_empty_run[n] = 0;
+		}
+		ce_empty_run[n]++;
+	} else {
+		ce_empty_run[n] = 0;
+	}
 	mutex_unlock(&bus.service);
-	lx_os_irq_enable(bus.ce_vector[pipe->pipe_num]);
+	if (has_cb && ce_empty_run[n] >= CE_EMPTY_STORM) {
+		if (!ce_left[n]) {
+			ce_left[n] = true;
+			lx_tell("lx: CE%u: %u interrupts within a second brought nothing (%llu of %llu so far): its vector stays masked, the "
+			    "100 ms look serves it\n", n, CE_EMPTY_STORM, ce_empty[n], ce_irqs[n]);
+		}
+		return;
+	}
+	lx_os_irq_enable(bus.ce_vector[n]);
 }
 
 /* A data path group's (pcic.c: ath11k_pcic_ext_interrupt_handler() and its NAPI poll, until it has less to do than allowed). */
@@ -619,6 +671,14 @@ irq_attach(struct ath11k_base *ab)
 			continue;
 		}
 		bus.ce_vector[i] = (int)(index++ % msi_users[0].num_vectors + bus_user_base(0));
+		if (i < CE_COUNT_MAX && ab->ce.ce_pipe[i].recv_cb != NULL && ce_recv_orig[i] == NULL) {
+			ce_recv_orig[i] = ab->ce.ce_pipe[i].recv_cb;
+			ab->ce.ce_pipe[i].recv_cb = ce_recv_wrap[i];
+		}
+		if (i < CE_COUNT_MAX && ab->ce.ce_pipe[i].send_cb != NULL && ce_send_orig[i] == NULL) {
+			ce_send_orig[i] = ab->ce.ce_pipe[i].send_cb;
+			ab->ce.ce_pipe[i].send_cb = ce_send_wrap[i];
+		}
 		if ((ret = lx_os_irq_attach((unsigned)bus.ce_vector[i], irq_ce, &ab->ce.ce_pipe[i])) != 0) {
 			return (ret);
 		}
@@ -656,6 +716,14 @@ irq_say(void)
 	lx_tell("lx: the radio's interrupts by vector (umi: copy engines 3-12, the data path's groups 14-31; else 0-9, 10-27):%s "
 	    "the thread found %llu "
 	    "times work no interrupt had brought\n", line[0] ? line : " NONE", bus.late);
+	line[0] = 0;
+	for (unsigned i = 0; i < CE_COUNT_MAX; i++) {
+		if (ce_irqs[i] != 0) {
+			snprintf(line + strlen(line), sizeof(line) - strlen(line), " CE%u %llu/%llu%s,", i, ce_irqs[i], ce_empty[i],
+			    ce_left[i] ? " (left to the look)" : "");
+		}
+	}
+	lx_tell("lx: the copy engines' interrupts / of them empty (no callback called):%s\n", line[0] ? line : " none");
 }
 
 static unsigned
