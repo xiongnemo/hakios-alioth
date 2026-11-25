@@ -79,6 +79,19 @@ static bool umi_poll_wanted, umi_poll_finished;
  * every millisecond once ten looks in a row found nothing and nothing was sent; a send wakes it at once.
  */
 static volatile uint32_t umi_poll_received, umi_poll_kicks;
+/*
+ * (the K40's, 2026-11-25, WEEK-1121 N24) boot-arg umi_wifi_irq=2: MHI's own interrupts -- its event rings raise
+ * vectors 1, 2 and 0 (umi_mhi.c), the three umi_pcie_setup_mhi_msi leaves unmasked, at the GIC's SPIs from the
+ * radio's first -- wake the IPC router's poll thread, which then waits up to UMI_MHI_IRQ_WAIT_MS when quiet instead
+ * of wifi_idle's N ms (~356 wakes a second at rest with wifi_idle=4). 1 is the rings' interrupts only (hakios.lx.c,
+ * lx_bus.c); absent / 0 / 1: the IPC router looked at as before.
+ */
+#define UMI_MHI_IRQ_WAIT_MS     1000
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid),
+    void *context);
+extern void gic_v3_spi_unmask(uint32_t intid);
+static bool umi_mhi_irq_on;
+static volatile uint32_t umi_mhi_irqs;
 static struct umi_pcie *umi_active_pcie;
 static bool umi_normal_session, umi_service_wanted, umi_service_finished = true;
 static struct {
@@ -411,6 +424,38 @@ umi_qrtr_poll(struct hakios_qrtr_port *port, uint32_t timeout_ms)
 	return error;
 }
 
+/* In interrupt context: one of MHI's vectors -- the poll thread is told (as a send of ours tells it). */
+static void
+umi_mhi_irq_arrived(__unused void *context, __unused uint32_t intid)
+{
+	os_atomic_inc(&umi_mhi_irqs, relaxed);
+	os_atomic_inc(&umi_poll_kicks, relaxed);
+	thread_wakeup((event_t)&umi_poll_wanted);
+}
+
+static void
+umi_mhi_irq_attach(void)
+{
+	uint32_t want = 0, data = 0, spi = 0;
+	unsigned long long address = 0;
+
+	(void)PE_parse_boot_argn("umi_wifi_irq", &want, sizeof(want));
+	if (want < 2 || !hakios_wifi_radio_msi(&address, &data, &spi)) {
+		return;
+	}
+	for (unsigned v = 0; v < 3; v++) {
+		if (gic_v3_spi_attach(spi + v, true, umi_mhi_irq_arrived, NULL) != KERN_SUCCESS) {
+			hakios_tl("UMI Wi-Fi: umi_wifi_irq=2: MHI's vector %u (SPI %u) cannot be attached: the IPC router is looked at "
+			    "as before\n", v, spi + v);
+			return;
+		}
+		gic_v3_spi_unmask(spi + v);
+	}
+	umi_mhi_irq_on = true;
+	hakios_tl("UMI Wi-Fi: umi_wifi_irq=2: MHI's interrupts (vectors 0-2, SPIs %u-%u) wake the IPC router's thread; it "
+	    "waits up to %u ms when quiet\n", spi, spi + 2, UMI_MHI_IRQ_WAIT_MS);
+}
+
 static void
 umi_wifi_poll_thread(__unused void *argument)
 {
@@ -433,12 +478,13 @@ umi_wifi_poll_thread(__unused void *argument)
 		seen = umi_poll_received;
 		kicks = umi_poll_kicks;
 		quiet = busy ? 0 : quiet + 1;
-		if (idle_ms != 0 && quiet >= 10) {
+		if ((idle_ms != 0 || umi_mhi_irq_on) && quiet >= 10) {
 			/*
 			 * (11-24) wifi_idle's long wait, armed first and then looked at: a send of ours (umi_qrtr_send) between
 			 * the look above and the sleep ends it before it begins, where msleep without a mutex slept through it.
 			 */
-			assert_wait_timeout((event_t)&umi_poll_wanted, THREAD_UNINT, idle_ms, NSEC_PER_MSEC);
+			assert_wait_timeout((event_t)&umi_poll_wanted, THREAD_UNINT, umi_mhi_irq_on ? UMI_MHI_IRQ_WAIT_MS : idle_ms,
+			    NSEC_PER_MSEC);
 			if (umi_poll_kicks != kicks || umi_poll_received != seen ||
 			    !os_atomic_load(&umi_poll_wanted, acquire)) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
@@ -802,6 +848,7 @@ umi_wifi_firmware_diagnostic(void *context)
 			}
 			os_atomic_store(&umi_poll_finished, false, relaxed);
 			os_atomic_store(&umi_poll_wanted, true, release);
+			if (!error) umi_mhi_irq_attach();
 			if (!error) error = lx_os_thread("umi-ipcr", umi_wifi_poll_thread, NULL);
 			if (!error) {
 				error = hakios_lx_start();
