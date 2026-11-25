@@ -33,7 +33,9 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>             /* (mdm_irq's wait: assert_wait_timeout, clear_wait) */
 #include <kern/thread.h>
+#include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -608,6 +610,35 @@ step_pcie2(void)
  */
 #define MDM_MSI_REGISTER        0x17a10040ull
 #define MDM_MSI_SPI             960u
+/*
+ * (2026-11-26, WEEK-1121 N30) boot-arg mdm_irq=1 (with mdm_msi=1, and mdm_idle -- idle_set's): the modem's MHI
+ * interrupts -- its event rings are told vectors 1-3 (alioth_mhi.c event_vectors), MHI's own is 0 -- each wake the
+ * listen's thread. MDM_MSI_SPI (960) is past this GIC's last line (GICD_TYPER 0x7b041d: INTIDs to 959, run
+ * 081521), so the MSI's writes went nowhere; with mdm_irq the MSI's data is MDM_IRQ_SPI instead -- the DT's
+ * qcom,pcie2_msi block (GIC SPIs 832-863 = INTIDs 864-895; Wi-Fi's PCIe0 has 800-831) -- and SPI MDM_IRQ_SPI + v
+ * is taken. From MDM_IDLE_AFTER_MS into the listen that thread then waits for one after every poll
+ * (at most MDM_IRQ_WAIT_MS, or until the next HELLO / beat line) instead of mdm_idle's looks; a poll that took its
+ * whole event budget polls again at once. If no interrupt has come by the first idle minute's end: mdm_idle's
+ * looks as before. Masked in mdm_stop(). 0 / absent, the default: polled, as before.
+ */
+#define MDM_IRQ_SPI             864u
+#define MDM_IRQ_VECTORS         4u
+#define MDM_IRQ_WAIT_MS         1000u
+static bool msi_on, mdm_irq_on;
+static uint32_t mdm_irqs;
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid),
+    void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+
+/* the MSI's data: MDM_IRQ_SPI with mdm_irq=1, else MDM_MSI_SPI as before */
+static uint32_t
+mdm_msi_data(void)
+{
+	uint32_t want = 0;
+
+	return PE_parse_boot_argn("mdm_irq", &want, sizeof(want)) && want != 0 ? MDM_IRQ_SPI : MDM_MSI_SPI;
+}
 #define MDM_PTE_DEVICE          (MDM_PTE | 2ull << 2 | 1ull << 53 | 1ull << 54)   /* MAIR entry 2 (Device-nGnRE), never executed */
 #define MDM_STREAM              0x1d01u         /* kona-pcie.dtsi pcie2: iommu-map <0x100 &apps_smmu 0x1d01 1> */
 #define MDM_WINDOW              0x20000000ull   /* kona-mhi.dtsi: qcom,iommu-dma-addr-pool <0x20000000 ...> */
@@ -968,10 +999,59 @@ dma_route(void)
 	return (rd(conf + 4) & 7) == 6;
 }
 
+/* In interrupt context (mdm_irq=1, N30): one of the modem's MHI vectors -- the listen's thread is told. */
+static void
+mdm_irq_arrived(__unused void *context, __unused uint32_t intid)
+{
+	os_atomic_inc(&mdm_irqs, relaxed);
+	thread_wakeup((event_t)&mdm_irqs);
+}
+
+/* (mdm_irq=1) the vectors taken; false (and nothing taken) where they cannot be */
+static bool
+mdm_irq_attach(void)
+{
+	uint32_t want = 0;
+
+	if (!PE_parse_boot_argn("mdm_irq", &want, sizeof(want)) || want == 0) {
+		return false;
+	}
+	if (!msi_on) {
+		say("mdm: 6: irq: mdm_irq=1 wants the MSI on (mdm_msi=1): looked at as before\n");
+		return false;
+	}
+	for (unsigned v = 0; v < MDM_IRQ_VECTORS; v++) {
+		kern_return_t kr = gic_v3_spi_attach(MDM_IRQ_SPI + v, true, mdm_irq_arrived, NULL);
+
+		if (kr == KERN_NAME_EXISTS) {
+			gic_v3_spi_unmask(MDM_IRQ_SPI + v);       /* (taken in an earlier start) */
+		} else if (kr != KERN_SUCCESS) {
+			say("mdm: 6: irq: vector %u (SPI %u) cannot be taken (%d): looked at as before\n", v, MDM_IRQ_SPI + v, kr);
+			for (unsigned w = 0; w < v; w++) {
+				gic_v3_spi_mask(MDM_IRQ_SPI + w);
+			}
+			return false;
+		}
+	}
+	say("mdm: 6: irq: the modem's MHI vectors 0-%u (SPIs %u-%u) wake the listen; it waits for one after each poll, "
+	    "at most %u ms (mdm_irq)\n", MDM_IRQ_VECTORS - 1, MDM_IRQ_SPI, MDM_IRQ_SPI + MDM_IRQ_VECTORS - 1, MDM_IRQ_WAIT_MS);
+	return true;
+}
+
+static void
+mdm_irq_mask(void)
+{
+	for (unsigned v = 0; mdm_irq_on && v < MDM_IRQ_VECTORS; v++) {
+		gic_v3_spi_mask(MDM_IRQ_SPI + v);
+	}
+	mdm_irq_on = false;
+}
+
 /* The modem stopped (PERST), what it was given put back. `leaving`: alioth_mdm_quiesce(), the other cores stopped. */
 static void
 mdm_stop(bool leaving)
 {
+	mdm_irq_mask();                                 /* (mdm_irq: masked only -- a detach waits for handlers) */
 	if (dma_on) {
 		wr(dbi + 4, 2);                                 /* nothing upstream through the root bridge */
 	}
@@ -1204,14 +1284,14 @@ msi_enable(void)
 			wr(conf + at + 4, (uint32_t)address);
 			if (wide) {
 				wr(conf + at + 8, (uint32_t)(address >> 32));
-				wr(conf + at + 12, MDM_MSI_SPI);
+				wr(conf + at + 12, mdm_msi_data());
 			} else {
-				wr(conf + at + 8, MDM_MSI_SPI);
+				wr(conf + at + 8, mdm_msi_data());
 			}
 			wr(conf + at, (head & 0xffffu) | on << 16);
 			say("mdm: 4: msi: capability at %#x (control %#x -> %#x, %s, %u vector%s): address %#llx, data %u\n", at,
 			    control, rd(conf + at) >> 16, wide ? "64-bit" : "32-bit", 1u << (control >> 1 & 7),
-			    (control >> 1 & 7) ? "s" : "", address, MDM_MSI_SPI);
+			    (control >> 1 & 7) ? "s" : "", address, mdm_msi_data());
 			return (rd(conf + at) >> 16 & 1) != 0;
 		}
 		at = (head >> 8) & 0xfc;
@@ -1277,7 +1357,7 @@ step_mhi(void)
 		uint32_t want_msi = 0;
 
 		if (PE_parse_boot_argn("mdm_msi", &want_msi, sizeof(want_msi)) && want_msi != 0) {
-			(void)msi_enable();
+			msi_on = msi_enable();
 		} else {
 			say("mdm: 4: msi: left off (mdm_msi=1 switches it on before BHI)\n");
 		}
@@ -3043,6 +3123,8 @@ step_qrtr(void)
 		 */
 		uint32_t idle_ms = 0, seen_events = mhi.events;
 		uint64_t quiet_from = start, idle_say = start + MDM_IDLE_AFTER_MS + 60000, naps = 0, looks = 0;
+		uint64_t irq_waits = 0, irq_woken = 0;
+		uint32_t irqs_before = 0, events_before = 0;
 
 		/* boot-arg mdm_listen=S: listened to for S seconds (run the kernel longer than that: loader_return_after) */
 		if (PE_parse_boot_argn("mdm_listen", &listen_s, sizeof(listen_s)) && listen_s != 0) {
@@ -3052,6 +3134,9 @@ step_qrtr(void)
 			idle_ms = 100;
 		}
 		say("mdm: 6: listening for %llu s\n", listen_ms / 1000);
+		if (idle_ms != 0) {
+			mdm_irq_on = mdm_irq_attach();
+		}
 		if (idle_ms != 0) {
 			say("mdm: 6: idle: after %u s, quiet %u ms: a look every %u ms, %u events a poll (mdm_idle)\n",
 			    MDM_IDLE_AFTER_MS / 1000, MDM_IDLE_QUIET_MS, idle_ms, IPCR_QUEUE / 2);
@@ -3075,6 +3160,8 @@ step_qrtr(void)
 				    QRTR_NODE_BCAST, NULL));
 				hello_at += 5000;
 			}
+			irqs_before = os_atomic_load(&mdm_irqs, relaxed);   /* (mdm_irq: one coming from here on ends the wait) */
+			events_before = mhi.events;
 			error = alioth_mhi_poll(&mhi);
 			while (error == 0 && ipcr.head != ipcr.tail) {
 				unsigned slot = ipcr.head++ % IPCR_QUEUE;
@@ -3093,12 +3180,37 @@ step_qrtr(void)
 					seen_events = mhi.events;
 					quiet_from = now;
 				}
-				if (now - quiet_from >= MDM_IDLE_QUIET_MS) {
+				if (mdm_irq_on && mhi.events - events_before < mhi.event_budget) {
+					/* (mdm_irq, N30) wait for an interrupt: at most MDM_IRQ_WAIT_MS, or until the next HELLO / beat line */
+					uint64_t until = hello_at < beat ? hello_at : beat;
+					uint32_t wait_ms = until <= now ? 1 : until - now > MDM_IRQ_WAIT_MS ? MDM_IRQ_WAIT_MS : (uint32_t)(until - now);
+
+					assert_wait_timeout((event_t)&mdm_irqs, THREAD_UNINT, wait_ms, NSEC_PER_MSEC);
+					if (os_atomic_load(&mdm_irqs, relaxed) != irqs_before) {
+						clear_wait(current_thread(), THREAD_AWAKENED);
+						irq_woken++;
+					} else if (thread_block(THREAD_CONTINUE_NULL) == THREAD_AWAKENED) {
+						irq_woken++;
+					}
+					irq_waits++;
+				} else if (mdm_irq_on) {
+					looks++;                        /* (its whole budget taken: again at once) */
+				} else if (now - quiet_from >= MDM_IDLE_QUIET_MS) {
 					delay(idle_ms * 1000);
 					naps++;
 				} else {
 					delay(1000);
 					looks++;
+				}
+				if (now >= idle_say && mdm_irq_on) {
+					say("mdm: 6: irq: a minute: %llu waits, %llu of them ended by an interrupt; %u interrupts in all, %u "
+					    "events, %u dropped (mdm_irq)\n", irq_waits, irq_woken, os_atomic_load(&mdm_irqs, relaxed), mhi.events,
+					    ipcr.dropped + efsq.dropped);
+					if (os_atomic_load(&mdm_irqs, relaxed) == 0) {
+						say("mdm: 6: irq: no interrupt in a minute: mdm_idle's looks as before (mdm_irq)\n");
+						mdm_irq_mask();
+					}
+					irq_waits = irq_woken = 0;
 				}
 				if (now >= idle_say) {
 					say("mdm: 6: idle: a minute: %llu naps of %u ms, %llu short looks; %u events, %u dropped in all "
