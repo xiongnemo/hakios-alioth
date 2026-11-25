@@ -240,7 +240,19 @@ lx_os_option(const char *name)
 	if (umi_wifi_is_board()) {
 		if (strcmp(name, "wifi_umi") == 0) return 1;
 		if (strcmp(name, "wifi_lx") == 0) return 2;
-		if (strcmp(name, "wifi_irq") == 0) return 0;
+		if (strcmp(name, "wifi_irq") == 0) {
+			/*
+			 * (the K40's, 2026-11-25, WEEK-1121 N24) boot-arg umi_wifi_irq=1: the radio's interrupts taken as wifi_irq=1
+			 * takes them on the other boards -- its MSI vectors (the address and data umi_wifi.c gives the radio's MSI
+			 * capability for MHI: the GIC's SETSPI register, SPIs from 800) attached through the GIC -- instead of the
+			 * rings looked at every wifi_idle ms. Absent or 0: looked at, as before. (Android on this phone: the chip
+			 * interrupts 3.2 times a second at rest; our three pollers wake ~920 times.)
+			 */
+			uint32_t irq = 0;
+
+			(void)PE_parse_boot_argn("umi_wifi_irq", &irq, sizeof(irq));
+			return irq;
+		}
 		if (strcmp(name, "wifi_scan") == 0) return umi_wifi_normal_session() ? 0 : 1;
 		if (strcmp(name, "wifi_station") == 0) return umi_wifi_normal_session() ? 1 : 0;
 		if (strcmp(name, "wifi_ba") == 0 || strcmp(name, "wifi_wide") == 0) return 1;

@@ -96,6 +96,14 @@ static struct ath11k_msi_user msi_users[] = {
 };
 static void irq_say(void);
 
+/*
+ * (the K40's, 2026-11-25, WEEK-1121 N24) The vector a user's interrupts start at. On the umi board (QCA6390 over PCIe,
+ * as pci.c has it: MHI 0-2, the copy engines 3-12, wake 13, the data path's groups 14-31) not the table's: the radio
+ * is told so (bus_get_user_msi_vector), and the functions have to hang at the same vectors (irq_attach) -- with the
+ * table's 0 and 10 every interrupt ran another ring's function (umi_wifi_irq=1, run 112456: ping 94 ms).
+ */
+static unsigned bus_user_base(unsigned user);
+
 static const struct ath11k_msi_config msi_config = {
 	.total_vectors = 28,
 	.total_users = 2,
@@ -610,7 +618,7 @@ irq_attach(struct ath11k_base *ab)
 		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR) {
 			continue;
 		}
-		bus.ce_vector[i] = (int)(index++ % msi_users[0].num_vectors + msi_users[0].base_vector);
+		bus.ce_vector[i] = (int)(index++ % msi_users[0].num_vectors + bus_user_base(0));
 		if ((ret = lx_os_irq_attach((unsigned)bus.ce_vector[i], irq_ce, &ab->ce.ce_pipe[i])) != 0) {
 			return (ret);
 		}
@@ -624,7 +632,7 @@ irq_attach(struct ath11k_base *ab)
 		    mask->rxdma2host[i] || mask->host2rxdma[i] || mask->rx_mon_status[i])) {
 			continue;
 		}
-		bus.group_vector[i] = (int)(i % msi_users[1].num_vectors + msi_users[1].base_vector);
+		bus.group_vector[i] = (int)(i % msi_users[1].num_vectors + bus_user_base(1));
 		if ((ret = lx_os_irq_attach((unsigned)bus.group_vector[i], irq_group, &ab->ext_irq_grp[i])) != 0) {
 			return (ret);
 		}
@@ -638,15 +646,25 @@ irq_say(void)
 {
 	char line[400] = "";
 
-	for (unsigned v = 0; v < msi_config.total_vectors; v++) {
+	for (unsigned v = 0; v < (bus.umi ? 32u : msi_config.total_vectors); v++) {
 		unsigned long long count = lx_os_irq_count(v);
 
 		if (count != 0) {
 			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %u: %llu,", v, count);
 		}
 	}
-	lx_tell("lx: the radio's interrupts by vector (copy engines 0-9, the data path's groups 10-27):%s the thread found %llu "
+	lx_tell("lx: the radio's interrupts by vector (umi: copy engines 3-12, the data path's groups 14-31; else 0-9, 10-27):%s "
+	    "the thread found %llu "
 	    "times work no interrupt had brought\n", line[0] ? line : " NONE", bus.late);
+}
+
+static unsigned
+bus_user_base(unsigned user)
+{
+	if (bus.umi) {
+		return (user == 0 ? 3 : 14);
+	}
+	return (msi_users[user].base_vector);
 }
 
 static int
@@ -655,8 +673,7 @@ bus_get_user_msi_vector(struct ath11k_base *ab, char *user, int *count, u32 *use
 	for (unsigned i = 0; i < nitems(msi_users); i++) {
 		if (strcmp(user, msi_users[i].name) == 0) {
 			*count = (int)msi_users[i].num_vectors;
-			*base_vector = msi_users[i].base_vector;
-			if (bus.umi) *base_vector = i == 0 ? 3 : 14;
+			*base_vector = bus_user_base(i);
 			*user_base_data = *base_vector + ab->pci.msi.ep_base_data;
 			return (0);
 		}
