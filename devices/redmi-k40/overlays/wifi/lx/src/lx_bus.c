@@ -1104,6 +1104,16 @@ lx_stop(void)
 		return;
 	}
 	driver = NULL;
+	/*
+	 * (the K40's, 2026-11-25, WEEK-1121 N24) pci.c's removal sets this before ath11k_core_deinit(): the QMI event
+	 * work then drops what comes meanwhile. Without it, the firmware's QMI server going away as the driver comes down
+	 * (the IPC router is stopped after us) is taken as a crash: SERVER_EXIT -> ath11k_core_pre_reconfigure_recovery()
+	 * on a driver half taken apart, a data abort (run 132836, umi_wifi_irq=2). Where the radio's interrupts are on;
+	 * the polling default as before.
+	 */
+	if (lx_os_option("wifi_irq")) {
+		set_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags);
+	}
 	lx_station_withdraw();
 	lx_station_leave();
 	ath11k_core_deinit(ab);
