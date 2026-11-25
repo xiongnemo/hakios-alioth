@@ -248,6 +248,81 @@ static struct {
 } later[16];
 
 /*
+ * (2026-11-26, WEEK-1121 N29) Boot-arg wifi_mon_ms=N (20..1000): ath11k's monitor-status reap timer
+ * (ath11k_dp_service_mon_ring, which re-arms itself every ATH11K_MON_TIMER_INTERVAL = 10 ms for good where the chip
+ * has no rxdma1 -- the QCA6390: 96 % of this ticker's fires at rest, run 051713) is armed N ms ahead instead while
+ * fewer than MON_BUSY_FRAMES frames came within the last second; frames coming, the driver's 10 ms at its next
+ * arming. A status ring reaped later holds more entries; what it feeds is the received frames' statistics, not
+ * the frames. lx_bus.c names the timer (lx_mon_timer_is). 0 / absent, the default: as the driver asks.
+ */
+#define MON_BUSY_FRAMES 20
+static struct timer_list *mon_timer;
+static unsigned mon_ms;
+static unsigned long mon_window;		/* jiffies: the start of the second being counted */
+static unsigned mon_window_frames;		/* frames counted at its start */
+static bool mon_quiet;
+static unsigned long mon_arms, mon_stretched;
+
+unsigned lx_frames_in(void);			/* lx_80211.c */
+void lx_mon_timer_is(struct timer_list *timer);
+
+void
+lx_mon_timer_is(struct timer_list *timer)
+{
+	if (timer == NULL) {
+		if (mon_ms != 0 && mon_timer != NULL) {
+			lx_tell("lx: the monitor ring's reap timer was armed %lu times, %lu of them %u ms ahead (wifi_mon_ms)\n",
+			    mon_arms, mon_stretched, mon_ms);
+		}
+		mon_timer = NULL;
+		return;
+	}
+	mon_ms = lx_os_option("wifi_mon_ms");
+	mon_ms = mon_ms == 0 ? 0 : mon_ms < 20 ? 20 : mon_ms > 1000 ? 1000 : mon_ms;
+	mon_arms = mon_stretched = 0;
+	mon_quiet = false;
+	mon_window = jiffies;
+	mon_window_frames = lx_frames_in();
+	mon_timer = timer;
+	if (mon_ms != 0) {
+		lx_tell("lx: the monitor ring's reap timer: %u ms ahead while fewer than %u frames a second come (wifi_mon_ms)\n",
+		    mon_ms, MON_BUSY_FRAMES);
+	}
+}
+
+/* (called with the lock held, from mod_timer) */
+static unsigned long
+mon_expires(struct timer_list *timer, unsigned long expires)
+{
+	unsigned frames;
+	unsigned long later;
+
+	if (mon_ms == 0 || timer != mon_timer) {
+		return (expires);
+	}
+	mon_arms++;
+	frames = lx_frames_in();
+	if (frames - mon_window_frames >= MON_BUSY_FRAMES) {
+		mon_quiet = false;			/* busy: the driver's pace, and a second counted anew */
+		mon_window = jiffies;
+		mon_window_frames = frames;
+	} else if ((long)(jiffies - mon_window) >= (long)msecs_to_jiffies(1000)) {
+		mon_quiet = true;			/* a quiet second */
+		mon_window = jiffies;
+		mon_window_frames = frames;
+	}
+	if (!mon_quiet) {
+		return (expires);
+	}
+	later = jiffies + msecs_to_jiffies(mon_ms);
+	if ((long)(later - expires) > 0) {
+		mon_stretched++;
+		return (later);
+	}
+	return (expires);
+}
+
+/*
  * (11-22, WEEK-1121 P2) Boot-arg wifi_idle=N (3..500): the ticker ("wifi-ticks", ~445 wakes a second on an idle phone)
  * sleeps until the earliest timer or delayed work is due, at most N ms and at least 2 (the old pace) -- and a timer
  * armed or work queued meanwhile wakes it at once (mod_timer, linux_queue_delayed_work_on), so nothing fires late.
@@ -424,7 +499,7 @@ mod_timer(struct timer_list *timer, unsigned long expires)
 			slot = (int)i;
 		}
 	}
-	timer->expires = expires;
+	timer->expires = mon_expires(timer, expires);	/* (wifi_mon_ms: N29) */
 	if (slot >= 0) {
 		armed[slot] = timer;
 		lx_os_wakeup(&jiffies);		/* (wifi_idle: the ticker's wait is reckoned again) */

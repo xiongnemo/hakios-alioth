@@ -2520,6 +2520,17 @@ lx_station_join(void)
 	return (error);
 }
 
+/* (2026-11-26, N29) frames received so far, for us and to everybody (lx_base.c's wifi_mon_ms); 0 without a radio */
+unsigned lx_frames_in(void);
+
+unsigned
+lx_frames_in(void)
+{
+	struct lx_radio *radio = the_radio;
+
+	return (radio != NULL ? radio->received + radio->received_group : 0);
+}
+
 /* What has passed since the network was joined. */
 void
 lx_station_say(void)

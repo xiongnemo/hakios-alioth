@@ -95,6 +95,7 @@ static struct ath11k_msi_user msi_users[] = {
 	{ .name = "DP", .num_vectors = 18, .base_vector = 10 },
 };
 static void irq_say(void);
+void lx_mon_timer_is(struct timer_list *timer);	/* (wifi_mon_ms: lx_base.c, N29) */
 
 /*
  * (the K40's, 2026-11-25, WEEK-1121 N24) The vector a user's interrupts start at. On the umi board (QCA6390 over PCIe,
@@ -1106,6 +1107,7 @@ lx_start(void)
 		lx_tell("lx: the driver's start fails: %d\n", ret);
 		return (-ret);
 	}
+	lx_mon_timer_is(&ab->mon_reap_timer);	/* (wifi_mon_ms, N29) */
 	if (bus.umi && (ret = ath11k_qmi_fwreset_from_cold_boot(ab)) != 0) {
 		ath11k_qmi_deinit_service(ab);
 		return -ret;
@@ -1184,6 +1186,7 @@ lx_stop(void)
 	}
 	lx_station_withdraw();
 	lx_station_leave();
+	lx_mon_timer_is(NULL);			/* (wifi_mon_ms, N29: its counts said) */
 	ath11k_core_deinit(ab);
 	lx_tell("lx: the driver is down again\n");
 }
