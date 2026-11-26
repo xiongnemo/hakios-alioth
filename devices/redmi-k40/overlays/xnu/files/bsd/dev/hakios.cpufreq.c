@@ -14,6 +14,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -325,6 +326,21 @@ hakios_cpufreq_cap(uint32_t domain, int row)
 #define GOV_TOUCH_MS    500
 #define GOV_REPORT_S    60
 
+/*
+ * (2026-11-26, WEEK-1121 N33) boot-arg gov_idle=N (ms, GOV_IDLE_MIN..GOV_IDLE_MAX). At rest the governor's 50 looks a
+ * second find every group at its bottom row with next to nothing to do (~48 wakes a second, census 134756). While
+ * every group's row is the bottom one, none is waiting to step down, no touch's window is open and each group's
+ * busiest core used under GOV_IDLE_PCT percent, the next look comes after N ms instead of GOV_MS -- or at once when a
+ * finger lands: the touch path wakes a napping governor (hakios.input.c), so a touch's boost comes no later than with
+ * the 20 ms looks. A load that grows without a touch is seen at the nap's end (as its share of the whole nap; from
+ * GOV_IDLE_PCT on the looks are GOV_MS apart again). 0 / absent, the default: every GOV_MS, as before.
+ */
+#define GOV_IDLE_MIN    40
+#define GOV_IDLE_MAX    1000
+#define GOV_IDLE_PCT    30
+
+extern volatile bool hakios_gov_napping;       /* hakios.input.c: a touch wakes &hakios_input_at while it is set */
+
 extern volatile uint64_t hakios_input_at;      /* hakios.input.c */
 extern void thread_set_thread_name(thread_t thread, const char *name);
 
@@ -348,6 +364,10 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 	uint32_t want_max[EPSS_DOMAINS] = { 0 }, lower_for[EPSS_DOMAINS] = { 0 }, ups = 0, downs = 0, touches = 0;
 	int row[EPSS_DOMAINS];
 	bool touching = false;
+	/* (gov_idle) */
+	uint32_t gov_idle = 0, looks = 0, naps = 0, nap_touches = 0;
+	uint64_t last_input = hakios_input_at, touch_lag_max = 0;
+	bool nap_next = false;
 
 	bzero(row_time, sizeof(row_time));
 	bzero(khz_time, sizeof(khz_time));
@@ -363,12 +383,44 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 	tell("cpugov: the cores' speed follows their load: every %u ms, 1.25 x what the busiest core of a group used (the "
 	    "top from %u%%), down after %u ms, the big cores at their top for %u ms after a touch\n", GOV_MS, GOV_FULL,
 	    GOV_DOWN_MS, GOV_TOUCH_MS);
+	if (PE_parse_boot_argn("gov_idle", &gov_idle, sizeof(gov_idle)) && gov_idle != 0 &&
+	    (gov_idle < GOV_IDLE_MIN || gov_idle > GOV_IDLE_MAX)) {
+		tell("cpugov: gov_idle=%u is outside %u..%u ms: not taken\n", gov_idle, GOV_IDLE_MIN, GOV_IDLE_MAX);
+		gov_idle = 0;
+	}
+	if (gov_idle != 0) {
+		tell("cpugov: gov_idle: at rest (every group at its bottom row, its busiest core under %u%%, no touch for %u ms) "
+		    "the next look after %u ms instead of %u, at once when a finger lands\n", GOV_IDLE_PCT, GOV_TOUCH_MS, gov_idle,
+		    GOV_MS);
+	}
 	for (;;) {
 		uint32_t busy_pct[EPSS_DOMAINS] = { 0 };
 		uint64_t now, span, input_at;
-		bool touched;
+		bool touched, woke_by_touch = false;
 
-		delay_for_interval(GOV_MS, NSEC_PER_MSEC);
+		if (nap_next) {
+			uint64_t deadline;
+			wait_result_t waited;
+
+			/* (armed first, then the flag, a fence, the touch time read: the touch path stores its time, a fence, reads
+			 * the flag -- one of the two sees the other) */
+			clock_interval_to_deadline(gov_idle, NSEC_PER_MSEC, &deadline);
+			(void)assert_wait_deadline((event_t)(uintptr_t)&hakios_input_at, THREAD_UNINT, deadline);
+			hakios_gov_napping = true;
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			if (hakios_input_at != last_input) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+				waited = THREAD_AWAKENED;
+			} else {
+				waited = thread_block(THREAD_CONTINUE_NULL);
+			}
+			hakios_gov_napping = false;
+			naps++;
+			woke_by_touch = waited == THREAD_AWAKENED;
+		} else {
+			delay_for_interval(GOV_MS, NSEC_PER_MSEC);
+		}
+		looks++;
 		now = mach_absolute_time();
 		span = now - then;
 		if (span == 0) {
@@ -388,6 +440,11 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 		input_at = hakios_input_at;
 		touched = input_at != 0 && now - input_at < touch_window;
+		if (woke_by_touch) {
+			nap_touches++;
+			touch_lag_max = MAX(touch_lag_max, now > input_at ? now - input_at : 0);
+		}
+		last_input = input_at;
 		if (touched && !touching) {
 			touches++;
 		}
@@ -432,6 +489,12 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 				downs++;
 			}
 		}
+		nap_next = gov_idle != 0 && !touched;
+		for (uint32_t d = 0; d < EPSS_DOMAINS && nap_next; d++) {
+			if (epss_top[d] >= 0 && (row[d] != 0 || lower_for[d] != 0 || busy_pct[d] >= GOV_IDLE_PCT)) {
+				nap_next = false;
+			}
+		}
 		lck_spin_lock(&cpufreq_lock);
 		for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
 			if (epss_top[d] >= 0 && gov_row[d] != row[d]) {
@@ -454,6 +517,16 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 				    epss_now_khz(d) / 1000);
 			}
 			tell("%s %u up, %u down, %u touches\n", line, ups, downs, touches);
+			if (gov_idle != 0) {
+				uint64_t lag_ns;
+
+				absolutetime_to_nanoseconds(touch_lag_max, &lag_ns);
+				tell("cpugov: gov_idle: the last %u s: %u looks, %u of them after a nap of %u ms; %u naps ended by a "
+				    "touch, the latest %llu us after it\n", GOV_REPORT_S, looks, naps, gov_idle, nap_touches,
+				    lag_ns / 1000);
+			}
+			looks = naps = nap_touches = 0;
+			touch_lag_max = 0;
 			bzero(row_time, sizeof(row_time));
 			bzero(khz_time, sizeof(khz_time));
 			window_time = 0;

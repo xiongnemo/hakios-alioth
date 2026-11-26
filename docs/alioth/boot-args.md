@@ -37,6 +37,7 @@ own event, or for N ms at most, and wakes at once when work arrives.
 | `net_idle=N` | ms, 20–60000 | the thread of a network link that is never polled (the radio's) checks every N ms; its minute counter line stays on time | 93 → 1 wakes a second |
 | `mic_idle=N` | ms, 1–1000 | while the microphone device is closed, its service waits for iOS to open it | 48 → 10 wakes a second. A recording not tried yet |
 | `torch_idle=N` | ms, 1–1000 | while the flashlight is off, its service waits for iOS to ask for it | 48 → 10 wakes a second. Turning it on not tried yet |
+| `gov_idle=N` | ms, 40–1000 | the CPU governor (`cpugov`) looks at the cores' load every 20 ms; while every group of cores is at its lowest speed with little to do (its busiest core under 30 %) and no touch came in the last 500 ms, it looks again after N ms instead. A finger landing wakes it at once, so a touch's boost comes no later than before; a load that grows without a touch is seen at the end of the nap | N=100: `cpufreq:gov_thread` 47.8 → 11.1 wakes a second at rest; the speeds at rest as before (big cores 722–762 MHz on average, 97–99 % of the time at the lowest); 12 home-screen swipes 5 s apart (run 154925): 13 touches counted as before, 12 of them found the governor napping and woke it 24-28 us after the finger (before: up to 20 ms to the next look) |
 
 ## Wi-Fi
 
