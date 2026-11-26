@@ -438,6 +438,90 @@ static bool bt_control_fault;
 static struct termios bt_control_termios;
 static uint32_t bt_kick;                /* (N17) what a waiting worker sleeps on: bytes of the host's queued, a client */
 
+/*
+ * (2026-11-26, WEEK-1121 N32) boot-arg bt_irq=1, with bt_idle (idle_set's): the UART's own interrupt -- dt
+ * qcom,qup_uart@998000: GIC SPI 0x25f = INTID 639, level, which nobody took -- ends the worker's nap when the controller
+ * sends (its WAKE_IND first: it cannot send more before our WAKE_ACK), so while it sleeps by IBS the worker naps up to
+ * BT_IRQ_WAIT_MS instead of bt_idle's N ms (~91 wakes a second at rest, census 131949: ~53 IBS wakes a minute). The
+ * SE's RX interrupts (secondary sequencer: FIFO watermark at one word, RX last) are enabled while it is on; the
+ * handler masks the GIC line and wakes the worker, which unmasks it before each nap once the RX FIFO is empty and the
+ * SE's interrupt status cleared (armed first, then unmasked, then the lock let go: nothing is lost in between). Until
+ * the first interrupt the naps stay bt_idle's. Given up for good -- bt_idle's naps, the SE's registers put back -- on:
+ * bytes found after a whole long nap without an interrupt, BT_IRQ_MISSES times in a minute; more than BT_IRQ_STORM
+ * interrupts in a second that brought nothing; no interrupt in the first minute though the controller woke.
+ * 0 / absent, the default: not taken, as before.
+ */
+#define BT_IRQ_SPI              639u
+#define BT_IRQ_WAIT_MS          1000u
+#define BT_IRQ_MISSES           3u
+#define BT_IRQ_STORM            200u
+#define GENI_M_IRQ_STATUS       0x610
+#define GENI_M_IRQ_EN           0x614
+#define GENI_M_IRQ_CLEAR        0x618
+#define GENI_S_IRQ_STATUS       0x640
+#define GENI_S_IRQ_EN           0x644
+#define GENI_S_IRQ_CLEAR        0x648
+#define GENI_RX_FIFO_STATUS     0x804
+#define GENI_RX_WATERMARK       0x810
+#define GENI_S_RX_FIFO_WM       (1u << 26)
+#define GENI_S_RX_FIFO_LAST     (1u << 27)
+static volatile uint32_t bt_irqs;
+static bool bt_irq_on;
+static uint32_t bt_irq_old_en, bt_irq_old_wm;
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid),
+    void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+
+/* In interrupt context: masked (level: it stays up while the RX FIFO holds a word), the worker told. */
+static void bt_irq_arrived(__unused void *context, __unused uint32_t intid)
+{
+    gic_v3_spi_mask(BT_IRQ_SPI);
+    bt_irqs++;
+    thread_wakeup((event_t)&bt_kick);
+}
+
+/* (bt_irq=1, with bt_idle) taken, masked until the first nap; false: not on (bt_idle's naps as before) */
+static bool bt_irq_start(vm_offset_t uart)
+{
+    uint32_t want=0;
+    if(!PE_parse_boot_argn("bt_irq",&want,sizeof(want)) || want==0) return false;
+    bt_irq_old_en=bt_read(uart,GENI_S_IRQ_EN);
+    bt_irq_old_wm=bt_read(uart,GENI_RX_WATERMARK);
+    hakios_tl("UMI BT: bt_irq: S_IRQ_EN %#x, M_IRQ_EN %#x, RX watermark %#x, RFR watermark %#x, RX FIFO %#x\n",
+        bt_irq_old_en,bt_read(uart,GENI_M_IRQ_EN),bt_irq_old_wm,bt_read(uart,0x814),bt_read(uart,GENI_RX_FIFO_STATUS));
+    bt_write(uart,GENI_RX_WATERMARK,1);
+    bt_write(uart,GENI_S_IRQ_EN,bt_irq_old_en|GENI_S_RX_FIFO_WM|GENI_S_RX_FIFO_LAST);
+    kern_return_t kr=gic_v3_spi_attach(BT_IRQ_SPI,false,bt_irq_arrived,NULL);
+    if(kr!=KERN_SUCCESS && kr!=KERN_NAME_EXISTS) {
+        bt_write(uart,GENI_S_IRQ_EN,bt_irq_old_en);
+        bt_write(uart,GENI_RX_WATERMARK,bt_irq_old_wm);
+        hakios_tl("UMI BT: bt_irq: INTID %u NOT TAKEN (%d): bt_idle's naps\n",BT_IRQ_SPI,kr);
+        return false;
+    }
+    gic_v3_spi_mask(BT_IRQ_SPI);
+    hakios_tl("UMI BT: bt_irq: INTID %u (the UART) taken; naps up to %u ms once it has come\n",BT_IRQ_SPI,BT_IRQ_WAIT_MS);
+    return true;
+}
+
+static void bt_irq_give_up(vm_offset_t uart,const char *why,uint32_t what)
+{
+    if(!bt_irq_on) return;
+    bt_irq_on=false;
+    gic_v3_spi_mask(BT_IRQ_SPI);
+    bt_write(uart,GENI_S_IRQ_EN,bt_irq_old_en);
+    bt_write(uart,GENI_RX_WATERMARK,bt_irq_old_wm);
+    hakios_tl("UMI BT: bt_irq: %s (%u; %u interrupts): given up, bt_idle's naps\n",why,what,bt_irqs);
+}
+
+/* Before a nap: the SE's interrupt status cleared; true when the RX FIFO is empty (it may be unmasked then). */
+static bool bt_irq_quiet(vm_offset_t uart)
+{
+    bt_write(uart,GENI_S_IRQ_CLEAR,bt_read(uart,GENI_S_IRQ_STATUS));
+    bt_write(uart,GENI_M_IRQ_CLEAR,bt_read(uart,GENI_M_IRQ_STATUS));
+    return (bt_read(uart,GENI_RX_FIFO_STATUS)&0x1ffffff)==0;
+}
+
 static errno_t bt_control_connect(kern_ctl_ref ref,struct sockaddr_ctl *address,void **info)
 {
     uid_t uid=kauth_cred_getuid(kauth_cred_get());
@@ -539,7 +623,14 @@ static void bt_control_worker(void *unused,wait_result_t result)
     (void)hakios_idle_arg("bt_idle",&idle_ms,HAKIOS_IDLE_BT);
     if(idle_ms>100) idle_ms=100;
     if(idle_ms) hakios_tl("UMI BT: the worker looks %u ms apart while the controller sleeps (bt_idle)\n",idle_ms);
+    /* (bt_irq, N32) */
+    bt_irq_on=idle_ms && bt_irq_start(bt_control_uart);
+    uint32_t irq_seen=bt_irqs,irq_minute=0,irq_naps=0,irq_long=0,irq_missed=0,irq_empty=0,irq_empty_from=0;
+    unsigned rx_top=bt_rx_head,ibs_from=bt_ibs_wakes;
+    bool after_long_quiet=false,after_irq=false,irq_first_minute=true;
+    uint64_t irq_second_at=0;
     for(;;) {
+        rx_top=bt_rx_head;                /* (bt_irq: did this turn's look bring bytes?) */
         lck_mtx_lock(&bt_control_lock);
         uint32_t unit=bt_control_unit;
         bool fault=bt_control_fault;
@@ -597,14 +688,46 @@ static void bt_control_worker(void *unused,wait_result_t result)
             int queued=unit?ctl_enqueuedata(bt_control,unit,receive,receive_length,0):ENOTCONN;
             if(queued!=ENOBUFS) receive_length=0;
         }
+        if(bt_irq_on) {
+            /* (bt_irq: bytes after a whole long nap no interrupt ended: a miss; an interrupt that brought nothing: empty) */
+            bool brought=bt_rx_head!=rx_top;
+            if(after_long_quiet && brought && ++irq_missed>=BT_IRQ_MISSES)
+                bt_irq_give_up(bt_control_uart,"bytes after whole naps without an interrupt, in a minute",irq_missed);
+            if(after_irq && !brought && !worked) irq_empty++;
+            after_long_quiet=after_irq=false;
+            if(mach_absolute_time()>=irq_second_at) {
+                if(irq_second_at && irq_empty-irq_empty_from>BT_IRQ_STORM)
+                    bt_irq_give_up(bt_control_uart,"interrupts that brought nothing, in a second",irq_empty-irq_empty_from);
+                irq_empty_from=irq_empty;
+                clock_interval_to_deadline(1,NSEC_PER_SEC,&irq_second_at);
+            }
+        }
         if(idle_ms && !worked && !waking && !tx.complete && !receive_length && !error && bt_peer_asleep &&
             !bt_ibs_ack_pending) {
             uint64_t deadline;
-            clock_interval_to_deadline(idle_ms,NSEC_PER_MSEC,&deadline);
+            bool arm=bt_irq_on && bt_irq_quiet(bt_control_uart), long_nap=arm && bt_irqs!=0;
+            clock_interval_to_deadline(long_nap ? BT_IRQ_WAIT_MS : idle_ms,NSEC_PER_MSEC,&deadline);
             lck_mtx_lock(&bt_control_lock);
             /* (under the queue's lock: a send between the look and the sleep wakes it, it is not lost for N ms) */
             if(bt_tx_head==bt_tx_tail && generation==bt_control_generation) {
-                lck_mtx_sleep_deadline(&bt_control_lock,LCK_SLEEP_DEFAULT,(event_t)&bt_kick,THREAD_UNINT,deadline);
+                if(arm) {
+                    /* (bt_irq: armed first, then unmasked, then the lock let go -- an interrupt or a send after any
+                     * of it ends the nap) */
+                    irq_seen=bt_irqs;
+                    assert_wait_deadline((event_t)&bt_kick,THREAD_UNINT,deadline);
+                    gic_v3_spi_unmask(BT_IRQ_SPI);
+                    lck_mtx_unlock(&bt_control_lock);
+                    (void)thread_block(THREAD_CONTINUE_NULL);
+                    gic_v3_spi_mask(BT_IRQ_SPI);
+                    lck_mtx_lock(&bt_control_lock);
+                    after_irq=bt_irqs!=irq_seen;
+                    after_long_quiet=long_nap && !after_irq && bt_tx_head==bt_tx_tail &&
+                        generation==bt_control_generation;
+                    irq_naps++;
+                    irq_long+=long_nap;
+                } else {
+                    lck_mtx_sleep_deadline(&bt_control_lock,LCK_SLEEP_DEFAULT,(event_t)&bt_kick,THREAD_UNINT,deadline);
+                }
                 naps++;
             }
             lck_mtx_unlock(&bt_control_lock);
@@ -615,6 +738,16 @@ static void bt_control_worker(void *unused,wait_result_t result)
         if(idle_ms && mach_absolute_time()>=say_at) {
             if(say_at) hakios_tl("UMI BT: a minute: %llu naps of up to %u ms, %llu short looks; IBS wakes %u sleeps %u (bt_idle)\n",
                 naps,idle_ms,looks,bt_ibs_wakes,bt_ibs_sleeps);
+            if(say_at && bt_irq_on) {
+                if(irq_first_minute && bt_irqs==0 && bt_ibs_wakes!=ibs_from)
+                    bt_irq_give_up(bt_control_uart,"no interrupt in the first minute, though the controller woke",
+                        bt_ibs_wakes-ibs_from);
+                else if(irq_minute++<12)
+                    hakios_tl("UMI BT: bt_irq: a minute: %u naps armed, %u of them long; %u interrupts in all, %u brought "
+                        "nothing, %u missed\n",irq_naps,irq_long,bt_irqs,irq_empty,irq_missed);
+                irq_first_minute=false;
+                irq_naps=irq_long=irq_missed=0;
+            }
             naps=looks=0;
             clock_interval_to_deadline(60,NSEC_PER_SEC,&say_at);
         }
