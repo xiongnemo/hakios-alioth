@@ -4531,6 +4531,16 @@ static uint32_t gov_touch_ms = GPU_GOV_TOUCH_MS, gov_jump;
 static uint64_t gov_level_us[16];               /* since the last minute's line */
 static uint32_t gov_votes, gov_refused;
 static bool gov_running;
+/*
+ * (2026-11-26, WEEK-1121 N34) boot-arg gpugov_idle=1. At rest the governor's 20 looks a second find the GPU at its
+ * lowest level with nothing submitted (a still home screen: 2 submissions a minute; ~19.6 wakes a second, census
+ * 152831). Once it is at the lowest level, nothing has been submitted for GPU_GOV_IDLE_MS and no touch's window is
+ * open, it waits for the next submission (the submit path wakes it) or a finger (hakios.input.c), GPU_GOV_NAP_MS at
+ * most, instead of GPU_GOV_MS; each look does what it did. 0 / absent, the default: every GPU_GOV_MS, as before.
+ */
+#define GPU_GOV_NAP_MS          1000
+static uint32_t gov_idle_on, gov_looks, gov_naps, gov_nap_submits, gov_nap_touches;
+extern volatile bool hakios_gpu_gov_napping;    /* hakios.input.c: a touch wakes &hakios_gpu_gov_napping while it is set */
 
 static bool
 gpu_gov_vote(uint32_t level)
@@ -4556,6 +4566,8 @@ gpu_gov_thread(void *arg __unused, wait_result_t wr __unused)
 	uint64_t then = mach_absolute_time(), busy_then = gpu_busy_total, touch_window, low_since = 0, idle_since = then;
 	uint64_t idle_window, down_window;
 	uint32_t fence_then = gpu_fence, refused_in_row = 0, top = gov_levels - 1;
+	uint64_t last_input = hakios_input_at;  /* (gpugov_idle) */
+	bool nap_next = false;
 
 	nanoseconds_to_absolutetime((uint64_t)gov_touch_ms * NSEC_PER_MSEC, &touch_window);
 	nanoseconds_to_absolutetime((uint64_t)GPU_GOV_IDLE_MS * NSEC_PER_MSEC, &idle_window);
@@ -4571,7 +4583,31 @@ gpu_gov_thread(void *arg __unused, wait_result_t wr __unused)
 		uint64_t now, span_ns, busy_ns, busy_now, input_at;
 		uint32_t pct, fence_now, want = gov_level;
 
-		delay_for_interval(GPU_GOV_MS, NSEC_PER_MSEC);
+		if (nap_next) {
+			uint64_t deadline;
+
+			/* (armed first, then the flag, a fence, the submission's number and the touch time read: the submit path
+			 * and the touch path store theirs, a fence, read the flag -- one of the two sees the other) */
+			clock_interval_to_deadline(GPU_GOV_NAP_MS, NSEC_PER_MSEC, &deadline);
+			(void)assert_wait_deadline((event_t)(uintptr_t)&hakios_gpu_gov_napping, THREAD_UNINT, deadline);
+			hakios_gpu_gov_napping = true;
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			if (gpu_fence != fence_then || hakios_input_at != last_input) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
+			hakios_gpu_gov_napping = false;
+			gov_naps++;
+			if (gpu_fence != fence_then) {
+				gov_nap_submits++;
+			} else if (hakios_input_at != last_input) {
+				gov_nap_touches++;
+			}
+		} else {
+			delay_for_interval(GPU_GOV_MS, NSEC_PER_MSEC);
+		}
+		gov_looks++;
 		now = mach_absolute_time();
 		busy_now = gpu_busy_total;
 		fence_now = gpu_fence;
@@ -4614,6 +4650,9 @@ gpu_gov_thread(void *arg __unused, wait_result_t wr __unused)
 				gov_running = false;
 			}
 		}
+		nap_next = gov_idle_on && gov_level == 1 && now - idle_since >= idle_window &&
+		    !(input_at != 0 && now - input_at < touch_window);
+		last_input = input_at;
 		then = now;
 		busy_then = busy_now;
 		fence_then = fence_now;
@@ -4645,6 +4684,13 @@ gpu_gov_start(void)
 		gov_touch_ms = v;
 	}
 	PE_parse_boot_argn("gpugov_jump", &gov_jump, sizeof(gov_jump));
+	PE_parse_boot_argn("gpugov_idle", &gov_idle_on, sizeof(gov_idle_on));
+	gov_idle_on = gov_idle_on == 1;
+	if (gov_idle_on) {
+		printf("adreno: gpugov: gpugov_idle=1: at its lowest level, nothing submitted for %u ms and no touch for %u ms, "
+		    "the governor waits for the next submission or a finger (%u ms at most) instead of looking every %u ms\n",
+		    GPU_GOV_IDLE_MS, gov_touch_ms, GPU_GOV_NAP_MS, GPU_GOV_MS);
+	}
 	gov_running = true;
 	if (kernel_thread_start(gpu_gov_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_set_thread_name(thread, "adreno:gpu_gov_thread");
@@ -4735,6 +4781,10 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring(0);
 	ring(gpu_fence);
 	ring_send();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);        /* (gpugov_idle: the number stored, a fence, the flag read) */
+	if (hakios_gpu_gov_napping) {
+		thread_wakeup((event_t)(uintptr_t)&hakios_gpu_gov_napping);
+	}
 	return gpu_fence;
 }
 
@@ -5040,6 +5090,11 @@ hakios_adreno_minute(void)
 			at += snprintf(line + at, sizeof(line) - at, " %u MHz %llu%%", gov_khz[i] / 1000, 100 * gov_level_us[i] / all);
 		}
 		printf("%s; %u votes, %u refused%s\n", line, gov_votes, gov_refused, gov_running ? "" : " (STOPPED)");
+		if (gov_idle_on) {
+			printf("adreno: gpugov: gpugov_idle: since the last line %u looks, %u of them after a nap; %u naps ended by "
+			    "a submission, %u by a touch\n", gov_looks, gov_naps, gov_nap_submits, gov_nap_touches);
+		}
+		gov_looks = gov_naps = gov_nap_submits = gov_nap_touches = 0;
 		bzero(gov_level_us, sizeof(gov_level_us));
 		gov_votes = gov_refused = 0;
 	}

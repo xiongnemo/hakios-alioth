@@ -194,6 +194,8 @@ touch_hold(uint32_t finger, uint32_t x, uint32_t y)
 volatile uint64_t hakios_input_at;
 /* (hakios.cpufreq.c, boot-arg gov_idle: set while the governor naps until &hakios_input_at is woken) */
 volatile bool hakios_gov_napping;
+/* (hakios.adreno.c, boot-arg gpugov_idle: set while the GPU's governor waits on &hakios_gpu_gov_napping) */
+volatile bool hakios_gpu_gov_napping;
 extern void alioth_refresh_activity(void);     /* (alioth_dsi.c: a frame every TE again, if a still screen had fewer) */
 
 static void
@@ -203,6 +205,9 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);        /* (the governor sets its flag, a fence, reads the time) */
 	if (hakios_gov_napping) {
 		wakeup((void *)(uintptr_t)&hakios_input_at);
+	}
+	if (hakios_gpu_gov_napping) {
+		wakeup((void *)(uintptr_t)&hakios_gpu_gov_napping);
 	}
 	if (type == HAKIOS_TOUCH_DOWN) {
 		alioth_refresh_activity();      /* (before the app has drawn anything: the frame after this is at full rate) */
