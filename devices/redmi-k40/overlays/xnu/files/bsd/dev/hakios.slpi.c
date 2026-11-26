@@ -1353,6 +1353,7 @@ dsp_shutdown(const char *why)
 	int32_t result;
 
 	printf("slpi: %u: %s: the sensor DSP is asked to stop, then TrustZone to shut it down\n", step, why);
+	hakios_ipcc_leave(HAKIOS_IPCC_SLPI);              /* (glink_irq) */
 	if (!leaving) {
 		link_stop();
 	}
@@ -2361,7 +2362,225 @@ static void
 link_wake(void)
 {
 	link_kick++;
-	thread_wakeup((event_t)&link_kick);
+	if (hakios_ipcc_kick_wanted(HAKIOS_IPCC_SLPI)) {    /* (glink_irq: not while it waits for the interrupt) */
+		thread_wakeup((event_t)&link_kick);
+	}
+}
+
+/*
+ * (2026-11-26, WEEK-1121 N31) boot-arg glink_irq=1, with glink_idle (idle_set's): IPCC's interrupt -- dt
+ * qcom,ipcc@408000, GIC SPI 229 = INTID 261, level, which nobody took -- wakes the audio and sensor DSPs' link threads.
+ * One line for every client's rings: its handler masks it and wakes the link whose ring IPCC names; a link that has
+ * heard and cleared its own rings unmasks it once IPCC names nobody, or wakes the other link when IPCC names that one's
+ * ring. While it is unmasked, and once one has come, a link waits up to GLINK_IRQ_WAIT_MS between looks (a message of
+ * ours no longer wakes it then: the answer rings; the interrupt ends the wait); while it is masked, or until the first
+ * has come, the looks are glink_idle's as before (the interrupt ends those waits too). Given up for good -- glink_idle's
+ * looks -- on: a ring a whole wait found without an interrupt, GLINK_IRQ_MISSES times in a minute; more than
+ * GLINK_IRQ_STORM interrupts without a ring in a second (and more than rings); a ring of a client neither link listens
+ * to; no interrupt in the first minute though rings came. Masked when both links have stopped (dsp_shutdown()).
+ * Here, not in hakios.adsp.c: the sensor DSP starts on every boot, the audio DSP not in a second kernel.
+ * 0 / absent, the default: not taken, as before.
+ */
+#define IPCC_IRQ_SPI            261u
+#define IPCC_LPASS_CLIENT       3u              /* (hakios.adsp.c's IPCC_LPASS) */
+#define GLINK_IRQ_MISSES        3u
+#define GLINK_IRQ_STORM         2000u
+#define GLINK_IRQ_MINUTES       12u             /* a line a minute for the first ones (the census comes at ~10) */
+struct hakios_ipcc_irq hakios_ipcc_irq;
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid),
+    void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+
+/* the link a word of IPCC_RECEIVED's names (HAKIOS_IPCC_*); 2: neither (nobody, or another client) */
+static unsigned
+ipcc_link_of(uint32_t received)
+{
+	return received == IPCC_NOBODY ? 2u : (received >> 16) == IPCC_LPASS_CLIENT ? HAKIOS_IPCC_ADSP :
+	       (received >> 16) == IPCC_SLPI ? HAKIOS_IPCC_SLPI : 2u;
+}
+
+/*
+ * In interrupt context: masked (it is level-triggered, and stays up until each ring is cleared), and the link whose
+ * ring IPCC names told -- both when it names neither's or that one's link is down. (11-26 run 124725: telling both
+ * woke the sensor link with every one of the audio DSP's 100 rings a second, 91 -> 100 wakes a second.) A link that
+ * finds the other's ring behind its own wakes that one (hakios_ipcc_looked()).
+ */
+static void
+ipcc_irq_arrived(__unused void *context, __unused uint32_t intid)
+{
+	unsigned only = ipcc_link_of(rd(hakios_ipcc_irq.ipcc + IPCC_RECEIVED));
+
+	gic_v3_spi_mask(IPCC_IRQ_SPI);
+	hakios_ipcc_irq.armed = 0;
+	os_atomic_inc(&hakios_ipcc_irq.count, relaxed);
+	if (only < 2u && hakios_ipcc_irq.event[only] == NULL) {
+		only = 2u;
+	}
+	for (unsigned w = 0; w < 2; w++) {
+		void *event = hakios_ipcc_irq.event[w];
+
+		if (event != NULL && (only == 2u || only == w)) {
+			thread_wakeup((event_t)event);
+		}
+	}
+}
+
+/*
+ * A message of ours sent (link_wake()): its thread needs no wake while it waits for the interrupt -- the DSP's answer,
+ * and the write-done of a send nobody waits on, ring. (11-26 run 124725: the feeder's 50 sends a second were a third
+ * of the audio link's 150 wakes.) 1: wake it, as before.
+ */
+int
+hakios_ipcc_kick_wanted(unsigned who)
+{
+	return !(hakios_ipcc_irq.state == HAKIOS_IPCC_ON && hakios_ipcc_irq.armed && hakios_ipcc_irq.count != 0 &&
+	       hakios_ipcc_irq.event[who] != NULL);
+}
+
+static void
+ipcc_give_up(const struct hakios_ipcc_link *l, const char *why, uint32_t what)
+{
+	if (os_atomic_cmpxchg(&hakios_ipcc_irq.state, HAKIOS_IPCC_ON, 3u, acq_rel)) {
+		gic_v3_spi_mask(IPCC_IRQ_SPI);
+		hakios_ipcc_irq.armed = 0;
+		printf("%s: link: glink_irq: %s (%#x; %u interrupts): given up, glink_idle's looks\n", l->name, why, what,
+		    hakios_ipcc_irq.count);
+	}
+}
+
+/* A link's thread starts: with glink_irq=1 the interrupt is taken on the first one's join. 1: it waits for it. */
+int
+hakios_ipcc_join(struct hakios_ipcc_link *l, void *event, uintptr_t ipcc, uint32_t received)
+{
+	uint32_t want = 0;
+
+	if (!PE_parse_boot_argn("glink_irq", &want, sizeof(want)) || want == 0 || ipcc == 0) {
+		return 0;
+	}
+	hakios_ipcc_irq.event[l->who] = event;          /* (before the interrupt is on: an early one wakes it too) */
+	if (os_atomic_cmpxchg(&hakios_ipcc_irq.state, 0u, 1u, acq_rel)) {
+		kern_return_t kr;
+
+		hakios_ipcc_irq.ipcc = ipcc;            /* (read by the handler) */
+		hakios_ipcc_irq.armed = 1;
+		kr = gic_v3_spi_attach(IPCC_IRQ_SPI, false, ipcc_irq_arrived, NULL);
+		printf("%s: link: glink_irq: INTID %u (IPCC) %s (%d); IPCC names %#x\n", l->name, IPCC_IRQ_SPI,
+		    kr == KERN_SUCCESS ? "taken" : "NOT TAKEN: glink_idle's looks", kr, received);
+		hakios_ipcc_irq.state = kr == KERN_SUCCESS ? HAKIOS_IPCC_ON : 3u;
+	}
+	for (unsigned ms = 0; ms < 1000 && hakios_ipcc_irq.state == 1u; ms++) {
+		sleep_us(1000);
+	}
+	if (hakios_ipcc_irq.state != HAKIOS_IPCC_ON) {
+		hakios_ipcc_irq.event[l->who] = NULL;
+		return 0;
+	}
+	l->minute_at = l->second_at = now_us();
+	l->irqs = l->second_from = hakios_ipcc_irq.count;
+	printf("%s: link: waits up to %u ms while IPCC's interrupt is on (glink_irq)\n", l->name, GLINK_IRQ_WAIT_MS);
+	return l->on = 1;
+}
+
+/* Before a wait: GLINK_IRQ_WAIT_MS while the interrupt is unmasked and once one has come; else 0 (glink_idle's look). */
+uint32_t
+hakios_ipcc_wait(struct hakios_ipcc_link *l)
+{
+	l->long_wait = l->on && hakios_ipcc_irq.state == HAKIOS_IPCC_ON && hakios_ipcc_irq.armed && hakios_ipcc_irq.count != 0;
+	return l->long_wait ? GLINK_IRQ_WAIT_MS : 0;
+}
+
+/* Armed for a wait: an interrupt since the last look ends it before it begins. */
+int
+hakios_ipcc_rang(const struct hakios_ipcc_link *l)
+{
+	return l->on && hakios_ipcc_irq.count != l->irqs;
+}
+
+/* After the wait, before the look. */
+void
+hakios_ipcc_begin(struct hakios_ipcc_link *l)
+{
+	uint32_t count = hakios_ipcc_irq.count;
+
+	l->quiet_wait = l->long_wait && count == l->irqs;
+	l->irqs = count;
+	l->looks++;
+	l->waits += l->long_wait != 0;
+}
+
+/* After its doorbells: `received', what IPCC names now; `rang', its own rings this look; `kicked', a message of ours. */
+void
+hakios_ipcc_looked(struct hakios_ipcc_link *l, uint32_t received, uint32_t rang, int kicked)
+{
+	uint64_t now;
+
+	if (!l->on || hakios_ipcc_irq.state != HAKIOS_IPCC_ON) {
+		return;
+	}
+	l->rang += rang != 0;
+	if (rang != 0) {
+		os_atomic_add(&hakios_ipcc_irq.rings, rang, relaxed);
+	}
+	/* (a ring that came during the look itself interrupts by now: not a miss) */
+	if (rang && l->quiet_wait && !kicked && hakios_ipcc_irq.count == l->irqs && ++l->missed >= GLINK_IRQ_MISSES) {
+		ipcc_give_up(l, "rings came in whole waits without an interrupt, in a minute", received);
+		return;
+	}
+	if (!hakios_ipcc_irq.armed) {
+		unsigned other = ipcc_link_of(received);
+
+		if (received == IPCC_NOBODY) {
+			hakios_ipcc_irq.armed = 1;
+			gic_v3_spi_unmask(IPCC_IRQ_SPI);
+		} else if (other == 2u) {
+			ipcc_give_up(l, "a ring of a client neither link listens to", received);
+			return;
+		} else if (other != l->who && hakios_ipcc_irq.event[other] != NULL) {
+			thread_wakeup((event_t)hakios_ipcc_irq.event[other]);
+		}
+		/* (else its own, come during the look: the next look soon; or the other DSP's while that link is down -- its
+		 * stop, run 124725: masked, glink_idle's looks, until that link is back and has cleared it) */
+	}
+	now = now_us();
+	if (now - l->second_at >= 1000000) {
+		/* (11-26 run 122143: the sensor DSP's start answers ~2,350 calls in a second, each with a ring: not a storm) */
+		uint32_t irqs = l->irqs - l->second_from, rings = hakios_ipcc_irq.rings - l->second_rings;
+		uint32_t empty = irqs > rings ? irqs - rings : 0;
+
+		if (empty > GLINK_IRQ_STORM && empty > rings) {
+			ipcc_give_up(l, "an interrupt storm: more interrupts than rings in a second", empty);
+			return;
+		}
+		l->second_at = now;
+		l->second_from = l->irqs;
+		l->second_rings = hakios_ipcc_irq.rings;
+	}
+	if (now - l->minute_at >= 60000000) {
+		if (l->minutes == 0 && hakios_ipcc_irq.count == 0 && l->rang != 0) {
+			ipcc_give_up(l, "no interrupt in the first minute, though rings came", l->rang);
+			return;
+		}
+		if (l->minutes < GLINK_IRQ_MINUTES) {
+			printf("%s: link: glink_irq: minute %u: %u looks, %u of them after a long wait, %u with rings; %u interrupts "
+			    "and %u rings in all, %u missed this minute\n", l->name, l->minutes + 1, l->looks, l->waits, l->rang,
+			    hakios_ipcc_irq.count, hakios_ipcc_irq.rings, l->missed);
+		}
+		l->minutes++;
+		l->minute_at = now;
+		l->looks = l->waits = l->rang = l->missed = 0;
+	}
+}
+
+/* A link stops (dsp_shutdown(), leaving included): no longer woken; masked when neither waits for it. */
+void
+hakios_ipcc_leave(unsigned who)
+{
+	hakios_ipcc_irq.event[who] = NULL;
+	if (hakios_ipcc_irq.event[0] == NULL && hakios_ipcc_irq.event[1] == NULL && hakios_ipcc_irq.state == HAKIOS_IPCC_ON) {
+		gic_v3_spi_mask(IPCC_IRQ_SPI);
+		hakios_ipcc_irq.armed = 0;
+	}
 }
 
 /* One whole message to the DSP on a channel; waits up to five seconds for an intent of the DSP's that it fits. */
@@ -3871,23 +4090,27 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	struct glink_packet *packet;
 	bool gave_up = false;
 	uint32_t idle_ms = 0, quiet = 0, kicks = link_kick, rings = doorbell.glink + doorbell.smp2p;
+	struct hakios_ipcc_link irq = { .name = "slpi", .who = HAKIOS_IPCC_SLPI };
 
 	(void)hakios_idle_arg("glink_idle", &idle_ms, HAKIOS_IDLE_GLINK);
 	if (idle_ms != 0) {
 		printf("slpi: link: looks %u ms apart after %u quiet ones (glink_idle)\n", idle_ms, LINK_QUIET);
+		(void)hakios_ipcc_join(&irq, (void *)&link_kick, ipcc.base, rd(ipcc.base + IPCC_RECEIVED)); /* (glink_irq) */
 	}
 	bzero(&last, sizeof(last));
 	dsp_words(&last);
 	while (link_wanted) {
-		bool busy = false;
+		bool busy = false, kicked;
+		uint32_t rang;
+		uint32_t wait_ms = hakios_ipcc_wait(&irq);  /* (glink_irq: 0 but while the interrupt is on) */
 
-		if (idle_ms != 0 && quiet >= LINK_QUIET) {
+		if (wait_ms != 0 || (idle_ms != 0 && quiet >= LINK_QUIET)) {
 			/*
 			 * (11-24) armed first, then looked at: a message of ours since the last look -- during it included, which
 			 * the look after the sleep alone would have slept through for idle_ms -- ends the wait before it begins.
 			 */
-			assert_wait_timeout((event_t)&link_kick, THREAD_UNINT, idle_ms, NSEC_PER_MSEC);
-			if (link_kick != kicks || !link_wanted) {
+			assert_wait_timeout((event_t)&link_kick, THREAD_UNINT, wait_ms != 0 ? wait_ms : idle_ms, NSEC_PER_MSEC);
+			if (link_kick != kicks || hakios_ipcc_rang(&irq) || !link_wanted) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 			} else {
 				thread_block(THREAD_CONTINUE_NULL);
@@ -3895,15 +4118,19 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		} else {
 			sleep_us(1000);
 		}
-		if (link_kick != kicks) {
+		hakios_ipcc_begin(&irq);
+		kicked = link_kick != kicks;
+		if (kicked) {
 			kicks = link_kick;
 			busy = true;
 		}
 		doorbells();
-		if (doorbell.glink + doorbell.smp2p != rings) {
+		rang = doorbell.glink + doorbell.smp2p - rings;
+		if (rang != 0) {
 			rings = doorbell.glink + doorbell.smp2p;
 			busy = true;
 		}
+		hakios_ipcc_looked(&irq, rd(ipcc.base + IPCC_RECEIVED), rang, kicked);
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
 			busy = true;
 			last = words;
@@ -3955,7 +4182,8 @@ link_stop(void)
 	rpc_end();                      /* (a call of ours that waits for an answer, next2 above all, gives up) */
 	if (link_runs) {
 		link_wanted = false;
-		link_wake();                    /* (glink_idle: it may be in a long wait) */
+		link_kick++;
+		thread_wakeup((event_t)&link_kick);     /* (glink_idle, glink_irq: it may be in a long wait) */
 		for (unsigned ms = 0; ms < 2000 && link_runs; ms++) {
 			sleep_ms(1);
 		}

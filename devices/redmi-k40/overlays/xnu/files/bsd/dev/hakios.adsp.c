@@ -1422,6 +1422,7 @@ dsp_shutdown(const char *why)
 	int32_t result;
 
 	printf("adsp: %u: %s: the audio DSP is asked to stop, then TrustZone to shut it down\n", step, why);
+	hakios_ipcc_leave(HAKIOS_IPCC_ADSP);              /* (glink_irq) */
 	if (!leaving) {
 		link_stop();
 	}
@@ -2431,7 +2432,9 @@ static void
 link_wake(void)
 {
 	link_kick++;
-	thread_wakeup((event_t)&link_kick);
+	if (hakios_ipcc_kick_wanted(HAKIOS_IPCC_ADSP)) {    /* (glink_irq: not while it waits for the interrupt) */
+		thread_wakeup((event_t)&link_kick);
+	}
 }
 
 /* One whole message to the DSP on a channel; waits up to five seconds for an intent of the DSP's that it fits. */
@@ -3091,10 +3094,12 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	bool gave_up = false;
 	uint32_t idle_ms = 0, quiet = 0, kicks = link_kick, rings = doorbell.glink + doorbell.smp2p;
 	uint32_t follow = 0, lazies = link_lazy;
+	struct hakios_ipcc_link irq = { .name = "adsp", .who = HAKIOS_IPCC_ADSP };
 
 	(void)hakios_idle_arg("glink_idle", &idle_ms, HAKIOS_IDLE_GLINK);
 	if (idle_ms != 0) {
 		printf("adsp: link: looks %u ms apart after %u quiet ones (glink_idle)\n", idle_ms, LINK_QUIET);
+		(void)hakios_ipcc_join(&irq, (void *)&link_kick, ipcc.base, rd(ipcc.base + IPCC_RECEIVED)); /* (glink_irq) */
 		/*
 		 * (11-24) Boot-arg glink_follow=N (1..LINK_QUIET): after a look that found only the DSP's own traffic -- its
 		 * rings or packets, no message of ours, no change of its state words -- N quick looks follow instead of
@@ -3112,15 +3117,17 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	bzero(&last, sizeof(last));
 	dsp_words(&last);
 	while (link_wanted) {
-		bool busy = false, ours = false;
+		bool busy = false, ours = false, kicked;
+		uint32_t rang;
+		uint32_t wait_ms = hakios_ipcc_wait(&irq);  /* (glink_irq: 0 but while the interrupt is on) */
 
-		if (idle_ms != 0 && quiet >= LINK_QUIET) {
+		if (wait_ms != 0 || (idle_ms != 0 && quiet >= LINK_QUIET)) {
 			/*
 			 * (11-24) armed first, then looked at: a message of ours since the last look -- during it included, which
 			 * the look after the sleep alone would have slept through for idle_ms -- ends the wait before it begins.
 			 */
-			assert_wait_timeout((event_t)&link_kick, THREAD_UNINT, idle_ms, NSEC_PER_MSEC);
-			if (link_kick != kicks || !link_wanted) {
+			assert_wait_timeout((event_t)&link_kick, THREAD_UNINT, wait_ms != 0 ? wait_ms : idle_ms, NSEC_PER_MSEC);
+			if (link_kick != kicks || hakios_ipcc_rang(&irq) || !link_wanted) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 			} else {
 				thread_block(THREAD_CONTINUE_NULL);
@@ -3128,7 +3135,9 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		} else {
 			sleep_us(1000);
 		}
-		if (link_kick != kicks) {
+		hakios_ipcc_begin(&irq);
+		kicked = link_kick != kicks;
+		if (kicked) {
 			uint32_t kick = link_kick, lazy = link_lazy;
 
 			/* (glink_follow: ours only when more kicks than unwaited sends -- the feeder's writes -- came) */
@@ -3138,10 +3147,12 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			busy = true;
 		}
 		doorbells();
-		if (doorbell.glink + doorbell.smp2p != rings) {
+		rang = doorbell.glink + doorbell.smp2p - rings;
+		if (rang != 0) {
 			rings = doorbell.glink + doorbell.smp2p;
 			busy = true;
 		}
+		hakios_ipcc_looked(&irq, rd(ipcc.base + IPCC_RECEIVED), rang, kicked);
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
 			busy = ours = true;     /* (glink_follow: a change of its state words counts as ours: the full look) */
 			last = words;
@@ -3195,7 +3206,8 @@ link_stop(void)
 
 	if (link_runs) {
 		link_wanted = false;
-		link_wake();                    /* (glink_idle: it may be in a long wait) */
+		link_kick++;
+		thread_wakeup((event_t)&link_kick);     /* (glink_idle, glink_irq: it may be in a long wait) */
 		for (unsigned ms = 0; ms < 2000 && link_runs; ms++) {
 			sleep_ms(1);
 		}

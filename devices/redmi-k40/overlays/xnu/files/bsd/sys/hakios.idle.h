@@ -23,6 +23,39 @@
 #define HAKIOS_IDLE_MIC                 100     /* mic_idle: the microphone service (hakios.mic.c) */
 #define HAKIOS_IDLE_TORCH               100     /* torch_idle: the torch service (hakios.torch.c) */
 
+/*
+ * (2026-11-26, WEEK-1121 N31) boot-arg glink_irq=1, with glink_idle (idle_set's): IPCC's interrupt wakes the audio and
+ * sensor DSPs' link threads (hakios.adsp.c, hakios.slpi.c; the shared part in hakios.slpi.c, where it is told).
+ */
+#define HAKIOS_IPCC_ADSP                0u
+#define HAKIOS_IPCC_SLPI                1u
+#define HAKIOS_IPCC_ON                  2u      /* hakios_ipcc_irq.state: taken (0 not tried, 1 being taken, 3 not / given up) */
+#define GLINK_IRQ_WAIT_MS               1000u   /* a link's longest wait while the interrupt is unmasked */
+struct hakios_ipcc_irq {
+	volatile uint32_t state;
+	volatile uint32_t armed;                /* unmasked: the next ring interrupts */
+	volatile uint32_t count;                /* interrupts so far */
+	volatile uint32_t rings;                /* the rings both links heard and cleared so far */
+	void *volatile event[2];                /* what each link waits on (HAKIOS_IPCC_*); NULL: none */
+	uintptr_t ipcc;                         /* IPCC's registers, as the first link mapped them (never unmapped) */
+};
+struct hakios_ipcc_link {                /* a link thread's own view of it */
+	const char *name;
+	unsigned who;
+	int on;                                 /* joined: it waits for the interrupt */
+	int long_wait, quiet_wait;              /* this wait GLINK_IRQ_WAIT_MS; and no interrupt ended it */
+	uint32_t irqs, missed, looks, waits, rang, minutes, second_from, second_rings;
+	uint64_t minute_at, second_at;
+};
+extern struct hakios_ipcc_irq hakios_ipcc_irq;
+int hakios_ipcc_join(struct hakios_ipcc_link *l, void *event, uintptr_t ipcc, uint32_t received);
+int hakios_ipcc_kick_wanted(unsigned who);
+uint32_t hakios_ipcc_wait(struct hakios_ipcc_link *l);
+int hakios_ipcc_rang(const struct hakios_ipcc_link *l);
+void hakios_ipcc_begin(struct hakios_ipcc_link *l);
+void hakios_ipcc_looked(struct hakios_ipcc_link *l, uint32_t received, uint32_t rang, int kicked);
+void hakios_ipcc_leave(unsigned who);
+
 /* the boot-arg `name' if given; else `set_value' with idle_set=1; else false and *value untouched */
 static inline int
 hakios_idle_arg(const char *name, uint32_t *value, uint32_t set_value)
