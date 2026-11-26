@@ -931,6 +931,7 @@ hakios_audio_dsp_memory_put(void)
 #define ASM_STREAM_CMD_OPEN_WRITE_V3            0x00010db3u
 #define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2        0x00010d98u
 #define ASM_SESSION_CMD_RUN_V2                  0x00010daau
+#define ASM_SESSION_CMD_PAUSE                   0x00010bd3u     /* (sound_pause) */
 #define ASM_DATA_CMD_WRITE_V2                   0x00010dabu
 #define ASM_DATA_EVENT_WRITE_DONE_V2            0x00010d99u
 #define ASM_SESSION_EVENT_RX_UNDERFLOW          0x00010c17u
@@ -956,6 +957,18 @@ static volatile uint32_t written_done, underflows, write_errors;
  * soon as it is back, not up to 2 ms later. 0 / absent, the default: every 2 ms, the old way.
  */
 static uint32_t feed_wait_ms;
+/*
+ * (2026-11-26, WEEK-1121 N36) boot-arg sound_pause=N (1..600 s; 0 / absent, the default: as before). At rest the
+ * DSP takes a period of silence every 20 ms for good: the feeder fills and writes it (~50 wakes a second), the audio
+ * DSP's link carries its write and its done (~100). Once the amplifiers have stopped (amp_hold_ms) and N s more of
+ * silence have gone by (whatever the ring holds then is silence: iOS may go on writing it for minutes after a
+ * key click), the watcher pauses the session (ASM_SESSION_CMD_PAUSE): the periods queued stay queued, nothing comes
+ * back, the feeder waits up to 1 s at a time, and iOS's silence is let go as it comes (ios_sink()). The first sound
+ * has the session run again (ASM_SESSION_CMD_RUN_V2, at once) before the amplifiers start: the queued silence plays
+ * first, as before, so a first sound waits what it waited. A pause the DSP refuses: not tried again in the run.
+ */
+static volatile bool sound_paused;
+static uint64_t paused_silence;         /* (frames of iOS's silence let go while paused: ios_sink()) */
 
 static void
 period_back(uint32_t token)
@@ -1248,6 +1261,19 @@ ios_sink(const int16_t *frames, uint32_t count)
 	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken = count < room ? count : room;
 	bool sound = false;
 
+	if (sound_paused) {
+		/* (sound_pause) silence while paused is taken and let go: the ring is kept for the sound that runs it again */
+		bool any = false;
+
+		for (uint32_t i = 0; i < 2 * count && !any; i++) {
+			any = frames[i] > SILENCE || frames[i] < -SILENCE;
+		}
+		if (!any) {
+			ios_frames += count;
+			paused_silence += count;
+			return count;
+		}
+	}
 	for (uint32_t i = 0; i < taken; i++) {
 		int16_t left = frames[2 * i], right = frames[2 * i + 1];
 		uint32_t l = left < 0 ? (uint32_t)-(int32_t)left : (uint32_t)left, r = right < 0 ? (uint32_t)-(int32_t)right : (uint32_t)right;
@@ -1406,10 +1432,13 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 				}
 			}
 		}
-		if (feed_wait_ms != 0) {
-			/* (a done after the look at `returned' wakes it, or is seen before it blocks: none is missed) */
-			assert_wait_timeout((event_t)&returned, THREAD_UNINT, feed_wait_ms, NSEC_PER_MSEC);
-			if (returned != 0 || stopping) {
+		if (feed_wait_ms != 0 || sound_paused) {
+			bool paused = sound_paused;
+
+			/* (a done after the look at `returned' wakes it, or is seen before it blocks: none is missed; sound_pause:
+			 * the resume wakes it) */
+			assert_wait_timeout((event_t)&returned, THREAD_UNINT, paused ? 1000 : feed_wait_ms, NSEC_PER_MSEC);
+			if (returned != 0 || stopping || (paused && !sound_paused)) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 			} else {
 				(void)thread_block(THREAD_CONTINUE_NULL);
@@ -1492,6 +1521,9 @@ watch(void)
 	uint64_t last_look = 0, last_monitor = 0, setup_next = 0, set_up_at = 0, last_test = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0, set_ups = 0;
 	uint32_t i2c_test = 0, idle_ms = 0, look_ms = 200, naps = 0, hold_ms = (uint32_t)(QUIET_BEFORE_OFF_US / 1000), lead = 0;
+	/* (sound_pause) */
+	uint32_t pause_s = 0, pauses = 0, resumes = 0, run_fails = 0;
+	uint64_t watch_began = now_us(), resume_us_max = 0;
 	/* (after a set-up that failed, the next one no sooner than this, in seconds: the last one for ever after) */
 	static const uint32_t setup_gap_s[] = { 2, 10, 60, 300 };
 
@@ -1514,6 +1546,12 @@ watch(void)
 	if (hold_ms != QUIET_BEFORE_OFF_US / 1000 || lead_ms != 0) {
 		say("sound: the amplifiers stop after %u ms of silence (amp_hold_ms); a first sound waits %u ms for them (amp_lead_ms)\n",
 		    hold_ms, lead_ms);
+	}
+	PE_parse_boot_argn("sound_pause", &pause_s, sizeof(pause_s));
+	pause_s = pause_s > 600 ? 600 : pause_s;
+	if (pause_s != 0) {
+		say("sound: sound_pause=%u: %u s of silence after the amplifiers stop, the DSP's session is paused; the first "
+		    "sound runs it again\n", pause_s, pause_s);
 	}
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
 	if (umi_profile && PE_parse_boot_argn("sound_i2c_test", &i2c_test, sizeof(i2c_test)) && i2c_test != 0) {
@@ -1580,6 +1618,22 @@ watch(void)
 			umi_speaker_i2c_test(i2c_test);
 			now = last_test = now_us();
 		}
+		if (sound_paused && sounded != 0 && now - sounded < 100000) {
+			uint32_t run[3] = { 0, 0, 0 };
+			uint64_t asked = now_us();
+
+			/* (sound_pause) the session first, the amplifiers after: what is queued -- silence -- plays first */
+			if (command("the session, run again (sound_pause)", APR_SVC_ASM, STREAM_PORT, ASM_SESSION_CMD_RUN_V2, run,
+			    sizeof(run), 0, NULL)) {
+				sound_paused = false;
+				resumes++;
+				thread_wakeup((event_t)&returned);      /* (the feeder, waiting up to 1 s) */
+				now = now_us();
+				resume_us_max = now - asked > resume_us_max ? now - asked : resume_us_max;
+			} else if (++run_fails % 50 == 1) {
+				say("sound: sound_pause: THE SESSION DID NOT RUN AGAIN (%u tries): iOS's sound waits\n", run_fails);
+			}
+		}
 		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
 			say_when("iOS plays: the amplifiers are started");
 			starts++;
@@ -1628,6 +1682,18 @@ watch(void)
 				}
 			}
 		}
+		if (pause_s != 0 && !sound_paused && !on && !stopping &&
+		    now - (sounded != 0 ? sounded : watch_began) > ((uint64_t)hold_ms + (uint64_t)pause_s * 1000) * 1000) {
+			if (command("the session, paused (sound_pause)", APR_SVC_ASM, STREAM_PORT, ASM_SESSION_CMD_PAUSE, NULL, 0, 0,
+			    NULL)) {
+				sound_paused = true;
+				pauses++;
+			} else {
+				say("sound: sound_pause: the DSP did not pause the session: not tried again in this run\n");
+				pause_s = 0;
+			}
+			now = now_us();
+		}
 		if (idle_ms != 0 && !on && !stopping) {
 			/*
 			 * sound_idle: amplifiers off, nothing to follow but a sound to come (and a volume, which matters at their
@@ -1654,6 +1720,11 @@ watch(void)
 	    given_up ? ", and the amplifiers were then given up on" : "");
 	if (idle_ms != 0) {
 		say("sound: the watcher napped %u times (sound_idle=%u), woken by a sound %u times\n", naps, idle_ms, watcher_kicks);
+	}
+	if (pauses != 0 || run_fails != 0) {
+		say("sound: sound_pause: the session was paused %u times, run again %u times (the longest %llu us), %u runs "
+		    "refused; %llu frames of iOS's silence let go while paused%s\n", pauses, resumes, resume_us_max, run_fails, paused_silence,
+		    sound_paused ? "; paused at the end" : "");
 	}
 	if (lead_ms != 0) {
 		say("sound: amp_lead_ms=%u: %u periods held back for the amplifiers, %u frames of silence dropped to catch up, %u "
