@@ -668,6 +668,212 @@ air_store_ptr(struct air_ctx *c, struct air_ptr ptr, nir_def *value, unsigned al
    }
 }
 
+/*
+ * (the K40's, 11-27; HAKIOS_AIR_PTR_SLOTS=1, boot-arg metal_ptr_slots=1, off by default) A POINTER KEPT IN A LOCAL.
+ * Photos' grid renderer (PhotosUICore fragment_main) keeps its opcode stream's pointer in a private struct
+ * (PXGShaderOpcodeContext), and VFX's particle / pbr shaders and QuartzCore's fixed_frag_lph_* do alike: a store of
+ * a pointer into an alloca, at a place known while translating -- 21 of the corpus's modules were refused for it.
+ * A pointer here is (where, byte offset), so the slot keeps the 32-bit byte offset and the translator remembers the
+ * where, the same for every store into that slot (a texture or sampler handle is its where alone: nothing is kept
+ * at run time). Refused as before: a slot whose place is not known while translating, one slot given pointers to
+ * two places, an argument-buffer or function-constant pointer, a load from a
+ * slot nothing was kept in before it in the translation's order, and a slot read back as a number.
+ */
+bool
+air_pointer_slots_enabled(void)
+{
+   static int on = -1;
+
+   if (on < 0) {
+      const char *e = getenv("HAKIOS_AIR_PTR_SLOTS");
+      on = e && e[0] == '1';
+   }
+   return on;
+}
+
+static bool
+pointer_slot_place(struct air_ctx *c, struct air_ptr slot, uint32_t *place)
+{
+   if (slot.offset && !nir_src_is_const(nir_src_for_ssa(slot.offset)))
+      return air_error(c, "instruction: a pointer kept in a local at a place not known while translating");
+   *place = slot.offset ? (uint32_t)nir_src_as_uint(nir_src_for_ssa(slot.offset)) : 0;
+   return true;
+}
+
+static struct air_ptr_slot *
+pointer_slot_at(struct air_ctx *c, uint32_t place)
+{
+   for (unsigned i = 0; i < c->num_ptr_slots; i++)
+      if (c->ptr_slots[i].offset == place)
+         return &c->ptr_slots[i];
+   return NULL;
+}
+
+static bool
+store_pointer_slot(struct air_ctx *c, struct air_ptr slot, struct air_ptr value, unsigned align)
+{
+   uint32_t place;
+
+   if (!pointer_slot_place(c, slot, &place))
+      return false;
+   switch (value.class) {
+   case AIR_PTR_UBO:
+   case AIR_PTR_SSBO:
+   case AIR_PTR_SHARED:
+   case AIR_PTR_SCRATCH:
+   case AIR_PTR_CONSTANT_DATA:
+   case AIR_PTR_TEXTURE:      /* a handle: its where is all of it (VFX's and QuartzCore's wrapped textures) */
+   case AIR_PTR_SAMPLER:
+      break;
+   default:
+      return air_error(c, "instruction: a store of a pointer into memory, which this frontend has no address to "
+                          "write (a pointer of class %u kept in a local)", value.class);
+   }
+   struct air_ptr_slot *s = pointer_slot_at(c, place);
+   if (s) {
+      if (s->where.class != value.class || s->where.binding != value.binding || s->where.is_image != value.is_image)
+         return air_error(c, "instruction: one local keeps pointers to two places");
+   } else {
+      c->ptr_slots = reralloc(c->mem_ctx, c->ptr_slots, struct air_ptr_slot, c->num_ptr_slots + 1);
+      s = &c->ptr_slots[c->num_ptr_slots++];
+      s->offset = place;
+      s->where = value;
+      s->where.offset = NULL;
+   }
+   if (value.class == AIR_PTR_TEXTURE || value.class == AIR_PTR_SAMPLER)
+      return true;            /* nothing of it to keep at run time */
+   nir_store_scratch(&c->b, ptr_offset(c, value), nir_imm_int(&c->b, place), .align_mul = MAX2(align, 4),
+                     .write_mask = 0x1);
+   return true;
+}
+
+/* a byte offset as a constant part and at most one part known at run time: (C + D), D NULL when constant */
+static bool
+split_offset(nir_def *d, uint32_t *k, nir_def **rest, unsigned depth)
+{
+   if (nir_src_is_const(nir_src_for_ssa(d))) {
+      *k += (uint32_t)nir_src_as_uint(nir_src_for_ssa(d));
+      return true;
+   }
+   nir_instr *ins = d->parent_instr;
+   if (depth < 8 && ins->type == nir_instr_type_alu && nir_instr_as_alu(ins)->op == nir_op_iadd &&
+       d->num_components == 1) {
+      nir_alu_instr *add = nir_instr_as_alu(ins);
+      if (add->src[0].swizzle[0] == 0 && add->src[1].swizzle[0] == 0 &&
+          add->src[0].src.ssa->num_components == 1 && add->src[1].src.ssa->num_components == 1)
+         return split_offset(add->src[0].src.ssa, k, rest, depth + 1) &&
+                split_offset(add->src[1].src.ssa, k, rest, depth + 1);
+   }
+   if (*rest)
+      return false;   /* two parts known at run time */
+   *rest = d;
+   return true;
+}
+
+/* A HANDLE out of a local at a place known only at run time: Photos' grid renderer copies its texture arrays into a
+ * struct and reads element %i of them. The place is C + D, C known here; the slots from C on hold consecutive
+ * textures of one kind, so D / 8 is the index into them, added to the first one's binding at run time.
+ */
+static struct air_val *
+load_handle_slot_dynamic(struct air_ctx *c, struct air_ptr slot)
+{
+   uint32_t k = 0;
+   nir_def *d = NULL;
+
+   if (!slot.offset || !split_offset(slot.offset, &k, &d, 0) || !d)
+      return air_error(c, "instruction: a pointer kept in a local at a place not known while translating"), NULL;
+   struct air_ptr_slot *first = pointer_slot_at(c, k);
+   if (!first || first->where.class != AIR_PTR_TEXTURE || first->where.offset)
+      return air_error(c, "instruction: a pointer kept in a local at a place not known while translating"), NULL;
+   /* every later slot of the run: the next binding, 8 bytes on */
+   for (unsigned n = 1;; n++) {
+      struct air_ptr_slot *s = pointer_slot_at(c, k + 8 * n);
+      if (!s)
+         break;
+      if (s->where.class != AIR_PTR_TEXTURE || s->where.is_image != first->where.is_image ||
+          s->where.binding != first->where.binding + n)
+         break;
+   }
+   if (first->where.is_image)
+      return air_error(c, "instruction: an image chosen at run time"), NULL;
+   struct air_ptr q = first->where;
+   q.offset = nir_ushr_imm(&c->b, nir_u2u32(&c->b, d), 3);
+   return air_val_ptr(c, q);
+}
+
+static struct air_val *
+load_pointer_slot(struct air_ctx *c, struct air_ptr slot, unsigned align)
+{
+   uint32_t place;
+
+   if (slot.offset && !nir_src_is_const(nir_src_for_ssa(slot.offset)))
+      return load_handle_slot_dynamic(c, slot);
+   if (!pointer_slot_place(c, slot, &place))
+      return NULL;
+   struct air_ptr_slot *s = pointer_slot_at(c, place);
+   if (!s)
+      return air_error(c, "instruction: a pointer loaded from a local no pointer was kept in before it"), NULL;
+   struct air_ptr q = s->where;
+   if (q.class != AIR_PTR_TEXTURE && q.class != AIR_PTR_SAMPLER)
+      q.offset = nir_load_scratch(&c->b, 1, 32, nir_imm_int(&c->b, place), .align_mul = MAX2(align, 4));
+   return air_val_ptr(c, q);
+}
+
+/* A handle out of a texture array: texture L + offset / 8 -- a binding when the offset is known here, the
+ * first one's binding and an index at run time when not. */
+static struct air_val *
+load_texture_table(struct air_ctx *c, struct air_ptr table)
+{
+   struct air_ptr q = { .class = AIR_PTR_TEXTURE, .binding = table.binding, .is_image = table.is_image };
+   if (!table.offset || nir_src_is_const(nir_src_for_ssa(table.offset))) {
+      uint32_t off = table.offset ? (uint32_t)nir_src_as_uint(nir_src_for_ssa(table.offset)) : 0;
+      if (off % 8)
+         return air_error(c, "instruction: a load %u bytes into a texture array", off), NULL;
+      q.binding += off / 8;
+      return air_val_ptr(c, q);
+   }
+   if (table.is_image)
+      return air_error(c, "instruction: an image chosen at run time"), NULL;
+   q.offset = nir_ushr_imm(&c->b, nir_u2u32(&c->b, table.offset), 3);
+   return air_val_ptr(c, q);
+}
+
+bool
+air_keep_texture_handles(struct air_ctx *c, struct air_ptr dst, struct air_ptr table, uint64_t bytes)
+{
+   if (!air_pointer_slots_enabled() || dst.class != AIR_PTR_SCRATCH || table.class != AIR_PTR_TEXTURE_TABLE)
+      return air_error(c, "instruction: a load through a texture or sampler pointer");
+   if (table.offset && !nir_src_is_const(nir_src_for_ssa(table.offset)))
+      return air_error(c, "intrinsic: memcpy out of a texture array at a place not known while translating");
+   uint32_t from = table.offset ? (uint32_t)nir_src_as_uint(nir_src_for_ssa(table.offset)) : 0;
+   if (from % 8 || bytes % 8)
+      return air_error(c, "intrinsic: memcpy of %u bytes out of a texture array", (unsigned)bytes);
+   for (uint64_t off = 0; off < bytes; off += 8) {
+      struct air_ptr h = { .class = AIR_PTR_TEXTURE, .binding = table.binding + (from + (uint32_t)off) / 8,
+                           .is_image = table.is_image };
+      struct air_ptr d = air_ptr_add(c, dst, nir_imm_int(&c->b, (int)off));
+      if (!store_pointer_slot(c, d, h, 8))
+         return false;
+   }
+   return true;
+}
+
+/* a load of a number that would read a pointer's slot: the slot holds a byte offset, not an address */
+static bool
+reads_pointer_slot(struct air_ctx *c, struct air_ptr from, const struct air_type *type)
+{
+   if (!c->num_ptr_slots || from.class != AIR_PTR_SCRATCH)
+      return false;
+   if (from.offset && !nir_src_is_const(nir_src_for_ssa(from.offset)))
+      return false;   /* (not known here: a local indexed at run time; such a read is not in the corpus) */
+   uint32_t at = from.offset ? (uint32_t)nir_src_as_uint(nir_src_for_ssa(from.offset)) : 0;
+   uint32_t size = MAX2(air_nir_components(type) * MAX2(air_nir_bit_size(c, type), 8) / 8, 1);
+   for (unsigned i = 0; i < c->num_ptr_slots; i++)
+      if (at < c->ptr_slots[i].offset + 8 && c->ptr_slots[i].offset < at + size)
+         return true;
+   return false;
+}
+
 /* -- metadata helpers --------------------------------------------------- */
 
 static const char *
@@ -1858,6 +2064,22 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          .binding = index,
          .is_image = write || cube_read,
       };
+      /* (11-27, HAKIOS_AIR_PTR_SLOTS=1) `array<texture2d<T>, N>`: air.location_index L, N -- N textures from L on,
+       * and the parameter a table of their handles (Photos' grid renderer's shaderStatic2DTextures / 3D) */
+      uint64_t count = 1;
+      int li = md_key(node, "air.location_index");
+      if (li >= 0 && !md_int(node, li + 2, &count))
+         count = 1;
+      if (count > 1 && air_pointer_slots_enabled()) {
+         if (count > 32)
+            return air_error(c, "interface: an array of %u textures", (unsigned)count);
+         for (unsigned k = 0; k < count; k++)
+            add_resource(c, write || cube_read ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index + k, 0,
+                         sample || read, write, param, node);
+         p.class = AIR_PTR_TEXTURE_TABLE;
+         c->params[param] = air_val_ptr(c, p);
+         return true;
+      }
       add_resource(c, write || cube_read ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
                    sample || read, write, param, node);
       c->params[param] = air_val_ptr(c, p);
@@ -2970,6 +3192,24 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
          air_set(c, &in->base, res);
          return true;
       }
+      if (p->ptr.class == AIR_PTR_TEXTURE_TABLE && in->base.type && in->base.type->kind == AIR_TYPE_POINTER) {
+         struct air_val *res = load_texture_table(c, p->ptr);
+         if (!res)
+            return false;
+         air_set(c, &in->base, res);
+         return true;
+      }
+      /* (11-27, HAKIOS_AIR_PTR_SLOTS=1) a pointer kept in a local, back: store_pointer_slot */
+      if (air_pointer_slots_enabled() && p->ptr.class == AIR_PTR_SCRATCH && in->base.type &&
+          in->base.type->kind == AIR_TYPE_POINTER) {
+         struct air_val *res = load_pointer_slot(c, p->ptr, in->align);
+         if (!res)
+            return false;
+         air_set(c, &in->base, res);
+         return true;
+      }
+      if (reads_pointer_slot(c, p->ptr, in->base.type))
+         return air_error(c, "instruction: a local that keeps a pointer read as a number");
       nir_def *res = air_load_ptr(c, p->ptr, in->base.type, in->align);
       if (!res)
          return false;
@@ -2990,6 +3230,9 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *sv = air_get(c, in->operands[0]);
       if (!sv)
          return false;
+      if (val_is_pointerish(sv) && air_pointer_slots_enabled() && sv->kind == AIR_VAL_PTR &&
+          p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_SCRATCH)
+         return store_pointer_slot(c, p->ptr, sv->ptr, in->align);
       if (val_is_pointerish(sv))
          return air_error(c, "instruction: a store of a pointer into memory, which this "
                              "frontend has no address to write");

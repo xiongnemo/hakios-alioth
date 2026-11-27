@@ -1418,6 +1418,13 @@ mesa_available(void)
 			setenv("HAKIOS_AIR_DUMP", dir, 0);
 			rw_print("metal_dump_air=1: every pipeline's stage modules into %sair-*.bc\n", dir);
 		}
+		/* (11-27) metal_ptr_slots=1: a pointer kept in a local -- Photos' grid renderer, VFX, QuartzCore's
+		 * fixed_frag_lph_* -- translated instead of refused (air_to_nir.c store_pointer_slot, HAKIOS_AIR_PTR_SLOTS);
+		 * off by default */
+		if (strstr(args, "metal_ptr_slots=1") != NULL && getenv("HAKIOS_AIR_PTR_SLOTS") == NULL) {
+			setenv("HAKIOS_AIR_PTR_SLOTS", "1", 0);
+			rw_print("metal_ptr_slots=1: pointers kept in locals translated\n");
+		}
 		/* (11-18) metal_air_disk=0: no translation cache on disk (air_metal.c translate_disk, HAKIOS_AIR_DISK) --
 		 * every launch translates its pipelines' AIR again, as before */
 		if (strstr(args, "metal_air_disk=0") != NULL && getenv("HAKIOS_AIR_DISK") == NULL) {

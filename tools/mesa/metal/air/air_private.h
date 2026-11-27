@@ -27,7 +27,8 @@ enum air_ptr_class {
    AIR_PTR_SCRATCH,       /* an alloca, or a program-scope variable */
    AIR_PTR_CONSTANT_DATA, /* a constant global: nir->constant_data */
    AIR_PTR_FUNCTION_CONSTANT, /* a function constant: .binding is its index */
-   AIR_PTR_TEXTURE,       /* a texture handle; offset unused */
+   AIR_PTR_TEXTURE,       /* a texture handle; offset unused -- (11-27, HAKIOS_AIR_PTR_SLOTS=1) or, when set, a
+                           * texture index chosen at run time, added to .binding (a texture array's element) */
    AIR_PTR_SAMPLER,       /* a sampler handle */
 
    /* An ARGUMENT BUFFER (`air.indirect_buffer`): .binding is the set's number
@@ -37,6 +38,12 @@ enum air_ptr_class {
     * why argument buffers need no addresses here.
     */
    AIR_PTR_ARGBUF,
+
+   /* (11-27, HAKIOS_AIR_PTR_SLOTS=1) an ARRAY OF TEXTURES (`array<texture2d<T>, N>`, a parameter with
+    * air.location_index L, N): .binding is L, .offset bytes into it -- each element is one 8-byte handle
+    * (struct metal::texture2d { ptr addrspace(1) }). A load out of it is the handle of texture L + offset / 8.
+    */
+   AIR_PTR_TEXTURE_TABLE,
 };
 
 struct air_ptr {
@@ -209,6 +216,13 @@ struct air_ctx {
    unsigned scratch_size;
    unsigned shared_size;
 
+   /* (11-27, HAKIOS_AIR_PTR_SLOTS=1) pointers kept in locals: the place in scratch, and where they point */
+   struct air_ptr_slot {
+      uint32_t offset;         /* bytes into scratch */
+      struct air_ptr where;    /* .offset unused: the slot keeps it */
+   } *ptr_slots;
+   unsigned num_ptr_slots;
+
    /* module-scope variables, by their air_global */
    struct hash_table *globals;
 
@@ -216,6 +230,8 @@ struct air_ctx {
 };
 
 bool air_error(struct air_ctx *c, const char *fmt, ...) PRINTFLIKE(2, 3);
+/* (11-27, HAKIOS_AIR_PTR_SLOTS=1) a memcpy of BYTES out of a texture array into a local: its handles kept in slots */
+bool air_keep_texture_handles(struct air_ctx *c, struct air_ptr dst, struct air_ptr table, uint64_t bytes);
 
 /* value bookkeeping */
 struct air_val *air_val_ssa(struct air_ctx *c, nir_def *def);

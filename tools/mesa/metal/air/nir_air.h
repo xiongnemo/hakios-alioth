@@ -470,6 +470,10 @@ unsigned air_module_function_constants(void *mem_ctx, const void *bitcode, size_
 int air_module_stage(void *mem_ctx, const void *bitcode, size_t size, const char **calls,
                      const char **error);
 
+/* (the K40's, 11-27) HAKIOS_AIR_PTR_SLOTS=1 (boot-arg metal_ptr_slots=1): pointers kept in locals are
+ * translated (air_to_nir.c store_pointer_slot); read once a process */
+bool air_pointer_slots_enabled(void);
+
 #ifdef __cplusplus
 }
 #endif

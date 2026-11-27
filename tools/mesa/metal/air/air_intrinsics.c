@@ -1387,6 +1387,9 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       /* in 4-byte pieces, which is what every memcpy in the corpus is a
        * multiple of (they copy float vectors out of constant buffers)
        */
+      /* (11-27, HAKIOS_AIR_PTR_SLOTS=1) a texture array copied into a local: its handles kept, not loaded */
+      if (src->ptr.class == AIR_PTR_TEXTURE_TABLE)
+         return air_keep_texture_handles(c, dst->ptr, src->ptr, bytes);
       if (bytes % 4)
          return air_error(c, "intrinsic: memcpy of %u bytes", (unsigned)bytes);
       for (uint64_t off = 0; off < bytes; off += 4) {
@@ -1733,6 +1736,8 @@ query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex
               nir_texop op, nir_def *lod, unsigned comps)
 {
    if (tex->is_image) {
+      if (tex->offset)
+         return air_error(c, "intrinsic: the size of an image chosen at run time"), NULL;
       nir_def *index = nir_imm_int(&c->b, tex->binding);
       switch (op) {
       case nir_texop_txs: {
@@ -1754,7 +1759,7 @@ query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex
       }
    }
 
-   nir_tex_instr *q = nir_tex_instr_create(c->nir, lod ? 1 : 0);
+   nir_tex_instr *q = nir_tex_instr_create(c->nir, (lod ? 1 : 0) + (tex->offset ? 1 : 0));
    q->op = op;
    q->sampler_dim = t->dim;
    q->is_array = t->is_array;
@@ -1763,6 +1768,10 @@ query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex
    q->sampler_index = 0;
    if (lod)
       q->src[0] = (nir_tex_src){ .src_type = nir_tex_src_lod, .src = nir_src_for_ssa(lod) };
+   /* (11-27) a texture array's element chosen at run time: the index past texture_index */
+   if (tex->offset)
+      q->src[lod ? 1 : 0] = (nir_tex_src){ .src_type = nir_tex_src_texture_offset,
+                                           .src = nir_src_for_ssa(tex->offset) };
    /* NIR fixes the size of a query's result itself -- txs is two components
     * for a 2D texture whatever the caller asks one of them for -- so it is
     * asked here and the component picked afterwards.
@@ -2025,6 +2034,8 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       if (is_float && value->bit_size == 16)
          value = nir_f2f32(&c->b, value);
       nir_alu_type src_type = is_float ? nir_type_float : nir_alu_type_get_base_type(dest_type);
+      if (tex.offset)   /* (11-27) */
+         return air_error(c, "intrinsic: an image chosen at run time");
       nir_image_store(&c->b, nir_imm_int(&c->b, tex.binding),
                       nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
@@ -2054,6 +2065,8 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       if (!t.is_ms && extra != 0)
          return air_error(c, "intrinsic: air.%s of mip level %u through an image (only 0 is handled)",
                           n->part[0], (unsigned)extra);
+      if (tex.offset)   /* (11-27) */
+         return air_error(c, "intrinsic: an image chosen at run time");
       nir_def *res = nir_image_load(&c->b, 4, dest_bits, nir_imm_int(&c->b, tex.binding),
                                     nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
                                     nir_imm_int(&c->b, t.is_ms ? extra : 0),
@@ -2107,7 +2120,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
     * exactly six, and the next source anyone adds should not be the one that overflows
     * this silently.
     */
-   nir_tex_src srcs[7];
+   nir_tex_src srcs[8];   /* (11-27: one more, a texture array's run-time index) */
    unsigned nsrc = 0;
    srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_coord,
                                  .src = nir_src_for_ssa(coord) };
@@ -2235,6 +2248,12 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       };
    }
 
+   /* (11-27, HAKIOS_AIR_PTR_SLOTS=1) a texture array's element chosen at run time: the index past texture_index */
+   if (tex.offset) {
+      if (tex.is_image)
+         return air_error(c, "intrinsic: an image chosen at run time");
+      srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_texture_offset, .src = nir_src_for_ssa(tex.offset) };
+   }
    nir_tex_instr *tex_instr = nir_tex_instr_create(c->nir, nsrc);
    tex_instr->op = op;
    tex_instr->sampler_dim = t.dim;

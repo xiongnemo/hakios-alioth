@@ -6909,6 +6909,8 @@ translate_disk(struct rwa_device *device, void *mem_ctx, const void *bitcode, si
       _mesa_sha1_update(&sha, bitcode, size);
       _mesa_sha1_update(&sha, e, strlen(e) + 1);
       _mesa_sha1_update(&sha, flags, sizeof(flags));
+      if (air_pointer_slots_enabled())   /* (11-27: only then, so every other key stays what it was) */
+         _mesa_sha1_update(&sha, "ptr-slots", 9);
       if (!opts->module_constants && opts->num_constants)
          _mesa_sha1_update(&sha, opts->constants, opts->num_constants * sizeof(*opts->constants));
       _mesa_sha1_final(&sha, digest);
