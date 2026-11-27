@@ -13,6 +13,7 @@
  */
 
 #include "nir.h"
+#include "util/set.h"
 #include "nir_builder.h"
 #include "nir_air.h"
 
@@ -168,6 +169,58 @@ air_place_threadgroup_buffers(nir_shader *nir, const unsigned lengths[AIR_TG_BUF
    return at;
 }
 
+/*
+ * (the K40's, 11-27; HAKIOS_AIR_OUT_ONCE=1, boot-arg metal_out_once=1, off by default) AN OUTPUT STORED ON TWO PATHS.
+ * A Metal function that returns from inside a branch stores its returned struct there (air_to_nir.c emit_return),
+ * so an output is stored in more than one block. ir3 keeps the last store it compiles as THE output (its
+ * outputs[] at nir->ir3), whichever path ran, and the end's collect then uses a value that does not dominate it --
+ * ir3's register allocator asserted "handle_live_in: physreg != ~0" (release: SIGSEGV) on Photos' grid renderer
+ * (PhotosUICore fragment_main). Mesa's own frontends make outputs temporaries that are copied out once, at the end
+ * (nir_lower_io_to_temporaries); this does the same, and only for a shader that stores some output twice, so every
+ * other translation stays what it was.
+ */
+static bool
+outputs_stored_twice(nir_shader *nir)
+{
+   struct set *seen = _mesa_pointer_set_create(NULL);
+   bool twice = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *st = nir_instr_as_intrinsic(instr);
+            if (st->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(st->src[0]));
+            if (!var || var->data.mode != nir_var_shader_out)
+               continue;
+            /* or stored anywhere but the last block: on some path not at all (a discard), the same thing to ir3 */
+            if (block != nir_impl_last_block(impl) || _mesa_set_search(seen, var)) {
+               twice = true;
+               break;
+            }
+            _mesa_set_add(seen, var);
+         }
+      }
+   }
+   _mesa_set_destroy(seen, NULL);
+   return twice;
+}
+
+static bool
+out_once_enabled(void)
+{
+   static int on = -1;
+
+   if (on < 0) {
+      const char *e = getenv("HAKIOS_AIR_OUT_ONCE");
+      on = e && e[0] == '1';
+   }
+   return on;
+}
+
 void
 air_finalize_for_gallium(nir_shader *nir, bool fs_position_is_sysval, bool base_group)
 {
@@ -252,6 +305,14 @@ air_finalize_for_gallium(nir_shader *nir, bool fs_position_is_sysval, bool base_
     * what this asks for: nir_assign_io_var_locations sorts by location, so the built-ins come before VAR0. The
     * fragment stage is linked to the vertex stage by slot, not by these numbers.
     */
+   if (out_once_enabled() && outputs_stored_twice(nir)) {
+      /* (11-27) outputs_stored_twice above: temporaries, copied out once at the end */
+      NIR_PASS(_, nir, nir_lower_io_to_temporaries, nir_shader_get_entrypoint(nir), true, false);
+      NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+      NIR_PASS(_, nir, nir_split_var_copies);
+      NIR_PASS(_, nir, nir_lower_var_copies);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   }
    if (nir->info.stage == MESA_SHADER_VERTEX)
       nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs, MESA_SHADER_VERTEX);
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,

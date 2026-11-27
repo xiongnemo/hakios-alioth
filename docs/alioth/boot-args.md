@@ -68,6 +68,7 @@ own event, or for N ms at most, and wakes at once when work arrives.
 | `appgl_wait_ms=N` | ms (with `appgl_fps`) | a GL app's present waits until its next surface is no longer on screen, so the app runs at the rate the screen takes rather than at a fixed cap | a map app at a 60 cap → about 85 frames a second, at uneven intervals |
 | `metal_upload=1` | 1 | Metal `replaceRegion` copies its bytes outside the library lock | correct, no measurable gain (the cost is the staging allocation) |
 | `metal_ptr_slots=1` | 1 | the Metal translator takes a pointer kept in a local (its byte offset kept there, where it points remembered while translating) and arrays of textures (`array<texture2d<T>, N>` bound as N textures, an element chosen at run time) | PC corpus: 3,499 → 3,501 translated (Photos' grid renderer, a Portrait shader), none lost; not run on the phone |
+| `metal_out_once=1` | 1 | a shader that stores an output on some paths only, or more than once, has its outputs copied out once at the end (`nir_lower_io_to_temporaries`), as ir3 expects | PC debug ir3: Photos' grid renderer compiles (it crashed the register allocator); 11 of 3,501 shaders touched, all compile; not run on the phone |
 | `gpu_ring_switch=1` | 1 | the GPU's command ring switches between apps' page tables itself (CP_SMMU_TABLE_UPDATE), so the processor no longer waits for the GPU to finish one app's work before it sends the next app's | not run on the phone yet; do not use it (its first boot is planned with someone at the phone) |
 
 ## Camera

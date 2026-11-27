@@ -1425,6 +1425,13 @@ mesa_available(void)
 			setenv("HAKIOS_AIR_PTR_SLOTS", "1", 0);
 			rw_print("metal_ptr_slots=1: pointers kept in locals translated\n");
 		}
+		/* (11-27) metal_out_once=1: a shader that stores an output on two paths (a return inside a branch) gets
+		 * its outputs as temporaries copied out once at the end (air_finalize.c outputs_stored_twice,
+		 * HAKIOS_AIR_OUT_ONCE) -- ir3 otherwise keeps the last store it compiles; off by default */
+		if (strstr(args, "metal_out_once=1") != NULL && getenv("HAKIOS_AIR_OUT_ONCE") == NULL) {
+			setenv("HAKIOS_AIR_OUT_ONCE", "1", 0);
+			rw_print("metal_out_once=1: outputs stored on two paths copied out once\n");
+		}
 		/* (11-18) metal_air_disk=0: no translation cache on disk (air_metal.c translate_disk, HAKIOS_AIR_DISK) --
 		 * every launch translates its pipelines' AIR again, as before */
 		if (strstr(args, "metal_air_disk=0") != NULL && getenv("HAKIOS_AIR_DISK") == NULL) {
