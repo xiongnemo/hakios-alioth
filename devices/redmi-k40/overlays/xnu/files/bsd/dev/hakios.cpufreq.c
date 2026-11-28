@@ -233,7 +233,7 @@ raise_domain(uint32_t domain, uint32_t cores)
 	 * highest row at or under what the hardware gives, so the rows above it are never asked for. Default 0: as before.
 	 */
 	{
-		uint32_t hwtop = 0, hw = epss_now_khz(domain);
+		uint32_t hwtop = 1, hw = epss_now_khz(domain);   /* (2026-11-26, 精简) cpufreq_hwtop=0: the table's top */
 
 		PE_parse_boot_argn("cpufreq_hwtop", &hwtop, sizeof(hwtop));
 		if (hwtop != 0 && hw != 0 && hw < top_khz) {

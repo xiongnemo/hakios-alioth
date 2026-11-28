@@ -1245,7 +1245,7 @@ static volatile bool watcher_napping;
 /*
  * (2026-11-22, N11) The amplifiers come up 170-182 ms after iOS's first sound (32 starts in 3 days), its first sample
  * reaches them 160 ms after it was written (PERIODS x 20 ms at the DSP): the first ~15 ms and their fade-in are lost,
- * most of a key click after 3 s of silence. Boot-arg amp_lead_ms=N (1..200; 0, the default: as before): when the
+ * most of a key click after 3 s of silence. Boot-arg amp_lead_ms=N (1..200; 40 the default since 2026-11-26; 0: as before): when the
  * amplifiers are off and sound comes, the feeder holds it back N ms (silence goes out, the ring is not taken from), so
  * it reaches them after they are up; the N ms it then lags are won back by dropping silence (never sound) from the ring.
  */
@@ -1520,7 +1520,7 @@ watch(void)
 	bool on = false, given_up = false, muted = false;
 	uint64_t last_look = 0, last_monitor = 0, setup_next = 0, set_up_at = 0, last_test = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0, set_ups = 0;
-	uint32_t i2c_test = 0, idle_ms = 0, look_ms = 200, naps = 0, hold_ms = (uint32_t)(QUIET_BEFORE_OFF_US / 1000), lead = 0;
+	uint32_t i2c_test = 0, idle_ms = 0, look_ms = 200, naps = 0, hold_ms = (uint32_t)(QUIET_BEFORE_OFF_US / 1000), lead = 40; /* (2026-11-26, 精简) amp_lead_ms */
 	/* (sound_pause) */
 	uint32_t pause_s = 0, pauses = 0, resumes = 0, run_fails = 0;
 	uint64_t watch_began = now_us(), resume_us_max = 0;

@@ -346,7 +346,7 @@ umi_qrtr_send_locked(struct hakios_qrtr_port *port, uint32_t node, uint32_t dst_
 	if (length >= 14 && q[0] == 0 && ((uint16_t)q[3] | (uint16_t)q[4] << 8) == 0x22 && q[7] == 0x01 &&
 	    ((uint16_t)q[8] | (uint16_t)q[9] << 8) == 4 && ((uint32_t)q[10] | (uint32_t)q[11] << 8 |
 	    (uint32_t)q[12] << 16 | (uint32_t)q[13] << 24) == 4) {
-		uint32_t off_wait = 0;
+		uint32_t off_wait = 300;        /* (2026-11-26, 精简) the default; wifi_off_wait=0: as long as the driver waits */
 
 		PE_parse_boot_argn("wifi_off_wait", &off_wait, sizeof(off_wait));
 		if (off_wait != 0) {

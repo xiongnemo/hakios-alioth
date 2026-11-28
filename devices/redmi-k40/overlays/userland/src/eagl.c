@@ -7240,7 +7240,7 @@ install(void)
 			}
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
-		wrap_once = strstr(arguments, "gl_wrap_once=1") != NULL;
+		wrap_once = strstr(arguments, "gl_wrap_once=0") == NULL;      /* (2026-11-26, 精简) on unless =0 */
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		early_flush = strstr(arguments, "glearly=1") != NULL;
 		copy_targets = strstr(arguments, "gltargetcopy=1") != NULL;

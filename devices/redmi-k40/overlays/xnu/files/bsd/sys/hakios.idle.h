@@ -2,8 +2,8 @@
  * (2026-11-24, WEEK-1121) boot-arg idle_set=1: every idle boot-arg of November 22-24 at the value measured for it
  * (WEEK-1121's boot-args table) in ten characters of the kernel's line. Spelled out they take ~200, and the line has
  * no room for them beside the rest of the week's (1104 of 1022 characters with a release's apps_token).
- * One given by its own name wins, 0 included (idle_set=1 bt_idle=0: Bluetooth as before). Absent / 0, the default:
- * each only by its own name, as before -- all off.
+ * One given by its own name wins, 0 included (idle_set=1 bt_idle=0: Bluetooth as before). Absent: as idle_set=1
+ * (the default since 2026-11-26); idle_set=0: each only by its own name, as before -- all off.
  */
 #ifndef _SYS_HAKIOS_IDLE_H_
 #define _SYS_HAKIOS_IDLE_H_
@@ -56,16 +56,17 @@ void hakios_ipcc_begin(struct hakios_ipcc_link *l);
 void hakios_ipcc_looked(struct hakios_ipcc_link *l, uint32_t received, uint32_t rang, int kicked);
 void hakios_ipcc_leave(unsigned who);
 
-/* the boot-arg `name' if given; else `set_value' with idle_set=1; else false and *value untouched */
+/* the boot-arg `name' if given; else `set_value' unless idle_set=0 (2026-11-26, 精简); else false and *value untouched */
 static inline int
 hakios_idle_arg(const char *name, uint32_t *value, uint32_t set_value)
 {
-	uint32_t set = 0;
+	uint32_t set = 1;
 
 	if (PE_parse_boot_argn(name, value, sizeof(*value))) {
 		return 1;
 	}
-	if (PE_parse_boot_argn("idle_set", &set, sizeof(set)) && set != 0) {
+	(void)PE_parse_boot_argn("idle_set", &set, sizeof(set));
+	if (set != 0) {
 		*value = set_value;
 		return 1;
 	}

@@ -1005,7 +1005,7 @@ static BOOL
 save_state(NSString *bundle_id, NSString *out, NSArray<NSString *> *skip)
 {
 	NSFileManager *fm = NSFileManager.defaultManager;
-	BOOL shaders = [boot_arg("state_shaders") isEqualToString:@"1"];
+	BOOL shaders = ![boot_arg("state_shaders") isEqualToString:@"0"];   /* (2026-11-26, 精简) on unless =0 */
 
 	if ([LSApplicationProxy applicationProxyForIdentifier:bundle_id].bundleURL == nil) {
 		say("ipainstall: %s is not installed\n", bundle_id.UTF8String);

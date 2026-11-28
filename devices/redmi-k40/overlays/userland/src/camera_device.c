@@ -1414,7 +1414,7 @@ worker(void *context)
 	isp_init(&isp);
 	/* boot-arg cam_stats=N: the exposure's and white balance's statistics from every Nth cell each way (4, the old
 	   way, by default; 8 reads a quarter as many: WEEK-1121 E1) */
-	isp.stats_step = boot_arg_number("cam_stats", 4);
+	isp.stats_step = boot_arg_number("cam_stats", 8);
 	if (isp.stats_step < 1 || isp.stats_step > 32) {
 		isp.stats_step = 4;
 	}
@@ -1423,7 +1423,7 @@ worker(void *context)
 	}
 	/* boot-arg cam_gather=1: the preview's cells only where the picture takes them (the same picture); 2: and the
 	   cells' road for narrower pictures (WEEK-1121 E4); 0 / absent: the old way */
-	isp.gather = boot_arg_number("cam_gather", 0);
+	isp.gather = boot_arg_number("cam_gather", 1);
 	if (isp.gather > 2) {
 		isp.gather = 0;
 	}
@@ -1431,7 +1431,7 @@ worker(void *context)
 		say("the preview's cells: only those the picture takes%s (cam_gather=%u)", isp.gather == 2 ?
 		    ", and for pictures to a quarter of the crop" : "", isp.gather);
 	}
-	render_pieces = boot_arg_number("cam_pieces", 8);
+	render_pieces = boot_arg_number("cam_pieces", 32);
 	if (render_pieces < 1 || render_pieces > 64) {
 		render_pieces = 8;
 	}

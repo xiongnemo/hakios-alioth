@@ -369,8 +369,8 @@ seed_start(void)
 	dispatch_queue_t queue = dispatch_queue_create("gnss_feed.seed", DISPATCH_QUEUE_SERIAL);
 
 	seed_queue = queue;
-	seed_for = boot_arg_number("gnss_seed_for", 0);
-	seed_auth = boot_arg_number("gnss_seed_auth", 0);
+	seed_for = boot_arg_number("gnss_seed_for", 120);
+	seed_auth = boot_arg_number("gnss_seed_auth", 30);
 	if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
 		say("gnss_feed: seed: no %s: no seed position\n", SEED_BUNDLE);
 		return;

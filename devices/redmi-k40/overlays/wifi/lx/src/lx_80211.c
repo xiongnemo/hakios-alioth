@@ -1628,12 +1628,12 @@ request_elements(struct lx_radio *radio, uint8_t *out)
 		 * if the firmware says so) -- "one receive chain": the access point then sent to us with one spatial stream
 		 * only (96 % VHT MCS 9, 1 stream: TCP in ~150 Mbit/s against ~340 out). mac80211 never sends that value as it
 		 * is: it writes the station's own SM power save there, "disabled" (3) with both chains on. Boot-arg
-		 * wifi_mimo=1 does the same; default 0: the driver's value, as before.
+		 * wifi_mimo=1 (the K40's default since 2026-11-26) does the same; 0: the driver's value, as before.
 		 */
 		/*
 		 * (2026-11-22, N10b) And the A-MPDU factor: ath11k_create_ht_cap() sets IEEE80211_HT_MAX_AMPDU_64K, which is 3 in
 		 * Linux but 0 in FreeBSD's linuxkpi (an enum with that one member) -- so we said "8 KB aggregates" (2^(13+0)-1
-		 * bytes, ~5 frames). Boot-arg wifi_ht_ampdu=N (1..3: 16, 32, 64 KB) says N; default 0: the driver's value.
+		 * bytes, ~5 frames). Boot-arg wifi_ht_ampdu=N (1..3: 16, 32, 64 KB) says N (3, the K40's default since 2026-11-26); 0: the driver's value.
 		 */
 		uint32_t ampdu = (uint32_t)lx_os_option("wifi_ht_ampdu");
 		uint8_t factor = ampdu >= 1 && ampdu <= 3 ? (uint8_t)ampdu : band->ht_cap.ampdu_factor;

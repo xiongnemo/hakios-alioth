@@ -257,6 +257,14 @@ lx_os_option(const char *name)
 		if (strcmp(name, "wifi_station") == 0) return umi_wifi_normal_session() ? 1 : 0;
 		if (strcmp(name, "wifi_ba") == 0 || strcmp(name, "wifi_wide") == 0) return 1;
 		if (strcmp(name, "wifi_quiet") == 0) return 1;
+		/* (2026-11-26, 精简) the K40's defaults, as boot.args gave them from 2026-11-25: HE, MIMO (no SM power save),
+		 * 64 KB HT aggregates; NAME=0 on the line gives the old behaviour */
+		if (strcmp(name, "wifi_he") == 0 || strcmp(name, "wifi_mimo") == 0 || strcmp(name, "wifi_ht_ampdu") == 0) {
+			uint32_t v = strcmp(name, "wifi_ht_ampdu") == 0 ? 3 : 1;
+
+			(void)PE_parse_boot_argn(name, &v, sizeof(v));
+			return v;
+		}
 	}
 	return hakios_wifi_option(name);
 }

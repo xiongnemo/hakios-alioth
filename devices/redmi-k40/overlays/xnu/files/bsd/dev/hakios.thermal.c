@@ -268,7 +268,7 @@ hakios_thermal_init(void)
 	tsens[1] = ml_io_map(TSENS1_TM, TSENS_TM_SIZE);
 	thermal_gov_init(&gov, top);
 	{
-		uint32_t hold = 0;              /* thermal_hold=N s: back down to nominal only when calm for N s (hakios.thermal.h) */
+		uint32_t hold = 5;              /* (2026-11-26, 精简) 5 unless given; thermal_hold=N s: back down to nominal only when calm for N s (hakios.thermal.h) */
 
 		PE_parse_boot_argn("thermal_hold", &hold, sizeof(hold));
 		gov.hold_ticks = (int)((hold > 60 ? 60 : hold) * 1000 / THERMAL_TICK_MS);

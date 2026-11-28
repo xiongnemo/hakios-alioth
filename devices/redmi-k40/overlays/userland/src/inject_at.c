@@ -29,20 +29,20 @@ static dispatch_imp original_dispatch;
 static Ivar device_ivar;
 
 static bool
-boot_arg_on(const char *name)
+boot_arg_on(const char *name, bool otherwise)
 {
 	char args[1100] = "";
 	size_t n = sizeof(args) - 1, len = strlen(name);
 
 	if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) != 0) {
-		return false;
+		return otherwise;
 	}
 	for (char *p = strstr(args, name); p != NULL; p = strstr(p + 1, name)) {
-		if ((p == args || p[-1] == ' ') && p[len] == '=' && p[len + 1] != '0') {
-			return true;
+		if ((p == args || p[-1] == ' ') && p[len] == '=') {
+			return p[len + 1] != '0';
 		}
 	}
-	return false;
+	return otherwise;                       /* (2026-11-26, 精简) absent: the caller's default */
 }
 
 static void
@@ -106,7 +106,7 @@ __attribute__((constructor))
 static void
 at_init(void)
 {
-	if (!boot_arg_on("at_home")) {
+	if (!boot_arg_on("at_home", true)) {
 		return;
 	}
 	if (!install()) {

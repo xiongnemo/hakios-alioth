@@ -242,7 +242,7 @@ static uint8_t country[3];                      /* wifi_answers=1: the country c
 static bool country_set;
 
 /*
- * (2026-11-22) Boot-arg wifi_answers: 0 (the default) refuses what is not built, as before; 1 also takes wifid's
+ * (2026-11-22) Boot-arg wifi_answers: 0 refuses what is not built, as before; 1 (the default since 2026-11-26) also takes wifid's
  * SET_PROPERTY (383: its heartbeat, external power state and app-aware parameters, every 5 s -- taken, nothing done)
  * and its COUNTRY_CODE (51: kept and given back, the radio's own regulatory setting left as it is), which it
  * otherwise retries every second, then every 30 s, for the whole run.
@@ -253,7 +253,7 @@ answers(void)
 	static int value = -1;
 
 	if (value < 0) {
-		uint32_t on = 0;
+		uint32_t on = 1;                /* (2026-11-26, 精简) wifi_answers=0: refused as before */
 
 		PE_parse_boot_argn("wifi_answers", &on, sizeof(on));
 		value = on != 0;
