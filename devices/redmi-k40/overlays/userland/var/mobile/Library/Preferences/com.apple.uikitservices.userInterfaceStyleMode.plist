@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Settings > Display & Brightness > Appearance: Automatic (the phone's owner, 2026-11-29), as the phone itself writes
+     it when the switch is turned on (100 in both keys; without the file iOS is Light). Light by day, Dark from sunset;
+     seen at 01:31 the same night: Dark. /var is made new at every boot, so without this file Appearance went back to
+     Light each time. (No file of this name in userland/var: this one replaces nothing.) -->
+<plist version="1.0">
+<dict>
+	<key>UserInterfaceStyleMode</key>
+	<integer>100</integer>
+	<key>MostRecentAutomaticMode</key>
+	<integer>100</integer>
+</dict>
+</plist>
