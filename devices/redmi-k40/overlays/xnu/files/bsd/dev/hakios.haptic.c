@@ -1263,6 +1263,28 @@ chip_state(void)
 static uint32_t tap_floor_pct;  /* 0: five eighths, the old way */
 static unsigned tap_wave = 1;   /* boot-arg haptic_tap_wave: the RAM waveform a tap plays (Android's effect N - 1) */
 
+/*
+ * Boot-arg haptic_warm=1 (11-29, N45): one waveform played at a gain nobody feels before iOS gets the motor. With
+ * haptic_tap_floor=100 the run's FIRST tap (waveform 1 at 0x40, straight out of the chip's first activation) made
+ * the AW8697 report a boost short circuit, twice -- while session A, whose first tap was 0x29, played waveform 1
+ * at 0x3e and 0x40 later on without a word. So the first activation is the weak one; this spends it on the loop
+ * waveform (11, peak 38 of 127) at gain 0x08 -- 304 against the 4838 of a first tap that played -- and waits for
+ * standby. A fault here is handled as any other (the chip into reset, the motor given up).
+ */
+static uint32_t haptic_warm;
+
+static void
+warm_up(void)
+{
+	if (!start_waveform(11, false, 0x08)) {
+		return;
+	}
+	if (!wait_standby(HAPTIC_MAX_MS)) {
+		(void)stop_waveform();
+	}
+	say("haptic: haptic_warm=1: a warm-up played (waveform 11 at gain 0x08); the chip's state %u\n", chip_state());
+}
+
 static uint8_t
 gain_for(uint32_t peak)
 {
@@ -1445,6 +1467,9 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 				}
 				(void)play_effect(effect);
 			} else if (ready && level == 5) {
+				if (haptic_warm) {
+					warm_up();
+				}
 				serve();
 			} else if (!ready && !broken) {
 				give_up("configuration or waveform loading failed");
@@ -1485,6 +1510,7 @@ hakios_haptic_init(void)
 		tap_wave = wave;
 		say("haptic: haptic_tap_wave=%u: taps play Android's waveform %u\n", wave, wave);
 	}
+	(void)PE_parse_boot_argn("haptic_warm", &haptic_warm, sizeof(haptic_warm));
 	if (PE_parse_boot_argn("haptic_tap_floor", &tap_floor_pct, sizeof(tap_floor_pct))) {
 		if (tap_floor_pct > 100) {
 			tap_floor_pct = 100;
