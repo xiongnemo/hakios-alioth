@@ -40,6 +40,8 @@
  *              to five eighths of their limit for the softest input (gain_for()).
  *              haptic_tap_wave=N: a tap plays the RAM's waveform N (1..10) instead of 1;
  *              haptic_tap_floor=P: the softest taps at P % of the limit instead of five eighths (11-28).
+ *              11-29, the owner's pick, the UMI defaults: waveform 2, every tap at the limit, the limit 0x80 and
+ *              the boost at the K40's own Android's setting, after a warm-up (hakios_haptic_init()).
  *
  * UMI selects the separate AW8697 path with umi_haptic=1..5. QUP11 is on GPIO 60/61,
  * reset GPIO 130, and the south TLMM tile is at 0x0f500000. Firmware is UMI's /vendor/firmware/aw8697_haptic.bin. Levels 1..4
@@ -426,6 +428,18 @@ regs_write(uint8_t reg, const uint8_t *values, unsigned count)
 #define HAPTIC_MAX_MS           1000
 #define UMI_HAPTIC_MAX_GAIN     0x40            /* the 0x60 gain tripped AW8697 boost short-circuit protection */
 
+/*
+ * (11-29, N45) The K40's own Android leaves the AW8697 at DATDBG (gain) 0x80 and BSTDBG4 0x62 (BST_VO 0x11); the
+ * UMI path writes UMI's (the Mi 10's) BST_VO 0x0c and caps the gain at 0x40 -- a lower boost voltage than this
+ * phone's own software and half its gain. Boot-args:
+ *   haptic_bst_vo=N   BST_VO N, 0x0c..0x11 (0x11: what the K40's Android leaves)
+ *   haptic_cap=G      the gain's cap G, 1..0x80 (0x80: the K40's Android's gain)
+ * Since 11-29 (the owner's pick, hakios_haptic_init()) 0x11 and 0x80 are the defaults on this phone, with the
+ * warm-up; the values below are the old ones, put back by haptic_bst_vo=0x0c haptic_cap=0x40.
+ */
+static uint32_t umi_bst_vo = 0x0c;
+static uint32_t umi_cap = UMI_HAPTIC_MAX_GAIN;
+
 static void
 give_up(const char *why)
 {
@@ -775,7 +789,7 @@ umi_configure(void)
 	    !umi_update_bits(0x34, 0xf8, 0x05) ||                     /* BSTCFG: stock 3.5 A limit */
 	    !umi_update_bits(0x47, 0xfb, 0x00) ||                     /* BST_AUTO: stock manual boost */
 	    !umi_offset_calibrate() ||
-	    !umi_update_bits(0x3a, 0xc1, 0x18) ||                     /* BSTDBG4.BST_VO = 0x0c */
+	    !umi_update_bits(0x3a, 0xc1, (uint8_t)(umi_bst_vo << 1)) ||  /* BSTDBG4.BST_VO: 0x0c (UMI), haptic_bst_vo */
 	    !put(0x5b, 0x05) ||                                       /* UMI stock resonance trim from its AW8697 calibration */
 	    !put(0x74, 0x00) || !put(0x75, 0x08) || !put(0x76, 0x03) || !put(0x77, 0xf8)) { /* BEMF thresholds */
 		return false;
@@ -991,8 +1005,8 @@ play_effect(unsigned effect)
 		uint32_t gain = 0x40;
 
 		(void)PE_parse_boot_argn("haptic_gain", &gain, sizeof(gain));
-		if (umi_chip && gain > UMI_HAPTIC_MAX_GAIN) {
-			gain = UMI_HAPTIC_MAX_GAIN;
+		if (umi_chip && gain > umi_cap) {
+			gain = umi_cap;
 		}
 		say("haptic: UMI AW8697 waveform %u is played at diagnostic gain %#x\n", effect, gain);
 		if (!start_waveform(effect, false, (uint8_t)gain) || !healthy("before UMI playback")) {
@@ -1178,7 +1192,7 @@ umi_start_waveform(unsigned waveform, bool forever, uint8_t gain)
 	if (!wait_standby(250) || !put(0x07, (uint8_t)waveform) || !put(0x08, 0) ||
 	    !put(0x0f, forever ? 0xf0 : 0x00) ||                        /* WAVSEQ1/2 and WAVLOOP1 */
 	    !umi_activate() ||
-	    !umi_update_bits(0x3a, 0xc1, 0x18) || !put(0x39, gain)) {  /* BSTDBG4 and DATDBG, after RAM mode is active */
+	    !umi_update_bits(0x3a, 0xc1, (uint8_t)(umi_bst_vo << 1)) || !put(0x39, gain)) {  /* BSTDBG4 and DATDBG, after RAM mode is active */
 		return false;
 	}
 	if (!regs_write(0x05, &go, 1)) {                               /* GO */
@@ -1288,7 +1302,7 @@ warm_up(void)
 static uint8_t
 gain_for(uint32_t peak)
 {
-	uint32_t top = umi_chip ? UMI_HAPTIC_MAX_GAIN : android_regs[AW_PLAYCFG2], third = 32767 / 3;
+	uint32_t top = umi_chip ? umi_cap : android_regs[AW_PLAYCFG2], third = 32767 / 3;
 	uint32_t low = tap_floor_pct ? top * tap_floor_pct / 100 : top * 5 / 8;
 
 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
@@ -1503,20 +1517,49 @@ hakios_haptic_init(void)
 	if (hakios_idle_arg("haptic_idle", &haptic_idle_ms, HAKIOS_IDLE_HAPTIC) && haptic_idle_ms > 1000) {
 		haptic_idle_ms = 1000;
 	}
-	/* boot-args haptic_tap_wave=N (1..10, the short RAM waveforms; 1 by default, the old way) and haptic_tap_floor=P
-	 * (gain_for()) -- 11-28, N45, an A/B by the owner's fingers */
+	/*
+	 * boot-args haptic_tap_wave=N (1..10, the short RAM waveforms) and haptic_tap_floor=P (gain_for()) -- 11-28, N45,
+	 * an A/B by the owner's fingers. 11-29, the owner picked (V5, "this one; make it the default"): on this phone's
+	 * AW8697 (UMI path) taps play waveform 2 (it ends dying out: no spring after the tap, which waveform 1 had) with
+	 * every tap at the cap, the cap 0x80 and BST_VO 0x11 (the K40's own Android's gain and boost setting), after the
+	 * warm-up (haptic_warm). The old way back, each on its own: haptic_tap_wave=1 haptic_tap_floor=0 haptic_cap=0x40
+	 * haptic_bst_vo=0x0c haptic_warm=0.
+	 */
+	if (umi_chip) {
+		tap_wave = 2;
+		tap_floor_pct = 100;
+		umi_cap = 0x80;
+		umi_bst_vo = 0x11;
+		haptic_warm = 1;
+	}
 	uint32_t wave = 0;
 	if (PE_parse_boot_argn("haptic_tap_wave", &wave, sizeof(wave)) && wave >= 1 && wave <= 10) {
 		tap_wave = wave;
 		say("haptic: haptic_tap_wave=%u: taps play Android's waveform %u\n", wave, wave);
 	}
 	(void)PE_parse_boot_argn("haptic_warm", &haptic_warm, sizeof(haptic_warm));
+	uint32_t v = 0;
+	if (PE_parse_boot_argn("haptic_bst_vo", &v, sizeof(v)) && v >= 0x0c && v <= 0x11) {
+		umi_bst_vo = v;
+		say("haptic: haptic_bst_vo=%#x: the boost's output setting %#x (0x11 the K40's Android's, the default; 0x0c UMI's)\n",
+		    v, v);
+	}
+	if (PE_parse_boot_argn("haptic_cap", &v, sizeof(v)) && v >= 1 && v <= 0x80) {
+		umi_cap = v;
+		say("haptic: haptic_cap=%#x: the gain's cap %#x (0x80 the K40's Android's gain, the default; 0x40 before 11-29)\n",
+		    v, v);
+	}
 	if (PE_parse_boot_argn("haptic_tap_floor", &tap_floor_pct, sizeof(tap_floor_pct))) {
 		if (tap_floor_pct > 100) {
 			tap_floor_pct = 100;
 		}
-		say("haptic: haptic_tap_floor=%u: the softest taps at %u%% of the top gain (five eighths without it)\n",
+		say("haptic: haptic_tap_floor=%u: the softest taps at %u%% of the top gain (0: five eighths, the old way)\n",
 		    tap_floor_pct, tap_floor_pct);
+	}
+	if (umi_chip) {
+		say("haptic: taps: waveform %u, softest at %u%% of the cap %#x, BST_VO %#x, warm-up %s (the owner's 11-29 picks: "
+		    "2, 100, 0x80, 0x11, on)\n", tap_wave, tap_floor_pct ? tap_floor_pct : 62, umi_cap, umi_bst_vo,
+		    haptic_warm ? "on" : "off");
 	}
 	uint32_t fix = 1;
 	if (PE_parse_boot_argn("haptic_i2c_fix", &fix, sizeof(fix)) && fix == 0) {

@@ -108,6 +108,20 @@ own event, or for N ms at most, and wakes at once when work arrives.
 Test roots only (their `loc_enable --all`): `loc_poll=N` (seconds between its app scans, default 10) and
 `loc_photos_v2=0` (leaves the Photos rows at version 1 and does not restart tccd; no measured gain).
 
+## Haptics
+
+Since 2026-11-29 the first five are **on by default** on this phone (the owner picked them by feel); each boot-arg puts
+one piece back the old way. The K40's own Android drives the AW8697 at gain 0x80 with its boost at 0x11; our driver,
+taken from the Mi 10's, had used 0x40 and the Mi 10's 0x0c, and its taps rang on after the drive ("a spring").
+
+| boot-arg | values (default) | what it does | measured |
+|---|---|---|---|
+| `haptic_tap_wave=N` | 1–10 (2) | the RAM waveform a tap plays; 1 = the old one, which ends at half its peak and lets the motor ring on | 2 ends dying out: no spring after the tap (owner's A/B against 1, 3 and 8) |
+| `haptic_tap_floor=P` | percent, 0–100 (100) | the softest taps at P % of the cap; 0 = five eighths, the old way | the keyboard's taps (iOS plays them softly) at the cap instead of 5/8 of it |
+| `haptic_cap=G` | 1–0x80 (0x80) | the gain's cap; 0x40 = the old cap | 0x80 = the K40's Android's own gain; never above it |
+| `haptic_bst_vo=N` | 0x0c–0x11 (0x11) | the boost's output setting; 0x0c = the Mi 10's, the old one | 0x11 = what the K40's Android leaves in the chip |
+| `haptic_warm=1` | 0/1 (1) | one waveform at gain 0x08, felt by nobody, before iOS gets the motor | without it a first tap at a high gain straight out of the chip's first activation made it report a boost short circuit (twice, 11-29) and the motor was off for the run; with it, 0 faults in 7 runs at up to 0x80 |
+
 ## Tried together
 
 In `devices/redmi-k40/boot.args` since 2026-11-25. This line ran on the phone in one boot, with a release's apps installed, for 8 to 20 minutes:
