@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Settings > Sounds & Haptics > Keyboard Feedback > Haptic: On (the phone's owner, 2026-11-28), as the phone itself
+     writes it (the key appears, 2, when the switch is turned on; without it the switch is off, iOS's default). /var is
+     made new at every boot, so without this file the switch was off again each time. -->
+<plist version="1.0">
+<dict>
+	<key>KeyboardVisceral</key>
+	<integer>2</integer>
+</dict>
+</plist>
