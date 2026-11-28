@@ -478,11 +478,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		*) echo "$library $names" ;;
 		esac
 	done > root/etc/inject.conf
-	# (the kernel keeps the list in 512 bytes, its 0 included: a longer one is refused WHOLE -- init says
+	# (the kernel keeps the list in 4096 bytes since 2026-11-25 (K1; init's buffer), its 0 included -- 512 before: a
+	# longer one is refused WHOLE -- init says
 	# "kern.exec_inject: error 22", no program gets a library of ours, and backboardd without libhakios.dylib
 	# shows no picture at all: WEEK-1121 run 143130)
-	if [ "$(wc -c < root/etc/inject.conf)" -ge 512 ]; then
-		echo "build.sh: etc/inject.conf is $(wc -c < root/etc/inject.conf) bytes, kern.exec_inject takes 511 at most" >&2
+	if [ "$(wc -c < root/etc/inject.conf)" -ge 4096 ]; then
+		echo "build.sh: etc/inject.conf is $(wc -c < root/etc/inject.conf) bytes, kern.exec_inject takes 4095 at most" >&2
 		exit 1
 	fi
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var

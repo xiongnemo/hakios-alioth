@@ -60,6 +60,19 @@
  		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
  		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
  #if APFS
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5695,7 +5695,9 @@ bad:
+  * from a job description, which is why the kernel adds this one. Set once by our init (from
+  * etc/inject.conf) before it hands over to launchd.
+  */
+-static char exec_inject_conf[512];
++/* (the K40's, 2026-11-25, WEEK-1121 K1) 4 KB as init's buffer: a list over 511 bytes was refused whole, and no
++ * program got a library of ours (run 143130). Upstream c7dcce0 did the same in its device patch. */
++static char exec_inject_conf[4096];
+ SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
+     "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
+ 
 --- a/config/Makefile
 +++ b/config/Makefile
 @@ -66,12 +66,15 @@
