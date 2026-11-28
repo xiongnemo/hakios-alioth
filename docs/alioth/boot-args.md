@@ -123,6 +123,17 @@ taken from the Mi 10's, had used 0x40 and the Mi 10's 0x0c, and its taps rang on
 | `haptic_bst_vo=N` | 0x0c–0x11 (0x11) | the boost's output setting; 0x0c = the Mi 10's, the old one | 0x11 = what the K40's Android leaves in the chip |
 | `haptic_warm=1` | 0/1 (1) | one waveform at gain 0x08, felt by nobody, before iOS gets the motor | without it a first tap at a high gain straight out of the chip's first activation made it report a boost short circuit (twice, 11-29) and the motor was off for the run; with it, 0 faults in 7 runs at up to 0x80 |
 
+## In the daily line since 2026-11-29
+
+The owner's walk-through of 2026-11-28 (one boot with these on top of the daily line: haptics, torch, a voice memo,
+a short sound after silence, swiping, Photos' grid, the camera -- all fine) made them part of `devices/redmi-k40/boot.args`
+on 2026-11-29, next to `umi_wifi_irq=2`:
+
+    wifi_idle=50 wifi_mon_ms=100 mdm_irq=1 glink_irq=1 bt_irq=1 gpugov_idle=1 gov_idle=100 sound_pause=10 metal_ptr_slots=1 metal_out_once=1
+
+Each is described in its section above; delete one there (or give it `=0`) for the old behaviour. At rest the
+interrupt set took the kernel from about 4,000 to about 1,400 wakes a second (2026-11-25..26).
+
 ## Tried together
 
 In `devices/redmi-k40/boot.args` from 2026-11-25, with pb_store=1 after it; the code's own defaults since 2026-11-26 (`=0` for the old). This line ran on the phone in one boot, with a release's apps installed, for 8 to 20 minutes:
