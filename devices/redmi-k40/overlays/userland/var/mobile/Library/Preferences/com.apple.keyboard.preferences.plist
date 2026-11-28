@@ -1,10 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Settings > Sounds & Haptics > Keyboard Feedback > Haptic: On (the phone's owner, 2026-11-28), as the phone itself
-     writes it (the key appears, 2, when the switch is turned on; without it the switch is off, iOS's default). /var is
-     made new at every boot, so without this file the switch was off again each time. -->
+<!-- This file REPLACES userland/var's of the same name (the overlay is copied over it), so it carries that one's key
+     too: DidShowContinuousPathIntroduction says the sliding-keyboard introduction has been shown; without it UIKit
+     puts nil into an array for the missing film and every application that wants a keyboard dies (11-28: a first
+     version of this file had only the key below, and every text field crashed with SIGABRT).
+     And: Settings > Sounds & Haptics > Keyboard Feedback > Haptic: On (the phone's owner, 2026-11-28), as the phone
+     itself writes it (KeyboardVisceral 2 when the switch is turned on; without it the switch is off, iOS's default).
+     /var is made new at every boot, so without it the switch was off again each time. -->
 <plist version="1.0">
 <dict>
+	<key>DidShowContinuousPathIntroduction</key>
+	<true/>
 	<key>KeyboardVisceral</key>
 	<integer>2</integer>
 </dict>
