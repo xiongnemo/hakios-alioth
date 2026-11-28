@@ -38,6 +38,8 @@
  *              again. Gain follows how loud iOS's waveform is. HK tops out at its stock 0x80;
  *              UMI tops out at 0x40 after the AW8697 reported a boost short-circuit at 0x60. Both taper
  *              to five eighths of their limit for the softest input (gain_for()).
+ *              haptic_tap_wave=N: a tap plays the RAM's waveform N (1..10) instead of 1;
+ *              haptic_tap_floor=P: the softest taps at P % of the limit instead of five eighths (11-28).
  *
  * UMI selects the separate AW8697 path with umi_haptic=1..5. QUP11 is on GPIO 60/61,
  * reset GPIO 130, and the south TLMM tile is at 0x0f500000. Firmware is UMI's /vendor/firmware/aw8697_haptic.bin. Levels 1..4
@@ -1253,11 +1255,19 @@ chip_state(void)
  * vibrations at gain 0x80. UMI's AW8697 reported boost short-circuit protection at gain 0x60, so cap it
  * at 0x40. Use the chip's top gain from a third of full scale up, then taper down to five eighths
  * of it for the softest effects.
+ *
+ * Boot-arg haptic_tap_floor=P (11-28, N45: the owner found the keyboard's taps "not crisp enough"; iOS plays them
+ * softly, so they sat at the floor): the softest effects at P percent of the top instead of five eighths (1..100;
+ * 100 = every tap at the top). Never above the top: the cap above stays what it is.
  */
+static uint32_t tap_floor_pct;  /* 0: five eighths, the old way */
+static unsigned tap_wave = 1;   /* boot-arg haptic_tap_wave: the RAM waveform a tap plays (Android's effect N - 1) */
+
 static uint8_t
 gain_for(uint32_t peak)
 {
-	uint32_t top = umi_chip ? UMI_HAPTIC_MAX_GAIN : android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
+	uint32_t top = umi_chip ? UMI_HAPTIC_MAX_GAIN : android_regs[AW_PLAYCFG2], third = 32767 / 3;
+	uint32_t low = tap_floor_pct ? top * tap_floor_pct / 100 : top * 5 / 8;
 
 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
 }
@@ -1299,7 +1309,7 @@ serve(void)
 				if (state == TAP && !wait_standby(0) && !stop_waveform()) {
 					break;
 				}
-				if (!start_waveform(1, false, gain ? gain : 1)) {
+				if (!start_waveform(tap_wave, false, gain ? gain : 1)) {
 					break;
 				}
 				state = TAP;
@@ -1308,8 +1318,8 @@ serve(void)
 				taps++;
 				if (taps + loops <= TOLD_EVENTS) {
 					wait_ms(4);
-					say("haptic: tap %u: iOS's waveform peaks at %u of 32768: Android's waveform 1 at gain %#04x; the "
-					    "chip's state %u\n", taps, peak, gain ? gain : 1, chip_state());
+					say("haptic: tap %u: iOS's waveform peaks at %u of 32768: Android's waveform %u at gain %#04x; the "
+					    "chip's state %u\n", taps, peak, tap_wave, gain ? gain : 1, chip_state());
 				}
 				break;
 			}
@@ -1467,6 +1477,20 @@ hakios_haptic_init(void)
 	}
 	if (hakios_idle_arg("haptic_idle", &haptic_idle_ms, HAKIOS_IDLE_HAPTIC) && haptic_idle_ms > 1000) {
 		haptic_idle_ms = 1000;
+	}
+	/* boot-args haptic_tap_wave=N (1..10, the short RAM waveforms; 1 by default, the old way) and haptic_tap_floor=P
+	 * (gain_for()) -- 11-28, N45, an A/B by the owner's fingers */
+	uint32_t wave = 0;
+	if (PE_parse_boot_argn("haptic_tap_wave", &wave, sizeof(wave)) && wave >= 1 && wave <= 10) {
+		tap_wave = wave;
+		say("haptic: haptic_tap_wave=%u: taps play Android's waveform %u\n", wave, wave);
+	}
+	if (PE_parse_boot_argn("haptic_tap_floor", &tap_floor_pct, sizeof(tap_floor_pct))) {
+		if (tap_floor_pct > 100) {
+			tap_floor_pct = 100;
+		}
+		say("haptic: haptic_tap_floor=%u: the softest taps at %u%% of the top gain (five eighths without it)\n",
+		    tap_floor_pct, tap_floor_pct);
 	}
 	uint32_t fix = 1;
 	if (PE_parse_boot_argn("haptic_i2c_fix", &fix, sizeof(fix)) && fix == 0) {
